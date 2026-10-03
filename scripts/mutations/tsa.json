@@ -1,0 +1,67 @@
+{
+ "packages": [
+  "./internal/tsa/"
+ ],
+ "mutations": [
+  {
+   "name": "T1 хэш в TSTInfo не сверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif !mi.HashAlgorithm.Algorithm.Equal(oidSHA256) || !bytes.Equal(mi.HashedMessage, imprint[:]) {",
+   "new": "\tif !mi.HashAlgorithm.Algorithm.Equal(oidSHA256) {"
+  },
+  {
+   "name": "T2 отпечаток TSTInfo не сверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif !bytes.Equal(h.Sum(nil), md) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "T3 цепочка сертификата не проверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\t\treturn Info{}, fmt.Errorf(\"%w: signer certificate: %v\", ErrInvalid, err)",
+   "new": "\t\t_ = err"
+  },
+  {
+   "name": "T4 назначение сертификата не проверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif len(signer.ExtKeyUsage) != 1 || signer.ExtKeyUsage[0] != x509.ExtKeyUsageTimeStamping || len(signer.UnknownExtKeyUsage) != 0 {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "T5 nonce ответа не сверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif info.tst.Nonce == nil || info.tst.Nonce.Cmp(nonce) != 0 {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "T6 подпись не проверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\t\tif err := rsa.VerifyPKCS1v15(pub, hash, digest, sig); err != nil {",
+   "new": "\t\tif err := rsa.VerifyPKCS1v15(pub, hash, digest, sig); err != nil && false {"
+  },
+  {
+   "name": "T7 signingCertificateV2 не сверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\t\tif err := checkSigningCert(raw, signer); err != nil {",
+   "new": "\t\tif err := checkSigningCert(raw, signer); err != nil && false {"
+  },
+  {
+   "name": "T8 статус отказа принимается",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif resp.Status.Status != 0 && resp.Status.Status != 1 {",
+   "new": "\tif resp.Status.Status > 5 {"
+  },
+  {
+   "name": "T9 тип содержимого в атрибутах не сверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif _, err := asn1.Unmarshal(ct, &ctOID); err != nil || !ctOID.Equal(oidTSTInfo) {",
+   "new": "\tif _, err := asn1.Unmarshal(ct, &ctOID); err != nil {"
+  },
+  {
+   "name": "T10 ECDSA-подпись не проверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\t\tif !ecdsa.VerifyASN1(pub, digest, sig) {",
+   "new": "\t\tif false {"
+  }
+ ]
+}

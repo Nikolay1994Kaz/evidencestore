@@ -1,0 +1,75 @@
+{
+ "packages": [
+  "./internal/server/",
+  "./internal/collector/"
+ ],
+ "mutations": [
+  {
+   "name": "V1 закреплённый сертификат не сверяется",
+   "file": "internal/server/server.go",
+   "old": "\tif src.CertSHA256 != \"\" && src.CertSHA256 != config.CertFingerprint(cert.Raw) {",
+   "new": "\tif src.CertSHA256 != \"\" && false {"
+  },
+  {
+   "name": "V2 клиентский сертификат не обязателен",
+   "file": "internal/server/server.go",
+   "old": "\t\tClientAuth:   tls.RequireAndVerifyClientCert,",
+   "new": "\t\tClientAuth:   tls.VerifyClientCertIfGiven,"
+  },
+  {
+   "name": "C1 позиция в файле не восстанавливается из буфера",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tc.pos = r.pos\n",
+   "new": ""
+  },
+  {
+   "name": "C2 недописанная строка уходит",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif err == io.EOF && (!final || len(line) == 0) {",
+   "new": "\t\tif err == io.EOF && len(line) == 0 {"
+  },
+  {
+   "name": "C3 подтверждённое не отмечается",
+   "file": "internal/collector/collector.go",
+   "old": "\tc.acked = batch[len(batch)-1].seq\n",
+   "new": ""
+  },
+  {
+   "name": "C4 ключ хранилища не сверяется",
+   "file": "internal/collector/collector.go",
+   "old": "\tif c.storeKey != nil && base64.RawStdEncoding.EncodeToString(c.storeKey) != st.PublicKey {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "C5 ротация не замечается",
+   "file": "internal/collector/collector.go",
+   "old": "\tcase cur != c.pos.Inode:",
+   "new": "\tcase cur != c.pos.Inode && false:"
+  },
+  {
+   "name": "C6 ротированный файл не дочитывается",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif old := c.findByInode(c.pos.Inode); old != \"\" {",
+   "new": "\t\tif old := c.findByInode(c.pos.Inode); old != \"\" && false {"
+  },
+  {
+   "name": "C7 потеря хвоста без пропуска номера",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)\n\t\t\tc.nextSeq++",
+   "new": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)"
+  },
+  {
+   "name": "C8 пачка без предела байтов",
+   "file": "internal/collector/collector.go",
+   "old": "(n == 0 || size+len(c.pending[n].body) <= maxBatchBytes)",
+   "new": "(n == 0 || size >= 0)"
+  },
+  {
+   "name": "C9 последняя строка ротированного файла теряется",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif err == io.EOF && (!final || len(line) == 0) {",
+   "new": "\t\tif err == io.EOF && (final || !final) {"
+  }
+ ],
+ "note": "V3 (имя из сертификата не сверяется с реестром на входе) снят как равносильный: store.Ingest и store.LastSeq сами отказывают неизвестному источнику (ErrUnknownSource → 403)."
+}

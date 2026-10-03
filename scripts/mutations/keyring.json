@@ -1,0 +1,218 @@
+{
+ "packages": [
+  "./internal/keyring/",
+  "./internal/evidence/"
+ ],
+ "mutations": [
+  {
+   "name": "M1a Seal отпускает замок до шифрования",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tk.mu.RLock()\n\tdefer k.mu.RUnlock()\n\tif k.closed {\n\t\treturn nil, ErrClosed\n\t}\n\te, ok := k.byName[scope]",
+   "new": "\tk.mu.RLock()\n\te, ok := k.byName[scope]\n\tclosed := k.closed\n\tk.mu.RUnlock()\n\tif closed {\n\t\treturn nil, ErrClosed\n\t}"
+  },
+  {
+   "name": "M1b UnwrapDEK отпускает замок до расшифровки",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tk.mu.RLock()\n\tdefer k.mu.RUnlock()\n\tif k.closed {\n\t\treturn nil, ErrClosed\n\t}\n\te, ok := k.byID[id]",
+   "new": "\tk.mu.RLock()\n\te, ok := k.byID[id]\n\tclosed := k.closed\n\tk.mu.RUnlock()\n\tif closed {\n\t\treturn nil, ErrClosed\n\t}"
+  },
+  {
+   "name": "M2 порча файла молча = пустой кейринг",
+   "file": "internal/keyring/format.go",
+   "old": "\t\treturn fmt.Errorf(\"%w: %s: root %s: %w\", ErrCorrupt, k.path, rootID, err)",
+   "new": "\t\treturn nil"
+  },
+  {
+   "name": "M3 нет файла = пустой кейринг",
+   "file": "internal/keyring/keyring.go",
+   "old": "\t\treturn nil, fmt.Errorf(\"%w: %s\", ErrNotFound, k.path)",
+   "new": "\t\treturn k, nil"
+  },
+  {
+   "name": "M4 уничтожение без поворота корня",
+   "file": "internal/keyring/destroy.go",
+   "old": "\tk.rootID = newRoot\n\tk.retired = append(slices.Clone(oldRetired), oldRoot)",
+   "new": "\tk.retired = append(slices.Clone(oldRetired), newRoot)"
+  },
+  {
+   "name": "M5 старый корень уничтожен до записи файла",
+   "file": "internal/keyring/destroy.go",
+   "old": "\toldRoot, oldRetired := k.rootID, k.retired\n",
+   "new": "\toldRoot, oldRetired := k.rootID, k.retired\n\tk.roots.DestroyRoot(oldRoot)\n"
+  },
+  {
+   "name": "M6 откат памяти при любой ошибке (P6)",
+   "file": "internal/keyring/destroy.go",
+   "old": "\tif !committed {\n\t\t// Файл не заменён",
+   "new": "\tif !committed || err != nil {\n\t\t// Файл не заменён"
+  },
+  {
+   "name": "M7 корни уничтожаются без подтверждённой копии",
+   "file": "internal/keyring/destroy.go",
+   "old": "\tif k.safe != k.gen {\n\t\tif _, err := k.persistLocked(); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n",
+   "new": ""
+  },
+  {
+   "name": "M8 ключ выдаётся, не дождавшись резерва",
+   "file": "internal/keyring/keyring.go",
+   "old": "if !ok || e.state != Active || e.gen > k.safe {",
+   "new": "if !ok || e.state != Active {"
+  },
+  {
+   "name": "M9 стёртый скоуп воскресает",
+   "file": "internal/keyring/keyring.go",
+   "old": "\t\t\tcase Destroyed:\n\t\t\t\treturn fmt.Errorf(\"%w: %q\", ErrScopeDestroyed, s)\n",
+   "new": ""
+  },
+  {
+   "name": "M10 чужой ключ = «стёрто»",
+   "file": "internal/keyring/envelope.go",
+   "old": "\t\treturn nil, ErrUnknownKey",
+   "new": "\t\treturn nil, ErrKeyDestroyed"
+  },
+  {
+   "name": "M11 Seal без проверки Close",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tif k.closed {\n\t\treturn nil, ErrClosed\n\t}\n\te, ok := k.byName[scope]",
+   "new": "\te, ok := k.byName[scope]"
+  },
+  {
+   "name": "M12 нет предела имени на запись",
+   "file": "internal/keyring/keyring.go",
+   "old": "if s == \"\" || len(s) > MaxScopeLen {",
+   "new": "if s == \"\" {"
+  },
+  {
+   "name": "M13 EffectiveAt не ставится",
+   "file": "internal/keyring/destroy.go",
+   "old": "\t\t\t\te.effective = now\n",
+   "new": "\t\t\t\t_ = now\n"
+  },
+  {
+   "name": "M14 нет отката ключей, если файл не заменён",
+   "file": "internal/keyring/destroy.go",
+   "old": "\t\tfor i, e := range due {\n\t\t\t*e = prev[i]\n\t\t}\n",
+   "new": ""
+  },
+  {
+   "name": "M15 корень неудачной попытки не уничтожается",
+   "file": "internal/keyring/destroy.go",
+   "old": "\t\tk.retired = append(slices.Clone(oldRetired), newRoot)",
+   "new": "\t\tk.retired = oldRetired"
+  },
+  {
+   "name": "M16 ключ пишется по key != nil",
+   "file": "internal/keyring/format.go",
+   "old": "\t\tif e.live() {\n\t\t\tb = append(b, e.key...)\n\t\t}",
+   "new": "\t\tb = append(b, e.key...)"
+  },
+  {
+   "name": "M17 safe сдвигается при сбое резерва",
+   "file": "internal/keyring/format.go",
+   "old": "\t\tif err := k.opt.Backup(k.path, k.gen); err != nil {\n",
+   "new": "\t\tif err := k.opt.Backup(k.path, k.gen); err != nil {\n\t\t\tk.safe = k.gen\n"
+  },
+  {
+   "name": "M18 поколение ключа не читается из файла",
+   "file": "internal/keyring/format.go",
+   "old": "\t\te.gen = d.u64()",
+   "new": "\t\td.u64()"
+  },
+  {
+   "name": "M19 CompleteDue не добивает старые корни",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\teff, err := k.finishLocked()\n\treturn infos(append(changed, eff...)), err",
+   "new": "\treturn infos(changed), nil"
+  },
+  {
+   "name": "M20 EffectiveAt при неуничтоженных корнях",
+   "file": "internal/keyring/destroy.go",
+   "old": "\tif len(rest) == 0 {\n\t\tnow := k.now()",
+   "new": "\tif true {\n\t\tnow := k.now()"
+  },
+  {
+   "name": "M21 EnsureScopes откатывает память после записи (P5)",
+   "file": "internal/keyring/keyring.go",
+   "old": "\tcommitted, err := k.persistLocked()\n\tif !committed {\n\t\tk.dropLocked(fresh)",
+   "new": "\tcommitted, err := k.persistLocked()\n\tif !committed || err != nil {\n\t\tk.dropLocked(fresh)"
+  },
+  {
+   "name": "M22 Close не закрывает",
+   "file": "internal/keyring/keyring.go",
+   "old": "\tk.closed = true\n\treturn nil",
+   "new": "\treturn nil"
+  },
+  {
+   "name": "M23 Unseal без проверки надгробия",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tcase e.state == Destroyed:\n\t\treturn nil, ErrKeyDestroyed\n",
+   "new": ""
+  },
+  {
+   "name": "M24 запись в закрытый месяц",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tcase e.state != Active:\n\t\treturn nil, fmt.Errorf(\"%w: %q is %v\", ErrScopeClosed, scope, e.state)\n",
+   "new": ""
+  },
+  {
+   "name": "M25 чтение ключа в ожидании уничтожения",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tcase e.state == Pending:\n\t\treturn nil, ErrKeyPending\n",
+   "new": ""
+  },
+  {
+   "name": "M26 срок ожидания не проверяется",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\tif wait < k.opt.MinWait {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "M27 нет предела числа подтверждений",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\tif len(approvals) > MaxApprovals {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "M28 нет предела имени подтвердившего",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\t\tif len(a.Who) > MaxApproverLen {",
+   "new": "\t\tif len(a.Who) > MaxApproverLen*1000 {"
+  },
+  {
+   "name": "M29 заявке хватает одного человека",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\tneed := 2\n",
+   "new": "\tneed := 1\n"
+  },
+  {
+   "name": "M30 один человек засчитан дважды",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\t\t\tseen[a.Who] = true",
+   "new": "\t\t\tseen[a.Who+string(rune(len(seen)))] = true"
+  },
+  {
+   "name": "M31 отмена без подтверждения",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\tif _, err := k.approve(OpCancelDestroy, e, approvals); err != nil {",
+   "new": "\tif _, err := k.approve(OpCancelDestroy, e, approvals); err != nil && false {"
+  },
+  {
+   "name": "M32 уничтожение не ждёт срока",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\t\tif e.state == Pending && !now.Before(e.destroyAfter) {",
+   "new": "\t\tif e.state == Pending && !now.Before(now) {"
+  },
+  {
+   "name": "M33 закрытый месяц открывается снова",
+   "file": "internal/keyring/keyring.go",
+   "old": "\t\t\tcase Deactivated, Pending:\n\t\t\t\treturn fmt.Errorf(\"%w: %q is %v\", ErrScopeClosed, s, e.state)\n",
+   "new": ""
+  },
+  {
+   "name": "M34 Deactivate не пишется на диск",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\tfor _, e := range changed {\n\t\te.state, e.deactivated = Deactivated, now\n\t}\n\tcommitted, err := k.persistLocked()",
+   "new": "\tfor _, e := range changed {\n\t\te.state, e.deactivated = Deactivated, now\n\t}\n\tcommitted, err := true, error(nil)"
+  }
+ ]
+}

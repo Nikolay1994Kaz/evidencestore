@@ -1,0 +1,67 @@
+{
+ "packages": [
+  "./internal/evlog/"
+ ],
+ "mutations": [
+  {
+   "name": "E1 ошибка fsync игнорируется",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif err := l.syncFile(l.active); err != nil {",
+   "new": "\tif err := l.syncFile(l.active); err != nil && false {"
+  },
+  {
+   "name": "E2 OnCommit до fsync",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif _, err := l.active.Write(buf); err != nil {",
+   "new": "\tif l.onCommit != nil {\n\t\tl.onCommit(seg.end(), all)\n\t}\n\tif _, err := l.active.Write(buf); err != nil {"
+  },
+  {
+   "name": "E3 без проверки CRC",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif crc32.Checksum(data, castagnoli) != binary.BigEndian.Uint32(h[4:]) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "E4 порча закрытого сегмента режется как хвост",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\t\tif !last {\n",
+   "new": "\t\t\tif false {\n"
+  },
+  {
+   "name": "E5 без проверки непрерывности сегментов",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\tif first != next {\n",
+   "new": "\t\tif false {\n"
+  },
+  {
+   "name": "E6 ошибка не защёлкивается",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif l.failed == nil {\n\t\tl.failed = err\n\t}",
+   "new": "\t_ = err"
+  },
+  {
+   "name": "E7 нет предела записи",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\tif len(rec) == 0 || len(rec) > MaxRecord {",
+   "new": "\t\tif len(rec) == 0 {"
+  },
+  {
+   "name": "E8 хвост не отрезается",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\t\tif err := f.Truncate(seg.size); err != nil {",
+   "new": "\t\t\tif err := f.Truncate(st.Size()); err != nil {"
+  },
+  {
+   "name": "E9 позиции пачки идут не подряд",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\t\tfirst += uint64(len(r.records))",
+   "new": "\t\t\tfirst += uint64(len(r.records)) + 1"
+  },
+  {
+   "name": "E10 Read читает без сверки позиции",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif pos == 0 || i == len(l.segs) || pos < l.segs[i].first {",
+   "new": "\tif i == len(l.segs) {"
+  }
+ ]
+}

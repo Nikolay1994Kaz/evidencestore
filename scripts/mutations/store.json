@@ -1,0 +1,185 @@
+{
+ "packages": [
+  "./internal/proof/",
+  "./internal/store/",
+  "./internal/server/",
+  "./internal/collector/"
+ ],
+ "mutations": [
+  {
+   "name": "P1 отпечаток в листе не сверяется",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tcase digest != r.Digest:",
+   "new": "\t\tcase false && digest != r.Digest:"
+  },
+  {
+   "name": "P2 источник и номер в листе не сверяются",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tcase leaf.Scope != sealed.Source || leaf.Subject != strconv.FormatUint(sealed.Seq, 10):",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "P3 время приёма в листе не сверяется",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tcase leaf.UnixNano != sealed.ReceivedAt:",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "P4 звенья не сверяются по хэшу",
+   "file": "internal/proof/proof.go",
+   "old": "\t\t\tif r.PrevHash != hashes[i-1] {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "P5 подпись головы не проверяется",
+   "file": "internal/proof/proof.go",
+   "old": "\terr = auditchain.VerifyStatement(b.Statement, trust.StoreKey)\n",
+   "new": "\terr = nil\n"
+  },
+  {
+   "name": "P6 голова не сверяется с последним звеном",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tif b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {",
+   "new": "\t\tif last < 0 {"
+  },
+  {
+   "name": "P7 путь Меркла не проверяется",
+   "file": "internal/proof/proof.go",
+   "old": "\tif !auditchain.VerifyProof(inc.Leaf.chain(), path, p.Root) {",
+   "new": "\tif !auditchain.VerifyProof(inc.Leaf.chain(), path, p.Root) && false {"
+  },
+  {
+   "name": "P8 T2 не обязана покрывать улику",
+   "file": "internal/proof/proof.go",
+   "old": "\tif u.HeadSeq < evidenceLink {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "P9 токен T2 не проверяется",
+   "file": "internal/proof/proof.go",
+   "old": "\tinfo, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, hash), trust)\n\tif err != nil {\n\t\treturn time.Time{}, err\n\t}",
+   "new": "\tinfo, _ := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, hash), trust)"
+  },
+  {
+   "name": "P10 T1 может лежать после улики",
+   "file": "internal/proof/proof.go",
+   "old": "\tif inc.LinkSeq >= evidenceLink {",
+   "new": "\tif inc.LinkSeq > evidenceLink+1000 {"
+  },
+  {
+   "name": "P11 время приёма позже T2 допустимо",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tif !r.Upper.IsZero() && recv.After(r.Upper.Add(time.Second)) {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "S1 повторы не отсекаются",
+   "file": "internal/store/ingest.go",
+   "old": "\t\tif pos := st.seqs.get(r.Seq); pos != 0 {",
+   "new": "\t\tif pos := st.seqs.get(r.Seq); pos != 0 && false {"
+  },
+  {
+   "name": "S2 время приёма не монотонно",
+   "file": "internal/store/store.go",
+   "old": "\tif t <= s.lastRecv {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "S3 цепь не досчитывается после падения",
+   "file": "internal/store/store.go",
+   "old": "\t\tif pos > maxChained {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "S4 потеря подтверждённых улик не останавливает",
+   "file": "internal/store/store.go",
+   "old": "\tif maxChained >= s.evlog.Next() {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "S5 откат кейринга принимается",
+   "file": "internal/store/keys.go",
+   "old": "\t\t\terrs = append(errs, fmt.Errorf(\"%w: %s is %q in keyring, chain says %q\", ErrKeyringMismatch, ki.Scope, cur, last))",
+   "new": "\t\t\ts.logKeyLocked(ki, \"\", nil, true)"
+  },
+  {
+   "name": "S6 пропуски номеров не замечаются",
+   "file": "internal/store/ingest.go",
+   "old": "\tgaps := st.takeGaps()",
+   "new": "\tgaps := st.takeGaps()[:0]"
+  },
+  {
+   "name": "S7 молчание объявляется каждый раз",
+   "file": "internal/store/jobs.go",
+   "old": "\t\t\tst.silent = true\n",
+   "new": ""
+  },
+  {
+   "name": "S8 токен TSA не проверяется перед цепью",
+   "file": "internal/store/jobs.go",
+   "old": "\tinfo, err := tsa.Verify(token, imprint, s.tsaTrust)\n\tif err != nil {",
+   "new": "\tinfo, err := tsa.Verify(token, imprint, s.tsaTrust)\n\tif err != nil && false {"
+  },
+  {
+   "name": "S9 квитанции ключей не пишутся",
+   "file": "internal/store/keys.go",
+   "old": "\ts.appendJSONEvent(auditchain.EventKeyState, ki.Scope, label, ev)\n",
+   "new": ""
+  },
+  {
+   "name": "S10 прошлый месяц не закрывается",
+   "file": "internal/store/keys.go",
+   "old": "\t\tif _, m, ok := scopeOf(ki.Scope); ok && m.Before(cur) {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "S11 срок хранения не учитывается",
+   "file": "internal/store/keys.go",
+   "old": "\t\tif !now.Before(expires) {",
+   "new": "\t\tif true {"
+  },
+  {
+   "name": "S12 ключ записи выдаётся без DEK-флага",
+   "file": "internal/store/proofs.go",
+   "old": "\tif withDEK {",
+   "new": "\tif true {"
+  },
+  {
+   "name": "S13 лист улики без позиции в журнале",
+   "file": "internal/store/chain.go",
+   "old": "\tnum := s.appendLeafLocked(proof.EvidenceLeaf(h, pos, digest))",
+   "new": "\tnum := s.appendLeafLocked(proof.EvidenceLeaf(h, pos+1, digest))"
+  },
+  {
+   "name": "S14 обещание без срока",
+   "file": "internal/store/ingest.go",
+   "old": "\t\t\tReceivedAt: n.header.ReceivedAt, Deadline: n.header.ReceivedAt + int64(mmd),",
+   "new": "\t\t\tReceivedAt: n.header.ReceivedAt, Deadline: n.header.ReceivedAt - int64(mmd),"
+  },
+  {
+   "name": "R1 восстановление не сверяет цепь с подписанной головой",
+   "file": "internal/store/replica.go",
+   "old": "\tif auditchain.EncodeHash(head.Hash) != st.HeadHash {",
+   "new": "\tif auditchain.EncodeHash(head.Hash) != st.HeadHash && false {"
+  },
+  {
+   "name": "R2 восстановление не замечает дыр в кусках",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\tif (i == 0 && c.start != 0) || (i > 0 && c.start != chunks[i-1].end) {",
+   "new": "\t\t\tif ((i == 0 && c.start != 0) || (i > 0 && c.start != chunks[i-1].end)) && false {"
+  },
+  {
+   "name": "R3 копия повторяет уже отправленное",
+   "file": "internal/store/replica.go",
+   "old": "\t\tsize, from := files[name], s.replica.Offsets[name]",
+   "new": "\t\tsize, from := files[name], int64(0)"
+  },
+  {
+   "name": "S15 текущий месяц закрывается без force",
+   "file": "internal/store/keys.go",
+   "old": "\tif !force {\n\t\tcur := monthStart(s.nowTime())",
+   "new": "\tif false {\n\t\tcur := monthStart(s.nowTime())"
+  }
+ ],
+ "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."
+}
