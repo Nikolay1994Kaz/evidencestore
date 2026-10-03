@@ -13,12 +13,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"evidencestore/internal/wal"
 )
 
 // fakeS3 — in-memory S3-совместимый сервер для теста клиента: path-style
-// PUT/GET/DELETE объектов + ListObjectsV2. Подпись не проверяет (это тест
+// PUT/GET объектов + ListObjectsV2. Подпись не проверяет (это тест
 // клиента, не сервера), но требует её наличия и обязательных SigV4-заголовков.
 type fakeS3 struct {
 	mu      sync.Mutex
@@ -83,9 +81,6 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			http.Error(w, "NoSuchKey", http.StatusNotFound)
 		}
-	case http.MethodDelete:
-		delete(f.objects, path)
-		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 	}
@@ -116,14 +111,14 @@ func TestS3Remote_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	// Put → Get байт-в-байт, ключ ложится под prefix из URL.
-	payload := []byte("wal chunk bytes \x00\x01\x02")
-	if err := remote.Put(ctx, "wal/wal_0001.log/0000000000000000.chunk", payload); err != nil {
+	payload := []byte("segment bytes \x00\x01\x02")
+	if err := remote.Put(ctx, "evidence/seg_00000000000000000001.log/00000000000000000000-00000000000000000017", payload); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := fake.objects["test-bucket/kv/prod/wal/wal_0001.log/0000000000000000.chunk"]; !ok {
+	if _, ok := fake.objects["test-bucket/kv/prod/evidence/seg_00000000000000000001.log/00000000000000000000-00000000000000000017"]; !ok {
 		t.Fatalf("объект не под ожидаемым ключом: %v", keysOf(fake.objects))
 	}
-	got, err := remote.Get(ctx, "wal/wal_0001.log/0000000000000000.chunk")
+	got, err := remote.Get(ctx, "evidence/seg_00000000000000000001.log/00000000000000000000-00000000000000000017")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,47 +127,20 @@ func TestS3Remote_RoundTrip(t *testing.T) {
 	}
 
 	// List возвращает ключи относительно prefix'а URL.
-	if err := remote.Put(ctx, "MANIFEST.json", []byte("{}")); err != nil {
+	if err := remote.Put(ctx, "heads/00000000000000000001.json", []byte("{}")); err != nil {
 		t.Fatal(err)
 	}
-	keys, err := remote.List(ctx, "wal/")
+	keys, err := remote.List(ctx, "evidence/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(keys) != 1 || keys[0] != "wal/wal_0001.log/0000000000000000.chunk" {
+	if len(keys) != 1 || keys[0] != "evidence/seg_00000000000000000001.log/00000000000000000000-00000000000000000017" {
 		t.Fatalf("list = %v", keys)
 	}
 
-	// Get отсутствующего → ErrNotExist; Delete идемпотентен.
+	// Get отсутствующего → ErrNotExist.
 	if _, err := remote.Get(ctx, "nope"); !errors.Is(err, ErrNotExist) {
 		t.Fatalf("want ErrNotExist, got %v", err)
-	}
-	if err := remote.Delete(ctx, "MANIFEST.json"); err != nil {
-		t.Fatal(err)
-	}
-	if err := remote.Delete(ctx, "MANIFEST.json"); err != nil {
-		t.Fatalf("повторный delete должен быть идемпотентен: %v", err)
-	}
-}
-
-// TestS3Remote_ShipperE2E — весь цикл шиппера поверх S3-бэкенда.
-func TestS3Remote_ShipperE2E(t *testing.T) {
-	remote, _ := newS3TestRemote(t)
-	dataDir := t.TempDir()
-	s := New(remote, dataDir, Options{RetainManifests: 2})
-	ctx := context.Background()
-
-	writeWAL(t, dataDir+"/wal_0001.log",
-		wal.Entry{Op: wal.OpSet, Key: "a", Value: []byte("1")},
-		wal.Entry{Op: wal.OpSet, Key: "b", Value: []byte("2")},
-	).Close()
-	if err := s.Tick(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	got := restoreAndReplay(t, remote, t.TempDir())
-	if got["a"] != "1" || got["b"] != "2" {
-		t.Fatalf("state = %v", got)
 	}
 }
 

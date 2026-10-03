@@ -19,10 +19,9 @@ import (
 
 // s3Remote — минимальный S3-совместимый клиент (AWS Signature V4) на stdlib.
 //
-// Осознанно НЕ aws-sdk-go: проекту нужны 4 операции (PUT/GET/DELETE/LIST), а
-// SDK тянет мегабайты зависимостей в бинарь, который до сих пор обходился
-// stdlib+metrics. Path-style addressing — работает с MinIO/Ceph/
-// LocalStack и с региональными endpoint'ами AWS.
+// Осознанно НЕ aws-sdk-go: проекту нужны 3 операции (PUT/GET/LIST), а SDK
+// тянет мегабайты зависимостей, когда хватает stdlib. Path-style addressing —
+// работает с MinIO/Ceph/LocalStack и с региональными endpoint'ами AWS.
 //
 // Креды и настройки:
 //   - access/secret: env KVSTORE_S3_ACCESS_KEY / KVSTORE_S3_SECRET_KEY,
@@ -113,19 +112,6 @@ func (s *s3Remote) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("ship: s3 get %s: %s", key, httpError(resp))
 	}
 	return readAll(resp.Body, key)
-}
-
-func (s *s3Remote) Delete(ctx context.Context, key string) error {
-	resp, err := s.do(ctx, http.MethodDelete, s.objectKey(key), nil, nil)
-	if err != nil {
-		return fmt.Errorf("ship: s3 delete %s: %w", key, err)
-	}
-	defer drainClose(resp)
-	// 204 — удалён; 404 — уже нет (идемпотентность ретеншна).
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("ship: s3 delete %s: %s", key, httpError(resp))
-	}
-	return nil
 }
 
 // listBucketResult — нужное подмножество ответа ListObjectsV2.

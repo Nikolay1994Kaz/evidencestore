@@ -53,8 +53,7 @@ esverify ─ cmd/esverify, internal/proof
 | `cmd/evidencestore` | сервер и команды оператора | `main.go` | демо |
 | `cmd/esverify` | утилита проверяющего | `main.go` | демо |
 | `cmd/escollect` | сборщик | `main.go` | демо |
-| `internal/ship` | ядро: используется только транспорт `Remote` (S3 с SigV4, каталог) | `remote.go`, `s3_remote.go`, `file_remote.go` | свои тесты |
-| `internal/wal` | ядро старого проекта, **не используется** (заменён `evlog`) | — | свои тесты |
+| `internal/ship` | ядро: транспорт копии наружу `Remote` (S3 с SigV4, каталог), без удаления | `remote.go`, `s3_remote.go`, `file_remote.go` | S3 — свои тесты; каталог — через `TestReplicaRestore` |
 
 ## Что лежит на диске
 
@@ -100,6 +99,7 @@ replica.url            копия: evidence/…, chain/… кусками по �
 | копия восстанавливается и сверяется с подписанной головой | `store.RestoreReplica` | `TestReplicaRestore` |
 | копия `keyring.dat` в резерв не держит шифрование; ключ без копии не выдаётся | `keyring.persistLocked` (общий замок отпущен, изменения в очереди на `wmu`), `keyring.Seal` | `TestBackupDoesNotBlockSeal`, `TestNewKeyWaitsForBackup` |
 | пропавшие листья цепи — громкая ошибка, а не «истёкшие» | `auditchain.ReadLeaves` (`ErrLeavesMissing`) | `TestMissingLeavesAreLoud` |
+| из копии наружу ничего не удаляется | `ship.Remote`: метода удаления нет | — (держит тип) |
 | отчёт проверяющего называет верную причину, почему тело закрыто | `proof.Report.Notes` | `TestNotesTellWhyBodyIsClosed` |
 | слишком длинный путь сокета админки — ошибка конфига, а не `bind: invalid argument` | `config.Validate` | `TestAdminSocketPathLimit` |
 

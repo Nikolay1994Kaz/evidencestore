@@ -10,8 +10,7 @@ import (
 )
 
 // fileRemote — бэкенд «директория как объектный стор». Для NFS/rclone-mount и
-// тестов. Put атомарен (tmp+rename) — читатель никогда не видит полуфайл,
-// это важно для MANIFEST.json, который перезаписывается на каждой публикации.
+// тестов. Put атомарен (tmp+rename) — читатель никогда не видит полуфайл.
 type fileRemote struct {
 	root string
 }
@@ -37,7 +36,7 @@ func (f *fileRemote) Put(_ context.Context, key string, data []byte) error {
 		return fmt.Errorf("ship: write %s: %w", key, err)
 	}
 	// fsync файла и каталога: file://-бэкенд — это и есть «удалённая» копия,
-	// его durability не слабее локальной (та же дисциплина, что у snapshot.wal).
+	// его durability не слабее локальной.
 	if err := syncFile(tmp); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("ship: sync %s: %w", key, err)
@@ -65,7 +64,8 @@ func (f *fileRemote) List(_ context.Context, prefix string) ([]string, error) {
 	base := f.root
 	err := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// Гонка с Delete во время обхода — пропускаем исчезнувшее.
+			// Файл исчез во время обхода (.tmp параллельного Put уже
+			// переименован) — пропускаем.
 			if os.IsNotExist(err) {
 				return nil
 			}
@@ -88,13 +88,6 @@ func (f *fileRemote) List(_ context.Context, prefix string) ([]string, error) {
 		return nil, fmt.Errorf("ship: list %s: %w", prefix, err)
 	}
 	return keys, nil
-}
-
-func (f *fileRemote) Delete(_ context.Context, key string) error {
-	if err := os.Remove(f.path(key)); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("ship: delete %s: %w", key, err)
-	}
-	return nil
 }
 
 func syncFile(path string) error {

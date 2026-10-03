@@ -4,11 +4,11 @@
 
 | Пакет | Откуда | Что делает |
 |---|---|---|
-| `internal/wal` | `kvstore/internal/wal` | WAL с групповым fsync, заголовок формата, LSN |
+| `internal/wal` | `kvstore/internal/wal` | WAL с групповым fsync, заголовок формата, LSN (удалён 03.10) |
 | `internal/auditchain` | `kvstore/internal/auditchain` | хэш-цепь, Merkle, подписанный экспорт Ed25519 |
 | `internal/keyring` | `kvstore/internal/keyring` | KEK/DEK, уничтожение ключа |
 | `internal/ship` | `kvstore/internal/ship` | копирование в S3 (SigV4 без aws-sdk) и в файл |
-| `internal/monitoring` | новый файл | 3 метрики из исходных 20+ (`WalWriteDuration`, `ShipErrors`, `ShipBytes`), префикс `evidencestore_` |
+| `internal/monitoring` | новый файл | 3 метрики из исходных 20+ (`WalWriteDuration`, `ShipErrors`, `ShipBytes`), префикс `evidencestore_` (удалён 03.10) |
 
 Изменено при переносе: только пути импорта (`kvstore/kvstore/internal/` → `evidencestore/internal/`) и путь в комментарии fuzz-теста. Логика не менялась.
 
@@ -23,14 +23,14 @@
   - читатели больше не обрезают файл (читатель во время записи мог отрезать недописанный кадр);
   - пропавшие листья — ошибка `ErrLeavesMissing`, а не «истёкшие по сроку хранения»: `ForEachLeaf` и `FindLeaf` их больше не пропускают;
   - добавлены `ScanLeaves`, `SignMessage`, `EncodeHash`.
-- `internal/wal` не используется: журнал улик — новый пакет `internal/evlog`.
-- `internal/ship`: используется только транспорт `Remote`.
+- `internal/wal` удалён: журнал улик — новый пакет `internal/evlog`.
+- `internal/ship`: оставлен только транспорт `Remote`; `Shipper` (снапшоты, манифесты, удаление старых объектов) удалён вместе с `wal`, из `Remote` убран `Delete`.
+- `internal/monitoring` удалён: все три его метрики относились к `wal` и `Shipper`. С ним из `go.mod` ушла `VictoriaMetrics/metrics`, осталась одна зависимость — `golang.org/x/sys`.
 - Новые пакеты: `evlog`, `tsa`, `proof`, `store`, `server`, `collector`, `config`, `pki`; команды `evidencestore`, `escollect`, `esverify`. Карта — `docs/ARCHITECTURE.md`, решения — `docs/DECISIONS.md`.
 
 ## Что осталось от старого проекта и ещё не вычищено
 
-- `ship`: переменные окружения `KVSTORE_S3_*`; `Shipper` со снапшотами и удалением старых объектов.
-- `internal/wal` целиком (kv-формат `Op`/`Key`/`Value`, «сборка kvstore» в ошибках) — не используется.
+- `ship`: переменные окружения `KVSTORE_S3_*`.
 - Удаления листьев по сроку в перенесённом коде не было, но от него оставались сообщение «истёк по retention» в `carrier.go` и обход «истёкших» листьев в `query.go`. Убраны 03.10: пропавшие листья теперь `ErrLeavesMissing`.
 
 ## Чего нет и надо писать
