@@ -1,0 +1,31 @@
+{
+ "packages": [
+  "./internal/auditchain/"
+ ],
+ "mutations": [
+  {
+   "name": "A1 ReadLeaves: пропажа старых листьев без ErrLeavesMissing",
+   "file": "internal/auditchain/carrier.go",
+   "old": "fmt.Errorf(\"%w: листья с номера %d не найдены\", ErrLeavesMissing, first)",
+   "new": "fmt.Errorf(\"листья с номера %d не найдены\", first)"
+  },
+  {
+   "name": "A2 ReadLeaves: нехватка записей в файле без ErrLeavesMissing",
+   "file": "internal/auditchain/carrier.go",
+   "old": "fmt.Errorf(\"%w: в файле листьев %d записей, запрошены %d..%d\",\n\t\t\tErrLeavesMissing, len(bodies), from, from+count)",
+   "new": "fmt.Errorf(\"в файле листьев %d записей, запрошены %d..%d\",\n\t\t\tlen(bodies), from, from+count)"
+  },
+  {
+   "name": "A3 ForEachLeaf молчит о пропавших листьях",
+   "file": "internal/auditchain/query.go",
+   "old": "\t\t\treturn cov, fmt.Errorf(\"auditchain: листья звена %d: %w\", i, err)",
+   "new": "\t\t\tcontinue"
+  },
+  {
+   "name": "A4 FindLeaf молчит о пропавших листьях",
+   "file": "internal/auditchain/query.go",
+   "old": "\t\t\treturn Record{}, nil, 0, fmt.Errorf(\"auditchain: листья звена %d: %w\", i, err)",
+   "new": "\t\t\tcontinue"
+  }
+ ]
+}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -616,6 +617,62 @@ func TestNewKeyWaitsForBackup(t *testing.T) {
 	if !bytes.Equal(before, readFile(t, filepath.Join(dir, FileName))) {
 		t.Fatal("EnsureScope сохранённого ключа переписал файл")
 	}
+}
+
+// Копия в резерв идёт без общего замка (P13 из разбора 29.09): пока она
+// тянется, Seal под уже скопированным ключом работает, новый ключ не
+// выдаётся, а другое изменение кейринга ждёт своей очереди.
+func TestBackupDoesNotBlockSeal(t *testing.T) {
+	gate, inBackup := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	var armed atomic.Bool // задержать ровно одну копию
+	k, _, _ := newRing(t, Options{Backup: func(string, uint64) error {
+		if armed.CompareAndSwap(true, false) {
+			close(inBackup)
+			<-gate
+		}
+		return nil
+	}})
+	t.Cleanup(release) // раньше Close из newRing: Close ждёт идущую копию
+	seal(t, k, "old", "x")
+	if err := k.EnsureScopes("other"); err != nil {
+		t.Fatal(err)
+	}
+
+	armed.Store(true)
+	done := make(chan error, 1)
+	go func() { done <- k.EnsureScopes("new") }()
+	<-inBackup
+
+	sealed := make(chan error, 1)
+	go func() { _, err := k.Seal("old", []byte("x")); sealed <- err }()
+	select {
+	case err := <-sealed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Seal под скопированным ключом ждёт чужую копию в резерв")
+	}
+	if _, err := k.Seal("new", []byte("x")); !errors.Is(err, ErrNotBackedUp) {
+		t.Fatalf("ключ выдан до конца копии: %v", err)
+	}
+	deact := make(chan error, 1)
+	go func() { deact <- k.Deactivate("other") }()
+	select {
+	case err := <-deact:
+		t.Fatalf("Deactivate прошёл посреди чужой копии: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-deact; err != nil {
+		t.Fatal(err)
+	}
+	seal(t, k, "new", "x")
 }
 
 // ⭐ Копия в резерв не прошла при повороте корня. Память не откатывается

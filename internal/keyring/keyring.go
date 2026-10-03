@@ -88,6 +88,7 @@ var (
 	ErrScopeDestroyed = errors.New("keyring: scope destroyed")
 	ErrBadState       = errors.New("keyring: invalid state for operation")
 	ErrApproval       = errors.New("keyring: approvals rejected")
+	ErrNotBackedUp    = errors.New("keyring: key not in backup yet")
 
 	// Исходы Unseal. Реплей обязан их различать: «стёрто» — пропустить
 	// запись, «ждёт уничтожения» — не грузить, но и не считать стёртым,
@@ -117,7 +118,8 @@ type Options struct {
 	// отвечает ошибкой) и старые корни не уничтожаются: иначе после потери
 	// диска в резерве не окажется нужного ключа или копия будет заперта уже
 	// уничтоженным корнем. Копия должна быть атомарной: неудачная попытка не
-	// портит прежнюю. Зовётся под замком, Seal в это время ждёт.
+	// портит прежнюю. Зовётся без общего замка: Seal под уже скопированными
+	// ключами в это время работает, другие изменения кейринга ждут очереди.
 	Backup func(path string, gen uint64) error
 	// MinWait — наименьший срок между заявкой на уничтожение и самим
 	// уничтожением. Задаётся настройкой, а не тем, кто подаёт заявку: иначе
@@ -172,6 +174,10 @@ func (e *entry) info() KeyInfo {
 
 // Keyring — ключи скоупов под корнем, durable в одном файле.
 type Keyring struct {
+	// wmu ставит изменения в очередь. Он держится всю операцию, в том числе
+	// пока persistLocked копирует файл в резерв с отпущенным mu: в этом окне
+	// читатели работают, а состояние не меняет никто.
+	wmu     sync.Mutex
 	mu      sync.RWMutex
 	path    string
 	roots   RootStore
@@ -208,6 +214,8 @@ func Create(dir string, roots RootStore, opt Options) (*Keyring, error) {
 	if err != nil {
 		return nil, err
 	}
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.rootID = id
@@ -247,6 +255,8 @@ func Open(dir string, roots RootStore, opt Options) (*Keyring, error) {
 // Только тогда под ними можно запечатывать: ключ без данных безвреден,
 // данные без ключа потеряны.
 func (k *Keyring) EnsureScopes(scopes ...string) error {
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.closed {
@@ -390,8 +400,11 @@ func (k *Keyring) List() []KeyInfo {
 
 // Close обнуляет ключи в памяти. Обнуление неполное: копии остаются внутри
 // cipher.AEAD (расписание раундов AES), до них из Go не добраться. После
-// Close методы отвечают ErrClosed, а не «стёрто».
+// Close методы отвечают ErrClosed, а не «стёрто». Идущую копию в резерв
+// Close дожидается.
 func (k *Keyring) Close() error {
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	for _, e := range k.byName {

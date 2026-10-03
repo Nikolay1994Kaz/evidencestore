@@ -100,6 +100,11 @@ func (k *Keyring) decodeBody(body []byte) error {
 // откатывать её нельзя, даже при err != nil (не прошла копия или fsync
 // каталога): откат развёл бы память и диск, а корень нового файла остался
 // бы сиротой, которую никто не уничтожит.
+//
+// На время копии mu отпускается: резерв бывает медленным (сеть), и Seal под
+// уже скопированными ключами ждать его не должен. Вызывающий держит wmu,
+// поэтому состояние в этом окне не меняется, а новый ключ Seal не выдаст,
+// пока safe его не догонит.
 func (k *Keyring) persistLocked() (committed bool, err error) {
 	k.gen++ // пропуски номеров после сбоев безвредны
 	body := k.encodeBodyLocked()
@@ -114,12 +119,16 @@ func (k *Keyring) persistLocked() (committed bool, err error) {
 	if committed, err := writeFileAtomic(k.path, append(hdr, sealed...)); err != nil {
 		return committed, err
 	}
+	gen := k.gen
 	if k.opt.Backup != nil {
-		if err := k.opt.Backup(k.path, k.gen); err != nil {
+		k.mu.Unlock()
+		err := k.opt.Backup(k.path, gen)
+		k.mu.Lock()
+		if err != nil {
 			return true, fmt.Errorf("keyring backup: %w", err)
 		}
 	}
-	k.safe = k.gen
+	k.safe = gen
 	return true, nil
 }
 

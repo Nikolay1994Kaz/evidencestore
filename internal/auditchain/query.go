@@ -2,7 +2,6 @@ package auditchain
 
 import (
 	"fmt"
-	"os"
 )
 
 // Чтение цепи для сверки и доказательств.
@@ -12,28 +11,23 @@ import (
 // звено на проверку и 442-813 нс на чтение, то есть 27-40 с на годовую цепь
 // (verify_bench_test.go). Отсюда два правила, которые видны в сигнатурах:
 // поиск идёт ОТ КОНЦА и ограничен окном, а обход отчитывается о том, сколько
-// журнала вообще уцелело.
+// успел прочесть.
 
-// Coverage — сколько журнала доступно на самом деле.
-//
-// ⭐Нужно потому, что листья живут по retention, а звенья вечны. Через год
-// нормальным состоянием будет «звеньев 31 млн, листьев от 20-миллионного» — и
-// сверка, которая об этом умолчит, объявит все ранние факты незаписанными.
-// Отчёт о непокрытом — не диагностика, а условие, при котором можно читать
-// остальные числа.
+// Coverage — сколько журнала прочитано. Если обход оборвался ошибкой, по
+// нему видно, докуда журнал цел.
 type Coverage struct {
 	Links          int    // звеньев в цепи
 	HeadSeq        uint64 // последнее звено
-	FirstLeafKnown uint64 // самый ранний доступный лист
-	LeavesRead     int    // сколько листьев удалось прочесть
-	LeavesExpired  uint64 // сколько выброшено retention'ом (доказуемо «было», недоказуемо «что»)
+	FirstLeafKnown uint64 // первый прочитанный лист
+	LeavesRead     int    // сколько листьев прочитано
 }
 
-// ForEachLeaf проходит доступные листья от старых к новым.
+// ForEachLeaf проходит листья от старых к новым.
 //
-// Отсутствие файла листьев для звена — НЕ ошибка: это retention, заявленное
-// свойство расцепления политик хранения. Такие звенья считаются в
-// LeavesExpired, и обход продолжается.
+// Листья не удаляются никогда, поэтому пропавший файл листьев — ошибка
+// (ErrLeavesMissing), как и порча. В ядре, откуда пришёл этот код, листья
+// жили по сроку хранения и пропажа считалась штатной; для улик это была бы
+// тихая потеря.
 func ForEachLeaf(dir string, fn func(Leaf)) (Coverage, error) {
 	var cov Coverage
 	links, err := ReadChain(dir)
@@ -52,11 +46,7 @@ func ForEachLeaf(dir string, fn func(Leaf)) (Coverage, error) {
 		}
 		leaves, err := ReadLeaves(dir, p.FirstLeaf, int(p.Count))
 		if err != nil {
-			if os.IsNotExist(err) || isRetentionGap(err) {
-				cov.LeavesExpired += uint64(p.Count)
-				continue
-			}
-			return cov, err
+			return cov, fmt.Errorf("auditchain: листья звена %d: %w", i, err)
 		}
 		if first {
 			cov.FirstLeafKnown = p.FirstLeaf
@@ -68,27 +58,6 @@ func ForEachLeaf(dir string, fn func(Leaf)) (Coverage, error) {
 		}
 	}
 	return cov, nil
-}
-
-// isRetentionGap отличает «файла листьев больше нет» от настоящей поломки.
-// Различать обязательно: первое штатно, второе замалчивать нельзя.
-func isRetentionGap(err error) bool {
-	return err != nil && (os.IsNotExist(err) ||
-		containsRetentionMessage(err.Error()))
-}
-
-func containsRetentionMessage(s string) bool {
-	const marker = "истёк по retention"
-	return stringContains(s, marker)
-}
-
-func stringContains(hay, needle string) bool {
-	for i := 0; i+len(needle) <= len(hay); i++ {
-		if hay[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // LeafQuery — что ищем для доказательства включения.
@@ -130,10 +99,7 @@ func FindLeaf(dir string, q LeafQuery) (Record, []Leaf, int, error) {
 		}
 		leaves, err := ReadLeaves(dir, p.FirstLeaf, int(p.Count))
 		if err != nil {
-			if isRetentionGap(err) {
-				continue // листья истекли — доказать это событие уже нельзя
-			}
-			return Record{}, nil, 0, err
+			return Record{}, nil, 0, fmt.Errorf("auditchain: листья звена %d: %w", i, err)
 		}
 		for idx, l := range leaves {
 			if l.Type != q.Type || l.Scope != q.Scope {

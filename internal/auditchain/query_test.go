@@ -1,6 +1,7 @@
 package auditchain
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -111,11 +112,11 @@ func TestVerifyRange_RejectsImpossibleStart(t *testing.T) {
 	}
 }
 
-// ⭐TestForEachLeaf_ReportsRetentionHonestly — листья живут по retention,
-// звенья вечны. Обход обязан сказать, сколько журнала УЖЕ НЕТ: иначе сверка
-// объявит ранние факты незаписанными и обвинит систему в порче, которой не
-// было.
-func TestForEachLeaf_ReportsRetentionHonestly(t *testing.T) {
+// ⭐TestMissingLeavesAreLoud — листья не удаляются никогда, и пропавший файл
+// листьев — потеря, а не «срок хранения». В ядре, откуда пришёл этот код,
+// пропажа считалась штатной; для улик она обязана быть ошибкой у всех
+// читателей, иначе стёртые снаружи улики выглядели бы как истёкшие.
+func TestMissingLeavesAreLoud(t *testing.T) {
 	dir := t.TempDir()
 	c := mustOpen(t, dir)
 	c.segmentBytes = 1 // каждый тик — свой файл листьев
@@ -133,43 +134,39 @@ func TestForEachLeaf_ReportsRetentionHonestly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seen != 4 || cov.LeavesRead != 4 || cov.LeavesExpired != 0 {
-		t.Fatalf("до retention: прочитано %d, cov=%+v", seen, cov)
+	if seen != 4 || cov.LeavesRead != 4 || cov.Links != 4 {
+		t.Fatalf("до пропажи: прочитано %d, cov=%+v", seen, cov)
 	}
-
-	// Retention выбросил самый старый файл листьев.
 	segs, err := leafSegments(dir)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(segs) != 4 {
+		t.Fatalf("файлов листьев %d, %v", len(segs), err)
 	}
-	if err := os.Remove(leafPath(dir, segs[0])); err != nil {
-		t.Fatal(err)
-	}
+	absent := LeafQuery{Type: EventEvidence, Scope: "нет такого"} // поиск пройдёт всю цепь
 
-	seen = 0
-	cov, err = ForEachLeaf(dir, func(Leaf) { seen++ })
-	if err != nil {
-		t.Fatalf("истёкшие листья приняты за поломку: %v", err)
-	}
-	if cov.LeavesExpired == 0 {
-		t.Fatal("об истёкших листьях не сказано — сверка сочтёт эти факты незаписанными")
-	}
-	if cov.LeavesRead+int(cov.LeavesExpired) != 4 {
-		t.Fatalf("прочитано %d + истекло %d ≠ 4", cov.LeavesRead, cov.LeavesExpired)
-	}
-	if cov.Links != 4 {
-		t.Fatalf("звеньев %d, ожидалось 4 — звенья retention не трогает", cov.Links)
+	// Пропал файл в середине: листья ищутся в соседнем и не находятся.
+	// Пропал самый старый: искать не в чем. Оба случая — ErrLeavesMissing.
+	for _, gone := range []int{2, 0} {
+		if err := os.Remove(leafPath(dir, segs[gone])); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadLeaves(dir, segs[gone], 1); !errors.Is(err, ErrLeavesMissing) {
+			t.Errorf("файл %d: ReadLeaves: %v", gone, err)
+		}
+		if _, err := ForEachLeaf(dir, func(Leaf) {}); !errors.Is(err, ErrLeavesMissing) {
+			t.Errorf("файл %d: ForEachLeaf: %v", gone, err)
+		}
+		if _, _, _, err := FindLeaf(dir, absent); !errors.Is(err, ErrLeavesMissing) {
+			t.Errorf("файл %d: FindLeaf: %v", gone, err)
+		}
 	}
 }
 
-// ⭐TestForEachLeaf_LoudOnCorruptLeafFile — порча ФАЙЛА ЛИСТЬЕВ не должна
-// сойти за retention.
+// ⭐TestForEachLeaf_LoudOnCorruptLeafFile — порча ФАЙЛА ЛИСТЬЕВ — громкая
+// ошибка, и не та, что у пропажи.
 //
 // ⚠Первая версия этого набора портила chain.log и была зелёной по неверной
-// причине: ошибку возвращал ReadChain, а ветка «листья истекли» оставалась
-// непроверенной. Мутация «считать любую ошибку чтения листьев за retention»
-// прошла насквозь — и это самая опасная из возможных: она превращает порчу
-// улики в штатное сообщение «данные истекли».
+// причине: ошибку возвращал ReadChain, а чтение листьев оставалось
+// непроверенным.
 func TestForEachLeaf_LoudOnCorruptLeafFile(t *testing.T) {
 	dir := t.TempDir()
 	c := mustOpen(t, dir)
@@ -183,7 +180,7 @@ func TestForEachLeaf_LoudOnCorruptLeafFile(t *testing.T) {
 
 	// ПАРНЫЙ КОНТРОЛЬ: до порчи листья читаются.
 	var seen int
-	if cov, err := ForEachLeaf(dir, func(Leaf) { seen++ }); err != nil || seen != 3 || cov.LeavesExpired != 0 {
+	if cov, err := ForEachLeaf(dir, func(Leaf) { seen++ }); err != nil || seen != 3 || cov.LeavesRead != 3 {
 		t.Fatalf("до порчи: seen=%d cov=%+v err=%v", seen, cov, err)
 	}
 
@@ -202,8 +199,8 @@ func TestForEachLeaf_LoudOnCorruptLeafFile(t *testing.T) {
 	if err == nil {
 		t.Fatalf("порча файла листьев принята молча (cov=%+v)", cov)
 	}
-	if cov.LeavesExpired != 0 {
-		t.Fatalf("порча засчитана как истёкшие по retention листья: %+v", cov)
+	if errors.Is(err, ErrLeavesMissing) {
+		t.Fatalf("порча названа пропажей: %v", err)
 	}
 }
 
@@ -211,7 +208,7 @@ func TestForEachLeaf_LoudOnRealCorruption(t *testing.T) {
 	dir := t.TempDir()
 	chainOfLinks(t, dir, 3)
 
-	// Порча ЗВЕНА — не retention, молчать нельзя.
+	// Порча ЗВЕНА — молчать нельзя.
 	path := filepath.Join(dir, chainFileName)
 	data, err := os.ReadFile(path)
 	if err != nil {

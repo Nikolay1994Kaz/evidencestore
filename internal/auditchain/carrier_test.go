@@ -577,8 +577,8 @@ func TestCarrier_OrderSurvivesFailureAtEveryPhase(t *testing.T) {
 	}
 }
 
-// TestCarrier_Rotation — листья режутся, цепь не трогается. Это и есть
-// расцепление политик хранения: корни вечны, листья по retention.
+// TestCarrier_Rotation — файлы листьев режутся по размеру, цепь не
+// трогается. Удаляются листья никогда.
 func TestCarrier_Rotation(t *testing.T) {
 	dir := t.TempDir()
 	c := mustOpen(t, dir)

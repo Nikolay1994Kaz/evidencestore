@@ -503,12 +503,14 @@ func ReadChain(dir string) ([]Record, error) {
 	return links, nil
 }
 
+// ErrLeavesMissing — нужных листьев на диске нет. Листья не удаляются
+// никогда, поэтому это потеря или порча каталога цепи, а не срок хранения:
+// звено доказывает, что N событий было, но какие — уже не доказать.
+var ErrLeavesMissing = errors.New("auditchain: leaves missing")
+
 // ReadLeaves читает count листьев начиная с номера first — то, из чего
-// строится путь Меркла для доказательства включения.
-//
-// Если файл с этими листьями уже истёк по retention, вернётся ошибка: звено
-// доказывает, что N операций было, но какие — уже недоказуемо. Это заявленное
-// свойство расцепления, а не отказ.
+// строится путь Меркла для доказательства включения. Нет файла с этими
+// листьями или в нём нет нужных записей — ErrLeavesMissing.
 func ReadLeaves(dir string, first uint64, count int) ([]Leaf, error) {
 	segs, err := leafSegments(dir)
 	if err != nil {
@@ -516,9 +518,12 @@ func ReadLeaves(dir string, first uint64, count int) ([]Leaf, error) {
 	}
 	idx := sort.Search(len(segs), func(i int) bool { return segs[i] > first }) - 1
 	if idx < 0 {
-		return nil, fmt.Errorf("auditchain: листья с номера %d не найдены — файл истёк по retention", first)
+		return nil, fmt.Errorf("%w: листья с номера %d не найдены", ErrLeavesMissing, first)
 	}
 	f, err := os.Open(leafPath(dir, segs[idx]))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %w", ErrLeavesMissing, err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -530,8 +535,8 @@ func ReadLeaves(dir string, first uint64, count int) ([]Leaf, error) {
 	}
 	from := int(first - segs[idx])
 	if from+count > len(bodies) {
-		return nil, fmt.Errorf("auditchain: в файле листьев %d записей, запрошены %d..%d",
-			len(bodies), from, from+count)
+		return nil, fmt.Errorf("%w: в файле листьев %d записей, запрошены %d..%d",
+			ErrLeavesMissing, len(bodies), from, from+count)
 	}
 	out := make([]Leaf, 0, count)
 	for i := from; i < from+count; i++ {

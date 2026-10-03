@@ -109,8 +109,8 @@
   {
    "name": "M17 safe сдвигается при сбое резерва",
    "file": "internal/keyring/format.go",
-   "old": "\t\tif err := k.opt.Backup(k.path, k.gen); err != nil {\n",
-   "new": "\t\tif err := k.opt.Backup(k.path, k.gen); err != nil {\n\t\t\tk.safe = k.gen\n"
+   "old": "\t\tif err != nil {\n\t\t\treturn true, fmt.Errorf(\"keyring backup: %w\", err)",
+   "new": "\t\tif err != nil {\n\t\t\tk.safe = gen\n\t\t\treturn true, fmt.Errorf(\"keyring backup: %w\", err)"
   },
   {
    "name": "M18 поколение ключа не читается из файла",
@@ -213,6 +213,24 @@
    "file": "internal/keyring/lifecycle.go",
    "old": "\tfor _, e := range changed {\n\t\te.state, e.deactivated = Deactivated, now\n\t}\n\tcommitted, err := k.persistLocked()",
    "new": "\tfor _, e := range changed {\n\t\te.state, e.deactivated = Deactivated, now\n\t}\n\tcommitted, err := true, error(nil)"
+  },
+  {
+   "name": "M36 копия в резерв под общим замком (P13)",
+   "file": "internal/keyring/format.go",
+   "old": "\t\tk.mu.Unlock()\n\t\terr := k.opt.Backup(k.path, gen)\n\t\tk.mu.Lock()\n",
+   "new": "\t\terr := k.opt.Backup(k.path, gen)\n"
+  },
+  {
+   "name": "M37 Seal выдаёт ключ, ещё не дошедший до резерва",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tcase e.gen > k.safe:\n",
+   "new": "\tcase e.gen > k.safe && false:\n"
+  },
+  {
+   "name": "M38 изменение кейринга не ждёт чужой копии",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "func (k *Keyring) Deactivate(scopes ...string) error {\n\tk.wmu.Lock()\n\tdefer k.wmu.Unlock()\n",
+   "new": "func (k *Keyring) Deactivate(scopes ...string) error {\n"
   }
  ]
 }

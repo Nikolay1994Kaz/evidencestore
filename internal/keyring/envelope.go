@@ -18,8 +18,8 @@ const envelopeOverhead = len(envelopeTag) + kekIDSize + 12 + dekSize + 16 + 12 +
 // kekID лежит открытым: по нему Unseal находит ключ, а после уничтожения
 // отличает «стёрто» от «повреждено». Он же входит в AAD обоих слоёв.
 //
-// Звать только после EnsureScope этого скоупа: он гарантирует, что ключ уже
-// в резерве.
+// Ключ, ещё не дошедший до резерва, Seal не выдаёт (ErrNotBackedUp): звать
+// после EnsureScope этого скоупа, он дожидается копии.
 func (k *Keyring) Seal(scope string, plaintext []byte) ([]byte, error) {
 	// Замок держится всю операцию: иначе Destroy или Close обнулят ключ
 	// посреди шифрования.
@@ -36,6 +36,8 @@ func (k *Keyring) Seal(scope string, plaintext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %q", ErrScopeDestroyed, scope)
 	case e.state != Active:
 		return nil, fmt.Errorf("%w: %q is %v", ErrScopeClosed, scope, e.state)
+	case e.gen > k.safe:
+		return nil, fmt.Errorf("%w: %q", ErrNotBackedUp, scope)
 	}
 	dek := make([]byte, dekSize)
 	defer zeroize(dek)

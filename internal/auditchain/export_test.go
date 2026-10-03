@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -271,5 +272,5 @@ func TestVerifyStatement_RejectsRandomKeyOfRightSize(t *testing.T) {
 }
 
 func containsSub(hay, needle string) bool {
-	return stringContains(hay, needle)
+	return strings.Contains(hay, needle)
 }

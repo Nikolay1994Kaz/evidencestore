@@ -57,6 +57,8 @@ func (TwoPeople) Check(op Op, _ string, _ [kekIDSize]byte, approvals []Approval)
 // запечатывать нельзя. Зовётся, когда месяц закончился: после этого
 // подвинутые назад часы уже не помогут дописать прошлый месяц.
 func (k *Keyring) Deactivate(scopes ...string) error {
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.closed {
@@ -96,6 +98,8 @@ func (k *Keyring) Deactivate(scopes ...string) error {
 // сразу перестаёт работать, но до срока уничтожение можно отменить. Срок не
 // короче Options.MinWait.
 func (k *Keyring) ScheduleDestroy(scope string, wait time.Duration, approvals []Approval) (KeyInfo, error) {
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.closed {
@@ -126,6 +130,8 @@ func (k *Keyring) ScheduleDestroy(scope string, wait time.Duration, approvals []
 
 // CancelDestroy отменяет заявку в период ожидания: Pending → Deactivated.
 func (k *Keyring) CancelDestroy(scope string, approvals []Approval) (KeyInfo, error) {
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.closed {
@@ -181,6 +187,8 @@ func (k *Keyring) approve(op Op, e *entry, approvals []Approval) ([]string, erro
 // что-то изменилось (уничтожен, стал окончательным): по каждому движок пишет
 // квитанцию в цепь. При ошибке тоже отдаёт то, что успело измениться.
 func (k *Keyring) CompleteDue() ([]KeyInfo, error) {
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.closed {
