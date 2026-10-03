@@ -1,0 +1,12 @@
+{
+  "server": "https://evidencestore.bank.local:8443",
+  "ca": "/etc/escollect/server-ca.crt",
+  "cert": "/etc/escollect/abs-core.crt",
+  "key": "/etc/escollect/abs-core.key",
+  "store_key": "PIN-THE-STORE-PUBLIC-KEY-PRINTED-BY-evidencestore-init",
+  "spool_dir": "/var/lib/escollect",
+  "file": "/var/log/abs/audit.log",
+  "from_start": false,
+  "batch": 256,
+  "flush_every": "1s"
+}

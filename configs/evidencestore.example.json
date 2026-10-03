@@ -1,0 +1,22 @@
+{
+  "data_dir": "/var/lib/evidencestore",
+  "roots_dir": "/var/lib/evidencestore-roots",
+  "listen": ":8443",
+  "tls": {
+    "cert": "/etc/evidencestore/server.crt",
+    "key": "/etc/evidencestore/server.key",
+    "client_ca": "/etc/evidencestore/collectors-ca.crt"
+  },
+  "chain": {"tick": "1s", "promise_mmd": "1m"},
+  "tsa": {
+    "url": "http://tsp.pki.gov.kz",
+    "every": "10m",
+    "trust": ["tsa/nca-kz/root_rsa_2020.cer", "tsa/nca-kz/nca_rsa_2022.cer"]
+  },
+  "keys": {"min_wait": "168h", "backup_dir": "/mnt/backup/evidencestore-keyring"},
+  "sources": [
+    {"name": "abs-core", "content_type": "syslog", "retention_months": 36, "expect_every": "10m"},
+    {"name": "pipelock", "content_type": "pipelock/receipt", "retention_months": 36, "expect_every": "1h",
+     "cert_sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+  ]
+}
