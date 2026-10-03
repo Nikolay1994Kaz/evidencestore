@@ -1,440 +1,410 @@
-// Package keyring — кейринг KEK'ов скоупов и конверт (envelope) поверх них.
+// Package keyring — ключи для криптостирания улик.
 //
-// Зачем. FORGET делает факт недостижимым немедленно, но байты живут дальше в
-// WAL, в снятых раньше снапшотах и в отгруженных архивах (docs/VMEM_DESIGN.md,
-// «Erasure guarantee»). Догнать эти копии удалением нельзя в принципе: шиппер
-// возит поколения и о содержимом не знает, а снапшот уже снят. Единственный
-// способ — чтобы копии с самого начала были шифротекстом, а стирание сводилось
-// к уничтожению ключа. Шифровать ПОСЛЕ того, как понадобилось стереть, поздно:
-// копии сделаны раньше.
+// Ключи в три уровня:
 //
-// Три решения приняты в docs/VMEM_DESIGN.md по измеренным числам, здесь только
-// их следствия для кода:
+//	корень      — живёт в RootStore (файл в пилоте, потом HSM), запирает keyring.dat целиком;
+//	ключ скоупа — KEK на «источник/месяц», обёртывает ключи записей;
+//	ключ записи — DEK, шифрует тело; обёрнутый DEK лежит в конверте рядом с ним.
 //
-//  1. Граница шифротекста = граница персистентности (WAL/снапшот/архив), а не
-//     путь чтения. В памяти движок работает с открытым текстом и не платит
-//     ничего; платят запись и реплей (~1.9 мкс/факт).
-//  2. KEK — на скоуп, в кейринге; DEK — на каждую запись, обёрнут KEK'ом и
-//     едет ВМЕСТЕ с данными. Без KEK обёрнутый DEK бесполезен, поэтому архив
-//     можно возить как есть, а секрет в него не попадает.
-//  3. Криптостирание получается на гранулярности скоупа. Точечный FORGET
-//     остаётся с прежней гарантией, и квитанция не утверждает иного.
+// Стереть тела скоупа — уничтожить его KEK. Но копии keyring.dat живут
+// дольше: в резерве, в бэкапах диска, в старых блоках SSD. Поэтому
+// уничтожение поворачивает корень: файл без ключа запирается новым корнем,
+// старый корень уничтожается, и все старые копии разом становятся
+// нечитаемыми. По той же причине файл можно копировать в резерв свободно: без
+// корня он бесполезен.
 //
-// ⚠Почему кейринг НЕ append-only, в отличие от всего остального в этом
-// проекте. Журнал с записью «ключ уничтожен» сохранил бы прежнюю запись с
-// самим ключом — то есть уничтожение было бы декоративным. Поэтому Destroy
-// переписывает файл целиком без уничтоженного ключа (tmp → fsync → rename →
-// fsync каталога). Кейринг мал (32 байта на скоуп), эта цена платится редко.
-// Доказательством стирания служит отдельная запись-квитанция, а не кейринг.
+// Жизнь ключа (по мотивам NIST SP 800-57):
+//
+//	Active ──Deactivate──▶ Deactivated ──ScheduleDestroy──▶ Pending ──CompleteDue──▶ Destroyed
+//	                            ▲                               │
+//	                            └────────CancelDestroy──────────┘
+//
+// Active шифрует и расшифровывает, Deactivated (прошлый месяц) только
+// расшифровывает, Pending не делает ничего, но уничтожение ещё можно
+// отменить, от Destroyed остаётся надгробие. Срок ожидания — не меньше
+// Options.MinWait, заявку подтверждают два человека (Policy).
+//
+// Порча файла — громкая ошибка: корень проверяет файл целиком, и один битый
+// байт даёт ErrCorrupt, а не тихую потерю части ключей.
 package keyring
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
 const (
-	// FileName — имя файла кейринга внутри каталога данных. ⚠Он не попадает
-	// в снапшот и не отгружается шиппером: в этом весь смысл разделения.
+	// FileName — файл кейринга в каталоге данных.
 	FileName = "keyring.dat"
+	// MaxScopeLen — предел имени скоупа. Пределы проверяются и при записи, и
+	// при чтении: иначе можно записать файл, который потом не откроется.
+	MaxScopeLen = 1024
+	// MaxApprovals и MaxApproverLen — пределы подтверждений одной заявки.
+	MaxApprovals   = 8
+	MaxApproverLen = 255
 
-	fileMagic   = "KRNG1\n"
-	kekSize     = 32 // AES-256
-	kekIDSize   = 16
-	dekSize     = 32
-	envelopeTag = "EV1"
+	fileMagic    = "KRNG2\n"
+	maxRootIDLen = 255
+	kekSize      = 32 // AES-256
+	kekIDSize    = 16
+	dekSize      = 32
+	envelopeTag  = "EV1"
 )
+
+// State — состояние ключа скоупа. Значения записываются в файл.
+type State uint8
+
+const (
+	Active      State = 1
+	Deactivated State = 2
+	Pending     State = 3
+	Destroyed   State = 4
+)
+
+var stateNames = [...]string{"", "active", "deactivated", "pending-destruction", "destroyed"}
+
+func (s State) String() string {
+	if s >= Active && s <= Destroyed {
+		return stateNames[s]
+	}
+	return fmt.Sprintf("State(%d)", uint8(s))
+}
 
 var (
-	// ErrKeyDestroyed — KEK для этой записи уничтожен (или скоупа не было).
-	// ⚠Это НОРМАЛЬНОЕ состояние после криптостирания, а не повреждение:
-	// реплей WAL обязан пережить его и пропустить запись, а не падать.
-	ErrKeyDestroyed = errors.New("keyring: key destroyed or unknown")
-	// ErrMalformed — конверт повреждён (не то же самое, что стёртый ключ).
-	ErrMalformed = errors.New("keyring: malformed envelope")
-	// ErrClosed — кейринг закрыт.
-	ErrClosed = errors.New("keyring: closed")
+	ErrNotFound       = errors.New("keyring: file not found")
+	ErrExists         = errors.New("keyring: file already exists")
+	ErrCorrupt        = errors.New("keyring: corrupt file")
+	ErrClosed         = errors.New("keyring: closed")
+	ErrScopeName      = errors.New("keyring: bad scope name")
+	ErrUnknownScope   = errors.New("keyring: unknown scope")
+	ErrScopeClosed    = errors.New("keyring: scope is not writable")
+	ErrScopeDestroyed = errors.New("keyring: scope destroyed")
+	ErrBadState       = errors.New("keyring: invalid state for operation")
+	ErrApproval       = errors.New("keyring: approvals rejected")
+
+	// Исходы Unseal. Реплей обязан их различать: «стёрто» — пропустить
+	// запись, «ждёт уничтожения» — не грузить, но и не считать стёртым,
+	// остальное — остановиться.
+	ErrKeyDestroyed = errors.New("keyring: key destroyed")
+	ErrKeyPending   = errors.New("keyring: key pending destruction")
+	ErrUnknownKey   = errors.New("keyring: unknown key")
+	ErrMalformed    = errors.New("keyring: malformed envelope")
 )
 
-type kek struct {
-	id   [kekIDSize]byte
-	key  []byte
-	aead cipher.AEAD // кэш: bench показал 336 нс + 1280 Б на каждый NewGCM
+// RootStore хранит корни. Корень не покидает хранилище: кейринг передаёт
+// ему байты, чтобы запереть или отпереть. Сейчас это FileRoots, для банка —
+// HSM за этим же интерфейсом.
+type RootStore interface {
+	NewRoot() (id string, err error)
+	Seal(id string, plaintext, aad []byte) ([]byte, error)
+	Open(id string, ciphertext, aad []byte) ([]byte, error)
+	// DestroyRoot уничтожает корень насовсем. Неизвестный id — не ошибка:
+	// после сбоя уничтожение повторяют.
+	DestroyRoot(id string) error
 }
 
-// Keyring — набор KEK'ов по скоупам, durable в одном файле.
+// Options — необязательные настройки.
+type Options struct {
+	// Backup копирует keyring.dat в резерв; зовётся после каждой записи
+	// файла. Пока копия не прошла, новый ключ не выдаётся (EnsureScope
+	// отвечает ошибкой) и старые корни не уничтожаются: иначе после потери
+	// диска в резерве не окажется нужного ключа или копия будет заперта уже
+	// уничтоженным корнем. Копия должна быть атомарной: неудачная попытка не
+	// портит прежнюю. Зовётся под замком, Seal в это время ждёт.
+	Backup func(path string, gen uint64) error
+	// MinWait — наименьший срок между заявкой на уничтожение и самим
+	// уничтожением. Задаётся настройкой, а не тем, кто подаёт заявку: иначе
+	// окно отмены было бы доброй волей заявителя.
+	MinWait time.Duration
+	// Policy решает, хватает ли подтверждений. nil — TwoPeople.
+	Policy Policy
+	// Now — часы для сроков ожидания; nil — time.Now. Нужны тестам.
+	Now func() time.Time
+}
+
+// KeyInfo — состояние ключа скоупа для оператора и квитанций в цепи.
+// Самого ключа в нём нет.
+type KeyInfo struct {
+	Scope         string
+	KEKID         [kekIDSize]byte
+	State         State
+	DeactivatedAt time.Time
+	DestroyAfter  time.Time // срок ожидания у Pending
+	DestroyedAt   time.Time // ключа нет в текущем файле
+	EffectiveAt   time.Time // старые корни уничтожены; ноль у Destroyed — CompleteDue надо повторить
+	Approvals     []string  // кто подтвердил уничтожение
+}
+
+type entry struct {
+	scope string
+	id    [kekIDSize]byte
+	state State
+	key   []byte      // nil у уничтоженного и после Close
+	aead  cipher.AEAD // кэш: NewGCM на каждый вызов стоит 336 нс и 1280 Б
+	gen   uint64      // поколение файла, в котором ключ появился
+
+	deactivated, destroyAfter, destroyed, effective time.Time
+	approvals                                       []string
+}
+
+// live — ключ ещё лежит в файле.
+func (e *entry) live() bool { return e.state != Destroyed }
+
+func (e *entry) info() KeyInfo {
+	return KeyInfo{
+		Scope:         e.scope,
+		KEKID:         e.id,
+		State:         e.state,
+		DeactivatedAt: e.deactivated,
+		DestroyAfter:  e.destroyAfter,
+		DestroyedAt:   e.destroyed,
+		EffectiveAt:   e.effective,
+		Approvals:     append([]string(nil), e.approvals...),
+	}
+}
+
+// Keyring — ключи скоупов под корнем, durable в одном файле.
 type Keyring struct {
-	mu     sync.RWMutex
-	path   string
-	byName map[string]*kek
-	byID   map[[kekIDSize]byte]*kek
-	closed bool
+	mu      sync.RWMutex
+	path    string
+	roots   RootStore
+	opt     Options
+	rootID  string   // корень текущего файла
+	retired []string // старые корни, ещё не уничтоженные
+	gen     uint64   // поколение текущего файла, +1 на каждую запись
+	safe    uint64   // последнее поколение, записанное и скопированное в резерв
+	byName  map[string]*entry
+	byID    map[[kekIDSize]byte]*entry
+	closed  bool
 }
 
-// Open читает кейринг из каталога данных, создавая пустой, если файла нет.
-func Open(dir string) (*Keyring, error) {
-	k := &Keyring{
+func newKeyring(dir string, roots RootStore, opt Options) *Keyring {
+	return &Keyring{
 		path:   filepath.Join(dir, FileName),
-		byName: make(map[string]*kek),
-		byID:   make(map[[kekIDSize]byte]*kek),
+		roots:  roots,
+		opt:    opt,
+		byName: make(map[string]*entry),
+		byID:   make(map[[kekIDSize]byte]*entry),
 	}
-	data, err := os.ReadFile(k.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return k, nil
+}
+
+// Create заводит пустой кейринг под новым корнем. Файл уже есть — ErrExists:
+// начинать с чистого листа поверх живых ключей нельзя.
+func Create(dir string, roots RootStore, opt Options) (*Keyring, error) {
+	k := newKeyring(dir, roots, opt)
+	if _, err := os.Stat(k.path); err == nil {
+		return nil, fmt.Errorf("%w: %s", ErrExists, k.path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("keyring create: %w", err)
 	}
+	id, err := k.newRoot()
 	if err != nil {
-		return nil, fmt.Errorf("keyring open: %w", err)
+		return nil, err
 	}
-	if err := k.decode(data); err != nil {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.rootID = id
+	if _, err := k.persistLocked(); err != nil {
 		return nil, err
 	}
 	return k, nil
 }
 
-// decode разбирает содержимое файла. Формат:
-//
-//	"KRNG1\n" | { u32 scopeLen | scope | kekID(16) | key(32) | u32 crc } …
-//
-// crc считается по всей записи без самого crc — половинчатая запись после
-// краша отбрасывается вместе с хвостом (ключ без данных безвреден, обратное —
-// нет, поэтому кейринг пишется и fsync-ается ДО того, как данные уедут в WAL).
-func (k *Keyring) decode(data []byte) error {
-	if len(data) < len(fileMagic) || string(data[:len(fileMagic)]) != fileMagic {
-		return fmt.Errorf("keyring: bad magic in %s", k.path)
+// Open открывает существующий кейринг. Файла нет — ErrNotFound, а не пустой
+// кейринг: иначе потерянный файл выглядел бы как «все ключи уничтожены».
+func Open(dir string, roots RootStore, opt Options) (*Keyring, error) {
+	k := newKeyring(dir, roots, opt)
+	data, err := os.ReadFile(k.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, k.path)
 	}
-	p := data[len(fileMagic):]
-	for len(p) > 0 {
-		if len(p) < 4 {
-			break // рваный хвост
-		}
-		n := int(binary.BigEndian.Uint32(p[:4]))
-		recLen := 4 + n + kekIDSize + kekSize + 4
-		if n < 0 || n > 1<<20 || len(p) < recLen {
-			break
-		}
-		rec := p[:recLen]
-		want := binary.BigEndian.Uint32(rec[recLen-4:])
-		if crc32.ChecksumIEEE(rec[:recLen-4]) != want {
-			break
-		}
-		scope := string(rec[4 : 4+n])
-		var id [kekIDSize]byte
-		copy(id[:], rec[4+n:4+n+kekIDSize])
-		key := make([]byte, kekSize)
-		copy(key, rec[4+n+kekIDSize:4+n+kekIDSize+kekSize])
-		e, err := newKEK(id, key)
-		if err != nil {
-			return err
-		}
-		k.byName[scope] = e
-		k.byID[id] = e
-		p = p[recLen:]
-	}
-	return nil
-}
-
-func newKEK(id [kekIDSize]byte, key []byte) (*kek, error) {
-	block, err := aes.NewCipher(key)
 	if err != nil {
+		return nil, fmt.Errorf("keyring open: %w", err)
+	}
+	if err := k.load(data); err != nil {
+		k.Close() // обнулить ключи, которые успели загрузиться
 		return nil, err
 	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	return &kek{id: id, key: key, aead: aead}, nil
+	return k, nil
 }
 
-// persistLocked атомарно переписывает файл целиком. Вызывается и при создании
-// ключа, и при уничтожении: полная перезапись — единственный способ, при
-// котором уничтоженный ключ действительно исчезает с диска.
-func (k *Keyring) persistLocked() error {
-	buf := make([]byte, 0, len(fileMagic)+len(k.byName)*(kekIDSize+kekSize+64))
-	buf = append(buf, fileMagic...)
-	// Детерминированный порядок: файл не должен меняться от прогона к прогону
-	// при неизменном содержимом (иначе не сравнить и не воспроизвести).
-	names := make([]string, 0, len(k.byName))
-	for name := range k.byName {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		e := k.byName[name]
-		start := len(buf)
-		var n [4]byte
-		binary.BigEndian.PutUint32(n[:], uint32(len(name)))
-		buf = append(buf, n[:]...)
-		buf = append(buf, name...)
-		buf = append(buf, e.id[:]...)
-		buf = append(buf, e.key...)
-		var c [4]byte
-		binary.BigEndian.PutUint32(c[:], crc32.ChecksumIEEE(buf[start:]))
-		buf = append(buf, c[:]...)
-	}
-
-	tmp := k.path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("keyring write: %w", err)
-	}
-	if _, err := f.Write(buf); err != nil {
-		f.Close()
-		return fmt.Errorf("keyring write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("keyring fsync: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("keyring close: %w", err)
-	}
-	if err := os.Rename(tmp, k.path); err != nil {
-		return fmt.Errorf("keyring rename: %w", err)
-	}
-	// fsync каталога: без него переименование может не пережить отказ питания,
-	// и после перезагрузки вернётся файл со СТЁРТЫМ ключом внутри.
-	d, err := os.Open(filepath.Dir(k.path))
-	if err != nil {
-		return fmt.Errorf("keyring dir open: %w", err)
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
-		return fmt.Errorf("keyring dir fsync: %w", err)
-	}
-	return nil
-}
-
-// EnsureScope возвращает KEK скоупа, создавая его при первом обращении.
-// Идемпотентна: повторный вызов отдаёт тот же идентификатор.
-func (k *Keyring) EnsureScope(scope string) ([kekIDSize]byte, error) {
+// EnsureScopes заводит ключи для скоупов, которых ещё нет, одной записью
+// файла. Скоупы следующего месяца лучше завести заранее одним вызовом: иначе
+// в полночь каждый источник придёт сюда за эксклюзивным замком отдельно.
+//
+// Закрытый скоуп не открывается снова (ErrScopeClosed), уничтоженный не
+// воскрешается (ErrScopeDestroyed): новый ключ под старым именем снова
+// открыл бы прошлый месяц для записи.
+//
+// nil означает, что все ключи активны, записаны и скопированы в резерв.
+// Только тогда под ними можно запечатывать: ключ без данных безвреден,
+// данные без ключа потеряны.
+func (k *Keyring) EnsureScopes(scopes ...string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.closed {
-		return [kekIDSize]byte{}, ErrClosed
+		return ErrClosed
 	}
-	if e, ok := k.byName[scope]; ok {
+	for _, s := range scopes {
+		if s == "" || len(s) > MaxScopeLen {
+			return fmt.Errorf("%w: length %d", ErrScopeName, len(s))
+		}
+		if e, ok := k.byName[s]; ok {
+			switch e.state {
+			case Destroyed:
+				return fmt.Errorf("%w: %q", ErrScopeDestroyed, s)
+			case Deactivated, Pending:
+				return fmt.Errorf("%w: %q is %v", ErrScopeClosed, s, e.state)
+			}
+		}
+	}
+	var fresh []*entry
+	for _, s := range scopes {
+		if _, ok := k.byName[s]; ok {
+			continue
+		}
+		// Ключ появится в следующей записи, отсюда gen+1.
+		e := &entry{scope: s, state: Active, key: make([]byte, kekSize), gen: k.gen + 1}
+		rand.Read(e.id[:]) // с Go 1.24 rand.Read не возвращает ошибок
+		rand.Read(e.key)
+		if err := k.add(e); err != nil {
+			zeroize(e.key)
+			k.dropLocked(fresh)
+			return err
+		}
+		fresh = append(fresh, e)
+	}
+	if k.savedLocked(scopes) {
+		return nil
+	}
+	committed, err := k.persistLocked()
+	if !committed {
+		k.dropLocked(fresh)
+	}
+	return err
+}
+
+// EnsureScope — EnsureScopes для одного скоупа; отдаёт ID его ключа. Если
+// ключ уже есть и сохранён, хватает общего замка, и Seal не ждёт.
+func (k *Keyring) EnsureScope(scope string) ([kekIDSize]byte, error) {
+	k.mu.RLock()
+	e := k.byName[scope]
+	ready := !k.closed && k.savedLocked([]string{scope})
+	k.mu.RUnlock()
+	if ready {
 		return e.id, nil
 	}
-	var id [kekIDSize]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		return id, err
+	if err := k.EnsureScopes(scope); err != nil {
+		return [kekIDSize]byte{}, err
 	}
-	key := make([]byte, kekSize)
-	if _, err := rand.Read(key); err != nil {
-		return id, err
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return k.byName[scope].id, nil
+}
+
+// savedLocked: все скоупы есть, активны и уже побывали в резерве.
+func (k *Keyring) savedLocked(scopes []string) bool {
+	for _, s := range scopes {
+		e, ok := k.byName[s]
+		if !ok || e.state != Active || e.gen > k.safe {
+			return false
+		}
 	}
-	e, err := newKEK(id, key)
+	return true
+}
+
+// add кладёт ключ в индексы. Повтор имени или ID — порча файла.
+func (k *Keyring) add(e *entry) error {
+	if _, dup := k.byName[e.scope]; dup {
+		return fmt.Errorf("%w: duplicate scope %q", ErrCorrupt, e.scope)
+	}
+	if _, dup := k.byID[e.id]; dup {
+		return fmt.Errorf("%w: duplicate key id", ErrCorrupt)
+	}
+	if e.live() {
+		aead, err := newAEAD(e.key)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrCorrupt, err)
+		}
+		e.aead = aead
+	}
+	k.byName[e.scope] = e
+	k.byID[e.id] = e
+	return nil
+}
+
+func (k *Keyring) dropLocked(es []*entry) {
+	for _, e := range es {
+		delete(k.byName, e.scope)
+		delete(k.byID, e.id)
+		zeroize(e.key)
+	}
+}
+
+// newRoot заводит корень. Длину имени проверяем сразу: слишком длинное имя
+// записалось бы в заголовок файла, который потом не откроется.
+func (k *Keyring) newRoot() (string, error) {
+	id, err := k.roots.NewRoot()
 	if err != nil {
-		return id, err
+		return "", fmt.Errorf("keyring new root: %w", err)
 	}
-	k.byName[scope] = e
-	k.byID[id] = e
-	if err := k.persistLocked(); err != nil {
-		delete(k.byName, scope) // не оставлять ключ, которого нет на диске
-		delete(k.byID, id)
-		return id, err
+	if id == "" || len(id) > maxRootIDLen {
+		return "", fmt.Errorf("keyring new root: bad id length %d", len(id))
 	}
 	return id, nil
 }
 
-// HasScope сообщает, существует ли живой KEK скоупа.
-func (k *Keyring) HasScope(scope string) bool {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-	_, ok := k.byName[scope]
-	return ok
-}
-
-// Scopes возвращает отсортированный список скоупов с живыми ключами.
+// Scopes возвращает скоупы, ключи которых ещё не уничтожены, в порядке имён.
 func (k *Keyring) Scopes() []string {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
-	out := make([]string, 0, len(k.byName))
-	for name := range k.byName {
-		out = append(out, name)
+	var out []string
+	for name, e := range k.byName {
+		if e.live() {
+			out = append(out, name)
+		}
 	}
 	sort.Strings(out)
 	return out
 }
 
-// Seal упаковывает открытый текст в конверт под ключом скоупа.
-//
-// Формат конверта (то, что уезжает в WAL/снапшот/архив):
-//
-//	"EV1" | kekID(16) | wrapNonce(12) | wrappedDEK(48) | dataNonce(12) | ct+tag
-//
-// kekID лежит открытым намеренно: по нему реплей понимает, каким ключом
-// разворачивать и — главное — что ключа больше нет (стирание, а не поломка).
-func (k *Keyring) Seal(scope string, plaintext []byte) ([]byte, error) {
+// List возвращает состояние всех ключей, включая надгробия, в порядке имён.
+// По нему движок после рестарта сверяет кейринг с квитанциями в цепи.
+func (k *Keyring) List() []KeyInfo {
 	k.mu.RLock()
-	e, ok := k.byName[scope]
-	k.mu.RUnlock()
-	if !ok {
-		return nil, ErrKeyDestroyed
+	defer k.mu.RUnlock()
+	out := make([]KeyInfo, 0, len(k.byName))
+	for _, e := range k.byName {
+		out = append(out, e.info())
 	}
-
-	dek := make([]byte, dekSize)
-	if _, err := rand.Read(dek); err != nil {
-		return nil, err
-	}
-	block, err := aes.NewCipher(dek)
-	if err != nil {
-		return nil, err
-	}
-	dataAEAD, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	wrapNonce := make([]byte, e.aead.NonceSize())
-	if _, err := rand.Read(wrapNonce); err != nil {
-		return nil, err
-	}
-	// kekID в дополнительных данных: подменить заголовок, не сломав разбор,
-	// не выйдет.
-	wrapped := e.aead.Seal(nil, wrapNonce, dek, e.id[:])
-
-	dataNonce := make([]byte, dataAEAD.NonceSize())
-	if _, err := rand.Read(dataNonce); err != nil {
-		return nil, err
-	}
-	ct := dataAEAD.Seal(nil, dataNonce, plaintext, e.id[:])
-
-	out := make([]byte, 0, len(envelopeTag)+kekIDSize+len(wrapNonce)+len(wrapped)+len(dataNonce)+len(ct))
-	out = append(out, envelopeTag...)
-	out = append(out, e.id[:]...)
-	out = append(out, wrapNonce...)
-	out = append(out, wrapped...)
-	out = append(out, dataNonce...)
-	out = append(out, ct...)
-	return out, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Scope < out[j].Scope })
+	return out
 }
 
-// IsEnvelope сообщает, похож ли блоб на конверт. Нужен на пути чтения, чтобы
-// отличить записи, сделанные до кейринга (они лежат открытым текстом и
-// криптостиранию не поддаются — см. coverage), от зашифрованных.
-func IsEnvelope(b []byte) bool {
-	return len(b) > len(envelopeTag)+kekIDSize && string(b[:len(envelopeTag)]) == envelopeTag
-}
-
-// Unseal разворачивает конверт. Возвращает ErrKeyDestroyed, если KEK
-// уничтожен — вызывающий обязан считать это штатным исходом.
-func (k *Keyring) Unseal(envelope []byte) ([]byte, error) {
-	if !IsEnvelope(envelope) {
-		return nil, ErrMalformed
-	}
-	p := envelope[len(envelopeTag):]
-	var id [kekIDSize]byte
-	copy(id[:], p[:kekIDSize])
-	p = p[kekIDSize:]
-
-	k.mu.RLock()
-	e, ok := k.byID[id]
-	k.mu.RUnlock()
-	if !ok {
-		return nil, ErrKeyDestroyed
-	}
-
-	wn := e.aead.NonceSize()
-	wrappedLen := dekSize + e.aead.Overhead()
-	if len(p) < wn+wrappedLen {
-		return nil, ErrMalformed
-	}
-	wrapNonce, wrapped := p[:wn], p[wn:wn+wrappedLen]
-	p = p[wn+wrappedLen:]
-
-	dek, err := e.aead.Open(nil, wrapNonce, wrapped, e.id[:])
-	if err != nil {
-		return nil, ErrMalformed
-	}
-	block, err := aes.NewCipher(dek)
-	if err != nil {
-		return nil, ErrMalformed
-	}
-	dataAEAD, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, ErrMalformed
-	}
-	dn := dataAEAD.NonceSize()
-	if len(p) < dn {
-		return nil, ErrMalformed
-	}
-	out, err := dataAEAD.Open(nil, p[:dn], p[dn:], e.id[:])
-	if err != nil {
-		return nil, ErrMalformed
-	}
-	return out, nil
-}
-
-// KEKIDOf достаёт идентификатор ключа из конверта, не разворачивая его.
-// Нужен coverage и квитанции: сказать «этот факт был под ключом K» можно и
-// после того, как K уничтожен.
-func KEKIDOf(envelope []byte) ([kekIDSize]byte, bool) {
-	var id [kekIDSize]byte
-	if !IsEnvelope(envelope) {
-		return id, false
-	}
-	copy(id[:], envelope[len(envelopeTag):len(envelopeTag)+kekIDSize])
-	return id, true
-}
-
-// Destroy уничтожает KEK скоупа: обнуляет его в памяти и переписывает файл
-// без него. После успешного возврата ни один конверт этого скоупа развернуть
-// нельзя — ни здесь, ни из снапшота, ни из отгруженного архива.
-//
-// Возвращает идентификатор уничтоженного ключа: именно он, а не содержимое,
-// попадает в квитанцию. Идемпотентна — повторный вызов даёт ok=false.
-func (k *Keyring) Destroy(scope string) (id [kekIDSize]byte, ok bool, err error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.closed {
-		return id, false, ErrClosed
-	}
-	e, exists := k.byName[scope]
-	if !exists {
-		return id, false, nil
-	}
-	id = e.id
-	delete(k.byName, scope)
-	delete(k.byID, id)
-	if err := k.persistLocked(); err != nil {
-		// Вернуть ключ в память: на диске он ещё есть, и молча делать вид,
-		// что стёрли, нельзя — это ровно та ложь, ради недопущения которой
-		// всё и строится.
-		k.byName[scope] = e
-		k.byID[id] = e
-		return id, false, err
-	}
-	zeroize(e.key)
-	e.aead = nil
-	return id, true, nil
-}
-
-func zeroize(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
-// Close закрывает кейринг и обнуляет ключи в памяти.
+// Close обнуляет ключи в памяти. Обнуление неполное: копии остаются внутри
+// cipher.AEAD (расписание раундов AES), до них из Go не добраться. После
+// Close методы отвечают ErrClosed, а не «стёрто».
 func (k *Keyring) Close() error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	for _, e := range k.byName {
 		zeroize(e.key)
-		e.aead = nil
+		e.key, e.aead = nil, nil
 	}
-	k.byName = map[string]*kek{}
-	k.byID = map[[kekIDSize]byte]*kek{}
 	k.closed = true
 	return nil
+}
+
+func (k *Keyring) now() time.Time {
+	if k.opt.Now != nil {
+		return k.opt.Now()
+	}
+	return time.Now()
 }
