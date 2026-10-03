@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,8 +84,17 @@ func openCopy(t *testing.T, data []byte, roots RootStore) (*Keyring, error) {
 // bodyOf вскрывает файл кейринга корнем и отдаёт открытое тело.
 func bodyOf(t *testing.T, data []byte, roots RootStore) []byte {
 	t.Helper()
-	hdr := len(fileMagic) + 2 + int(binary.BigEndian.Uint16(data[len(fileMagic):]))
-	body, err := roots.Open(string(data[len(fileMagic)+2:hdr]), data[hdr:], data[:hdr])
+	idEnd := len(fileMagic) + 2 + int(binary.BigEndian.Uint16(data[len(fileMagic):]))
+	hdr := idEnd + 2 + int(binary.BigEndian.Uint16(data[idEnd:]))
+	fileKey, err := roots.Unwrap(string(data[len(fileMagic)+2:idEnd]), data[idEnd+2:hdr], data[:idEnd])
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := newAEAD(fileKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _, err := openNext(a, data[hdr:], len(data)-hdr-a.NonceSize(), data[:hdr])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,11 +748,11 @@ type flakyRoots struct {
 	failSeal, failDestroy bool
 }
 
-func (f *flakyRoots) Seal(id string, plaintext, aad []byte) ([]byte, error) {
+func (f *flakyRoots) Wrap(id string, key, aad []byte) ([]byte, error) {
 	if f.failSeal {
 		return nil, errors.New("hsm unavailable")
 	}
-	return f.FileRoots.Seal(id, plaintext, aad)
+	return f.FileRoots.Wrap(id, key, aad)
 }
 
 func (f *flakyRoots) DestroyRoot(id string) error {
@@ -1070,5 +1080,101 @@ func TestOrphanRootAfterStaleRestore(t *testing.T) {
 	}
 	if _, err := openCopy(t, hostBackup, roots); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("бэкап умершей машины открывается: %v", err)
+	}
+}
+
+// sizeRoots запоминает, сколько байт хранилище корней получало на обёртку.
+type sizeRoots struct {
+	FileRoots
+	max int
+}
+
+func (s *sizeRoots) Wrap(id string, key, aad []byte) ([]byte, error) {
+	s.max = max(s.max, len(key))
+	return s.FileRoots.Wrap(id, key, aad)
+}
+
+// ⭐ Хранилище корней (HSM, KMS) получает только ключ файла — 32 байта, как
+// бы ни разросся keyring.dat: у AWS KMS Encrypt предел 4096 байт, а здесь
+// 1200 ключей — больше сотни килобайт.
+func TestRootSeesOnlyFileKey(t *testing.T) {
+	dir, roots := t.TempDir(), &sizeRoots{FileRoots: FileRoots{Dir: t.TempDir()}}
+	k, err := Create(dir, roots, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	var scopes []string
+	for s := range 20 {
+		for m := range 60 {
+			scopes = append(scopes, fmt.Sprintf("source-%02d/%04d-%02d", s, 2026+m/12, m%12+1))
+		}
+	}
+	if err := k.EnsureScopes(scopes...); err != nil {
+		t.Fatal(err)
+	}
+	size := len(readFile(t, filepath.Join(dir, FileName)))
+	if roots.max != fileKeySize || size < 100_000 {
+		t.Fatalf("корню отдано %d байт при файле %d байт", roots.max, size)
+	}
+}
+
+// Ключ файла новый при каждой записи.
+func TestFileKeyIsFreshPerWrite(t *testing.T) {
+	k, dir, roots := newRing(t, Options{})
+	keyOf := func() []byte {
+		data := readFile(t, filepath.Join(dir, FileName))
+		idEnd := len(fileMagic) + 2 + int(binary.BigEndian.Uint16(data[len(fileMagic):]))
+		hdr := idEnd + 2 + int(binary.BigEndian.Uint16(data[idEnd:]))
+		key, err := roots.Unwrap(string(data[len(fileMagic)+2:idEnd]), data[idEnd+2:hdr], data[:idEnd])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return key
+	}
+	first := keyOf()
+	if err := k.EnsureScopes("a"); err != nil {
+		t.Fatal(err)
+	}
+	second := keyOf()
+	if bytes.Equal(first, second) || bytes.Equal(first, make([]byte, fileKeySize)) {
+		t.Fatal("ключ файла не меняется между записями")
+	}
+}
+
+// Прежний формат KRNG2 (весь файл запирал корень) не читается, и причина
+// названа.
+func TestLegacyFormatRefused(t *testing.T) {
+	_, err := openCopy(t, []byte(legacyMagic+"\x00\x20whatever"), FileRoots{Dir: t.TempDir()})
+	if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "KRNG2") {
+		t.Fatalf("файл KRNG2: %v", err)
+	}
+}
+
+// CompleteDueAt уничтожает по переданному времени, а не по своим часам:
+// движок передаёт меньшее из своих часов и метки TSA. Ноль — ничего не
+// уничтожать.
+func TestCompleteDueAtUsesGivenTime(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)}
+	k, _, _ := newRing(t, Options{Now: c.now})
+	seal(t, k, "a", "x")
+	if err := k.Deactivate("a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.ScheduleDestroy("a", time.Hour, two); err != nil {
+		t.Fatal(err)
+	}
+	c.t = c.t.Add(2 * time.Hour) // часы кейринга уже за сроком
+	for _, at := range []time.Time{c.t.Add(-90 * time.Minute), {}} {
+		if out, err := k.CompleteDueAt(at); err != nil || len(out) != 0 {
+			t.Fatalf("at=%v: уничтожен раньше срока по переданному времени: %+v, %v", at, out, err)
+		}
+	}
+	if got := info(t, k, "a"); got.State != Pending {
+		t.Fatalf("состояние %v", got.State)
+	}
+	out, err := k.CompleteDueAt(c.t.Add(-30 * time.Minute))
+	if err != nil || len(out) != 1 || out[0].State != Destroyed || !out[0].DestroyedAt.Equal(c.t.Add(-30*time.Minute)) {
+		t.Fatalf("после срока: %+v, %v", out, err)
 	}
 }

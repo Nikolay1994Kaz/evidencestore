@@ -44,14 +44,14 @@ esverify ─ cmd/esverify, internal/proof
 | Пакет | Что делает | Главные файлы | Тесты |
 |---|---|---|---|
 | `internal/evidence` | формат улики: заголовок открыто, тело конвертом; отпечаток `SHA-256("evidencestore/sealed/v1" ‖ байты)` | `record.go`, `seal.go` | золотые байты, обрезки, фазз, стирание |
-| `internal/keyring` | ключи: корень → KEK месяца → DEK записи; формат KRNG2; уничтожение поворотом корня; состояния и двухэтапное уничтожение; зеркало корней и корни-сироты | `keyring.go`, `format.go`, `envelope.go`, `lifecycle.go`, `destroy.go`, `rootfile.go` | 23 теста, 50 мутаций |
+| `internal/keyring` | ключи: корень → ключ файла → KEK месяца → DEK записи; формат KRNG3 (корень заворачивает только ключ файла); уничтожение поворотом корня; состояния и двухэтапное уничтожение; зеркало корней и корни-сироты | `keyring.go`, `format.go`, `envelope.go`, `lifecycle.go`, `destroy.go`, `rootfile.go` | 27 тестов, 54 мутации |
 | `internal/gateway` | проверка бортового журнала Pipelock при приёме: хэш записи (проекции v1–v3), сцепка `prev_hash` по писателям, подписи контрольных точек | `pipelock.go`, `testdata/pipelock-v3.6.0` (настоящий вывод Pipelock) | 8 тестов, 12 мутаций |
 | `internal/metrics` | показатели в текстовом формате Prometheus, без зависимостей | `metrics.go` | формат вывода |
 | `internal/evlog` | журнал улик: групповой коммит, ответ после fsync, сегменты только дописываются, fail-stop | `evlog.go` | 9 тестов, 10 мутаций |
 | `internal/auditchain` | цепь (ядро): листья, звено с корнем Меркла, голова в двух слотах, подписанное заявление Ed25519 | `carrier.go`, `chain.go`, `merkle.go`, `export.go`, `query.go` | тесты ядра + `TestReadersDoNotTruncate`, `TestMissingLeavesAreLoud`; 4 мутации |
 | `internal/tsa` | RFC 3161: запрос, офлайн-проверка CMS до корня, встроенная демо-служба | `tsa.go`, `local.go`, `testdata/` (настоящий токен НУЦ) | 11 тестов (один — живой НУЦ, по переменным окружения), 10 мутаций |
 | `internal/proof` | пакет доказательств и его проверка; обещание при приёме; часть пакета для журналов гейтвея | `proof.go`, `promise.go`, `gateway.go` | синтетическая цепь: каждая проверка — свой тест |
-| `internal/store` | движок: приём, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `gateway.go`, `metrics.go` | 21 тест (падение, откат кейринга, стирание, копия, журнал Pipelock…) |
+| `internal/store` | движок: приём, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `gateway.go`, `metrics.go` | 22 теста (падение, откат кейринга, стирание, копия, журнал Pipelock, окно отмены по TSA…) |
 | `internal/server` | HTTPS-приём с mTLS и админка через unix-сокет | `server.go` | mTLS, источник из сертификата, админка |
 | `internal/collector` | сборщик: файл или файлы по маске → буфер → пачки; обещания хранилища | `collector.go` | доставка, рестарт без дублей, ротация (с дочитыванием старого файла), переустановка, длинные строки, шарды Pipelock по маске |
 | `internal/config` | конфигурация JSON и реестр источников | `config.go` | предел пути сокета; остальное — через тесты движка и сервера |
@@ -111,6 +111,8 @@ replica.url            копия: evidence/…, chain/… кусками по �
 | пока есть корни-сироты, уничтожение не окончательно | `keyring.finishLocked`, `keyring.OrphanRoots` | `TestOrphanRootBlocksEffective`, `TestOrphanRootAfterStaleRestore`, `TestOrphanRootsAdmin` |
 | потеря каталога корней не уносит ключи, уничтожение затирает обе копии | `keyring.FileRoots` (`Mirror`) | `TestRootsMirror`, `TestFileRootsMirrorFailures` |
 | каталоги ключей не вкладываются друг в друга | `config.Validate` | `TestKeyDirsDoNotNest` |
+| хранилищу корней (HSM, KMS) уходит только ключ файла, 32 байта | `keyring.persistLocked` (KRNG3) | `TestRootSeesOnlyFileKey`, `TestFileKeyIsFreshPerWrite`, `TestLegacyFormatRefused` |
+| окно отмены отмеряется и по метке TSA; без метки уничтожение ждёт | `store.CompleteDue`, `keyring.CompleteDueAt` | `TestDestroyWaitsForTSATime` |
 | хэши и подписи Pipelock повторяются байт в байт | `gateway.Entry.ComputeHash`, `gateway.Tracker` | `TestPipelockRecorderVectors`, `TestPipelockTamperedEntry`, `TestDetailBytesAreHashedAsWritten`, `TestTimestampNormalizedLikePipelock` |
 | запись журнала гейтвея: вердикт в цепи, после падения досчитывается | `store.recordGateway`, `store.open` (вердикты по телам) | `TestGatewayJournalProof`, `TestGatewayVerdictCatchUp` |
 | пакет: тело — та самая запись гейтвея, её накрывает подписанная точка | `proof.verifyGateway` | `TestGatewayJournalProof`, `TestGatewayBodyMustMatchVerdict`, `TestGatewayVerdictOfAnotherRecord`, `TestGatewayTamperedEntry` |

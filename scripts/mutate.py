@@ -46,8 +46,12 @@ def run(pkg, only):
         signal.signal(signal.SIGTERM, restore)
         signal.signal(signal.SIGINT, restore)
         try:
-            vet = subprocess.run(["go", "vet"] + spec["packages"], cwd=ROOT, capture_output=True, text=True)
-            if vet.returncode != 0 and ("undefined" in vet.stderr or "declared and not used" in vet.stderr or "cannot use" in vet.stderr):
+            # Сначала только сборка (с тестами): любая ошибка компиляции —
+            # «не собрался», а не «пойман». Раньше смотрели текст ошибки vet и
+            # пропускали, например, «imported and not used».
+            build = subprocess.run(["go", "test", "-count=1", "-run", "^$"] + spec["packages"],
+                                   cwd=ROOT, capture_output=True, text=True, timeout=600)
+            if build.returncode != 0:
                 broken += 1
                 print(f"НЕ СОБРАЛСЯ {name}")
                 continue

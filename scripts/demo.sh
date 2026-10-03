@@ -128,7 +128,7 @@ if "$BIN/evidencestore" keys schedule -config "$CFG" -scope "abs-core/$MONTH" -a
   echo "ОШИБКА: хватило одного подтверждения"; exit 1
 fi
 "$BIN/evidencestore" keys schedule -config "$CFG" -scope "abs-core/$MONTH" -approve operator -approve security -wait 1s
-sleep 1.5
+sleep 2.1 # срок отмеряется и по метке TSA, а время в метке — с точностью до секунды
 "$BIN/evidencestore" keys complete -config "$CFG"
 "$BIN/evidencestore" stamp -config "$CFG"
 

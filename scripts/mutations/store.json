@@ -263,6 +263,18 @@
    "file": "internal/store/ingest.go",
    "old": "\t\tif err != nil {\n\t\t\ts.ingestErrors.Add(1)\n\t\t}",
    "new": "\t\t_ = err"
+  },
+  {
+   "name": "S27 время TSA не ограничивает уничтожение",
+   "file": "internal/store/keys.go",
+   "old": "\t\t\tcase t.Before(at):\n\t\t\t\tat = t",
+   "new": "\t\t\tcase false:\n\t\t\t\tat = t"
+  },
+  {
+   "name": "S28 без метки TSA уничтожение идёт по часам хоста",
+   "file": "internal/store/keys.go",
+   "old": "\t\t\t\tat, stampErr = time.Time{}, fmt.Errorf(",
+   "new": "\t\t\t\tstampErr = fmt.Errorf("
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

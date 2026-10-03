@@ -275,6 +275,8 @@ func TestAdminProofAndKeys(t *testing.T) {
 	if resp, body := post(t, e.admin, "http://admin/admin/keys/schedule", ScheduleRequest{Scope: scope, Approvals: []string{"operator", "security"}}); resp == nil || resp.StatusCode != 200 {
 		t.Fatalf("schedule: %v %s", resp, body)
 	}
+	// Срок отмеряется и по метке TSA, а время в метке — с точностью до секунды.
+	time.Sleep(1100 * time.Millisecond)
 	if resp, body := post(t, e.admin, "http://admin/admin/keys/complete", nil); resp == nil || resp.StatusCode != 200 {
 		t.Fatalf("complete: %v %s", resp, body)
 	}

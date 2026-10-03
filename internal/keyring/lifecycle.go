@@ -187,11 +187,16 @@ func (k *Keyring) approve(op Op, e *entry, approvals []Approval) ([]string, erro
 	return who, nil
 }
 
-// CompleteDue — второй шаг: уничтожает ключи с истёкшим сроком ожидания и
-// добивает старые корни. Звать по расписанию. Отдаёт ключи, у которых
+// CompleteDue — CompleteDueAt по часам кейринга.
+func (k *Keyring) CompleteDue() ([]KeyInfo, error) { return k.CompleteDueAt(k.now()) }
+
+// CompleteDueAt — второй шаг: уничтожает ключи, чей срок ожидания истёк к
+// моменту at, и добивает старые корни. at — время, которому верят: движок
+// берёт меньшее из своих часов и метки TSA, ноль — ничего не уничтожать,
+// только добить корни. Звать по расписанию. Отдаёт ключи, у которых
 // что-то изменилось (уничтожен, стал окончательным): по каждому движок пишет
 // квитанцию в цепь. При ошибке тоже отдаёт то, что успело измениться.
-func (k *Keyring) CompleteDue() ([]KeyInfo, error) {
+func (k *Keyring) CompleteDueAt(at time.Time) ([]KeyInfo, error) {
 	k.wmu.Lock()
 	defer k.wmu.Unlock()
 	k.mu.Lock()
@@ -199,10 +204,9 @@ func (k *Keyring) CompleteDue() ([]KeyInfo, error) {
 	if k.closed {
 		return nil, ErrClosed
 	}
-	now := k.now()
 	var due []*entry
 	for _, e := range k.byName {
-		if e.state == Pending && !now.Before(e.destroyAfter) {
+		if e.state == Pending && !at.IsZero() && !at.Before(e.destroyAfter) {
 			due = append(due, e)
 		}
 	}
@@ -210,7 +214,7 @@ func (k *Keyring) CompleteDue() ([]KeyInfo, error) {
 
 	var changed []*entry
 	if len(due) > 0 {
-		committed, err := k.rotateLocked(due)
+		committed, err := k.rotateLocked(due, at)
 		if committed {
 			changed = append(changed, due...)
 		}

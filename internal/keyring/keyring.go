@@ -2,7 +2,8 @@
 //
 // Ключи в три уровня:
 //
-//	корень      — живёт в RootStore (файл в пилоте, потом HSM), запирает keyring.dat целиком;
+//	корень      — живёт в RootStore (файл в пилоте, потом HSM), заворачивает ключ,
+//	              которым заперт keyring.dat целиком;
 //	ключ скоупа — KEK на «источник/месяц», обёртывает ключи записей;
 //	ключ записи — DEK, шифрует тело; обёрнутый DEK лежит в конверте рядом с ним.
 //
@@ -50,12 +51,15 @@ const (
 	MaxApprovals   = 8
 	MaxApproverLen = 255
 
-	fileMagic    = "KRNG2\n"
-	maxRootIDLen = 255
-	kekSize      = 32 // AES-256
-	kekIDSize    = 16
-	dekSize      = 32
-	envelopeTag  = "EV1"
+	fileMagic     = "KRNG3\n"
+	legacyMagic   = "KRNG2\n" // прежний формат: весь файл запирал сам корень
+	maxRootIDLen  = 255
+	fileKeySize   = 32  // ключ файла, его заворачивает корень
+	maxWrappedLen = 512 // предел завёрнутого ключа: у HSM и KMS обёртка длиннее ключа
+	kekSize       = 32  // AES-256
+	kekIDSize     = 16
+	dekSize       = 32
+	envelopeTag   = "EV1"
 )
 
 // State — состояние ключа скоупа. Значения записываются в файл.
@@ -106,13 +110,16 @@ var (
 	ErrMalformed    = errors.New("keyring: malformed envelope")
 )
 
-// RootStore хранит корни. Корень не покидает хранилище: кейринг передаёт
-// ему байты, чтобы запереть или отпереть. Сейчас это FileRoots, для банка —
-// HSM за этим же интерфейсом.
+// RootStore хранит корни. Корень не покидает хранилище: кейринг передаёт ему
+// ключ файла (32 байта), чтобы завернуть или развернуть. Сейчас это
+// FileRoots, для банка — HSM (C_WrapKey) или KMS за этим же интерфейсом.
 type RootStore interface {
 	NewRoot() (id string, err error)
-	Seal(id string, plaintext, aad []byte) ([]byte, error)
-	Open(id string, ciphertext, aad []byte) ([]byte, error)
+	// Wrap заворачивает ключ файла корнем id; aad связывает обёртку с
+	// заголовком файла.
+	Wrap(id string, key, aad []byte) ([]byte, error)
+	// Unwrap разворачивает ключ файла.
+	Unwrap(id string, wrapped, aad []byte) ([]byte, error)
 	// DestroyRoot уничтожает корень насовсем. Неизвестный id — не ошибка:
 	// после сбоя уничтожение повторяют.
 	DestroyRoot(id string) error

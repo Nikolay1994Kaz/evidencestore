@@ -1,6 +1,8 @@
 package keyring
 
 import (
+	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,7 +13,9 @@ import (
 
 // Формат keyring.dat:
 //
-//	"KRNG2\n" | u16 len | rootID | RootStore.Seal(rootID, body, aad = всё, что до него)
+//	"KRNG3\n" | u16 len | rootID | u16 len | wrapped | nonce(12) | GCM(fileKey, body, aad = всё, что до nonce)
+//
+//	wrapped = RootStore.Wrap(rootID, fileKey, aad = "KRNG3\n" | u16 len | rootID)
 //
 //	body:  u64 gen | u64 safe | u32 n | { str rootID }… | u32 n | { entry }…
 //	entry: str scope | kekID(16) | u8 state | u64 gen
@@ -23,24 +27,47 @@ import (
 // без него не узнать, каким корнем отпирать. Он же входит в AAD, поэтому
 // подменить его незаметно нельзя.
 //
+// Корень заворачивает только ключ файла — 32 байта, новые при каждой
+// записи, — а не сам файл: HSM и KMS рассчитаны на ключи, а не на данные
+// (у AWS KMS Encrypt предел 4096 байт), keyring.dat же растёт с каждым
+// месяцем каждого источника, надгробия не удаляются. Уничтожен корень —
+// ключ файла не развернуть, и файл не открыть.
+//
 // safe — последнее поколение, чья копия в резерве подтверждена к моменту
 // записи. Своё поколение файл подтвердить не может, поэтому safe отстаёт на
 // запись: после рестарта ключи из последней записи переподтверждаются.
 
 func (k *Keyring) load(data []byte) error {
+	if bytes.HasPrefix(data, []byte(legacyMagic)) {
+		return fmt.Errorf("%w: %s: format KRNG2 is not read any more (prototype data: run `evidencestore init` again)", ErrCorrupt, k.path)
+	}
 	if len(data) < len(fileMagic)+2 || string(data[:len(fileMagic)]) != fileMagic {
 		return fmt.Errorf("%w: %s: bad magic", ErrCorrupt, k.path)
 	}
 	n := int(binary.BigEndian.Uint16(data[len(fileMagic):]))
-	hdrLen := len(fileMagic) + 2 + n
-	if n == 0 || n > maxRootIDLen || len(data) < hdrLen {
+	idEnd := len(fileMagic) + 2 + n
+	if n == 0 || n > maxRootIDLen || len(data) < idEnd+2 {
 		return fmt.Errorf("%w: %s: bad header", ErrCorrupt, k.path)
 	}
-	rootID := string(data[len(fileMagic)+2 : hdrLen])
-	body, err := k.roots.Open(rootID, data[hdrLen:], data[:hdrLen])
+	rootID := string(data[len(fileMagic)+2 : idEnd])
+	w := int(binary.BigEndian.Uint16(data[idEnd:]))
+	hdrLen := idEnd + 2 + w
+	if w == 0 || w > maxWrappedLen || len(data) < hdrLen {
+		return fmt.Errorf("%w: %s: bad header", ErrCorrupt, k.path)
+	}
+	fileKey, err := k.roots.Unwrap(rootID, data[idEnd+2:hdrLen], data[:idEnd])
 	if err != nil {
 		// %w дважды: снаружи видны и «файл не открыть», и причина (нет корня?).
 		return fmt.Errorf("%w: %s: root %s: %w", ErrCorrupt, k.path, rootID, err)
+	}
+	defer zeroize(fileKey)
+	aead, err := newAEAD(fileKey)
+	if err != nil {
+		return fmt.Errorf("%w: %s: file key: %v", ErrCorrupt, k.path, err)
+	}
+	body, _, err := openNext(aead, data[hdrLen:], len(data)-hdrLen-aead.NonceSize(), data[:hdrLen])
+	if err != nil {
+		return fmt.Errorf("%w: %s: body: %v", ErrCorrupt, k.path, err)
 	}
 	defer zeroize(body) // в body открытые ключи всех скоупов
 	k.rootID = rootID
@@ -110,14 +137,27 @@ func (k *Keyring) persistLocked() (committed bool, err error) {
 	k.gen++ // пропуски номеров после сбоев безвредны
 	body := k.encodeBodyLocked()
 	defer zeroize(body)
+	fileKey := make([]byte, fileKeySize)
+	defer zeroize(fileKey)
+	rand.Read(fileKey)
 	hdr := []byte(fileMagic)
 	hdr = binary.BigEndian.AppendUint16(hdr, uint16(len(k.rootID)))
 	hdr = append(hdr, k.rootID...)
-	sealed, err := k.roots.Seal(k.rootID, body, hdr)
+	wrapped, err := k.roots.Wrap(k.rootID, fileKey, hdr)
 	if err != nil {
-		return false, fmt.Errorf("keyring seal: %w", err)
+		return false, fmt.Errorf("keyring wrap: %w", err)
 	}
-	if committed, err := writeFileAtomic(k.path, append(hdr, sealed...)); err != nil {
+	if len(wrapped) == 0 || len(wrapped) > maxWrappedLen {
+		return false, fmt.Errorf("keyring wrap: %d bytes, expected 1..%d", len(wrapped), maxWrappedLen)
+	}
+	hdr = binary.BigEndian.AppendUint16(hdr, uint16(len(wrapped)))
+	hdr = append(hdr, wrapped...)
+	aead, err := newAEAD(fileKey)
+	if err != nil {
+		return false, err
+	}
+	data := appendSealed(bytes.Clone(hdr), aead, body, hdr)
+	if committed, err := writeFileAtomic(k.path, data); err != nil {
 		return committed, err
 	}
 	return true, k.backupLocked()

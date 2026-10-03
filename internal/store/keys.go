@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -311,11 +312,40 @@ func (s *Store) CancelDestroy(scope string, approvals []keyring.Approval) (keyri
 	return ki, err
 }
 
-// CompleteDue уничтожает ключи с истёкшим сроком ожидания.
-func (s *Store) CompleteDue() ([]keyring.KeyInfo, error) {
-	changed, err := s.keys.CompleteDue()
+// CompleteDue уничтожает ключи, чей срок ожидания истёк. Срок отмеряется
+// по меньшему из двух времён — наших часов и метки TSA, взятой тут же над
+// текущей головой: перевод часов хоста вперёд не сокращает окно отмены.
+// Метка ложится в цепь раньше квитанции об уничтожении, и проверяющий видит,
+// что срок истёк по времени TSA. Без TSA — по нашим часам. Метки не
+// получить — уничтожение ждёт (старые корни при этом добиваются).
+func (s *Store) CompleteDue(ctx context.Context) ([]keyring.KeyInfo, error) {
+	var at time.Time // ноль — ничего не уничтожать, только добить корни
+	var stampErr error
+	if now := s.nowTime(); s.dueBy(now) {
+		at = now
+		if s.tsaURL != "" || s.tsaLocal != nil {
+			t, err := s.stampNow(ctx)
+			switch {
+			case err != nil:
+				at, stampErr = time.Time{}, fmt.Errorf("store: key destruction waits for TSA time: %w", err)
+			case t.Before(at):
+				at = t
+			}
+		}
+	}
+	changed, err := s.keys.CompleteDueAt(at)
 	s.syncKeys("complete", nil)
-	return changed, err
+	return changed, errors.Join(stampErr, err)
+}
+
+// dueBy — есть ли ключ, ждущий уничтожения, чей срок истёк к now.
+func (s *Store) dueBy(now time.Time) bool {
+	for _, ki := range s.keys.List() {
+		if ki.State == keyring.Pending && !now.Before(ki.DestroyAfter) {
+			return true
+		}
+	}
+	return false
 }
 
 // DueScope — месяц источника, вышедший за срок хранения.

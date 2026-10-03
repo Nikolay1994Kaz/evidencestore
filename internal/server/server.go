@@ -397,7 +397,7 @@ func (s *Server) AdminHandler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string][]string{"destroyed": done})
 	})
 	mux.HandleFunc("POST /admin/keys/complete", func(w http.ResponseWriter, r *http.Request) {
-		changed, err := s.store.CompleteDue()
+		changed, err := s.store.CompleteDue(r.Context())
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return

@@ -101,21 +101,23 @@ func (f FileRoots) aead(id string) (cipher.AEAD, error) {
 	return nil, first
 }
 
-func (f FileRoots) Seal(id string, plaintext, aad []byte) ([]byte, error) {
+// Wrap заворачивает ключ файла корнем (AES-256-GCM).
+func (f FileRoots) Wrap(id string, key, aad []byte) ([]byte, error) {
 	a, err := f.aead(id)
 	if err != nil {
 		return nil, err
 	}
-	return appendSealed(nil, a, plaintext, aad), nil
+	return appendSealed(nil, a, key, aad), nil
 }
 
-func (f FileRoots) Open(id string, ciphertext, aad []byte) ([]byte, error) {
+// Unwrap разворачивает ключ файла.
+func (f FileRoots) Unwrap(id string, wrapped, aad []byte) ([]byte, error) {
 	a, err := f.aead(id)
 	if err != nil {
 		return nil, err
 	}
-	pt, _, err := openNext(a, ciphertext, len(ciphertext)-a.NonceSize(), aad)
-	return pt, err
+	key, _, err := openNext(a, wrapped, len(wrapped)-a.NonceSize(), aad)
+	return key, err
 }
 
 // DestroyRoot затирает файл нулями и удаляет — в Dir и в Mirror. Затирание —

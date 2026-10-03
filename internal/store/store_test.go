@@ -22,6 +22,7 @@ import (
 	"evidencestore/internal/keyring"
 	"evidencestore/internal/proof"
 	"evidencestore/internal/ship"
+	"evidencestore/internal/tsa"
 )
 
 // clock — подвижные часы теста.
@@ -814,5 +815,77 @@ func TestOrphanRootsAdmin(t *testing.T) {
 	s.flush()
 	if got := leavesOf(t, cfg, auditchain.EventRoots); len(got) != 1 || !bytes.Contains(got[0].Payload, []byte(orphan)) {
 		t.Fatalf("событие в цепи: %+v", got)
+	}
+}
+
+// ⭐ Окно отмены отмеряется и по метке TSA: часы хоста, ушедшие вперёд, не
+// уничтожают ключ раньше срока; без метки уничтожение ждёт; метка со
+// временем после срока лежит в цепи раньше квитанции об уничтожении.
+func TestDestroyWaitsForTSATime(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t)
+	s := openStore(t, cfg, c)
+	tsaClock := newClock() // своя служба меток — свои часы
+	s.tsaLocal.Now = tsaClock.now
+	ctx := context.Background()
+	ingest(t, s, "abs-core", 1, 1)
+	scope := "abs-core/2026-09"
+	if err := s.Deactivate(true, scope); err != nil {
+		t.Fatal(err)
+	}
+	const wait = 7 * 24 * time.Hour
+	ki, err := s.ScheduleDestroy(scope, wait, []keyring.Approval{{Who: "operator"}, {Who: "security"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustStamp(t, s) // метка до срока: по ней уничтожать рано
+
+	c.add(8 * 24 * time.Hour) // часы хоста ушли вперёд, TSA — нет
+	if _, err := s.CompleteDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.keyInfo(scope); got.State != keyring.Pending {
+		t.Fatalf("уничтожен по часам хоста: %v", got.State)
+	}
+
+	saved := s.tsaLocal
+	s.tsaLocal, s.tsaURL = nil, "http://127.0.0.1:1" // служба меток недоступна
+	tsaClock.add(8 * 24 * time.Hour)
+	if _, err := s.CompleteDue(ctx); err == nil {
+		t.Fatal("без метки уничтожение прошло молча")
+	}
+	if got, _ := s.keyInfo(scope); got.State != keyring.Pending {
+		t.Fatalf("уничтожен без метки: %v", got.State)
+	}
+	s.tsaLocal, s.tsaURL = saved, ""
+
+	changed, err := s.CompleteDue(ctx)
+	if err != nil || len(changed) != 1 || changed[0].State != keyring.Destroyed {
+		t.Fatalf("после срока по TSA: %+v, %v", changed, err)
+	}
+	s.flush()
+	_, chainDir, _ := dirs(cfg)
+	var lastStamp time.Time
+	found := false
+	if err := auditchain.ScanLeaves(chainDir, func(_ uint64, l auditchain.Leaf) error {
+		switch {
+		case l.Type == auditchain.EventTimestamp:
+			gen, err := tsa.GenTime(l.Payload)
+			if err != nil {
+				return err
+			}
+			lastStamp = gen
+		case l.Type == auditchain.EventKeyState && l.Scope == scope && strings.HasPrefix(l.Subject, "destroyed") && !found:
+			found = true
+			if lastStamp.Before(ki.DestroyAfter) {
+				t.Errorf("перед квитанцией метка %v, срок %v", lastStamp, ki.DestroyAfter)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("квитанции уничтожения в цепи нет")
 	}
 }

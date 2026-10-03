@@ -199,8 +199,8 @@
   {
    "name": "M32 уничтожение не ждёт срока",
    "file": "internal/keyring/lifecycle.go",
-   "old": "\t\tif e.state == Pending && !now.Before(e.destroyAfter) {",
-   "new": "\t\tif e.state == Pending && !now.Before(now) {"
+   "old": "\t\tif e.state == Pending && !at.IsZero() && !at.Before(e.destroyAfter) {",
+   "new": "\t\tif e.state == Pending && !at.IsZero() {"
   },
   {
    "name": "M33 закрытый месяц открывается снова",
@@ -303,6 +303,30 @@
    "file": "internal/keyring/rootfile.go",
    "old": "\tseen := map[string]bool{}\n\tfor _, dir := range f.dirs() {",
    "new": "\tseen := map[string]bool{}\n\tfor _, dir := range f.dirs()[:1] {"
+  },
+  {
+   "name": "K1 ключ файла не случайный",
+   "file": "internal/keyring/format.go",
+   "old": "\trand.Read(fileKey)\n",
+   "new": "\t_ = rand.Reader\n"
+  },
+  {
+   "name": "K2 корню отдаётся всё тело",
+   "file": "internal/keyring/format.go",
+   "old": "\twrapped, err := k.roots.Wrap(k.rootID, fileKey, hdr)",
+   "new": "\twrapped, err := k.roots.Wrap(k.rootID, body, hdr)"
+  },
+  {
+   "name": "K3 прежний формат без внятной причины",
+   "file": "internal/keyring/format.go",
+   "old": "\tif bytes.HasPrefix(data, []byte(legacyMagic)) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "L1 срок уничтожения по часам кейринга, а не по доверенному времени",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\t\tif e.state == Pending && !at.IsZero() && !at.Before(e.destroyAfter) {",
+   "new": "\t\tif e.state == Pending && !k.now().Before(e.destroyAfter) {"
   }
  ]
 }

@@ -70,7 +70,9 @@ func (s *Store) Maintain(now time.Time) {
 	if err := s.deactivatePastMonths(now); err != nil {
 		s.log.Error("deactivate past months", "err", err)
 	}
-	if _, err := s.CompleteDue(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := s.CompleteDue(ctx); err != nil {
 		// Сироты держат окончательность, пока не решит оператор: про них —
 		// один раз на новый набор, а не каждую минуту.
 		if !errors.Is(err, keyring.ErrOrphanRoots) || err.Error() != s.orphanWarned {
@@ -118,26 +120,39 @@ func (s *Store) CheckSilence(now time.Time) {
 
 // Stamp заверяет текущую голову цепи у TSA и кладёт токен в цепь листом.
 // Отдаёт заверенную голову; ноль — заверять нечего (голова не менялась).
-func (s *Store) Stamp(ctx context.Context) (_ uint64, err error) {
+func (s *Store) Stamp(ctx context.Context) (uint64, error) {
+	head, _, err := s.stamp(ctx)
+	return head, err
+}
+
+// stampNow ставит метку над текущей головой и отдаёт её время: так берётся
+// доверенное время для уничтожения ключей. Голова после прошлой метки всегда
+// новее заверенной — в ней лежит сам прошлый токен, — поэтому метка будет.
+func (s *Store) stampNow(ctx context.Context) (time.Time, error) {
+	_, gen, err := s.stamp(ctx)
+	return gen, err
+}
+
+func (s *Store) stamp(ctx context.Context) (_ uint64, gen time.Time, err error) {
 	defer func() {
 		if err != nil {
 			s.stampErrors.Add(1)
 		}
 	}()
 	if s.tsaURL == "" && s.tsaLocal == nil {
-		return 0, errors.New("store: no TSA configured")
+		return 0, gen, errors.New("store: no TSA configured")
 	}
 	s.stampMu.Lock()
 	defer s.stampMu.Unlock()
 	if err := s.flush(); err != nil {
-		return 0, err
+		return 0, gen, err
 	}
 	s.chainMu.Lock()
 	head := s.chain.Head()
 	already := head.Seq == 0 || head.Seq <= s.lastStamped
 	s.chainMu.Unlock()
 	if already {
-		return 0, nil
+		return 0, gen, nil
 	}
 	imprint := proof.HeadImprint(head.Seq, head.Hash)
 	var token []byte
@@ -147,13 +162,13 @@ func (s *Store) Stamp(ctx context.Context) (_ uint64, err error) {
 		token, err = tsa.Request(ctx, s.tsaHTTP, s.tsaURL, imprint)
 	}
 	if err != nil {
-		return 0, err
+		return 0, gen, err
 	}
 	// Токен проверяется до того, как лечь в цепь: в цепь не попадает то,
 	// что проверяющий потом не примет.
 	info, err := tsa.Verify(token, imprint, s.tsaTrust)
 	if err != nil {
-		return 0, fmt.Errorf("store: TSA token rejected: %w", err)
+		return 0, gen, fmt.Errorf("store: TSA token rejected: %w", err)
 	}
 	s.chainMu.Lock()
 	num := s.appendLeafLocked(auditchain.Leaf{
@@ -163,9 +178,9 @@ func (s *Store) Stamp(ctx context.Context) (_ uint64, err error) {
 		Payload:  token,
 	})
 	s.tokens = append(s.tokens, tokenRef{head: head.Seq, leaf: num, gen: info.GenTime})
-	s.lastStamped = head.Seq
+	s.lastStamped = max(s.lastStamped, head.Seq)
 	err = s.flushLocked()
 	s.chainMu.Unlock()
 	s.log.Info("tsa stamp", "head", head.Seq, "gen_time", info.GenTime)
-	return head.Seq, err
+	return head.Seq, info.GenTime, err
 }

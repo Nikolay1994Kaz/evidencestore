@@ -23,17 +23,17 @@ import (
 // rotateLocked убирает ключи due из файла и перезапирает файл новым корнем.
 // committed — файл заменён: ключи уничтожены, даже если err != nil (не
 // прошла копия). Тогда память уже равна диску и не откатывается.
-func (k *Keyring) rotateLocked(due []*entry) (committed bool, err error) {
+// at — время уничтожения (то, по которому истёк срок).
+func (k *Keyring) rotateLocked(due []*entry, at time.Time) (committed bool, err error) {
 	newRoot, err := k.newRoot()
 	if err != nil {
 		return false, err
 	}
 	oldRoot, oldRetired := k.rootID, k.retired
 	prev := make([]entry, len(due))
-	now := k.now()
 	for i, e := range due {
 		prev[i] = *e
-		e.state, e.destroyed, e.changed = Destroyed, now, k.gen+1
+		e.state, e.destroyed, e.changed = Destroyed, at, k.gen+1
 	}
 	k.rootID = newRoot
 	k.retired = append(slices.Clone(oldRetired), oldRoot)

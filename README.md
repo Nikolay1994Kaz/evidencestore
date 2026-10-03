@@ -37,11 +37,13 @@ See [`configs/evidencestore.example.json`](configs/evidencestore.example.json) a
 
 ### Keys
 
-Month keys live in `keyring.dat`, which is locked by a root key in `roots_dir`. Three places matter:
+Month keys live in `keyring.dat`. It is encrypted under a fresh file key on every write, and only that 32-byte file key is wrapped by the root key in `roots_dir`, so the root can move into an HSM or a KMS unchanged. Three places matter:
 
 - `keys.backup_dir` receives a copy of `keyring.dat` after every change. A new month key is not used until that copy has landed, so losing `data_dir` never loses a key that sealed a record. The copy is useless without the root.
 - `keys.roots_mirror_dir` is a second copy of the roots on another disk or machine. Every root is written to both places and destroyed in both. Without a mirror, losing `roots_dir` makes every stored body unreadable for good; the chain and the proofs survive.
 - Nothing else may hold a copy of `roots_dir` or of the mirror. An old root copy plus an old `keyring.dat` still opens a destroyed key, so destruction is only as final as your control over those copies. The config check rejects layouts where one directory would hold both `keyring.dat` (or its backup) and a root.
+
+The waiting period before a key is destroyed is measured by the store clock and by a fresh TSA time-stamp, whichever is earlier: moving the host clock forward does not shorten it, and without a time-stamp destruction waits. The time-stamp lands in the chain before the destruction receipt.
 
 A key state change enters the chain only after it has reached `keys.backup_dir`. If the backup is down, the change still takes effect, the operator gets an error saying the copy is pending, and the store retries every minute; `status` shows `keyring_backup_pending` meanwhile.
 
@@ -53,7 +55,7 @@ With `replica.url` set (`s3://bucket/prefix?endpoint=…&region=…` or `file://
 
 ### Gateway journals (Pipelock)
 
-A source with `"content_type": "pipelock/recorder"` carries the flight recorder of a [Pipelock](https://github.com/luckyPipewrench/pipelock) gateway: JSONL where every entry is hash-chained to the previous one and checkpoints are signed with the gateway's Ed25519 key. Pin that key in the source as `gateway_key` (64 hex, `pipelock signing pubkey`). Point the collector at the shards with a glob, since Pipelock writes every shard to a new file:
+A source with `"content_type": "pipelock/recorder"` carries the flight recorder of a [Pipelock](https://github.com/luckyPipewrench/pipelock) gateway: JSONL where every entry is hash-chained to the previous one and checkpoints are signed with the gateway's Ed25519 key. Pin that key in the source as `gateway_key` (64 hex, `pipelock signing pubkey`). Point the collector at the shards with a glob, since Pipelock writes every shard to a new file (full example: [`configs/collector.pipelock.example.json`](configs/collector.pipelock.example.json)):
 
 ```json
 {"glob": "/var/lib/pipelock/recorder/evidence-*.jsonl", "from_start": true}
