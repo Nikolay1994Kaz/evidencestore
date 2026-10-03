@@ -305,3 +305,127 @@ func TestBigLinesFitRequestLimit(t *testing.T) {
 		t.Fatalf("доставлено %d из 20", last)
 	}
 }
+
+// pipelockShards — шарды настоящего бортового журнала Pipelock из тестовых
+// данных пакета gateway, по порядку записи.
+var pipelockShards = []string{"0", "8", "16", "25", "33"}
+
+const pipelockDir = "../gateway/testdata/pipelock-v3.6.0/session1"
+const pipelockSession = "proxy.run.699f05e62af002bf3614fd97248a719a"
+
+func shardName(n string) string { return "evidence-" + pipelockSession + "-" + n + ".jsonl" }
+
+// copyShards кладёт шарды в каталог журнала; mtime — время изменения
+// каждого (по порядку), nil — у всех одно.
+func copyShards(t *testing.T, dir string, shards []string, mtime func(i int) time.Time) []string {
+	t.Helper()
+	var lines []string
+	for i, n := range shards {
+		data, err := os.ReadFile(filepath.Join(pipelockDir, shardName(n)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, shardName(n))
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mtime(i), mtime(i)); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")...)
+	}
+	return lines
+}
+
+func globRig(t *testing.T) *rig {
+	t.Helper()
+	r := newRig(t)
+	r.cfg.File, r.cfg.Glob = "", filepath.Join(r.logDir, "evidence-*.jsonl")
+	if err := r.cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// ⭐ Pipelock пишет каждый шард в новый файл: сборщик по маске читает шарды
+// по порядку записи, без пропусков и повторов, и после перезапуска
+// продолжает с того же места.
+func TestGlobFollowsPipelockShards(t *testing.T) {
+	r := globRig(t)
+	base := time.Now().Add(-time.Hour)
+	want := copyShards(t, r.logDir, pipelockShards[:3], func(i int) time.Time { return base.Add(time.Duration(i) * time.Second) })
+	c := r.collector(t)
+	cycle(t, c)
+	c.Close()
+
+	// Перезапуск, потом новые шарды.
+	c = r.collector(t)
+	want = append(want, copyShards(t, r.logDir, pipelockShards[3:], func(i int) time.Time { return base.Add(time.Duration(10+i) * time.Second) })...)
+	cycle(t, c)
+	cycle(t, c)
+	if got := r.bodies(t); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("принято %d строк, ожидали %d; первые расхождения видны в выводе:\n%v", len(got), len(want), got)
+	}
+}
+
+// Время изменения у шардов одно (грубые часы ФС): порядок — по числу в
+// имени, а не по строке: «-16» после «-8».
+func TestGlobEqualMTimesUseNaturalOrder(t *testing.T) {
+	r := globRig(t)
+	same := time.Now().Add(-time.Hour)
+	want := copyShards(t, r.logDir, pipelockShards, func(int) time.Time { return same })
+	c := r.collector(t)
+	cycle(t, c)
+	if got := r.bodies(t); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("порядок строк нарушен: принято %d, ожидали %d", len(got), len(want))
+	}
+}
+
+// Текущий файл удалили недочитанным: потеря видна пропуском номера, чтение
+// продолжается со следующего файла.
+func TestGlobCurrentFileGoneLeavesGap(t *testing.T) {
+	r := globRig(t)
+	base := time.Now().Add(-time.Hour)
+	first := filepath.Join(r.logDir, "evidence-a-0.jsonl")
+	appendLines(t, first, "one\n")
+	os.Chtimes(first, base, base)
+	c := r.collector(t)
+	cycle(t, c)
+	appendLines(t, first, "two\n") // не прочитана
+	os.Remove(first)
+	second := filepath.Join(r.logDir, "evidence-a-2.jsonl")
+	appendLines(t, second, "three\n")
+	cycle(t, c)
+	if got := r.bodies(t); len(got) != 3 || got[0] != "one" || !strings.HasPrefix(got[1], "<нет 2") || got[2] != "three" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+func TestNaturalLess(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		less bool
+	}{
+		{"e-8.jsonl", "e-16.jsonl", true},
+		{"e-16.jsonl", "e-8.jsonl", false},
+		{"e-08", "e-8", true}, // числа равны: порядок по записи, но устойчивый
+		{"a", "b", true},
+		{"e-2", "e-2.x", true},
+	} {
+		if got := naturalLess(tc.a, tc.b); got != tc.less {
+			t.Errorf("%s < %s = %v", tc.a, tc.b, got)
+		}
+	}
+}
+
+func TestGlobConfig(t *testing.T) {
+	base := Config{Server: "https://x", CA: "ca", Cert: "c", Key: "k", SpoolDir: "s"}
+	both, none, bad := base, base, base
+	both.File, both.Glob = "/a.log", "/b/*.log"
+	bad.Glob = "/b/[*.log"
+	for name, c := range map[string]Config{"file и glob": both, "ни того ни другого": none, "кривая маска": bad} {
+		if err := c.validate(); err == nil {
+			t.Errorf("%s: принято", name)
+		}
+	}
+}

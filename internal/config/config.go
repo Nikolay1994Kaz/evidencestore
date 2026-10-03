@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,10 @@ type Config struct {
 	Listen string `json:"listen"`
 	// AdminSocket — unix-сокет администрирования; по умолчанию DataDir/admin.sock.
 	AdminSocket string `json:"admin_socket"`
+	// MetricsListen — адрес /metrics в формате Prometheus, например
+	// 127.0.0.1:9464; пусто — выключено. Показатели без секретов, но и не
+	// для всех: по умолчанию слушать только на этой машине.
+	MetricsListen string `json:"metrics_listen"`
 
 	TLS     TLS      `json:"tls"`
 	Chain   Chain    `json:"chain"`
@@ -86,6 +91,10 @@ type Keys struct {
 	// BackupDir — куда копировать keyring.dat после каждой записи. Пусто —
 	// без резерва (только для разработки).
 	BackupDir string `json:"backup_dir"`
+	// RootsMirrorDir — второй каталог корней на другом диске или машине:
+	// корень пишется в оба и уничтожается в обоих. Пусто — корни в одном
+	// каталоге, и его потеря уносит тела всех месяцев.
+	RootsMirrorDir string `json:"roots_mirror_dir"`
 }
 
 // Source — запись реестра источников. Заводит оператор вместе с ИБ.
@@ -108,7 +117,16 @@ type Source struct {
 	ExpectEvery Duration `json:"expect_every"`
 	// Disabled — источник выведен из работы: приём отклоняется.
 	Disabled bool `json:"disabled"`
+	// GatewayKey — открытый ключ гейтвея (Ed25519, 64 hex) для источника с
+	// content_type "pipelock/recorder": им при приёме проверяются подписи
+	// контрольных точек бортового журнала. Пусто — подписи не проверяются,
+	// сцепка и хэши — проверяются.
+	GatewayKey string `json:"gateway_key"`
 }
+
+// GatewayContentType — строки бортового журнала Pipelock: такой источник
+// проверяется при приёме (пакет gateway).
+const GatewayContentType = "pipelock/recorder"
 
 // MaxSourceName совпадает с evidence.MaxSourceLen.
 const MaxSourceName = 255
@@ -171,6 +189,7 @@ func (c *Config) resolve(base string) {
 	abs(&c.TLS.Key)
 	abs(&c.TLS.ClientCA)
 	abs(&c.Keys.BackupDir)
+	abs(&c.Keys.RootsMirrorDir)
 	for i := range c.TSA.Trust {
 		abs(&c.TSA.Trust[i])
 	}
@@ -212,6 +231,24 @@ func (c *Config) Validate() error {
 			errs = append(errs, errors.New("roots_dir must be outside data_dir: a copy holding both opens every key"))
 		}
 	}
+	// Копия, где лежат и keyring.dat (data_dir или его резерв), и корень,
+	// открывает все ключи. Поэтому корни и их зеркало не делят каталог ни с
+	// тем, ни с другим.
+	for _, p := range []struct{ a, an, b, bn string }{
+		{c.Keys.RootsMirrorDir, "keys.roots_mirror_dir", c.DataDir, "data_dir"},
+		{c.Keys.RootsMirrorDir, "keys.roots_mirror_dir", c.RootsDir, "roots_dir"},
+		{c.Keys.RootsMirrorDir, "keys.roots_mirror_dir", c.Keys.BackupDir, "keys.backup_dir"},
+		{c.RootsDir, "roots_dir", c.Keys.BackupDir, "keys.backup_dir"},
+	} {
+		if nested(p.a, p.b) {
+			errs = append(errs, fmt.Errorf("%s and %s must not share a directory or contain one another: a copy holding keyring.dat and its root opens every key", p.an, p.bn))
+		}
+	}
+	if c.MetricsListen != "" {
+		if _, _, err := net.SplitHostPort(c.MetricsListen); err != nil {
+			errs = append(errs, fmt.Errorf("metrics_listen: %w", err))
+		}
+	}
 	if len(c.AdminSocket) > MaxSocketPath {
 		errs = append(errs, fmt.Errorf("admin_socket path is %d bytes, a unix socket allows %d: set admin_socket to a shorter path", len(c.AdminSocket), MaxSocketPath))
 	}
@@ -243,11 +280,31 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("sources[%d] %s: cert_sha256 must be 64 hex characters", i, s.Name))
 			}
 		}
+		if s.GatewayKey != "" {
+			if b, err := hex.DecodeString(s.GatewayKey); err != nil || len(b) != 32 {
+				errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_key must be 64 hex characters (Ed25519 public key)", i, s.Name))
+			}
+			if s.ContentType != GatewayContentType {
+				errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_key is used only with content_type %q", i, s.Name, GatewayContentType))
+			}
+		}
 		if s.RetentionMonths < 0 {
 			errs = append(errs, fmt.Errorf("sources[%d] %s: retention_months must be >= 0", i, s.Name))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// nested — один каталог совпадает с другим или лежит внутри него.
+func nested(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	inside := func(x, y string) bool {
+		rel, err := filepath.Rel(y, x)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+	}
+	return inside(a, b) || inside(b, a)
 }
 
 // Source ищет источник по имени.

@@ -57,7 +57,15 @@ func optTime(t time.Time) *time.Time {
 
 // logKeyLocked пишет событие, если состояние ключа сменилось с последнего
 // записанного. Зовётся под scopeMu.
+//
+// Только по состоянию, дошедшему до резерва (Confirmed): keyring.dat,
+// поднятый из резерва после потери диска, тогда не окажется позади цепи, и
+// хранилище стартует. Неподтверждённое состояние ляжет в цепь позже — его
+// допишет syncKeys после Confirm в обслуживании.
 func (s *Store) logKeyLocked(ki keyring.KeyInfo, op string, approvals []keyring.Approval, recovered bool) {
+	if !ki.Confirmed {
+		return
+	}
 	label := keyLabel(ki)
 	if s.keyLabels[ki.Scope] == label {
 		return
@@ -156,7 +164,8 @@ func (s *Store) ensureScopesLocked(scopes []string) error {
 		return nil
 	}
 	err := s.keys.EnsureScopes(fresh...)
-	// Квитанции — и при ошибке: ключ мог записаться, не дойдя до резерва.
+	// Квитанции — только у ключей, дошедших до резерва (logKeyLocked). Ключ,
+	// записанный без копии, Seal не выдаст, и в цепь он ляжет после Confirm.
 	for _, sc := range fresh {
 		if ki, ok := s.keyInfo(sc); ok {
 			s.logKeyLocked(ki, "create", nil, false)
@@ -240,6 +249,31 @@ func (s *Store) deactivatePastMonths(now time.Time) error {
 
 // Keys — состояние всех ключей.
 func (s *Store) Keys() []keyring.KeyInfo { return s.keys.List() }
+
+// OrphanRoots — корни, которых не знает keyring.dat (keyring.OrphanRoots).
+func (s *Store) OrphanRoots() ([]string, error) { return s.keys.OrphanRoots() }
+
+// DestroyOrphanRoots уничтожает корни-сироты по решению оператора и пишет
+// это событием в цепь. Безопасно для улик: при запуске хранилище проверило,
+// что каждая улика журнала запечатана ключом из keyring.dat, а им заперт его
+// собственный корень, не сирота.
+func (s *Store) DestroyOrphanRoots() ([]string, error) {
+	done, err := s.keys.DestroyOrphanRoots()
+	if len(done) > 0 {
+		s.appendJSONEvent(auditchain.EventRoots, "", "orphan-roots-destroyed", map[string]any{"roots": done})
+		s.log.Warn("orphan keyring roots destroyed", "roots", done)
+	}
+	return done, err
+}
+
+// confirmKeys повторяет копию keyring.dat в резерв, если она не прошла, и
+// дописывает в цепь квитанции, ждавшие копии.
+func (s *Store) confirmKeys() {
+	if err := s.keys.Confirm(); err != nil {
+		s.log.Warn("keyring backup pending", "err", err)
+	}
+	s.syncKeys("", nil)
+}
 
 // ErrCurrentMonth — попытка закрыть текущий или будущий месяц без force:
 // приём от источника встал бы до конца месяца.

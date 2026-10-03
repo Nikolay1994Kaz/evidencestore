@@ -26,7 +26,7 @@
 - `internal/wal` удалён: журнал улик — новый пакет `internal/evlog`.
 - `internal/ship`: оставлен только транспорт `Remote`; `Shipper` (снапшоты, манифесты, удаление старых объектов) удалён вместе с `wal`, из `Remote` убран `Delete`.
 - `internal/monitoring` удалён: все три его метрики относились к `wal` и `Shipper`. С ним из `go.mod` ушла `VictoriaMetrics/metrics`, осталась одна зависимость — `golang.org/x/sys`.
-- Новые пакеты: `evlog`, `tsa`, `proof`, `store`, `server`, `collector`, `config`, `pki`; команды `evidencestore`, `escollect`, `esverify`. Карта — `docs/ARCHITECTURE.md`, решения — `docs/DECISIONS.md`.
+- Новые пакеты: `evlog`, `tsa`, `proof`, `store`, `server`, `collector`, `config`, `pki`, `gateway`, `metrics`; команды `evidencestore`, `escollect`, `esverify`. Карта — `docs/ARCHITECTURE.md`, решения — `docs/DECISIONS.md`.
 
 ## Что осталось от старого проекта и ещё не вычищено
 
@@ -35,4 +35,4 @@
 
 ## Чего нет и надо писать
 
-Проверка подписей квитанций Pipelock при приёме, приём syslog у сборщика, `Policy` с проверкой подписей подтверждающих, HSM как `RootStore`, метрики.
+У журнала Pipelock — подписи отдельных квитанций и файл `chain-link` между сессиями; приём syslog у сборщика, `Policy` с проверкой подписей подтверждающих, HSM как `RootStore`.

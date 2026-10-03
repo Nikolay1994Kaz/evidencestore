@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"evidencestore/internal/auditchain"
+	"evidencestore/internal/keyring"
 	"evidencestore/internal/proof"
 	"evidencestore/internal/tsa"
 )
@@ -62,6 +63,7 @@ func (s *Store) loop(every time.Duration, fn func()) {
 // Maintain — обслуживание ключей: завести месяцы, закрыть прошлые,
 // уничтожить те, у которых истёк срок ожидания.
 func (s *Store) Maintain(now time.Time) {
+	s.confirmKeys()
 	if err := s.ensureMonthScopes(now); err != nil {
 		s.log.Error("ensure month keys", "err", err)
 	}
@@ -69,7 +71,14 @@ func (s *Store) Maintain(now time.Time) {
 		s.log.Error("deactivate past months", "err", err)
 	}
 	if _, err := s.CompleteDue(); err != nil {
-		s.log.Error("complete key destruction", "err", err)
+		// Сироты держат окончательность, пока не решит оператор: про них —
+		// один раз на новый набор, а не каждую минуту.
+		if !errors.Is(err, keyring.ErrOrphanRoots) || err.Error() != s.orphanWarned {
+			s.log.Error("complete key destruction", "err", err)
+		}
+		if errors.Is(err, keyring.ErrOrphanRoots) {
+			s.orphanWarned = err.Error()
+		}
 	}
 }
 
@@ -109,7 +118,12 @@ func (s *Store) CheckSilence(now time.Time) {
 
 // Stamp заверяет текущую голову цепи у TSA и кладёт токен в цепь листом.
 // Отдаёт заверенную голову; ноль — заверять нечего (голова не менялась).
-func (s *Store) Stamp(ctx context.Context) (uint64, error) {
+func (s *Store) Stamp(ctx context.Context) (_ uint64, err error) {
+	defer func() {
+		if err != nil {
+			s.stampErrors.Add(1)
+		}
+	}()
 	if s.tsaURL == "" && s.tsaLocal == nil {
 		return 0, errors.New("store: no TSA configured")
 	}
@@ -127,7 +141,6 @@ func (s *Store) Stamp(ctx context.Context) (uint64, error) {
 	}
 	imprint := proof.HeadImprint(head.Seq, head.Hash)
 	var token []byte
-	var err error
 	if s.tsaLocal != nil {
 		token, err = s.tsaLocal.Sign(imprint[:], nil)
 	} else {

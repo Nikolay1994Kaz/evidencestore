@@ -33,12 +33,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"evidencestore/internal/auditchain"
 	"evidencestore/internal/config"
 	"evidencestore/internal/evidence"
 	"evidencestore/internal/evlog"
+	"evidencestore/internal/gateway"
 	"evidencestore/internal/keyring"
 	"evidencestore/internal/ship"
 	"evidencestore/internal/tsa"
@@ -102,12 +104,14 @@ type Store struct {
 	// chainMu — всё, что пишет в цепь или читает её файлы. Порядок
 	// захвата: mu раньше chainMu, никогда наоборот.
 	chainMu     sync.Mutex
-	nextLeaf    uint64     // сквозной номер следующего листа
-	linked      uint64     // сколько листьев накрыто звеньями
-	links       []linkRef  // звенья по порядку
-	evLeaf      []uint64   // evLeaf[pos-1] = номер листа улики + 1
-	tokens      []tokenRef // метки TSA, лёгшие в цепь листьями
-	lastStamped uint64     // голова, заверенная последней
+	nextLeaf    uint64              // сквозной номер следующего листа
+	linked      uint64              // сколько листьев накрыто звеньями
+	links       []linkRef           // звенья по порядку
+	evLeaf      []uint64            // evLeaf[pos-1] = номер листа улики + 1
+	tokens      []tokenRef          // метки TSA, лёгшие в цепь листьями
+	lastStamped uint64              // голова, заверенная последней
+	gwLeaf      map[uint64]uint64   // позиция улики гейтвея → лист её вердикта
+	gwMarks     map[string][]gwMark // источник → контрольные точки и поломки по порядку
 
 	// Копия наружу (replica.go).
 	replicaMu     sync.Mutex
@@ -115,6 +119,14 @@ type Store struct {
 	replicaRemote ship.Remote
 
 	stampMu sync.Mutex // метки по одной: фон и оператор не заверяют одну голову дважды
+
+	orphanWarned string // о каких сиротах уже предупредили (Maintain)
+
+	// Счётчики для /metrics с запуска (metrics.go).
+	ingestErrors  atomic.Uint64
+	stampErrors   atomic.Uint64
+	replicaErrors atomic.Uint64
+	replicaOK     atomic.Int64 // unix-нс конца последней удачной копии
 
 	stop      chan struct{}
 	wg        sync.WaitGroup
@@ -143,6 +155,13 @@ type sourceState struct {
 	silent   bool
 
 	pendingGaps []gap // найденные пропуски, ещё не записанные в цепь
+
+	// Журнал гейтвея (gateway.go); gw == nil — источник не гейтвей.
+	gw         *gateway.Tracker
+	gwMu       sync.Mutex    // пачки такого источника — по одной
+	gwVerified uint64        // последняя позиция с вердиктом в цепи
+	gwProblems atomic.Uint64 // записи с поломкой с момента запуска
+	dups       atomic.Uint64 // повторно присланные записи с момента запуска
 }
 
 func (s *Store) nowTime() time.Time {
@@ -154,6 +173,10 @@ func (s *Store) nowTime() time.Time {
 
 func dirs(cfg *config.Config) (evidenceDir, chainDir, tsaDir string) {
 	return filepath.Join(cfg.DataDir, "evidence"), filepath.Join(cfg.DataDir, "chain"), filepath.Join(cfg.DataDir, "tsa-local")
+}
+
+func rootStore(cfg *config.Config) keyring.FileRoots {
+	return keyring.FileRoots{Dir: cfg.RootsDir, Mirror: cfg.Keys.RootsMirrorDir}
 }
 
 func keyringOptions(cfg *config.Config, now func() time.Time) keyring.Options {
@@ -201,12 +224,15 @@ func backupFile(src, dir string, gen uint64) error {
 // Init заводит хранилище: каталоги, кейринг под новым корнем, ключ подписи.
 // Повторный Init на живом хранилище — ошибка (keyring.ErrExists).
 func Init(cfg *config.Config) (publicKey string, err error) {
-	for _, d := range []string{cfg.DataDir, cfg.RootsDir} {
+	for _, d := range []string{cfg.DataDir, cfg.RootsDir, cfg.Keys.RootsMirrorDir} {
+		if d == "" {
+			continue
+		}
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return "", err
 		}
 	}
-	k, err := keyring.Create(cfg.DataDir, keyring.FileRoots{Dir: cfg.RootsDir}, keyringOptions(cfg, nil))
+	k, err := keyring.Create(cfg.DataDir, rootStore(cfg), keyringOptions(cfg, nil))
 	if err != nil {
 		return "", err
 	}
@@ -249,6 +275,8 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 		log:       opt.Logger,
 		now:       opt.Now,
 		sources:   make(map[string]*sourceState),
+		gwLeaf:    make(map[uint64]uint64),
+		gwMarks:   make(map[string][]gwMark),
 		scopes:    make(map[string]bool),
 		keyLabels: make(map[string]string),
 		stop:      make(chan struct{}),
@@ -262,7 +290,7 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 	}
 	s.opened = s.nowTime()
 	for _, src := range cfg.Sources {
-		s.sources[src.Name] = &sourceState{cfg: src, known: true, inflight: map[uint64]bool{}}
+		s.sources[src.Name] = &sourceState{cfg: src, known: true, inflight: map[uint64]bool{}, gw: newTracker(src)}
 	}
 	if err := s.open(); err != nil {
 		s.closeFiles()
@@ -280,11 +308,21 @@ func (s *Store) open() error {
 	s.chainDir = chainDir
 
 	var err error
-	if s.keys, err = keyring.Open(cfg.DataDir, keyring.FileRoots{Dir: cfg.RootsDir}, keyringOptions(cfg, s.now)); err != nil {
+	if s.keys, err = keyring.Open(cfg.DataDir, rootStore(cfg), keyringOptions(cfg, s.now)); err != nil {
 		if errors.Is(err, keyring.ErrNotFound) {
 			return fmt.Errorf("%w (run `evidencestore init` first)", err)
 		}
 		return err
+	}
+	// Файл после рестарта не знает, что из него уже в резерве: копия
+	// подтверждает это, и квитанции, ждавшие её, лягут в цепь при сверке.
+	if err := s.keys.Confirm(); err != nil {
+		s.log.Warn("keyring backup pending", "err", err)
+	}
+	if orphans, err := s.keys.OrphanRoots(); err != nil {
+		return err
+	} else if len(orphans) > 0 {
+		s.log.Warn("keyring roots unknown to keyring.dat: destruction stays non-final until `evidencestore keys destroy-orphan-roots`", "roots", orphans)
 	}
 	if err := s.openTSA(tsaDir); err != nil {
 		return err
@@ -306,16 +344,26 @@ func (s *Store) open() error {
 	}
 
 	var maxRecv int64
-	var tail []pending // улики, которых ещё нет в цепи
+	var tail []pending              // улики, которых ещё нет в цепи
+	var gwTail []pending            // улики гейтвея без вердикта в цепи
+	keyUse := map[[16]byte]uint64{} // ключ → первая улика под ним
 	visit := func(pos uint64, data []byte) error {
 		sealed, err := evidence.Unmarshal(data)
 		if err != nil {
 			return fmt.Errorf("evidence log position %d: %w", pos, err)
 		}
+		if id, ok := keyring.KEKIDOf(sealed.Envelope); ok {
+			if _, seen := keyUse[id]; !seen {
+				keyUse[id] = pos
+			}
+		}
 		s.indexRecord(sealed.Header, pos)
 		maxRecv = max(maxRecv, sealed.ReceivedAt)
 		if pos > maxChained {
 			tail = append(tail, pending{pos: pos, header: sealed.Header, digest: evidence.Digest(data)})
+		}
+		if st := s.sources[sealed.Source]; st != nil && st.gw != nil && pos > st.gwVerified {
+			gwTail = append(gwTail, pending{pos: pos, header: sealed.Header, envelope: sealed.Envelope})
 		}
 		return nil
 	}
@@ -328,6 +376,9 @@ func (s *Store) open() error {
 	if maxChained >= s.evlog.Next() {
 		return fmt.Errorf("%w: chain covers position %d, log ends at %d", ErrEvidenceLost, maxChained, s.evlog.Next()-1)
 	}
+	if err := s.checkKeyUse(keyUse); err != nil {
+		return err
+	}
 	s.lastRecv = maxRecv
 	if len(tail) > 0 {
 		s.log.Info("chain catch-up", "records", len(tail))
@@ -336,6 +387,18 @@ func (s *Store) open() error {
 			s.appendEvidenceLocked(p.header, p.pos, p.digest)
 		}
 		s.chainMu.Unlock()
+	}
+	// Вердикты гейтвея, не успевшие лечь в цепь до падения: тела вскрываются
+	// ключами месяца и проверяются заново, в порядке журнала.
+	for _, p := range gwTail {
+		st := s.sources[p.header.Source]
+		var v gateway.Verdict
+		if body, err := s.keys.Unseal(p.envelope); err != nil {
+			v = gateway.Verdict{Problem: "catch-up after restart: body unavailable: " + err.Error()}
+		} else {
+			v = st.gw.Check(body)
+		}
+		s.appendGatewayVerdict(st, p.header, p.pos, v)
 	}
 	if err := s.reconcileKeys(keyEvents); err != nil {
 		return err
@@ -347,10 +410,30 @@ func (s *Store) open() error {
 	return s.flush()
 }
 
+// checkKeyUse: каждый ключ, под которым запечатаны улики журнала, известен
+// кейрингу — живым или надгробием. Иначе keyring.dat не тот (чужой или
+// поднят из резерва старше этих улик): тела под незнакомым ключом не
+// открыть, а сироты, которых он не знает, нельзя уничтожать. Сверка с цепью
+// этого не видит, если квитанция ключа не успела лечь в цепь до падения.
+func (s *Store) checkKeyUse(use map[[16]byte]uint64) error {
+	known := map[[16]byte]bool{}
+	for _, ki := range s.keys.List() {
+		known[ki.KEKID] = true
+	}
+	var errs []error
+	for id, pos := range use {
+		if !known[id] {
+			errs = append(errs, fmt.Errorf("%w: evidence at position %d is sealed with key %x, unknown to keyring.dat (wrong file, or restored from a backup older than this evidence)", ErrKeyringMismatch, pos, id))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 type pending struct {
-	pos    uint64
-	header evidence.Header
-	digest [32]byte
+	pos      uint64
+	header   evidence.Header
+	digest   [32]byte
+	envelope []byte // только у улик гейтвея
 }
 
 func (s *Store) openTSA(dir string) error {

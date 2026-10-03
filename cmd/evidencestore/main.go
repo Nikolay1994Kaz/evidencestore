@@ -8,7 +8,7 @@
 //	evidencestore proof    -config C -source S -seq N [-dek] [-out F]
 //	evidencestore statement -config C          подписанная голова цепи
 //	evidencestore tsa-root -config C -out F    корень встроенной демо-TSA
-//	evidencestore keys list|due|deactivate|schedule|cancel|complete -config C …
+//	evidencestore keys list|due|deactivate|schedule|cancel|complete|destroy-orphan-roots -config C …
 //	evidencestore restore  -config C -from URL -store-key KEY  журнал и цепь из копии
 //
 // Команды оператора ходят в работающий сервер через unix-сокет админки:
@@ -103,10 +103,12 @@ Operator (talks to the running server via its admin socket):
   keys schedule      -config FILE -scope S -approve A -approve B [-wait 168h]
   keys cancel        -config FILE -scope S -approve A
   keys complete      -config FILE
+  keys destroy-orphan-roots -config FILE       destroy keyring roots unknown to keyring.dat
+                                               (shown in status; they keep destruction non-final)
 
 Disaster recovery:
   restore   -config FILE -from URL -store-key KEY   rebuild evidence log and chain from the copy;
-            keyring.dat and sign.key come from keys.backup_dir, roots from their own backup
+            keyring.dat and sign.key come from keys.backup_dir, roots from keys.roots_mirror_dir
 `)
 }
 
@@ -251,13 +253,18 @@ func cmdRestore(args []string) error {
 	}
 	fmt.Printf("restored %d files, %d bytes; chain verified up to signed head %d\n", rep.Files, rep.Bytes, rep.HeadSeq)
 	fmt.Printf("now put keyring.dat into %s and sign.key into %s (from keys.backup_dir),\n", cfg.DataDir, filepath.Join(cfg.DataDir, "chain"))
-	fmt.Println("restore roots_dir from its own backup, then run `evidencestore serve`")
+	if cfg.Keys.RootsMirrorDir != "" {
+		fmt.Printf("make sure roots_dir %s exists (the store reads missing roots from the mirror %s),\n", cfg.RootsDir, cfg.Keys.RootsMirrorDir)
+	} else {
+		fmt.Println("put the roots back into roots_dir (without keys.roots_mirror_dir there is no copy the store knows of),")
+	}
+	fmt.Println("then run `evidencestore serve` and check `evidencestore status` for orphan_roots")
 	return nil
 }
 
 func cmdKeys(args []string) error {
 	if len(args) == 0 {
-		return errors.New("keys: list|due|deactivate|schedule|cancel|complete")
+		return errors.New("keys: list|due|deactivate|schedule|cancel|complete|destroy-orphan-roots")
 	}
 	sub, args := args[0], args[1:]
 	fs := flag.NewFlagSet("keys "+sub, flag.ExitOnError)
@@ -273,6 +280,8 @@ func cmdKeys(args []string) error {
 		return adminGet(args, "/admin/keys/due", fs)
 	case "complete":
 		return adminPost(args, "/admin/keys/complete", nil, fs)
+	case "destroy-orphan-roots":
+		return adminPost(args, "/admin/keys/destroy-orphan-roots", nil, fs)
 	case "deactivate":
 		return adminPost(args, "/admin/keys/deactivate", func() any {
 			return map[string]any{"scopes": []string{*scope}, "force": *force}

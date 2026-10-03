@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -32,7 +33,7 @@ func (k *Keyring) rotateLocked(due []*entry) (committed bool, err error) {
 	now := k.now()
 	for i, e := range due {
 		prev[i] = *e
-		e.state, e.destroyed = Destroyed, now
+		e.state, e.destroyed, e.changed = Destroyed, now, k.gen+1
 	}
 	k.rootID = newRoot
 	k.retired = append(slices.Clone(oldRetired), oldRoot)
@@ -57,12 +58,20 @@ func (k *Keyring) rotateLocked(due []*entry) (committed bool, err error) {
 // finishLocked уничтожает старые корни и отдаёт ключи, ставшие
 // окончательно уничтоженными. Сначала — полная запись текущего состояния с
 // копией в резерв, если её ещё не было: пока резерв заперт старым корнем,
-// уничтожать этот корень нельзя.
+// уничтожать этот корень нельзя. Окончательным уничтожение становится, когда
+// старых корней не осталось и сирот нет (OrphanRoots).
 func (k *Keyring) finishLocked() ([]*entry, error) {
-	if len(k.retired) == 0 {
+	waiting := false // уничтожены, но ещё не окончательно
+	for _, e := range k.byName {
+		if !e.live() && e.effective.IsZero() {
+			waiting = true
+			break
+		}
+	}
+	if len(k.retired) == 0 && !waiting {
 		return nil, nil
 	}
-	if k.safe != k.gen {
+	if len(k.retired) > 0 && k.safe != k.gen {
 		if _, err := k.persistLocked(); err != nil {
 			return nil, err
 		}
@@ -77,25 +86,43 @@ func (k *Keyring) finishLocked() ([]*entry, error) {
 	}
 	prev := k.retired
 	k.retired = rest
-	var marked []*entry
-	if len(rest) == 0 {
-		now := k.now()
-		for _, e := range k.byName {
-			if !e.live() && e.effective.IsZero() {
-				e.effective = now
-				marked = append(marked, e)
+	type mark struct {
+		e       *entry
+		changed uint64
+	}
+	var marks []mark
+	if len(rest) == 0 && waiting {
+		switch orphans, err := k.orphansLocked(); {
+		case err != nil:
+			errs = append(errs, err)
+		case len(orphans) > 0:
+			errs = append(errs, fmt.Errorf("%w: %s", ErrOrphanRoots, strings.Join(orphans, ", ")))
+		default:
+			now := k.now()
+			for _, e := range k.byName {
+				if !e.live() && e.effective.IsZero() {
+					marks = append(marks, mark{e, e.changed})
+					e.effective, e.changed = now, k.gen+1
+				}
 			}
 		}
+	}
+	if len(rest) == len(prev) && len(marks) == 0 {
+		return nil, errors.Join(errs...) // файл не изменился
 	}
 	committed, err := k.persistLocked()
 	if !committed {
 		// Уничтоженные корни не вернуть, и не нужно: DestroyRoot повторяется
 		// без ошибки. Не записалась только отметка — поставим её в следующий раз.
 		k.retired = prev
-		for _, e := range marked {
-			e.effective = time.Time{}
+		for _, m := range marks {
+			m.e.effective, m.e.changed = time.Time{}, m.changed
 		}
-		marked = nil
+		marks = nil
+	}
+	marked := make([]*entry, len(marks))
+	for i, m := range marks {
+		marked[i] = m.e
 	}
 	return marked, errors.Join(append(errs, err)...)
 }

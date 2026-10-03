@@ -15,6 +15,13 @@
 //
 // Тело не трогается: строка уходит байт в байт (без перевода строки).
 // Строка длиннее предела режется на куски, каждый — отдельная запись.
+//
+// Вместо одного файла можно читать файлы по маске (glob) — для источников,
+// которые пишут новые файлы, а не ротируют один: бортовой журнал Pipelock
+// кладёт каждый шард в новый файл evidence-<сессия>-<seq>.jsonl. Файлы идут
+// по времени изменения, при равенстве — по имени, где числа сравниваются как
+// числа. Текущий файл дочитывается до конца, когда за ним появился
+// следующий: значит, писатель его закрыл. В каталоге — один писатель.
 package collector
 
 import (
@@ -35,6 +42,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +63,9 @@ type Config struct {
 	StoreKey string `json:"store_key"` // закреплённый открытый ключ хранилища (base64): проверка обещаний
 	SpoolDir string `json:"spool_dir"`
 	File     string `json:"file"` // читаемый файл журнала
+	// Glob — маска файлов (filepath.Match) вместо file, когда источник
+	// пишет новые файлы: "/var/lib/pipelock/recorder/evidence-*.jsonl".
+	Glob string `json:"glob"`
 	// FromStart — читать файл с начала (иначе — только новые строки).
 	FromStart  bool            `json:"from_start"`
 	Batch      int             `json:"batch"`
@@ -74,7 +85,7 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("collector config %s: %w", path, err)
 	}
 	base := filepath.Dir(path)
-	for _, p := range []*string{&c.CA, &c.Cert, &c.Key, &c.SpoolDir, &c.File} {
+	for _, p := range []*string{&c.CA, &c.Cert, &c.Key, &c.SpoolDir, &c.File, &c.Glob} {
 		if *p != "" && !filepath.IsAbs(*p) {
 			*p = filepath.Join(base, *p)
 		}
@@ -90,9 +101,17 @@ func (c *Config) validate() error {
 		c.FlushEvery = config.Duration(time.Second)
 	}
 	var errs []error
-	for name, v := range map[string]string{"server": c.Server, "ca": c.CA, "cert": c.Cert, "key": c.Key, "spool_dir": c.SpoolDir, "file": c.File} {
+	for name, v := range map[string]string{"server": c.Server, "ca": c.CA, "cert": c.Cert, "key": c.Key, "spool_dir": c.SpoolDir} {
 		if v == "" {
 			errs = append(errs, fmt.Errorf("%s is required", name))
+		}
+	}
+	if (c.File == "") == (c.Glob == "") {
+		errs = append(errs, errors.New("exactly one of file and glob is required"))
+	}
+	if c.Glob != "" {
+		if _, err := filepath.Match(c.Glob, ""); err != nil {
+			errs = append(errs, fmt.Errorf("glob %q: %w", c.Glob, err))
 		}
 	}
 	return errors.Join(errs...)
@@ -108,6 +127,14 @@ type Collector struct {
 	nextSeq uint64 // номер следующей строки
 	acked   uint64 // всё до этого номера включительно принято хранилищем
 	pos     filePos
+	// globMTime — время изменения файла, на который сборщик перешёл последним
+	// (режим glob): если текущий файл удалят, чтение продолжится с файлов не
+	// старше его.
+	globMTime int64
+	// globHead — первая строка текущего файла (до 64 байт): номер inode
+	// удалённого файла ядро отдаёт новому, и только содержимое отличает
+	// новый файл от прежнего.
+	globHead string
 
 	spool    *os.File
 	spoolLen int64
@@ -127,7 +154,9 @@ type spoolRecord struct {
 }
 
 type state struct {
-	Acked uint64 `json:"acked"`
+	Acked     uint64 `json:"acked"`
+	GlobMTime int64  `json:"glob_mtime,omitempty"` // unix-нс, режим glob
+	GlobHead  string `json:"glob_head,omitempty"`
 }
 
 // New поднимает сборщик: буфер, состояние, клиент TLS.
@@ -178,7 +207,7 @@ func (c *Collector) load() error {
 		if err := json.Unmarshal(data, &st); err != nil {
 			return fmt.Errorf("collector state: %w", err)
 		}
-		c.acked = st.Acked
+		c.acked, c.globMTime, c.globHead = st.Acked, st.GlobMTime, st.GlobHead
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -277,7 +306,18 @@ func (c *Collector) Bootstrap(ctx context.Context) error {
 		return err
 	}
 	c.nextSeq, c.acked = st.LastSeq+1, st.LastSeq
-	if !c.cfg.FromStart {
+	switch {
+	case c.cfg.FromStart:
+	case c.cfg.Glob != "":
+		files, err := c.globFiles()
+		if err != nil {
+			return err
+		}
+		if len(files) > 0 {
+			last := files[len(files)-1]
+			c.pos, c.globMTime = filePos{Inode: last.ino, Offset: last.size}, last.mtime
+		}
+	default:
 		if fi, err := os.Stat(c.cfg.File); err == nil {
 			c.pos = filePos{Inode: inode(fi), Offset: fi.Size()}
 		}
@@ -323,6 +363,9 @@ func (c *Collector) Run(ctx context.Context) error {
 // сборщик пропускает один номер, и хранилище запишет в цепь пропуск: потеря
 // видна, а не тиха.
 func (c *Collector) ReadOnce() (int, error) {
+	if c.cfg.Glob != "" {
+		return c.readGlob()
+	}
 	fi, err := os.Stat(c.cfg.File)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
@@ -355,6 +398,140 @@ func (c *Collector) ReadOnce() (int, error) {
 	n, err := c.readLines(c.cfg.File, false)
 	return total + n, err
 }
+
+// globFile — файл под маской.
+type globFile struct {
+	path  string
+	ino   uint64
+	size  int64
+	mtime int64 // unix-нс
+}
+
+// globFiles — файлы под маской в порядке записи: по времени изменения, при
+// равенстве — по имени с числами как числами («-8» раньше «-16»).
+func (c *Collector) globFiles() ([]globFile, error) {
+	paths, err := filepath.Glob(c.cfg.Glob)
+	if err != nil {
+		return nil, err
+	}
+	var out []globFile
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		out = append(out, globFile{path: p, ino: inode(fi), size: fi.Size(), mtime: fi.ModTime().UnixNano()})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].mtime != out[j].mtime {
+			return out[i].mtime < out[j].mtime
+		}
+		return naturalLess(filepath.Base(out[i].path), filepath.Base(out[j].path))
+	})
+	return out, nil
+}
+
+// readGlob — ReadOnce для маски: дочитать текущий файл и, если за ним уже
+// есть следующий, перейти к нему.
+func (c *Collector) readGlob() (int, error) {
+	files, err := c.globFiles()
+	if err != nil || len(files) == 0 {
+		return 0, err
+	}
+	if c.pos.Inode == 0 {
+		if err := c.switchTo(files[0]); err != nil {
+			return 0, err
+		}
+	}
+	total := 0
+	for {
+		i := slices.IndexFunc(files, func(f globFile) bool { return f.ino == c.pos.Inode })
+		if i >= 0 && c.pos.Offset > 0 && c.globHead != "" && fileHead(files[i].path) != c.globHead {
+			i = -1 // тот же inode, другой файл: прежний удалён
+		}
+		if i < 0 {
+			// Текущий файл удалён, его непрочитанный хвост потерян: пропуск
+			// номера в цепи хранилища, чтение — с файлов не старше его.
+			j := slices.IndexFunc(files, func(f globFile) bool { return f.mtime >= c.globMTime })
+			if c.globMTime == 0 {
+				j = len(files) - 1 // время неизвестно: не перечитывать старое
+			}
+			if j < 0 {
+				return total, nil // новых файлов ещё нет
+			}
+			c.log.Error("current log file is gone, its unread tail is lost; leaving a gap in numbering", "glob", c.cfg.Glob)
+			c.nextSeq++
+			if err := c.switchTo(files[j]); err != nil {
+				return total, err
+			}
+			continue
+		}
+		final := i < len(files)-1
+		n, err := c.readLines(files[i].path, final)
+		total += n
+		if n > 0 && c.globHead == "" {
+			c.globHead = fileHead(files[i].path)
+		}
+		if err != nil || !final {
+			return total, err
+		}
+		if err := c.switchTo(files[i+1]); err != nil {
+			return total, err
+		}
+	}
+}
+
+// switchTo делает файл текущим и запоминает его время изменения.
+func (c *Collector) switchTo(f globFile) error {
+	c.pos, c.globMTime, c.globHead = filePos{Inode: f.ino}, f.mtime, ""
+	c.log.Info("reading log file", "file", f.path)
+	return c.saveState()
+}
+
+// fileHead — первая строка файла, не длиннее 64 байт.
+func fileHead(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, 64)
+	n, _ := io.ReadFull(f, buf)
+	head, _, _ := bytes.Cut(buf[:n], []byte("\n"))
+	return string(head)
+}
+
+// naturalLess сравнивает имена так, что подряд идущие цифры — числа.
+func naturalLess(a, b string) bool {
+	for a != "" && b != "" {
+		ca, cb := chunk(a), chunk(b)
+		a, b = a[len(ca):], b[len(cb):]
+		if ca == cb {
+			continue
+		}
+		na, nb := strings.TrimLeft(ca, "0"), strings.TrimLeft(cb, "0")
+		if isDigit(ca[0]) && isDigit(cb[0]) && na != nb {
+			if len(na) != len(nb) {
+				return len(na) < len(nb)
+			}
+			return na < nb
+		}
+		return ca < cb
+	}
+	return len(a) < len(b)
+}
+
+// chunk — первые подряд идущие цифры или не-цифры строки.
+func chunk(s string) string {
+	d := isDigit(s[0])
+	i := 1
+	for i < len(s) && isDigit(s[i]) == d {
+		i++
+	}
+	return s[:i]
+}
+
+func isDigit(b byte) bool { return '0' <= b && b <= '9' }
 
 // findByInode ищет в каталоге журнала файл с этим inode: так находится
 // ротированный файл под новым именем.
@@ -523,7 +700,7 @@ func (c *Collector) Pending() int { return len(c.pending) }
 func (c *Collector) Acked() uint64 { return c.acked }
 
 func (c *Collector) saveState() error {
-	data, _ := json.Marshal(state{Acked: c.acked})
+	data, _ := json.Marshal(state{Acked: c.acked, GlobMTime: c.globMTime, GlobHead: c.globHead})
 	tmp := c.statePath() + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err

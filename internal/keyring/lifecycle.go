@@ -2,6 +2,7 @@ package keyring
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -72,7 +73,9 @@ func (k *Keyring) Deactivate(scopes ...string) error {
 		}
 		switch e.state {
 		case Active:
-			changed = append(changed, e)
+			if !slices.Contains(changed, e) {
+				changed = append(changed, e)
+			}
 		case Deactivated:
 		default:
 			return fmt.Errorf("%w: %q is %v", ErrBadState, s, e.state)
@@ -82,13 +85,15 @@ func (k *Keyring) Deactivate(scopes ...string) error {
 		return nil
 	}
 	now := k.now()
-	for _, e := range changed {
-		e.state, e.deactivated = Deactivated, now
+	prev := make([]entry, len(changed))
+	for i, e := range changed {
+		prev[i] = *e
+		e.state, e.deactivated, e.changed = Deactivated, now, k.gen+1
 	}
 	committed, err := k.persistLocked()
 	if !committed {
-		for _, e := range changed {
-			e.state, e.deactivated = Active, time.Time{}
+		for i, e := range changed {
+			*e = prev[i]
 		}
 	}
 	return err
@@ -110,22 +115,22 @@ func (k *Keyring) ScheduleDestroy(scope string, wait time.Duration, approvals []
 		return KeyInfo{}, fmt.Errorf("%w: %q", ErrUnknownScope, scope)
 	}
 	if e.state != Deactivated {
-		return e.info(), fmt.Errorf("%w: %q is %v, schedule needs %v", ErrBadState, scope, e.state, Deactivated)
+		return e.info(k.safe), fmt.Errorf("%w: %q is %v, schedule needs %v", ErrBadState, scope, e.state, Deactivated)
 	}
 	if wait < k.opt.MinWait {
-		return e.info(), fmt.Errorf("%w: wait %v is shorter than minimum %v", ErrBadState, wait, k.opt.MinWait)
+		return e.info(k.safe), fmt.Errorf("%w: wait %v is shorter than minimum %v", ErrBadState, wait, k.opt.MinWait)
 	}
 	who, err := k.approve(OpScheduleDestroy, e, approvals)
 	if err != nil {
-		return e.info(), err
+		return e.info(k.safe), err
 	}
 	prev := *e
-	e.state, e.destroyAfter, e.approvals = Pending, k.now().Add(wait), who
+	e.state, e.destroyAfter, e.approvals, e.changed = Pending, k.now().Add(wait), who, k.gen+1
 	committed, err := k.persistLocked()
 	if !committed {
 		*e = prev
 	}
-	return e.info(), err
+	return e.info(k.safe), err
 }
 
 // CancelDestroy отменяет заявку в период ожидания: Pending → Deactivated.
@@ -142,18 +147,18 @@ func (k *Keyring) CancelDestroy(scope string, approvals []Approval) (KeyInfo, er
 		return KeyInfo{}, fmt.Errorf("%w: %q", ErrUnknownScope, scope)
 	}
 	if e.state != Pending {
-		return e.info(), fmt.Errorf("%w: %q is %v, cancel needs %v", ErrBadState, scope, e.state, Pending)
+		return e.info(k.safe), fmt.Errorf("%w: %q is %v, cancel needs %v", ErrBadState, scope, e.state, Pending)
 	}
 	if _, err := k.approve(OpCancelDestroy, e, approvals); err != nil {
-		return e.info(), err
+		return e.info(k.safe), err
 	}
 	prev := *e
-	e.state, e.destroyAfter, e.approvals = Deactivated, time.Time{}, nil
+	e.state, e.destroyAfter, e.approvals, e.changed = Deactivated, time.Time{}, nil, k.gen+1
 	committed, err := k.persistLocked()
 	if !committed {
 		*e = prev
 	}
-	return e.info(), err
+	return e.info(k.safe), err
 }
 
 // approve проверяет пределы и зовёт Policy; отдаёт имена подтвердивших.
@@ -210,21 +215,21 @@ func (k *Keyring) CompleteDue() ([]KeyInfo, error) {
 			changed = append(changed, due...)
 		}
 		if err != nil {
-			return infos(changed), err
+			return k.infos(changed), err
 		}
 	}
 	eff, err := k.finishLocked()
-	return infos(append(changed, eff...)), err
+	return k.infos(append(changed, eff...)), err
 }
 
 // infos — KeyInfo по списку без повторов, в порядке первого появления.
-func infos(es []*entry) []KeyInfo {
+func (k *Keyring) infos(es []*entry) []KeyInfo {
 	seen := make(map[*entry]bool, len(es))
 	var out []KeyInfo
 	for _, e := range es {
 		if !seen[e] {
 			seen[e] = true
-			out = append(out, e.info())
+			out = append(out, e.info(k.safe))
 		}
 	}
 	return out

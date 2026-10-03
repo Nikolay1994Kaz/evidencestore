@@ -827,3 +827,248 @@ func TestEffectiveOnlyAfterRootDestroyed(t *testing.T) {
 		t.Fatalf("старая копия после уничтожения корня: %v", err)
 	}
 }
+
+// Квитанцию в цепь пишут по состоянию, дошедшему до резерва (Confirmed).
+// Лёгший резерв изменение не откатывает, Confirm повторяет копию. После
+// рестарта файл не знает, что из него уже в резерве, — до Confirm ничего не
+// подтверждено.
+func TestConfirmWaitsForBackup(t *testing.T) {
+	bl := &backupLog{}
+	opt := Options{Backup: bl.backup}
+	k, dir, roots := newRing(t, opt)
+	seal(t, k, "a", "x")
+	if ki := info(t, k, "a"); !ki.Confirmed {
+		t.Fatal("ключ в резерве, а не подтверждён")
+	}
+
+	bl.err = errors.New("backup down")
+	if err := k.Deactivate("a"); !errors.Is(err, ErrBackupPending) || !errors.Is(err, bl.err) {
+		t.Fatalf("Deactivate при лежащем резерве: %v", err)
+	}
+	if ki := info(t, k, "a"); ki.State != Deactivated || ki.Confirmed {
+		t.Fatalf("после сбоя копии: %v, confirmed=%v", ki.State, ki.Confirmed)
+	}
+	if !k.BackupPending() {
+		t.Fatal("копия не прошла, а BackupPending молчит")
+	}
+	if err := k.Confirm(); !errors.Is(err, bl.err) {
+		t.Fatalf("Confirm при лежащем резерве: %v", err)
+	}
+	bl.err = nil
+	if err := k.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	if ki := info(t, k, "a"); !ki.Confirmed || k.BackupPending() {
+		t.Fatalf("после Confirm: confirmed=%v, pending=%v", ki.Confirmed, k.BackupPending())
+	}
+
+	k.Close()
+	k2, err := Open(dir, roots, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k2.Close()
+	if ki := info(t, k2, "a"); ki.Confirmed {
+		t.Fatal("после рестарта подтверждено без копии")
+	}
+	n := len(bl.copies)
+	if err := k2.Confirm(); err != nil || len(bl.copies) != n+1 {
+		t.Fatalf("Confirm после рестарта: %v, копий %d → %d", err, n, len(bl.copies))
+	}
+	if ki := info(t, k2, "a"); !ki.Confirmed {
+		t.Fatal("после Confirm не подтверждено")
+	}
+	if err := k2.Confirm(); err != nil || len(bl.copies) != n+1 {
+		t.Fatalf("повторный Confirm копирует снова: %v, копий %d", err, len(bl.copies))
+	}
+}
+
+// ⭐ Зеркало корней: потеря каталога корней не уносит ключи, а уничтожение
+// затирает корень в обеих копиях.
+func TestRootsMirror(t *testing.T) {
+	dir := t.TempDir()
+	roots := FileRoots{Dir: t.TempDir(), Mirror: t.TempDir()}
+	k, err := Create(dir, roots, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { k.Close() })
+	env := seal(t, k, "a", "secret")
+
+	// Диск с каталогом корней умер, каталог создан заново пустым.
+	if err := os.RemoveAll(roots.Dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(roots.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	k2, err := Open(dir, roots, Options{})
+	if err != nil {
+		t.Fatalf("без основного каталога корней: %v", err)
+	}
+	if body, err := k2.Unseal(env); err != nil || string(body) != "secret" {
+		t.Fatalf("тело через зеркало: %q, %v", body, err)
+	}
+	k2.Close()
+
+	schedule(t, k, "a")
+	if out, err := k.CompleteDue(); err != nil || len(out) != 1 || out[0].EffectiveAt.IsZero() {
+		t.Fatalf("уничтожение: %+v, %v", out, err)
+	}
+	for _, d := range roots.dirs() {
+		if m, _ := filepath.Glob(filepath.Join(d, "*"+rootSuffix)); len(m) != 1 {
+			t.Fatalf("в %s корней %d, ожидали только текущий", d, len(m))
+		}
+	}
+}
+
+// Отказ зеркала: новый корень без второй копии не остаётся, а уничтожение
+// не считается сделанным, пока не затёрта и вторая копия.
+func TestFileRootsMirrorFailures(t *testing.T) {
+	roots := FileRoots{Dir: t.TempDir(), Mirror: t.TempDir()}
+	if err := os.Chmod(roots.Mirror, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roots.NewRoot(); err == nil {
+		t.Fatal("корень создан без зеркала")
+	}
+	if got, err := roots.Roots(); err != nil || len(got) != 0 {
+		t.Fatalf("после отказа зеркала остались корни: %v, %v", got, err)
+	}
+	if err := os.Chmod(roots.Mirror, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := roots.NewRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(roots.Mirror, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := roots.DestroyRoot(id); err == nil {
+		t.Fatal("уничтожение прошло, хотя копия в зеркале осталась")
+	}
+	if got, err := roots.Roots(); err != nil || len(got) != 1 || got[0] != id {
+		t.Fatalf("корень с живой копией в зеркале не виден: %v, %v", got, err)
+	}
+	if err := os.Chmod(roots.Mirror, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := roots.DestroyRoot(id); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := roots.Roots(); err != nil || len(got) != 0 {
+		t.Fatalf("после уничтожения: %v, %v", got, err)
+	}
+}
+
+// Сирота — корень, которого не знает keyring.dat. Пока он есть, уничтожение
+// не окончательно; уничтожает сирот оператор. Корни, ждущие уничтожения, —
+// не сироты.
+func TestOrphanRootBlocksEffective(t *testing.T) {
+	k, _, roots := newFlakyRing(t)
+	seal(t, k, "a", "x")
+	seal(t, k, "b", "y")
+	schedule(t, k, "a")
+	roots.failDestroy = true
+	if _, err := k.CompleteDue(); err == nil {
+		t.Fatal("уничтожение прошло при отказе корня")
+	}
+	if got, err := k.OrphanRoots(); err != nil || len(got) != 0 {
+		t.Fatalf("корень, ждущий уничтожения, принят за сироту: %v, %v", got, err)
+	}
+	roots.failDestroy = false
+	if _, err := k.CompleteDue(); err != nil {
+		t.Fatal(err)
+	}
+
+	orphan, err := roots.NewRoot() // упали между созданием корня и записью файла
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := k.OrphanRoots(); err != nil || len(got) != 1 || got[0] != orphan {
+		t.Fatalf("сирота: %v, %v", got, err)
+	}
+	schedule(t, k, "b")
+	out, err := k.CompleteDue()
+	if !errors.Is(err, ErrOrphanRoots) || len(out) != 1 || !out[0].EffectiveAt.IsZero() {
+		t.Fatalf("при живой сироте: %+v, %v", out, err)
+	}
+	if _, err := k.CompleteDue(); !errors.Is(err, ErrOrphanRoots) {
+		t.Fatalf("повтор без решения оператора: %v", err)
+	}
+	if done, err := k.DestroyOrphanRoots(); err != nil || len(done) != 1 || done[0] != orphan {
+		t.Fatalf("уничтожение сирот: %v, %v", done, err)
+	}
+	out, err = k.CompleteDue()
+	if err != nil || len(out) != 1 || out[0].Scope != "b" || out[0].EffectiveAt.IsZero() {
+		t.Fatalf("после уничтожения сирот: %+v, %v", out, err)
+	}
+	if got, _ := k.OrphanRoots(); len(got) != 0 {
+		t.Fatalf("сироты остались: %v", got)
+	}
+}
+
+// ⭐ Резерв отстал от поворота корня, машина умерла, keyring.dat поднят из
+// резерва. Корень неудачного поворота остался сиротой: им заперт файл
+// умершей машины, а тот мог уцелеть в её бэкапах и открывает ключи,
+// стёртые уже на новой машине. Пока сироту не уничтожат, стирание не
+// окончательно.
+func TestOrphanRootAfterStaleRestore(t *testing.T) {
+	bl := &backupLog{}
+	k, dir, roots := newRing(t, Options{Backup: bl.backup})
+	seal(t, k, "a", "A")
+	envB := seal(t, k, "b", "secret B")
+	schedule(t, k, "a")
+	keyringBackup := bl.copies[len(bl.copies)-1]
+	bl.err = errors.New("backup down")
+	if _, err := k.CompleteDue(); err == nil {
+		t.Fatal("поворот корня прошёл при лежащем резерве")
+	}
+	hostBackup := readFile(t, filepath.Join(dir, FileName)) // ночной бэкап data_dir
+	k.Close()
+
+	r, err := openCopy(t, keyringBackup, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if got, err := r.OrphanRoots(); err != nil || len(got) != 1 {
+		t.Fatalf("сирота после восстановления: %v, %v", got, err)
+	}
+	if _, err := r.CompleteDue(); !errors.Is(err, ErrOrphanRoots) {
+		t.Fatalf("довели a при живой сироте: %v", err)
+	}
+	if err := r.Deactivate("b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ScheduleDestroy("b", 0, two); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CompleteDue(); !errors.Is(err, ErrOrphanRoots) {
+		t.Fatalf("стёрли b при живой сироте: %v", err)
+	}
+	if ki := info(t, r, "b"); ki.State != Destroyed || !ki.EffectiveAt.IsZero() {
+		t.Fatalf("b окончательно стёрт при живой сироте: %v, effective=%v", ki.State, ki.EffectiveAt)
+	}
+	old, err := openCopy(t, hostBackup, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body, err := old.Unseal(envB); err != nil || string(body) != "secret B" {
+		t.Fatalf("сценарий не воспроизвёлся: %q, %v", body, err)
+	}
+	old.Close()
+
+	if _, err := r.DestroyOrphanRoots(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.CompleteDue()
+	if err != nil || len(out) != 2 || out[0].EffectiveAt.IsZero() || out[1].EffectiveAt.IsZero() {
+		t.Fatalf("после уничтожения сироты: %+v, %v", out, err)
+	}
+	if _, err := openCopy(t, hostBackup, roots); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("бэкап умершей машины открывается: %v", err)
+	}
+}

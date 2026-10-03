@@ -62,6 +62,11 @@ func (s *Store) Proof(source string, seq uint64, withDEK bool) (proof.Bundle, er
 			break
 		}
 	}
+	// Журнал гейтвея: вердикт при приёме и контрольная точка после записи.
+	if b.Gateway, err = s.gatewayProofLocked(source, pos); err != nil {
+		return proof.Bundle{}, err
+	}
+
 	// T1: последняя метка, лежащая в звене раньше звена улики.
 	for i := len(s.tokens) - 1; i >= 0; i-- {
 		t := s.tokens[i]
@@ -164,6 +169,12 @@ type Status struct {
 	PublicKey  string         `json:"public_key"`
 	Sources    []SourceStatus `json:"sources"`
 	LogFailure string         `json:"log_failure,omitempty"`
+	// KeyringBackupPending — последняя запись keyring.dat не дошла до
+	// резерва (keys.backup_dir); Confirm повторяет копию раз в минуту.
+	KeyringBackupPending bool `json:"keyring_backup_pending,omitempty"`
+	// OrphanRoots — корни, которых не знает keyring.dat: уничтожение не
+	// окончательно, пока оператор их не уничтожит.
+	OrphanRoots []string `json:"orphan_roots,omitempty"`
 }
 
 func (s *Store) Status() Status {
@@ -189,6 +200,10 @@ func (s *Store) Status() Status {
 	out.PublicKey = s.signer.PublicKeyString()
 	if err := s.Healthy(); err != nil {
 		out.LogFailure = err.Error()
+	}
+	out.KeyringBackupPending = s.keys.BackupPending()
+	if orphans, err := s.keys.OrphanRoots(); err == nil {
+		out.OrphanRoots = orphans
 	}
 	return out
 }

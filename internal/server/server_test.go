@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -304,5 +305,25 @@ func TestAdminSocketIsPrivate(t *testing.T) {
 	}
 	if st.Mode().Perm() != 0o600 {
 		t.Fatalf("права сокета %v", st.Mode().Perm())
+	}
+}
+
+// /metrics отдаёт показатели в текстовом формате Prometheus.
+func TestMetricsEndpoint(t *testing.T) {
+	e := setup(t)
+	post(t, e.collector(t, "abs-core"), e.url+"/v1/ingest", records(1, 2))
+	hs := httptest.NewServer(e.srv.MetricsHandler())
+	t.Cleanup(hs.Close)
+	resp, err := http.Get(hs.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain; version=0.0.4") {
+		t.Fatalf("%s %q", resp.Status, resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(body), `evidencestore_records{source="abs-core"} 2`+"\n") {
+		t.Fatalf("нет записей источника:\n%s", body)
 	}
 }

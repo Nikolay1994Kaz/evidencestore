@@ -1,0 +1,5 @@
+tag: v3.6.0 (annotated tag object d34083c1758c92baa1811acdca93442e4ad78bbb)
+commit: 3e868ac5d5b62d3a2790958542171143af8a0e38
+commit date: 2026-10-02T23:00:22+00:00
+binary: pipelock version 3.6.0
+go: go version go1.27.0 linux/amd64

@@ -30,6 +30,7 @@ import (
 	"evidencestore/internal/config"
 	"evidencestore/internal/evlog"
 	"evidencestore/internal/keyring"
+	"evidencestore/internal/metrics"
 	"evidencestore/internal/proof"
 	"evidencestore/internal/store"
 )
@@ -98,11 +99,21 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	admin := &http.Server{Handler: s.AdminHandler(), ReadHeaderTimeout: 10 * time.Second}
+	mon := &http.Server{Handler: s.MetricsHandler(), ReadHeaderTimeout: 10 * time.Second}
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	go func() { errc <- intake.ServeTLS(ln, "", "") }()
 	go func() { errc <- admin.Serve(adminLn) }()
-	s.log.Info("evidencestore listening", "intake", ln.Addr().String(), "admin", s.cfg.AdminSocket)
+	if s.cfg.MetricsListen != "" {
+		monLn, err := net.Listen("tcp", s.cfg.MetricsListen)
+		if err != nil {
+			intake.Close()
+			admin.Close()
+			return err
+		}
+		go func() { errc <- mon.Serve(monLn) }()
+	}
+	s.log.Info("evidencestore listening", "intake", ln.Addr().String(), "admin", s.cfg.AdminSocket, "metrics", s.cfg.MetricsListen)
 
 	select {
 	case <-ctx.Done():
@@ -112,10 +123,23 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 	intake.Shutdown(shutdown)
 	admin.Shutdown(shutdown)
+	mon.Shutdown(shutdown)
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
 	}
 	return err
+}
+
+// MetricsHandler — GET /metrics в текстовом формате Prometheus.
+func (s *Server) MetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if err := metrics.Write(w, s.store.Metrics(time.Now())); err != nil {
+			s.log.Warn("metrics", "err", err)
+		}
+	})
+	return mux
 }
 
 // ListenAdmin открывает unix-сокет админки с правами 0600.
@@ -363,6 +387,14 @@ func (s *Server) AdminHandler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, keyView(ki))
+	})
+	mux.HandleFunc("POST /admin/keys/destroy-orphan-roots", func(w http.ResponseWriter, r *http.Request) {
+		done, err := s.store.DestroyOrphanRoots()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string][]string{"destroyed": done})
 	})
 	mux.HandleFunc("POST /admin/keys/complete", func(w http.ResponseWriter, r *http.Request) {
 		changed, err := s.store.CompleteDue()

@@ -59,6 +59,7 @@ func (k *Keyring) decodeBody(body []byte) error {
 		copy(e.id[:], d.take(kekIDSize))
 		e.state = State(d.u8())
 		e.gen = d.u64()
+		e.changed = k.gen // что из файла уже в резерве, файл сам не знает
 		e.deactivated = d.time()
 		e.destroyAfter = d.time()
 		e.destroyed = d.time()
@@ -119,17 +120,23 @@ func (k *Keyring) persistLocked() (committed bool, err error) {
 	if committed, err := writeFileAtomic(k.path, append(hdr, sealed...)); err != nil {
 		return committed, err
 	}
+	return true, k.backupLocked()
+}
+
+// backupLocked копирует текущий файл в резерв и двигает safe. Общий замок на
+// время копии отпускается (см. persistLocked); вызывающий держит wmu.
+func (k *Keyring) backupLocked() error {
 	gen := k.gen
 	if k.opt.Backup != nil {
 		k.mu.Unlock()
 		err := k.opt.Backup(k.path, gen)
 		k.mu.Lock()
 		if err != nil {
-			return true, fmt.Errorf("keyring backup: %w", err)
+			return fmt.Errorf("%w: %w", ErrBackupPending, err)
 		}
 	}
 	k.safe = gen
-	return true, nil
+	return nil
 }
 
 func (k *Keyring) encodeBodyLocked() []byte {

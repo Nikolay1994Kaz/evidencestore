@@ -2,6 +2,7 @@
   "data_dir": "/var/lib/evidencestore",
   "roots_dir": "/var/lib/evidencestore-roots",
   "listen": ":8443",
+  "metrics_listen": "127.0.0.1:9464",
   "tls": {
     "cert": "/etc/evidencestore/server.crt",
     "key": "/etc/evidencestore/server.key",
@@ -9,14 +10,19 @@
   },
   "chain": {"tick": "1s", "promise_mmd": "1m"},
   "tsa": {
-    "url": "http://tsp.pki.gov.kz",
+    "url": "http://timestamp.digicert.com",
     "every": "10m",
-    "trust": ["tsa/nca-kz/root_rsa_2020.cer", "tsa/nca-kz/nca_rsa_2022.cer"]
+    "trust": ["tsa/digicert/DigiCertTrustedRootG4.crt", "tsa/digicert/DigiCertTrustedG4TimeStampingRSA4096SHA2562025CA1.crt"]
   },
-  "keys": {"min_wait": "168h", "backup_dir": "/mnt/backup/evidencestore-keyring"},
+  "keys": {
+    "min_wait": "168h",
+    "backup_dir": "/mnt/backup/evidencestore-keyring",
+    "roots_mirror_dir": "/mnt/roots-mirror/evidencestore"
+  },
   "sources": [
     {"name": "abs-core", "content_type": "syslog", "retention_months": 36, "expect_every": "10m"},
-    {"name": "pipelock", "content_type": "pipelock/receipt", "retention_months": 36, "expect_every": "1h",
-     "cert_sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+    {"name": "pipelock", "content_type": "pipelock/recorder", "retention_months": 36, "expect_every": "1h",
+     "cert_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+     "gateway_key": "0000000000000000000000000000000000000000000000000000000000000000"}
   ]
 }

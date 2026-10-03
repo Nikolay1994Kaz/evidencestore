@@ -179,6 +179,90 @@
    "file": "internal/store/keys.go",
    "old": "\tif !force {\n\t\tcur := monthStart(s.nowTime())",
    "new": "\tif false {\n\t\tcur := monthStart(s.nowTime())"
+  },
+  {
+   "name": "S16 квитанция ключа до копии в резерв",
+   "file": "internal/store/keys.go",
+   "old": "\tif !ki.Confirmed {\n\t\treturn\n\t}\n\tlabel := keyLabel(ki)",
+   "new": "\tlabel := keyLabel(ki)"
+  },
+  {
+   "name": "S17 обслуживание не повторяет копию кейринга",
+   "file": "internal/store/jobs.go",
+   "old": "\ts.confirmKeys()\n\tif err := s.ensureMonthScopes(now)",
+   "new": "\tif err := s.ensureMonthScopes(now)"
+  },
+  {
+   "name": "S18 ключи улик не сверяются с кейрингом",
+   "file": "internal/store/store.go",
+   "old": "\tif err := s.checkKeyUse(keyUse); err != nil {\n\t\treturn err\n\t}\n",
+   "new": ""
+  },
+  {
+   "name": "S19 при старте копия кейринга не подтверждается",
+   "file": "internal/store/store.go",
+   "old": "\tif err := s.keys.Confirm(); err != nil {\n\t\ts.log.Warn(\"keyring backup pending\", \"err\", err)\n\t}\n\tif orphans",
+   "new": "\tif orphans"
+  },
+  {
+   "name": "S20 вердикт гейтвея не ложится в цепь",
+   "file": "internal/store/gateway.go",
+   "old": "\tnum := s.appendLeafLocked(proof.GatewayLeaf(h, pos, v))\n\ts.indexGatewayLocked(h.Source, pos, num, v)\n",
+   "new": ""
+  },
+  {
+   "name": "S21 вердикты после падения не досчитываются",
+   "file": "internal/store/store.go",
+   "old": "\tfor _, p := range gwTail {",
+   "new": "\tfor _, p := range gwTail[:0] {"
+  },
+  {
+   "name": "S22 состояние цепочки гейтвея не поднимается из цепи",
+   "file": "internal/store/chain.go",
+   "old": "\t\t\t\tst.gw.Resume(v)\n",
+   "new": ""
+  },
+  {
+   "name": "S23 контрольная точка за поломкой накрывает запись",
+   "file": "internal/store/gateway.go",
+   "old": "\t\tif m.broken {\n\t\t\tbreak\n\t\t}\n",
+   "new": ""
+  },
+  {
+   "name": "S24 вердикт не сверяется с уликой",
+   "file": "internal/proof/gateway.go",
+   "old": "\t\tcase leaf.Scope != sealed.Source || leaf.Subject != strconv.FormatUint(sealed.Seq, 10):\n\t\t\terr = fmt.Errorf(\"вердикт про %s/%s, а улика %s/%d\", leaf.Scope, leaf.Subject, sealed.Source, sealed.Seq)\n\t\tcase pos != r.Position:\n\t\t\terr = fmt.Errorf(\"вердикт про позицию %d, а улика на позиции %d\", pos, r.Position)\n",
+   "new": ""
+  },
+  {
+   "name": "P12 хэш тела не сверяется с вердиктом",
+   "file": "internal/proof/gateway.go",
+   "old": "\t\tif err == nil && (h != v.Hash || e.Hash != v.Hash) {",
+   "new": "\t\tif false && (h != v.Hash || e.Hash != v.Hash) {"
+  },
+  {
+   "name": "P13 подпись точки не проверяется ключом проверяющего",
+   "file": "internal/proof/gateway.go",
+   "old": "\t\tadd(\"контрольная точка подписана закреплённым ключом гейтвея\", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf(\"seq %d\", cv.Seq))",
+   "new": "\t\tadd(\"контрольная точка подписана закреплённым ключом гейтвея\", nil, fmt.Sprintf(\"seq %d\", cv.Seq))"
+  },
+  {
+   "name": "P14 поломка записи гейтвея не валит пакет",
+   "file": "internal/proof/gateway.go",
+   "old": "\tif !v.Clean() {\n\t\terr = fmt.Errorf(\"сцепка %s",
+   "new": "\tif false {\n\t\terr = fmt.Errorf(\"сцепка %s"
+  },
+  {
+   "name": "S25 повторы не считаются",
+   "file": "internal/store/ingest.go",
+   "old": "\t\t\tst.dups.Add(1)\n",
+   "new": ""
+  },
+  {
+   "name": "S26 ошибки приёма не считаются",
+   "file": "internal/store/ingest.go",
+   "old": "\t\tif err != nil {\n\t\t\ts.ingestErrors.Add(1)\n\t\t}",
+   "new": "\t\t_ = err"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

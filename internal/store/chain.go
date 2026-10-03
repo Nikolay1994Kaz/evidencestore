@@ -58,6 +58,16 @@ func (s *Store) scanChain() (map[string]string, uint64, error) {
 			s.lastStamped = max(s.lastStamped, head)
 		case auditchain.EventKeyState:
 			keyEvents[l.Scope] = l.Subject
+		case auditchain.EventGateway:
+			pos, v, err := proof.ParseGatewayLeaf(l)
+			if err != nil {
+				return fmt.Errorf("chain leaf %d: %w", num, err)
+			}
+			s.indexGatewayLocked(l.Scope, pos, num, v)
+			if st := s.sources[l.Scope]; st != nil && st.gw != nil {
+				st.gw.Resume(v)
+				st.gwVerified = max(st.gwVerified, pos)
+			}
 		}
 		return nil
 	})

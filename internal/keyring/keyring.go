@@ -89,6 +89,13 @@ var (
 	ErrBadState       = errors.New("keyring: invalid state for operation")
 	ErrApproval       = errors.New("keyring: approvals rejected")
 	ErrNotBackedUp    = errors.New("keyring: key not in backup yet")
+	// ErrBackupPending — изменение записано в keyring.dat, а копия в резерв
+	// не прошла. Изменение действует; Confirm повторит копию.
+	ErrBackupPending = errors.New("keyring: change saved, backup copy pending")
+	// ErrOrphanRoots — в хранилище корней есть корни, которых не знает
+	// keyring.dat (см. OrphanRoots). Пока они есть, уничтожение не становится
+	// окончательным.
+	ErrOrphanRoots = errors.New("keyring: orphan roots present")
 
 	// Исходы Unseal. Реплей обязан их различать: «стёрто» — пропустить
 	// запись, «ждёт уничтожения» — не грузить, но и не считать стёртым,
@@ -109,6 +116,9 @@ type RootStore interface {
 	// DestroyRoot уничтожает корень насовсем. Неизвестный id — не ошибка:
 	// после сбоя уничтожение повторяют.
 	DestroyRoot(id string) error
+	// Roots перечисляет корни, которые есть в хранилище: по ним находятся
+	// сироты (OrphanRoots).
+	Roots() ([]string, error)
 }
 
 // Options — необязательные настройки.
@@ -142,6 +152,10 @@ type KeyInfo struct {
 	DestroyedAt   time.Time // ключа нет в текущем файле
 	EffectiveAt   time.Time // старые корни уничтожены; ноль у Destroyed — CompleteDue надо повторить
 	Approvals     []string  // кто подтвердил уничтожение
+	// Confirmed — это состояние уже в резерве. Квитанцию в цепь пишут только
+	// по таким: тогда keyring.dat, восстановленный из резерва, не окажется
+	// позади цепи.
+	Confirmed bool
 }
 
 type entry struct {
@@ -151,6 +165,9 @@ type entry struct {
 	key   []byte      // nil у уничтоженного и после Close
 	aead  cipher.AEAD // кэш: NewGCM на каждый вызов стоит 336 нс и 1280 Б
 	gen   uint64      // поколение файла, в котором ключ появился
+	// changed — поколение записи, в которой состояние менялось последним.
+	// Только в памяти: после Open считается последним поколением файла.
+	changed uint64
 
 	deactivated, destroyAfter, destroyed, effective time.Time
 	approvals                                       []string
@@ -159,7 +176,8 @@ type entry struct {
 // live — ключ ещё лежит в файле.
 func (e *entry) live() bool { return e.state != Destroyed }
 
-func (e *entry) info() KeyInfo {
+// info — состояние ключа; safe — последнее поколение, дошедшее до резерва.
+func (e *entry) info(safe uint64) KeyInfo {
 	return KeyInfo{
 		Scope:         e.scope,
 		KEKID:         e.id,
@@ -169,6 +187,7 @@ func (e *entry) info() KeyInfo {
 		DestroyedAt:   e.destroyed,
 		EffectiveAt:   e.effective,
 		Approvals:     append([]string(nil), e.approvals...),
+		Confirmed:     e.changed <= safe,
 	}
 }
 
@@ -281,7 +300,7 @@ func (k *Keyring) EnsureScopes(scopes ...string) error {
 			continue
 		}
 		// Ключ появится в следующей записи, отсюда gen+1.
-		e := &entry{scope: s, state: Active, key: make([]byte, kekSize), gen: k.gen + 1}
+		e := &entry{scope: s, state: Active, key: make([]byte, kekSize), gen: k.gen + 1, changed: k.gen + 1}
 		rand.Read(e.id[:]) // с Go 1.24 rand.Read не возвращает ошибок
 		rand.Read(e.key)
 		if err := k.add(e); err != nil {
@@ -392,10 +411,101 @@ func (k *Keyring) List() []KeyInfo {
 	defer k.mu.RUnlock()
 	out := make([]KeyInfo, 0, len(k.byName))
 	for _, e := range k.byName {
-		out = append(out, e.info())
+		out = append(out, e.info(k.safe))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Scope < out[j].Scope })
 	return out
+}
+
+// BackupPending — последняя запись keyring.dat ещё не в резерве.
+func (k *Keyring) BackupPending() bool {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return k.safe < k.gen
+}
+
+// Confirm повторяет копию в резерв, если последняя запись туда не дошла.
+// Звать по расписанию: иначе изменение, записанное при лежащем резерве,
+// ждало бы следующего изменения кейринга, а его квитанция — вместе с ним.
+// nil — всё записанное уже в резерве.
+func (k *Keyring) Confirm() error {
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.closed {
+		return ErrClosed
+	}
+	if k.safe >= k.gen {
+		return nil
+	}
+	return k.backupLocked()
+}
+
+// OrphanRoots — корни в хранилище корней, которых не знает keyring.dat: ни
+// корень файла, ни ждущие уничтожения. Сирота остаётся после сбоя между
+// созданием корня и записью файла (им ничего не заперто) и после
+// восстановления keyring.dat из резерва, отставшего от поворота корня. Во
+// втором случае сиротой заперт файл умершей машины, и копия того файла из её
+// бэкапов открывает ключи, уничтоженные позже. Поэтому, пока сироты есть,
+// уничтожение не становится окончательным (EffectiveAt не ставится).
+func (k *Keyring) OrphanRoots() ([]string, error) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.closed {
+		return nil, ErrClosed
+	}
+	return k.orphansLocked()
+}
+
+func (k *Keyring) orphansLocked() ([]string, error) {
+	all, err := k.roots.Roots()
+	if err != nil {
+		return nil, fmt.Errorf("keyring list roots: %w", err)
+	}
+	known := map[string]bool{k.rootID: true}
+	for _, r := range k.retired {
+		known[r] = true
+	}
+	var out []string
+	for _, id := range all {
+		if !known[id] {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// DestroyOrphanRoots уничтожает корни-сироты и отдаёт уничтоженные. Только по
+// решению оператора: если каталог корней по ошибке общий с другим
+// хранилищем, его корни здесь тоже выглядят сиротами.
+func (k *Keyring) DestroyOrphanRoots() ([]string, error) {
+	// wmu: корень файла и ждущие уничтожения не меняются, пока идёт
+	// уничтожение, и новый корень поворота не примется за сироту. Читателям
+	// корни не нужны, общий замок не держим.
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
+	k.mu.RLock()
+	if k.closed {
+		k.mu.RUnlock()
+		return nil, ErrClosed
+	}
+	orphans, err := k.orphansLocked()
+	k.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	var done []string
+	var errs []error
+	for _, id := range orphans {
+		if err := k.roots.DestroyRoot(id); err != nil {
+			errs = append(errs, fmt.Errorf("keyring destroy root %s: %w", id, err))
+			continue
+		}
+		done = append(done, id)
+	}
+	return done, errors.Join(errs...)
 }
 
 // Close обнуляет ключи в памяти. Обнуление неполное: копии остаются внутри

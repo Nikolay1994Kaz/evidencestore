@@ -39,7 +39,12 @@ const (
 // Без ошибки — все записи пачки на диске (новые) или были там раньше
 // (повторы). С ошибкой — ни одна новая запись не подтверждена; повтор той
 // же пачки безопасен: принятые раньше ответят «duplicate».
-func (s *Store) Ingest(source string, recs []Incoming) ([]Result, error) {
+func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
+	defer func() {
+		if err != nil {
+			s.ingestErrors.Add(1)
+		}
+	}()
 	if len(recs) == 0 {
 		return nil, nil
 	}
@@ -48,6 +53,15 @@ func (s *Store) Ingest(source string, recs []Incoming) ([]Result, error) {
 	}
 	if err := s.Healthy(); err != nil {
 		return nil, err
+	}
+	// Журнал гейтвея — по одной пачке: вердикт записи зависит от предыдущей,
+	// и считать их надо в порядке журнала улик.
+	s.mu.Lock()
+	gst := s.sources[source]
+	s.mu.Unlock()
+	if gst != nil && gst.gw != nil {
+		gst.gwMu.Lock()
+		defer gst.gwMu.Unlock()
 	}
 
 	// 1. Под замком: повторы, резерв номеров, время приёма.
@@ -92,6 +106,7 @@ func (s *Store) Ingest(source string, recs []Incoming) ([]Result, error) {
 		results[i].Seq = r.Seq
 		if pos := st.seqs.get(r.Seq); pos != 0 {
 			results[i].Status, results[i].Position = StatusDuplicate, pos
+			st.dups.Add(1)
 			continue
 		}
 		news = append(news, fresh{i: i, header: evidence.Header{
@@ -137,6 +152,15 @@ func (s *Store) Ingest(source string, recs []Incoming) ([]Result, error) {
 	if err != nil {
 		release()
 		return nil, err
+	}
+
+	// 3а. Журнал гейтвея: вердикты листами в цепь, в порядке журнала.
+	if st.gw != nil {
+		items := make([]gwItem, len(news))
+		for j, n := range news {
+			items[j] = gwItem{header: n.header, pos: first + uint64(j), body: n.body}
+		}
+		s.recordGateway(st, items)
 	}
 
 	// 4. Индекс принятых, пропуски номеров, обещания.

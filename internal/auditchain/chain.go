@@ -56,6 +56,13 @@ const (
 	EventBatch EventType = 6
 	// EventStart — хранилище запущено: Payload = открытый ключ подписи.
 	EventStart EventType = 7
+	// EventRoots — оператор уничтожил корни кейринга, которых не знал
+	// keyring.dat (сироты): Payload = их номера.
+	EventRoots EventType = 8
+	// EventGateway — вердикт хранилища по записи журнала гейтвея при приёме:
+	// Scope = источник, Subject = номер у источника, Payload = позиция улики
+	// и вердикт (см. пакеты proof и gateway).
+	EventGateway EventType = 9
 )
 
 // ⭐ЛИСТ И ЗВЕНО — ПОЧЕМУ ЭТО РАЗНЫЕ ТИПЫ.

@@ -14,6 +14,7 @@
 #
 #   WORK=/tmp/es-demo scripts/demo.sh     # каталог стенда (по умолчанию mktemp)
 #   DEMO_TSA=nca scripts/demo.sh          # метки у настоящей TSA НУЦ РК (нужен интернет)
+#   DEMO_TSA=digicert scripts/demo.sh     # метки у публичной TSA DigiCert (нужен интернет)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 WORK=${WORK:-$(mktemp -d)}
@@ -30,10 +31,16 @@ step "учебный УЦ: сертификат сервера и сборщик
 "$BIN/evidencestore" dev-pki -out "$WORK/pki" -source abs-core
 
 TSA_JSON='"url": "local", "every": "1h"'
-if [ "${DEMO_TSA:-}" = "nca" ]; then
+case "${DEMO_TSA:-}" in
+nca)
   NCA=$(pwd)/configs/tsa/nca-kz
   TSA_JSON="\"url\": \"http://tsp.pki.gov.kz\", \"every\": \"1h\", \"trust\": [\"$NCA/root_rsa_2020.cer\", \"$NCA/nca_rsa_2022.cer\"]"
-fi
+  ;;
+digicert)
+  DC=$(pwd)/configs/tsa/digicert
+  TSA_JSON="\"url\": \"http://timestamp.digicert.com\", \"every\": \"1h\", \"trust\": [\"$DC/DigiCertTrustedRootG4.crt\", \"$DC/DigiCertTrustedG4TimeStampingRSA4096SHA2562025CA1.crt\"]"
+  ;;
+esac
 
 cat >"$WORK/evidencestore.json" <<EOF
 {
@@ -43,7 +50,7 @@ cat >"$WORK/evidencestore.json" <<EOF
   "tls": {"cert": "pki/server.crt", "key": "pki/server.key", "client_ca": "pki/ca.crt"},
   "chain": {"tick": "200ms", "promise_mmd": "10s"},
   "tsa": {$TSA_JSON},
-  "keys": {"min_wait": "1s", "backup_dir": "keyring-backup"},
+  "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},
   "sources": [
     {"name": "abs-core", "content_type": "syslog", "retention_months": 36, "expect_every": "1h"}
   ]
@@ -84,12 +91,14 @@ echo "обещания хранилища у сборщика для номер�
 step "метка времени над головой цепи, пакет доказательств по улике №2 с ключом записи"
 "$BIN/evidencestore" stamp -config "$CFG"
 "$BIN/evidencestore" proof -config "$CFG" -source abs-core -seq 2 -dek -out "$WORK/proof-2.json"
-if [ "${DEMO_TSA:-}" = "nca" ]; then
-  TSA_TRUST="$NCA/root_rsa_2020.cer,$NCA/nca_rsa_2022.cer"
-else
+case "${DEMO_TSA:-}" in
+nca) TSA_TRUST="$NCA/root_rsa_2020.cer,$NCA/nca_rsa_2022.cer" ;;
+digicert) TSA_TRUST="$DC/DigiCertTrustedRootG4.crt,$DC/DigiCertTrustedG4TimeStampingRSA4096SHA2562025CA1.crt" ;;
+*)
   "$BIN/evidencestore" tsa-root -config "$CFG" -out "$WORK/tsa-root.crt"
   TSA_TRUST="$WORK/tsa-root.crt"
-fi
+  ;;
+esac
 grep '"seq":2,' "$WORK/spool/promises.jsonl" >"$WORK/promise-2.json"
 
 step "проверяющий: esverify офлайн, с обещанием, полученным сборщиком при приёме"

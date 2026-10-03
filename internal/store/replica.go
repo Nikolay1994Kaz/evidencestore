@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"evidencestore/internal/auditchain"
 	"evidencestore/internal/ship"
@@ -114,7 +115,14 @@ func (s *Store) saveReplicaState() error {
 
 // ShipOnce дотягивает копию: новые байты каждого файла и подписанную
 // голову. Отдаёт, сколько байт уехало.
-func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (int64, error) {
+func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error) {
+	defer func() {
+		if err != nil {
+			s.replicaErrors.Add(1)
+		} else {
+			s.replicaOK.Store(time.Now().UnixNano())
+		}
+	}()
 	s.replicaMu.Lock()
 	defer s.replicaMu.Unlock()
 	if err := s.loadReplicaState(ctx, r); err != nil {

@@ -36,6 +36,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
@@ -118,6 +120,21 @@ type Log struct {
 	// тест мог устроить отказ fsync: иначе правило «ответ только после
 	// успешного fsync» нечем проверить.
 	syncFile func(*os.File) error
+
+	// Для показателей: пачки, записанные с fsync, и время записи с fsync.
+	commits     atomic.Uint64
+	commitNanos atomic.Uint64
+}
+
+// Stats — сколько пачек записано с fsync и сколько это заняло всего.
+type Stats struct {
+	Commits     uint64
+	CommitNanos uint64
+}
+
+// Stats — показатели журнала с открытия.
+func (l *Log) Stats() Stats {
+	return Stats{Commits: l.commits.Load(), CommitNanos: l.commitNanos.Load()}
 }
 
 // Open открывает журнал в каталоге, создавая его при первом запуске. visit,
@@ -356,6 +373,7 @@ func (l *Log) commit(batch []*request) {
 		buf = append(buf, rec...)
 		off += int64(frameHead + len(rec))
 	}
+	start := time.Now()
 	if _, err := l.active.Write(buf); err != nil {
 		l.fail(fmt.Errorf("evlog: write: %w", err))
 		reply(0, l.Failed())
@@ -366,6 +384,8 @@ func (l *Log) commit(batch []*request) {
 		reply(0, l.Failed())
 		return
 	}
+	l.commitNanos.Add(uint64(time.Since(start)))
+	l.commits.Add(1)
 	first := seg.end()
 	l.mu.Lock()
 	seg.offsets = append(seg.offsets, offsets...)

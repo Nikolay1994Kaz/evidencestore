@@ -9,8 +9,10 @@ Retention is enforced by destroying keys (crypto-erasure). Every record of a sou
 ## Quick start
 
 ```sh
-scripts/demo.sh                 # builds everything, runs a full scenario offline
-DEMO_TSA=nca scripts/demo.sh    # same, time-stamps from the real NCA RK TSA
+scripts/demo.sh                    # builds everything, runs a full scenario offline
+DEMO_TSA=digicert scripts/demo.sh  # same, time-stamps from the public DigiCert TSA
+DEMO_TSA=nca scripts/demo.sh       # same, time-stamps from the NCA of Kazakhstan
+PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # a real Pipelock gateway, see below
 ```
 
 The demo runs these steps:
@@ -26,16 +28,58 @@ The demo runs these steps:
 | Binary | Role |
 |---|---|
 | `evidencestore` | the store: `init`, `serve`, plus operator commands over a local admin socket (`status`, `stamp`, `proof`, `keys …`, `dev-pki`) |
-| `escollect` | collector next to the source: tails a log file, numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
+| `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
 | `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven |
 
 ## Configuration
 
-See [`configs/evidencestore.example.json`](configs/evidencestore.example.json) and [`configs/collector.example.json`](configs/collector.example.json). Every source is registered by name. The name must equal the CommonName of the collector's client certificate, and the certificate can be pinned by its SHA-256 fingerprint. The source is always taken from the certificate, never from the request.
+See [`configs/evidencestore.example.json`](configs/evidencestore.example.json) and [`configs/collector.example.json`](configs/collector.example.json). The example time-stamps with the public DigiCert TSA (`configs/tsa/digicert`); any RFC 3161 service works if its certificates are listed in `tsa.trust`, e.g. `http://tsp.pki.gov.kz` with `configs/tsa/nca-kz/*.cer` in Kazakhstan. Tokens are verified before they enter the chain. Every source is registered by name. The name must equal the CommonName of the collector's client certificate, and the certificate can be pinned by its SHA-256 fingerprint. The source is always taken from the certificate, never from the request.
 
-`roots_dir` holds the key that locks the keyring. It must live outside `data_dir` and must never be backed up together with it.
+### Keys
 
-With `replica.url` set (`s3://bucket/prefix?endpoint=…&region=…` or `file:///path`), the evidence log and the chain are copied in immutable chunks, together with signed chain heads. Nothing is ever deleted from the copy, and keys never go there. `evidencestore restore` rebuilds the log and the chain from the copy and verifies them against the last signed head. `keyring.dat` and `sign.key` come back from `keys.backup_dir`.
+Month keys live in `keyring.dat`, which is locked by a root key in `roots_dir`. Three places matter:
+
+- `keys.backup_dir` receives a copy of `keyring.dat` after every change. A new month key is not used until that copy has landed, so losing `data_dir` never loses a key that sealed a record. The copy is useless without the root.
+- `keys.roots_mirror_dir` is a second copy of the roots on another disk or machine. Every root is written to both places and destroyed in both. Without a mirror, losing `roots_dir` makes every stored body unreadable for good; the chain and the proofs survive.
+- Nothing else may hold a copy of `roots_dir` or of the mirror. An old root copy plus an old `keyring.dat` still opens a destroyed key, so destruction is only as final as your control over those copies. The config check rejects layouts where one directory would hold both `keyring.dat` (or its backup) and a root.
+
+A key state change enters the chain only after it has reached `keys.backup_dir`. If the backup is down, the change still takes effect, the operator gets an error saying the copy is pending, and the store retries every minute; `status` shows `keyring_backup_pending` meanwhile.
+
+`status` also lists `orphan_roots`: roots that `keyring.dat` does not know. They appear after a crash in the middle of a key rotation, or after `keyring.dat` was restored from a backup older than the last rotation. In the second case an orphan can still open an old `keyring.dat` from the dead machine, so destruction is not reported as final (`destroyed-effective`) while orphans exist. Remove them with `evidencestore keys destroy-orphan-roots`, but only if `roots_dir` is not shared with another store.
+
+### Copy and restore
+
+With `replica.url` set (`s3://bucket/prefix?endpoint=…&region=…` or `file:///path`), the evidence log and the chain are copied in immutable chunks, together with signed chain heads. Nothing is ever deleted from the copy, and keys never go there. `evidencestore restore` rebuilds the log and the chain from the copy and verifies them against the last signed head. `keyring.dat` and `sign.key` come back from `keys.backup_dir`, the roots from `keys.roots_mirror_dir`. On start the store checks that every record in the log is sealed with a key that `keyring.dat` knows: a wrong or too old `keyring.dat` stops the start instead of leaving bodies unreadable.
+
+### Gateway journals (Pipelock)
+
+A source with `"content_type": "pipelock/recorder"` carries the flight recorder of a [Pipelock](https://github.com/luckyPipewrench/pipelock) gateway: JSONL where every entry is hash-chained to the previous one and checkpoints are signed with the gateway's Ed25519 key. Pin that key in the source as `gateway_key` (64 hex, `pipelock signing pubkey`). Point the collector at the shards with a glob, since Pipelock writes every shard to a new file:
+
+```json
+{"glob": "/var/lib/pipelock/recorder/evidence-*.jsonl", "from_start": true}
+```
+
+At intake the store recomputes each entry's hash (Pipelock's frozen v1–v3 projections), checks the `prev_hash` linkage per writer and verifies checkpoint signatures with the pinned key. Nothing is rejected: the entry is stored as received, and a verdict goes into the chain next to it. The chain fields of the gateway (`seq`, `hash`, `prev_hash`) stay readable after the month key is destroyed.
+
+A proof bundle for such a record also shows that the body is exactly that gateway entry (the hash is recomputed offline from the body) and that a checkpoint signed by the gateway covers it. Pass the gateway key to `esverify -gateway-key` to check that signature yourself. Limits: the linkage between the entry and the checkpoint was checked by the store at intake (the bundle does not carry the entries in between); a Pipelock restart starts a new chain, and the signed `chain-link` file that connects sessions is not checked yet; one writer per recorder directory. Verified against real Pipelock v3.6.0 output (`internal/gateway/testdata`).
+
+### Monitoring
+
+Set `metrics_listen` (for example `127.0.0.1:9464`) to expose `/metrics` in the Prometheus text format. Worth an alert:
+
+| Condition | Meaning |
+|---|---|
+| `evidencestore_log_failed == 1` | the evidence log stopped after a write or fsync error; intake is refused until a human looks |
+| `evidencestore_keyring_backup_pending == 1` for 10 minutes | `keyring.dat` changes are not reaching `keys.backup_dir`; new month keys are not issued |
+| `time() - evidencestore_tsa_last_stamp_timestamp_seconds > 2 × tsa.every` | time-stamps are not landing |
+| `time() - evidencestore_replica_last_success_timestamp_seconds > 3 × replica.every` | the copy is falling behind |
+| `evidencestore_source_silent == 1` | a source has been quiet longer than its `expect_every` |
+| `increase(evidencestore_gateway_problems_total[1h]) > 0` | a gateway journal entry was broken, out of order or badly signed |
+| `evidencestore_keys_due > 0` | months past retention wait for a destruction request (two approvers) |
+| `evidencestore_keyring_orphan_roots > 0` | key destruction is not final until orphan roots are dealt with |
+| `rate(evidencestore_ingest_errors_total[5m]) > 0` | ingest requests are failing |
+
+Also exported: records and duplicates per source, evidence-log batches and their fsync time, the chain head.
 
 ## What is proven, and what is not
 
@@ -45,7 +89,8 @@ Proven offline:
 - they have not been altered since;
 - they entered the chain between the two time-stamps T1 and T2;
 - the store committed to including them by the signed deadline it gave the collector;
-- with the record key: the body as received.
+- with the record key: the body as received;
+- for gateway journals: the body is the gateway's own entry, and a checkpoint signed by the gateway covers it.
 
 Not proven:
 
@@ -60,6 +105,11 @@ Root on the store host can delete files. After the next time-stamp, deletion or 
 ```sh
 go build ./... && go vet ./... && go test -race ./...
 python3 scripts/mutate.py keyring     # mutation testing: every injected bug must fail a test
+                                      # sets: keyring, evlog, tsa, store, edge, auditchain, gateway
 ```
 
 Design notes in Russian: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (code map), [`docs/DECISIONS.md`](docs/DECISIONS.md) (decisions and open questions), [`docs/CONCEPT.md`](docs/CONCEPT.md), [`docs/PROVENANCE.md`](docs/PROVENANCE.md).
+
+## License
+
+Apache License 2.0, see [`LICENSE`](LICENSE).

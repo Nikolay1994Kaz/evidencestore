@@ -49,7 +49,7 @@
   {
    "name": "M7 корни уничтожаются без подтверждённой копии",
    "file": "internal/keyring/destroy.go",
-   "old": "\tif k.safe != k.gen {\n\t\tif _, err := k.persistLocked(); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n",
+   "old": "\tif len(k.retired) > 0 && k.safe != k.gen {\n\t\tif _, err := k.persistLocked(); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n",
    "new": ""
   },
   {
@@ -85,8 +85,8 @@
   {
    "name": "M13 EffectiveAt не ставится",
    "file": "internal/keyring/destroy.go",
-   "old": "\t\t\t\te.effective = now\n",
-   "new": "\t\t\t\t_ = now\n"
+   "old": "\t\t\t\t\te.effective, e.changed = now, k.gen+1\n",
+   "new": "\t\t\t\t\t_, e.changed = now, k.gen+1\n"
   },
   {
    "name": "M14 нет отката ключей, если файл не заменён",
@@ -109,8 +109,8 @@
   {
    "name": "M17 safe сдвигается при сбое резерва",
    "file": "internal/keyring/format.go",
-   "old": "\t\tif err != nil {\n\t\t\treturn true, fmt.Errorf(\"keyring backup: %w\", err)",
-   "new": "\t\tif err != nil {\n\t\t\tk.safe = gen\n\t\t\treturn true, fmt.Errorf(\"keyring backup: %w\", err)"
+   "old": "\t\tif err != nil {\n\t\t\treturn fmt.Errorf(\"%w: %w\", ErrBackupPending, err)",
+   "new": "\t\tif err != nil {\n\t\t\tk.safe = gen\n\t\t\treturn fmt.Errorf(\"%w: %w\", ErrBackupPending, err)"
   },
   {
    "name": "M18 поколение ключа не читается из файла",
@@ -121,14 +121,14 @@
   {
    "name": "M19 CompleteDue не добивает старые корни",
    "file": "internal/keyring/lifecycle.go",
-   "old": "\teff, err := k.finishLocked()\n\treturn infos(append(changed, eff...)), err",
-   "new": "\treturn infos(changed), nil"
+   "old": "\teff, err := k.finishLocked()\n\treturn k.infos(append(changed, eff...)), err",
+   "new": "\treturn k.infos(changed), nil"
   },
   {
    "name": "M20 EffectiveAt при неуничтоженных корнях",
    "file": "internal/keyring/destroy.go",
-   "old": "\tif len(rest) == 0 {\n\t\tnow := k.now()",
-   "new": "\tif true {\n\t\tnow := k.now()"
+   "old": "\tif len(rest) == 0 && waiting {",
+   "new": "\tif waiting {"
   },
   {
    "name": "M21 EnsureScopes откатывает память после записи (P5)",
@@ -211,8 +211,8 @@
   {
    "name": "M34 Deactivate не пишется на диск",
    "file": "internal/keyring/lifecycle.go",
-   "old": "\tfor _, e := range changed {\n\t\te.state, e.deactivated = Deactivated, now\n\t}\n\tcommitted, err := k.persistLocked()",
-   "new": "\tfor _, e := range changed {\n\t\te.state, e.deactivated = Deactivated, now\n\t}\n\tcommitted, err := true, error(nil)"
+   "old": "\t\te.state, e.deactivated, e.changed = Deactivated, now, k.gen+1\n\t}\n\tcommitted, err := k.persistLocked()",
+   "new": "\t\te.state, e.deactivated, e.changed = Deactivated, now, k.gen+1\n\t}\n\tcommitted, err := true, error(nil)"
   },
   {
    "name": "M36 копия в резерв под общим замком (P13)",
@@ -231,6 +231,78 @@
    "file": "internal/keyring/lifecycle.go",
    "old": "func (k *Keyring) Deactivate(scopes ...string) error {\n\tk.wmu.Lock()\n\tdefer k.wmu.Unlock()\n",
    "new": "func (k *Keyring) Deactivate(scopes ...string) error {\n"
+  },
+  {
+   "name": "M39 Confirmed всегда истина",
+   "file": "internal/keyring/keyring.go",
+   "old": "\t\tConfirmed:     e.changed <= safe,",
+   "new": "\t\tConfirmed:     true,"
+  },
+  {
+   "name": "M40 закрытие не помечает поколение записи",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\t\te.state, e.deactivated, e.changed = Deactivated, now, k.gen+1\n",
+   "new": "\t\te.state, e.deactivated = Deactivated, now\n"
+  },
+  {
+   "name": "M41 после загрузки всё считается в резерве",
+   "file": "internal/keyring/format.go",
+   "old": "\t\te.changed = k.gen // что из файла уже в резерве, файл сам не знает\n",
+   "new": "\t\te.changed = 0\n"
+  },
+  {
+   "name": "M42 Confirm не повторяет копию",
+   "file": "internal/keyring/keyring.go",
+   "old": "\tif k.safe >= k.gen {\n\t\treturn nil\n\t}\n\treturn k.backupLocked()\n}",
+   "new": "\treturn nil\n}"
+  },
+  {
+   "name": "M43 сироты не мешают окончательности",
+   "file": "internal/keyring/destroy.go",
+   "old": "\t\tcase len(orphans) > 0:\n",
+   "new": "\t\tcase false:\n"
+  },
+  {
+   "name": "M44 ждущие уничтожения корни считаются сиротами",
+   "file": "internal/keyring/keyring.go",
+   "old": "\tfor _, r := range k.retired {\n\t\tknown[r] = true\n\t}\n",
+   "new": ""
+  },
+  {
+   "name": "M45 корень файла считается сиротой",
+   "file": "internal/keyring/keyring.go",
+   "old": "\tknown := map[string]bool{k.rootID: true}",
+   "new": "\tknown := map[string]bool{}"
+  },
+  {
+   "name": "M46 уничтожение не затирает зеркало",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\tvar errs []error\n\tfor _, dir := range f.dirs() {",
+   "new": "\tvar errs []error\n\tfor _, dir := range f.dirs()[:1] {"
+  },
+  {
+   "name": "M47 корень не читается из зеркала",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\tvar first error\n\tfor _, dir := range f.dirs() {",
+   "new": "\tvar first error\n\tfor _, dir := range f.dirs()[:1] {"
+  },
+  {
+   "name": "M48 новый корень не пишется в зеркало",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\tfor i, dir := range f.dirs() {",
+   "new": "\tfor i, dir := range f.dirs()[:1] {"
+  },
+  {
+   "name": "M49 отказ зеркала оставляет корень",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\t\t\t\tdestroyFile(q)\n",
+   "new": "\t\t\t\t_ = q\n"
+  },
+  {
+   "name": "M50 перечисление корней не видит зеркало",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\tseen := map[string]bool{}\n\tfor _, dir := range f.dirs() {",
+   "new": "\tseen := map[string]bool{}\n\tfor _, dir := range f.dirs()[:1] {"
   }
  ]
 }

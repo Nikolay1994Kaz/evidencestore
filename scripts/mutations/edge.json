@@ -69,6 +69,30 @@
    "file": "internal/collector/collector.go",
    "old": "\t\tif err == io.EOF && (!final || len(line) == 0) {",
    "new": "\t\tif err == io.EOF && (final || !final) {"
+  },
+  {
+   "name": "C10 шарды по строке, а не по числу",
+   "file": "internal/collector/collector.go",
+   "old": "\t\treturn naturalLess(filepath.Base(out[i].path), filepath.Base(out[j].path))",
+   "new": "\t\treturn filepath.Base(out[i].path) < filepath.Base(out[j].path)"
+  },
+  {
+   "name": "C11 переиспользованный inode не замечается",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif i >= 0 && c.pos.Offset > 0 && c.globHead != \"\" && fileHead(files[i].path) != c.globHead {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "C12 следующий файл раньше, чем дочитан текущий",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif err := c.switchTo(files[i+1]); err != nil {",
+   "new": "\t\tif err := c.switchTo(files[len(files)-1]); err != nil {"
+  },
+  {
+   "name": "C13 удалённый файл без пропуска номера",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n\t\t\tc.nextSeq++\n",
+   "new": "\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n"
   }
  ],
  "note": "V3 (имя из сертификата не сверяется с реестром на входе) снят как равносильный: store.Ingest и store.LastSeq сами отказывают неизвестному источнику (ErrUnknownSource → 403)."

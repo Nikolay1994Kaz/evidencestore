@@ -31,6 +31,7 @@ import (
 
 	"evidencestore/internal/auditchain"
 	"evidencestore/internal/evidence"
+	"evidencestore/internal/gateway"
 	"evidencestore/internal/keyring"
 	"evidencestore/internal/tsa"
 )
@@ -85,6 +86,9 @@ type Leaf struct {
 func FromLeaf(l auditchain.Leaf) Leaf {
 	return Leaf{UnixNano: l.UnixNano, Type: uint8(l.Type), Scope: l.Scope, Subject: l.Subject, Payload: l.Payload}
 }
+
+// Chain — лист в виде цепи.
+func (l Leaf) Chain() auditchain.Leaf { return l.chain() }
 
 func (l Leaf) chain() auditchain.Leaf {
 	return auditchain.Leaf{UnixNano: l.UnixNano, Type: auditchain.EventType(l.Type), Scope: l.Scope, Subject: l.Subject, Payload: l.Payload}
@@ -150,6 +154,8 @@ type Bundle struct {
 	Links     []Link               `json:"links"` // подряд, последнее — голова из Statement
 	Statement auditchain.Statement `json:"statement"`
 	DEK       []byte               `json:"dek,omitempty"` // ключ этой записи, если выдан
+	// Gateway — для улик из журнала гейтвея (content_type pipelock/recorder).
+	Gateway *GatewayProof `json:"gateway,omitempty"`
 }
 
 func (b Bundle) JSON() ([]byte, error) { return json.MarshalIndent(b, "", " ") }
@@ -172,6 +178,9 @@ type Trust struct {
 	StoreKey ed25519.PublicKey
 	// TSA — корни и промежуточные сертификаты службы меток времени.
 	TSA tsa.Trust
+	// GatewayKey — закреплённый открытый ключ гейтвея: им проверяется подпись
+	// контрольной точки. nil — подпись проверило только хранилище при приёме.
+	GatewayKey ed25519.PublicKey
 }
 
 // Check — один пункт отчёта.
@@ -194,6 +203,10 @@ type Report struct {
 	Body       []byte // тело, если выдан DEK и он подошёл
 	BodyOpened bool
 	BodyKey    bool // в пакете был ключ записи (подошёл он или нет)
+
+	Gateway           *gateway.Verdict // вердикт хранилища по записи журнала гейтвея
+	GatewayCheckpoint *gateway.Verdict // контрольная точка, накрывшая запись
+	GatewayKeyChecked bool             // подпись точки проверена ключом проверяющего
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -223,6 +236,7 @@ func (r Report) Notes() []string {
 	default:
 		n = append(n, "тело не вскрыто: ключ записи не выдан или ключ месяца уничтожен (стирание по сроку)")
 	}
+	n = append(n, r.gatewayNotes()...)
 	n = append(n, "подпись хранилища доказывает, что ЭТОТ экземпляр подписал голову; против переписывания всей цепи её владельцем работает только метка TSA")
 	n = append(n, "доказано, что такие байты пришли от источника и не менялись; правдивость их содержимого не доказывается")
 	return n
@@ -329,6 +343,12 @@ func Verify(b Bundle, trust Trust) Report {
 		if add("тело вскрывается выданным ключом записи, тег GCM сходится", err, fmt.Sprintf("%d байт", len(body))) {
 			r.Body, r.BodyOpened = body, true
 		}
+	}
+
+	// 10. Улика из журнала гейтвея: вердикт при приёме, хэш тела, подпись
+	// контрольной точки.
+	if b.Gateway != nil {
+		verifyGateway(b.Gateway, sealed, &r, trust, linkAt, add)
 	}
 	return r
 }
@@ -451,6 +471,12 @@ func (r Report) Text() string {
 	}
 	if !r.Lower.IsZero() || !r.Upper.IsZero() {
 		s += fmt.Sprintf("Вошла в цепь между T1 = %s и T2 = %s (по меткам TSA)\n", fmtTime(r.Lower), fmtTime(r.Upper))
+	}
+	if g := r.Gateway; g != nil {
+		s += fmt.Sprintf("Запись журнала гейтвея: seq %d, сессия %s, хэш %s\n", g.Seq, g.Session, short(g.Hash))
+		if c := r.GatewayCheckpoint; c != nil {
+			s += fmt.Sprintf("Накрыта контрольной точкой гейтвея seq %d\n", c.Seq)
+		}
 	}
 	s += "\nПроверки:\n"
 	for _, c := range r.Checks {

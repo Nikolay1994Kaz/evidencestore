@@ -617,3 +617,202 @@ func TestReplicaRestore(t *testing.T) {
 		t.Fatal("подменённая копия восстановилась")
 	}
 }
+
+// keyStates — метки состояний скоупа в цепи по порядку.
+func keyStates(t *testing.T, cfg *config.Config, scope string) string {
+	t.Helper()
+	var got []string
+	for _, l := range leavesOf(t, cfg, auditchain.EventKeyState) {
+		if l.Scope == scope {
+			got = append(got, l.Subject)
+		}
+	}
+	return strings.Join(got, ",")
+}
+
+// restoreFromCopy — восстановление на новой машине по README: журнал и цепь
+// из копии, keyring.dat и sign.key из резерва ключей, корни на месте.
+func restoreFromCopy(t *testing.T, cfg *config.Config, remote ship.Remote, pub string) *config.Config {
+	t.Helper()
+	restored := *cfg
+	restored.DataDir = filepath.Join(t.TempDir(), "data")
+	restored.AdminSocket = ""
+	restored.Replica.URL = ""
+	restored.Defaults()
+	key, _ := base64.RawStdEncoding.DecodeString(pub)
+	if _, err := RestoreReplica(context.Background(), remote, restored.DataDir, ed25519.PublicKey(key)); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{keyring.FileName, "sign.key"} {
+		data, err := os.ReadFile(filepath.Join(cfg.Keys.BackupDir, name))
+		if err != nil {
+			t.Fatalf("в резерве ключей нет %s: %v", name, err)
+		}
+		dst := filepath.Join(restored.DataDir, name)
+		if name == "sign.key" {
+			dst = filepath.Join(restored.DataDir, "chain", name)
+		}
+		if err := os.WriteFile(dst, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, tsaDir := dirs(cfg)
+	_, _, tsaDir2 := dirs(&restored)
+	if err := os.CopyFS(tsaDir2, os.DirFS(tsaDir)); err != nil {
+		t.Fatal(err)
+	}
+	return &restored
+}
+
+// ⭐ Резерв ключей лёг в момент смены ключа, потом умер диск данных.
+// Восстановление по README поднимает хранилище: в цепь ложатся только
+// состояния, дошедшие до резерва, поэтому keyring.dat из резерва не бывает
+// позади цепи (раньше старт отказывал с ErrKeyringMismatch).
+func TestRestoreAfterFailedKeyringBackup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(s *Store) error
+	}{
+		{"новый месяц", func(s *Store) error {
+			_, err := s.Ingest("abs-core", []Incoming{{Seq: 4, Body: []byte("x")}})
+			return err
+		}},
+		{"закрытие месяца", func(s *Store) error { return s.Deactivate(true, "abs-core/2026-09") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newClock()
+			remoteDir, backupDir := t.TempDir(), filepath.Join(t.TempDir(), "keys-backup")
+			cfg := testConfig(t, func(c *config.Config) {
+				c.Replica.URL = "file://" + remoteDir
+				c.Keys.BackupDir = backupDir
+			})
+			s := openStore(t, cfg, c)
+			remote, err := ship.OpenRemote(cfg.Replica.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ingest(t, s, "abs-core", 1, 3)
+			mustStamp(t, s)
+
+			if err := os.Chmod(backupDir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "новый месяц" {
+				c.set(time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC))
+			}
+			if err := tc.change(s); !errors.Is(err, keyring.ErrBackupPending) {
+				t.Fatalf("при лежащем резерве: %v", err)
+			}
+			if err := os.Chmod(backupDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			mustStamp(t, s)
+			if _, err := s.ShipOnce(context.Background(), remote); err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+
+			restored := restoreFromCopy(t, cfg, remote, s.PublicKey())
+			s2, err := Open(restored, Options{Logger: quiet, Now: c.now, NoBackground: true})
+			if err != nil {
+				t.Fatalf("восстановленное хранилище не стартует: %v", err)
+			}
+			defer s2.Close()
+			for q := uint64(1); q <= 3; q++ {
+				b, err := s2.Proof("abs-core", q, true)
+				if err != nil || len(b.DEK) == 0 {
+					t.Fatalf("улика %d после восстановления: %v", q, err)
+				}
+			}
+		})
+	}
+}
+
+// Квитанция о смене ключа ложится в цепь, когда изменение дошло до резерва:
+// при лежащем резерве — позже, из обслуживания.
+func TestKeyReceiptWaitsForBackup(t *testing.T) {
+	c := newClock()
+	backupDir := filepath.Join(t.TempDir(), "keys-backup")
+	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = backupDir })
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 1)
+
+	if err := os.Chmod(backupDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(backupDir, 0o700) })
+	if err := s.Deactivate(true, "abs-core/2026-09"); !errors.Is(err, keyring.ErrBackupPending) {
+		t.Fatalf("при лежащем резерве: %v", err)
+	}
+	s.Maintain(c.now())
+	s.flush()
+	if got := keyStates(t, cfg, "abs-core/2026-09"); got != "active" {
+		t.Fatalf("квитанция до копии в резерв: %q", got)
+	}
+	if !s.Status().KeyringBackupPending {
+		t.Fatal("статус молчит о неприехавшей копии")
+	}
+
+	if err := os.Chmod(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.Maintain(c.now())
+	s.flush()
+	if got := keyStates(t, cfg, "abs-core/2026-09"); got != "active,deactivated" {
+		t.Fatalf("квитанция после копии: %q", got)
+	}
+	if s.Status().KeyringBackupPending {
+		t.Fatal("копия прошла, а статус всё ещё ждёт")
+	}
+}
+
+// keyring.dat старше улик в журнале — старт отказывает, даже если квитанция
+// нового ключа не успела лечь в цепь до падения: каждый ключ, под которым
+// запечатаны улики, обязан быть известен кейрингу.
+func TestWrongKeyringStopsStart(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t)
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 1)
+	s.flush()
+	old, err := os.ReadFile(filepath.Join(cfg.DataDir, keyring.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.set(time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC))
+	ingest(t, s, "abs-core", 2, 2) // новый ключ месяца; квитанция ещё в памяти
+	crashed := copyDirs(t, cfg)
+	if err := os.WriteFile(filepath.Join(crashed.DataDir, keyring.FileName), old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Open(crashed, Options{Logger: quiet, Now: c.now, NoBackground: true})
+	if !errors.Is(err, ErrKeyringMismatch) || !strings.Contains(err.Error(), "unknown to keyring.dat") {
+		t.Fatalf("старт со старым keyring.dat: %v", err)
+	}
+}
+
+// Корень, которого не знает keyring.dat, виден в статусе; оператор его
+// уничтожает, и это событие ложится в цепь.
+func TestOrphanRootsAdmin(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t)
+	orphan, err := rootStore(cfg).NewRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := openStore(t, cfg, c)
+	if got := s.Status().OrphanRoots; len(got) != 1 || got[0] != orphan {
+		t.Fatalf("сирота в статусе: %v", got)
+	}
+	done, err := s.DestroyOrphanRoots()
+	if err != nil || len(done) != 1 || done[0] != orphan {
+		t.Fatalf("уничтожение сирот: %v, %v", done, err)
+	}
+	if got := s.Status().OrphanRoots; len(got) != 0 {
+		t.Fatalf("после уничтожения: %v", got)
+	}
+	s.flush()
+	if got := leavesOf(t, cfg, auditchain.EventRoots); len(got) != 1 || !bytes.Contains(got[0].Payload, []byte(orphan)) {
+		t.Fatalf("событие в цепи: %+v", got)
+	}
+}

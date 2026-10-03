@@ -1,0 +1,79 @@
+{
+ "packages": [
+  "./internal/gateway/"
+ ],
+ "mutations": [
+  {
+   "name": "G1 проекция v2 без event_kind",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\tcase 2:\n\t\treturn append(append(head, e.TraceID, e.Type, e.EventKind), tail...), true",
+   "new": "\tcase 2:\n\t\treturn append(append(head, e.TraceID, e.Type), tail...), true"
+  },
+  {
+   "name": "G2 detail перекодируется перед хэшем",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\te := Entry(w)\n",
+   "new": "\te := Entry(w)\n\tvar g any\n\tif json.Unmarshal(e.Detail, &g) == nil {\n\t\te.Detail, _ = json.Marshal(g)\n\t}\n"
+  },
+  {
+   "name": "G3 разорванная сцепка считается целой",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\tdefault:\n\t\tv.Link = LinkBroken\n",
+   "new": "\tdefault:\n\t\tv.Link = LinkOK\n"
+  },
+  {
+   "name": "G4 подпись контрольной точки не проверяется",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\tcase ed25519.Verify(t.key, []byte(e.PrevHash), sig):",
+   "new": "\tcase true:"
+  },
+  {
+   "name": "G5 подпись проверяется над чужим полем",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\tcase ed25519.Verify(t.key, []byte(e.PrevHash), sig):",
+   "new": "\tcase ed25519.Verify(t.key, []byte(e.Hash), sig):"
+  },
+  {
+   "name": "G6 повтор ключа не ловится",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\t\tif seen[k] {",
+   "new": "\t\tif false && seen[k] {"
+  },
+  {
+   "name": "G7 нулевой байт в поле не ловится",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\t\tif strings.ContainsRune(v, 0) {",
+   "new": "\t\tif strings.ContainsRune(v, 0) && false {"
+  },
+  {
+   "name": "G8 Resume не поднимает состояние",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\t\tt.last[v.Namespace()] = v.Hash",
+   "new": "\t\t_ = v.Hash"
+  },
+  {
+   "name": "G9 после поломки состояние не двигается",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\tt.last[e.namespace()] = e.Hash\n\tif e.Type == \"checkpoint\" {",
+   "new": "\tif v.Link != LinkBroken {\n\t\tt.last[e.namespace()] = e.Hash\n\t}\n\tif e.Type == \"checkpoint\" {"
+  },
+  {
+   "name": "G10 v3 без пространства цепочки принимается",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\tif e.Version == 3 && (e.ChainKind == \"\" || e.WriterInstanceID == \"\") {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "G11 время хэшируется без приведения к UTC",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\t\te.Timestamp.UTC().Format(time.RFC3339Nano),",
+   "new": "\t\te.Timestamp.Format(time.RFC3339Nano),"
+  },
+  {
+   "name": "G12 цепочки разных писателей смешиваются",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\treturn e.SessionID + \"\\x00\" + e.ChainKind + \"\\x00\" + e.WriterInstanceID\n}",
+   "new": "\treturn \"\"\n}"
+  }
+ ]
+}

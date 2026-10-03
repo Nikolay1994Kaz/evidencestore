@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 
+	"evidencestore/internal/gateway"
 	"evidencestore/internal/proof"
 	"evidencestore/internal/tsa"
 )
@@ -26,10 +27,11 @@ func main() {
 	storeKey := flag.String("store-key", "", "pinned store public key (base64) or file containing it")
 	tsaTrust := flag.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM)")
 	promisePath := flag.String("promise", "", "signed promise received by the collector (JSON), optional")
+	gatewayKey := flag.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
 	asJSON := flag.Bool("json", false, "print the report as JSON")
 	flag.Parse()
 	if *proofPath == "" || *storeKey == "" || *tsaTrust == "" {
-		fmt.Fprintln(os.Stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE]")
+		fmt.Fprintln(os.Stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY]")
 		os.Exit(2)
 	}
 	data, err := os.ReadFile(*proofPath)
@@ -41,7 +43,16 @@ func main() {
 	trust, err := tsa.LoadTrust(*tsaTrust)
 	fail(err)
 
-	report := proof.Verify(bundle, proof.Trust{StoreKey: key, TSA: trust})
+	pt := proof.Trust{StoreKey: key, TSA: trust}
+	if *gatewayKey != "" {
+		raw := *gatewayKey
+		if b, err := os.ReadFile(raw); err == nil {
+			raw = string(b)
+		}
+		pt.GatewayKey, err = gateway.ParseKey(raw)
+		fail(err)
+	}
+	report := proof.Verify(bundle, pt)
 	valid := report.Valid()
 	var promiseErr error
 	if *promisePath != "" {
@@ -55,6 +66,10 @@ func main() {
 		out := map[string]any{"valid": valid, "checks": report.Checks, "notes": report.Notes(),
 			"source": report.Header.Source, "seq": report.Header.Seq, "received_at": report.Header.ReceivedAt,
 			"lower": report.Lower, "upper": report.Upper, "body_opened": report.BodyOpened}
+		if report.Gateway != nil {
+			out["gateway"] = report.Gateway
+			out["gateway_checkpoint"] = report.GatewayCheckpoint
+		}
 		if promiseErr != nil {
 			out["promise_error"] = promiseErr.Error()
 		}
