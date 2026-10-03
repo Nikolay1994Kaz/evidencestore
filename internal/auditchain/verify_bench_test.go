@@ -121,7 +121,7 @@ func BenchmarkReadChain(b *testing.B) {
 func leafForBench(i int) Leaf {
 	return Leaf{
 		UnixNano: int64(1_753_700_000_000_000_000 + i),
-		Type:     EventRemember,
+		Type:     EventEvidence,
 		Scope:    "user:nikolay",
 		Subject:  fmt.Sprintf("01KYSEE4S0JC03XEEVR4H40%03d", i%1000),
 		Payload:  []byte(`{"h":"3q2+7wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","src":"agent-a","sealed":true}`),

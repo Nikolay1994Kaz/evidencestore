@@ -14,9 +14,8 @@ import (
 
 // Подписанный экспорт: то, что предъявляют ТРЕТЬЕЙ СТОРОНЕ.
 //
-// ⭐ПОЧЕМУ ПОДПИСЬ АСИММЕТРИЧНАЯ, А НЕ HMAC. У конкурента (Hakuya, разбор
-// 28.07 по коду) журнал заверяется HMAC — то есть тем же секретом, которым он
-// и создаётся. Проверить такую подпись может только держатель секрета, а он и
+// ⭐ПОЧЕМУ ПОДПИСЬ АСИММЕТРИЧНАЯ, А НЕ HMAC. Журнал, заверенный HMAC,
+// заверен тем же секретом, которым он и создаётся. Проверить такую подпись может только держатель секрета, а он и
 // есть та сторона, чьи утверждения проверяют. Аудитору остаётся либо верить на
 // слово, либо получить секрет — и тогда он сам сможет подделать что угодно, а
 // заявление перестанет что-либо доказывать про кого-либо. Ed25519 разрывает
@@ -47,7 +46,7 @@ const StatementVersion = 1
 // signDomain — префикс подписываемых байт. Разделение доменов на том же
 // основании, что у листа и узла в дереве: подпись над заявлением не должна
 // быть предъявима как подпись над чем-то ещё.
-const signDomain = "vmem-audit-statement-v1"
+const signDomain = "evidencestore/statement/v1"
 
 // SignKeyFileName — приватный ключ инстанса рядом с цепью.
 const SignKeyFileName = "sign.key"
@@ -93,6 +92,12 @@ func LoadOrCreateSigner(dir string) (*Signer, error) {
 	}
 	return &Signer{priv: priv}, nil
 }
+
+// SignMessage подписывает произвольное сообщение. Домен вызывающий обязан
+// вписать в само сообщение первым полем с префиксом длины, как делает
+// statementBytes: тогда подпись над одним видом сообщений не предъявить как
+// подпись над другим.
+func (s *Signer) SignMessage(msg []byte) []byte { return ed25519.Sign(s.priv, msg) }
 
 // PublicKey — то, что публикуют и закрепляют у аудитора.
 func (s *Signer) PublicKey() ed25519.PublicKey {
@@ -144,13 +149,16 @@ func statementBytes(st Statement) []byte {
 	return buf
 }
 
+// EncodeHash — хэш в том виде, в каком он лежит в заявлении (HeadHash).
+func EncodeHash(h [32]byte) string { return base64.RawStdEncoding.EncodeToString(h[:]) }
+
 // Sign выпускает подписанное заявление о голове.
 func (s *Signer) Sign(head Head, links int, unixSec int64) Statement {
 	st := Statement{
 		Version:   StatementVersion,
 		PublicKey: s.PublicKeyString(),
 		HeadSeq:   head.Seq,
-		HeadHash:  base64.RawStdEncoding.EncodeToString(head.Hash[:]),
+		HeadHash:  EncodeHash(head.Hash),
 		Links:     links,
 		SignedAt:  unixSec,
 	}
@@ -190,8 +198,8 @@ func VerifyStatement(st Statement, pinned ed25519.PublicKey) error {
 // InclusionProof — доказательство того, что конкретное событие лежит в цепи.
 //
 // ⭐Показывает ТОЛЬКО своё событие: путь Меркла сходится к корню, не раскрывая
-// соседних листьев. Владелец памяти может доказать «моя запись есть и не
-// менялась», не предъявляя аудитору чужих людей из того же батча.
+// соседних листьев. Можно доказать «эта улика есть и не менялась», не
+// предъявляя проверяющему чужих улик из того же батча.
 type InclusionProof struct {
 	Version int `json:"v"`
 	Leaf    struct {
@@ -250,7 +258,8 @@ func BuildProof(link Record, leaves []Leaf, idx int, st Statement) (InclusionPro
 // предком подписанной головы. Для этого нужен сам файл цепи — документ
 // маленький как раз потому, что не тащит её с собой. Проверяющий делает второй
 // шаг сам: берёт chain.log, находит звено LinkSeq, сверяет корень и
-// прогоняет Verify до головы из заявления. Порядок назван в docs/COMMANDS.md.
+// прогоняет Verify до головы из заявления. Полный пакет доказательств со
+// звеньями до головы и метками TSA собирает пакет proof.
 func (pr InclusionProof) Verify(pinned ed25519.PublicKey) error {
 	if err := VerifyStatement(pr.Statement, pinned); err != nil {
 		return err

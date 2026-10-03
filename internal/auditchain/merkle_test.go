@@ -9,7 +9,7 @@ import (
 func leafN(i int) Leaf {
 	return Leaf{
 		UnixNano: int64(1_753_700_000_000_000_000 + i),
-		Type:     EventRemember,
+		Type:     EventEvidence,
 		Scope:    "user:nikolay",
 		Subject:  fmt.Sprintf("fact-%04d", i),
 		Payload:  []byte("sha256:отпечаток содержания"),
@@ -145,7 +145,7 @@ func TestMerkle_RootChangesOnAnyLeafEdit(t *testing.T) {
 			{"subject", func(l *Leaf) { l.Subject += "!" }},
 			{"scope", func(l *Leaf) { l.Scope = "user:другой" }},
 			{"payload", func(l *Leaf) { l.Payload = []byte("другой отпечаток") }},
-			{"type", func(l *Leaf) { l.Type = EventForget }},
+			{"type", func(l *Leaf) { l.Type = EventGap }},
 			{"time", func(l *Leaf) { l.UnixNano++ }},
 		} {
 			edited := leavesN(7)
@@ -161,8 +161,8 @@ func TestMerkle_RootChangesOnAnyLeafEdit(t *testing.T) {
 // листьям: без префикса длины scope="a", subject="bc" неотличим от
 // scope="ab", subject="c".
 func TestMerkle_FieldsAreUnambiguous(t *testing.T) {
-	x := Leaf{UnixNano: 1, Type: EventRemember, Scope: "a", Subject: "bc"}
-	y := Leaf{UnixNano: 1, Type: EventRemember, Scope: "ab", Subject: "c"}
+	x := Leaf{UnixNano: 1, Type: EventEvidence, Scope: "a", Subject: "bc"}
+	y := Leaf{UnixNano: 1, Type: EventEvidence, Scope: "ab", Subject: "c"}
 	if LeafHash(x) == LeafHash(y) {
 		t.Fatal("границы полей неоднозначны: перенос символа между scope и subject не меняет хеш")
 	}

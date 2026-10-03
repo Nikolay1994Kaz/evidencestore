@@ -226,11 +226,11 @@ func trimNL(s string) string {
 // shred: payload — поля квитанции (scope/kek_id/facts_removed/destroyed_at).
 func sampleRecord(typ EventType) Record {
 	switch typ {
-	case EventShred:
+	case EventKeyState:
 		return Record{
 			Seq:      1,
 			UnixNano: 1_753_700_000_000_000_000,
-			Type:     EventShred,
+			Type:     EventKeyState,
 			Scope:    "user:nikolay",
 			Subject:  "",
 			Payload:  make([]byte, 128), // квитанция
@@ -239,7 +239,7 @@ func sampleRecord(typ EventType) Record {
 		return Record{
 			Seq:      1,
 			UnixNano: 1_753_700_000_000_000_000,
-			Type:     EventRemember,
+			Type:     EventEvidence,
 			Scope:    "user:nikolay",
 			Subject:  "01J9ZQKF7YQ8H3M2N4P6R8T0VW",
 			Payload:  make([]byte, 64), // источник + хеш содержимого
@@ -264,7 +264,7 @@ func BenchmarkLinkAndHash(b *testing.B) {
 	for _, tc := range []struct {
 		name string
 		typ  EventType
-	}{{"remember", EventRemember}, {"shred", EventShred}} {
+	}{{"remember", EventEvidence}, {"shred", EventKeyState}} {
 		b.Run(tc.name, func(b *testing.B) {
 			src := sampleRecord(tc.typ)
 			rand.Read(src.Payload)
@@ -282,7 +282,7 @@ func BenchmarkLinkAndHash(b *testing.B) {
 
 // BenchmarkFrame — кадрирование записи (длина + CRC) поверх хеширования.
 func BenchmarkFrame(b *testing.B) {
-	r := sampleRecord(EventRemember)
+	r := sampleRecord(EventEvidence)
 	rand.Read(r.Payload)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -296,7 +296,7 @@ func BenchmarkFrame(b *testing.B) {
 // ---------------------------------------------------------------------------
 
 func BenchmarkJournalAppend(b *testing.B) {
-	frame := frameRecord(sampleRecord(EventRemember))
+	frame := frameRecord(sampleRecord(EventEvidence))
 	b.Logf("кадр записи remember: %d Б", len(frame))
 
 	modes := []struct {
@@ -472,7 +472,7 @@ func benchEvent(b *testing.B, mode syncMode, batchN int) {
 		b.Fatal(err)
 	}
 
-	src := sampleRecord(EventRemember)
+	src := sampleRecord(EventEvidence)
 	rand.Read(src.Payload)
 
 	flush := func(head Head) {
@@ -533,7 +533,7 @@ func BenchmarkShredEvent(b *testing.B) {
 	defer jf.Close()
 	headPath := filepath.Join(dir, "chain.head")
 
-	src := sampleRecord(EventShred)
+	src := sampleRecord(EventKeyState)
 	rand.Read(src.Payload)
 
 	var head Head

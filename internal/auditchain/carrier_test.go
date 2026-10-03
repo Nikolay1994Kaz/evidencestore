@@ -2,6 +2,7 @@ package auditchain
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -423,7 +424,7 @@ func TestCarrier_AppendSyncClosesWindow(t *testing.T) {
 
 	shred := Leaf{
 		UnixNano: 1_753_700_000_000_000_099,
-		Type:     EventShred,
+		Type:     EventKeyState,
 		Scope:    "user:nikolay",
 		Payload:  []byte(`{"kek_id":"k1","facts_removed":7}`),
 	}
@@ -754,8 +755,8 @@ func TestCarrier_RecordRoundTrip(t *testing.T) {
 func TestCarrier_LeafRoundTrip(t *testing.T) {
 	for _, l := range []Leaf{
 		leafN(3),
-		{UnixNano: 1, Type: EventShred, Scope: "s", Subject: "", Payload: nil},
-		{UnixNano: -1, Type: EventForget, Scope: "", Subject: "", Payload: []byte{0, 255}},
+		{UnixNano: 1, Type: EventKeyState, Scope: "s", Subject: "", Payload: nil},
+		{UnixNano: -1, Type: EventGap, Scope: "", Subject: "", Payload: []byte{0, 255}},
 	} {
 		body := frameLeaf(l)
 		got, err := decodeLeaf(body[4 : len(body)-4])
@@ -765,5 +766,56 @@ func TestCarrier_LeafRoundTrip(t *testing.T) {
 		if LeafHash(got) != LeafHash(l) {
 			t.Errorf("лист после разбора даёт другой хеш: %+v против %+v", got, l)
 		}
+	}
+}
+
+// Читатели не трогают файлы: недописанный кадр в хвосте пропускается, но не
+// отрезается — его, может быть, дописывают прямо сейчас.
+func TestReadersDoNotTruncate(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		c.Append(Leaf{UnixNano: int64(i + 1), Type: EventEvidence, Scope: "s", Subject: fmt.Sprint(i)})
+		if _, err := c.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Close()
+	segs, _ := leafSegments(dir)
+	leafFile := leafPath(dir, segs[0])
+	chainFile := filepath.Join(dir, chainFileName)
+	for _, p := range []string{leafFile, chainFile} {
+		f, _ := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+		f.Write([]byte{0, 0, 0, 9, 1, 2})
+		f.Close()
+	}
+	sizes := func() [2]int64 {
+		a, _ := os.Stat(leafFile)
+		b, _ := os.Stat(chainFile)
+		return [2]int64{a.Size(), b.Size()}
+	}
+	before := sizes()
+	links, err := ReadChain(dir)
+	if err != nil || len(links) != 5 {
+		t.Fatalf("ReadChain: %d, %v", len(links), err)
+	}
+	var nums []uint64
+	if err := ScanLeaves(dir, func(num uint64, l Leaf) error {
+		if l.Subject != fmt.Sprint(num) {
+			return fmt.Errorf("лист %d: %q", num, l.Subject)
+		}
+		nums = append(nums, num)
+		return nil
+	}); err != nil || len(nums) != 5 {
+		t.Fatalf("ScanLeaves: %v, %v", nums, err)
+	}
+	if _, err := ReadLeaves(dir, 2, 3); err != nil {
+		t.Fatal(err)
+	}
+	if after := sizes(); after != before {
+		t.Fatalf("читатель изменил файлы: %v → %v", before, after)
 	}
 }

@@ -122,7 +122,7 @@ func TestProof_EndToEnd(t *testing.T) {
 	st := s.Sign(head, 1, 1_753_700_000)
 
 	link, leaves, idx, err := FindLeaf(dir, LeafQuery{
-		Type: EventRemember, Scope: "user:nikolay", Subject: leafN(4).Subject,
+		Type: EventEvidence, Scope: "user:nikolay", Subject: leafN(4).Subject,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestProof_DetectsEdits(t *testing.T) {
 
 	s, _ := newSigner(t)
 	st := s.Sign(head, 1, 1_753_700_000)
-	link, leaves, idx, err := FindLeaf(dir, LeafQuery{Type: EventRemember, Scope: "user:nikolay", Subject: leafN(2).Subject})
+	link, leaves, idx, err := FindLeaf(dir, LeafQuery{Type: EventEvidence, Scope: "user:nikolay", Subject: leafN(2).Subject})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestProof_DetectsEdits(t *testing.T) {
 	}{
 		{"предмет листа", func(p *InclusionProof) { p.Leaf.Subject = "другой факт" }},
 		{"время листа", func(p *InclusionProof) { p.Leaf.UnixNano++ }},
-		{"тип листа", func(p *InclusionProof) { p.Leaf.Type = uint8(EventForget) }},
+		{"тип листа", func(p *InclusionProof) { p.Leaf.Type = uint8(EventGap) }},
 		{"скоуп листа", func(p *InclusionProof) { p.Leaf.Scope = "user:другой" }},
 		{"корень", func(p *InclusionProof) { p.Root = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }},
 		{"шаг пути", func(p *InclusionProof) { p.Path[0].Hash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }},
@@ -222,7 +222,7 @@ func TestProof_RejectsLinkNewerThanStatement(t *testing.T) {
 	s, _ := newSigner(t)
 	stale := s.Sign(first, 1, 1_753_700_000) // заявление на момент ПЕРВОГО звена
 
-	link, leaves, idx, err := FindLeaf(dir, LeafQuery{Type: EventRemember, Scope: "user:nikolay", Subject: leafN(1).Subject})
+	link, leaves, idx, err := FindLeaf(dir, LeafQuery{Type: EventEvidence, Scope: "user:nikolay", Subject: leafN(1).Subject})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestFindLeaf_MissReportsWindow(t *testing.T) {
 	c.Flush()
 	c.Close()
 
-	if _, _, _, err := FindLeaf(dir, LeafQuery{Type: EventShred, Scope: "нет такого"}); err == nil {
+	if _, _, _, err := FindLeaf(dir, LeafQuery{Type: EventKeyState, Scope: "нет такого"}); err == nil {
 		t.Fatal("несуществующее событие найдено")
 	}
 }

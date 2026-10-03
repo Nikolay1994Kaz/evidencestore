@@ -18,7 +18,7 @@ import (
 
 // Носитель цепи на диске: три файла и жёсткий порядок записи между ними.
 //
-//	leaves_<первый>.log  события — обычные данные: ротируются, жмутся, живут по retention
+//	leaves_<первый>.log  события — ротируются по размеру, не удаляются и не сжимаются никогда
 //	chain.log            звенья-агрегаты — append-only, не трогается никогда
 //	chain.head           48 Б × 2 слота — голова, пишется на месте с fdatasync
 //
@@ -33,7 +33,8 @@ import (
 //
 //	листья → fsync → звено → fsync → голова
 //
-// Тот же приём, что в SHRED («сначала память, потом ключ»): отказ обязан
+// Тот же приём, что при уничтожении ключа (сначала новый файл, потом старый
+// корень): отказ обязан
 // оставлять МЕНЕЕ ДОКАЗАННОЕ, а не менее доказуемое. Листья без корня
 // доигрываются — Open поднимает их и включает в следующее звено. Корень без
 // листьев не чинится ничем: остаётся «что-то было, а что — неизвестно»,
@@ -306,8 +307,8 @@ func (c *Carrier) Head() Head {
 // порядке, с fsync между фазами.
 //
 // Пустой батч не пишет НИЧЕГО и не двигает голову. Иначе простаивающий
-// инстанс (на живом :6381 темп — 2.2 факта в сутки) писал бы 31.5 млн пустых
-// звеньев в год: 3.5 ГБ сообщений «ничего не произошло» при бюджете 10 ГБ.
+// инстанс писал бы 31.5 млн пустых звеньев в год: 3.5 ГБ сообщений «ничего
+// не произошло» при бюджете 10 ГБ.
 func (c *Carrier) Flush() (Head, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -487,7 +488,7 @@ func ReadChain(dir string) ([]Record, error) {
 	}
 	defer f.Close()
 
-	bodies, _, err := readFrames(f)
+	bodies, err := readFramesRO(f)
 	if err != nil {
 		return nil, err
 	}
@@ -523,7 +524,7 @@ func ReadLeaves(dir string, first uint64, count int) ([]Leaf, error) {
 	}
 	defer f.Close()
 
-	bodies, _, err := readFrames(f)
+	bodies, err := readFramesRO(f)
 	if err != nil {
 		return nil, err
 	}
@@ -570,6 +571,19 @@ func frameLeaf(l Leaf) []byte     { return frame(encodeLeafForHash(l)) }
 // ⚠Обрыв допускается только в последнем кадре. Битый кадр в середине — это
 // либо порча, либо правка; молчать о нём нельзя, поэтому это ошибка.
 func readFrames(f *os.File) ([][]byte, int64, error) {
+	return scanFrames(f, true)
+}
+
+// readFramesRO — то же для читателей (ReadChain, ReadLeaves, ScanLeaves):
+// оборванный хвост пропускается, но файл не трогается. Обрезать хвост вправе
+// только носитель при открытии: читатель, запущенный во время записи,
+// увидел бы недописанный кадр и отрезал бы его у пишущего.
+func readFramesRO(f *os.File) ([][]byte, error) {
+	bodies, _, err := scanFrames(f, false)
+	return bodies, err
+}
+
+func scanFrames(f *os.File, truncate bool) ([][]byte, int64, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, 0, err
 	}
@@ -601,7 +615,7 @@ func readFrames(f *os.File) ([][]byte, int64, error) {
 	}
 
 	torn := int64(len(data) - off)
-	if torn > 0 {
+	if torn > 0 && truncate {
 		// Хвост отрезаем физически: иначе следующая запись пристроится за
 		// мусором и разъедется навсегда.
 		if err := f.Truncate(int64(off)); err != nil {
@@ -739,4 +753,41 @@ func syncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// ScanLeaves проходит все листья по порядку, читая каждый файл один раз, и
+// отдаёт сквозной номер листа. Сюда входят и листья, ещё не накрытые
+// звеном. Листья не удаляются никогда, поэтому дыра в нумерации файлов —
+// порча, а не срок хранения.
+func ScanLeaves(dir string, fn func(num uint64, l Leaf) error) error {
+	segs, err := leafSegments(dir)
+	if err != nil {
+		return err
+	}
+	var next uint64
+	for _, first := range segs {
+		if first != next {
+			return fmt.Errorf("auditchain: нет листьев %d…%d — файл листьев утрачен", next, first-1)
+		}
+		f, err := os.Open(leafPath(dir, first))
+		if err != nil {
+			return err
+		}
+		bodies, err := readFramesRO(f)
+		f.Close()
+		if err != nil {
+			return err
+		}
+		for _, b := range bodies {
+			l, err := decodeLeaf(b)
+			if err != nil {
+				return fmt.Errorf("auditchain: лист %d: %w", next, err)
+			}
+			if err := fn(next, l); err != nil {
+				return err
+			}
+			next++
+		}
+	}
+	return nil
 }
