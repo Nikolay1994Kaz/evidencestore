@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -254,27 +255,35 @@ func TestTamperingIsDetected(t *testing.T) {
 	}
 }
 
-// Повтор безопасен: уже принятое отвечает «duplicate», в том числе после
+// Повтор безопасен: уже принятое отвечает «duplicate» с тем же обещанием,
+// что при приёме (сборщик мог упасть до записи обещания), в том числе после
 // рестарта; сборщик после переустановки узнаёт последний номер.
 func TestDuplicatesAndLastSeq(t *testing.T) {
 	c := newClock()
 	cfg := testConfig(t)
 	s := openStore(t, cfg, c)
-	ingest(t, s, "abs-core", 1, 3)
+	first := ingest(t, s, "abs-core", 1, 3)
 	res := ingest(t, s, "abs-core", 2, 4)
 	if res[0].Status != StatusDuplicate || res[1].Status != StatusDuplicate || res[2].Status != StatusAccepted {
 		t.Fatalf("повторы: %+v", res)
 	}
-	if res[0].Promise != nil {
-		t.Fatal("повтор получил новое обещание")
+	for i, r := range res[:2] {
+		if r.Promise == nil || !reflect.DeepEqual(*r.Promise, *first[i+1].Promise) || r.Digest != first[i+1].Digest {
+			t.Fatalf("повтор %d: обещание %+v, при приёме %+v", r.Seq, r.Promise, first[i+1].Promise)
+		}
 	}
+	accepted4 := res[2]
 	s.Close()
 	s2 := openStore(t, cfg, c)
 	if last, err := s2.LastSeq("abs-core"); err != nil || last != 4 {
 		t.Fatalf("LastSeq: %d, %v", last, err)
 	}
-	if res := ingest(t, s2, "abs-core", 4, 5); res[0].Status != StatusDuplicate || res[1].Status != StatusAccepted {
+	res = ingest(t, s2, "abs-core", 4, 5)
+	if res[0].Status != StatusDuplicate || res[1].Status != StatusAccepted {
 		t.Fatalf("после рестарта: %+v", res)
+	}
+	if res[0].Promise == nil || !reflect.DeepEqual(*res[0].Promise, *accepted4.Promise) {
+		t.Fatalf("повтор после рестарта: обещание %+v, при приёме %+v", res[0].Promise, accepted4.Promise)
 	}
 	for _, bad := range [][]Incoming{
 		{{Seq: 0, Body: []byte("x")}},
@@ -287,6 +296,57 @@ func TestDuplicatesAndLastSeq(t *testing.T) {
 	}
 	if _, err := s2.Ingest("intruder", []Incoming{{Seq: 1, Body: []byte("x")}}); !errors.Is(err, ErrUnknownSource) {
 		t.Fatalf("чужой источник: %v", err)
+	}
+}
+
+// ⭐ Под занятым номером другое тело (сборщик откатили к старой копии или
+// второй сборщик с тем же сертификатом): не «duplicate», который молча
+// потерял бы запись, а отказ всей пачке и событие в цепи. Стёртое тело
+// сверить нечем — тоже конфликт.
+func TestSeqConflict(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t)
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 2)
+	_, err := s.Ingest("abs-core", []Incoming{
+		{Seq: 2, Body: []byte("written after the collector was rolled back")},
+		{Seq: 3, Body: []byte("abs-core event 3")},
+	})
+	if !errors.Is(err, ErrSeqConflict) {
+		t.Fatalf("конфликт: %v", err)
+	}
+	if last, _ := s.LastSeq("abs-core"); last != 2 {
+		t.Fatalf("из пачки с конфликтом принято: LastSeq %d", last)
+	}
+	b, err := s.Proof("abs-core", 2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, _ := evidence.Unmarshal(b.Evidence)
+	if body, _ := keyring.OpenWithDEK(sealed.Envelope, b.DEK); string(body) != "abs-core event 2" {
+		t.Fatalf("принятое тело заменено: %q", body)
+	}
+	if n := s.sources["abs-core"].conflicts.Load(); n != 1 {
+		t.Fatalf("конфликтов %d", n)
+	}
+
+	// Тело стёрто (ключ месяца ждёт уничтожения): повтор того же тела сверить
+	// нечем, «duplicate» сказать нельзя.
+	scope := "abs-core/2026-09"
+	if err := s.Deactivate(true, scope); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ScheduleDestroy(scope, time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Ingest("abs-core", []Incoming{{Seq: 1, Body: []byte("abs-core event 1")}}); !errors.Is(err, ErrSeqConflict) {
+		t.Fatalf("стёртое тело: %v", err)
+	}
+	s.Close()
+	events := leavesOf(t, cfg, auditchain.EventConflict)
+	if len(events) != 2 || events[0].Scope != "abs-core" || !strings.Contains(string(events[0].Payload), `"seq":2`) ||
+		!strings.Contains(string(events[1].Payload), "erased") {
+		t.Fatalf("события конфликта в цепи: %+v", events)
 	}
 }
 

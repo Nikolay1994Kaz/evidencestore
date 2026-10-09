@@ -19,8 +19,8 @@
   {
    "name": "C1 позиция в файле не восстанавливается из буфера",
    "file": "internal/collector/collector.go",
-   "old": "\t\tc.pos = r.pos\n",
-   "new": ""
+   "old": "\t\tc.nextSeq, c.pos = last.seq+1, last.pos\n",
+   "new": "\t\tc.nextSeq = last.seq + 1\n"
   },
   {
    "name": "C2 недописанная строка уходит",
@@ -37,7 +37,7 @@
   {
    "name": "C4 ключ хранилища не сверяется",
    "file": "internal/collector/collector.go",
-   "old": "\tif c.storeKey != nil && base64.RawStdEncoding.EncodeToString(c.storeKey) != st.PublicKey {",
+   "old": "\tif base64.RawStdEncoding.EncodeToString(c.storeKey) != st.PublicKey {",
    "new": "\tif false {"
   },
   {
@@ -49,20 +49,20 @@
   {
    "name": "C6 ротированный файл не дочитывается",
    "file": "internal/collector/collector.go",
-   "old": "\t\tif old := c.findByInode(c.pos.Inode); old != \"\" {",
+   "old": "\t\tif old := c.findByInode(c.pos.Inode); old != \"\" && !c.replaced(old) {",
    "new": "\t\tif old := c.findByInode(c.pos.Inode); old != \"\" && false {"
   },
   {
    "name": "C7 потеря хвоста без пропуска номера",
    "file": "internal/collector/collector.go",
-   "old": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)\n\t\t\tc.nextSeq++",
-   "new": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)"
+   "old": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)\n\t\t\tc.nextSeq++\n",
+   "new": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)\n"
   },
   {
    "name": "C8 пачка без предела байтов",
    "file": "internal/collector/collector.go",
-   "old": "(n == 0 || size+len(c.pending[n].body) <= maxBatchBytes)",
-   "new": "(n == 0 || size >= 0)"
+   "old": "\t\tif len(batch) > 0 && size+len(r.body) > maxBatchBytes {",
+   "new": "\t\tif false {"
   },
   {
    "name": "C9 последняя строка ротированного файла теряется",
@@ -77,22 +77,178 @@
    "new": "\t\treturn filepath.Base(out[i].path) < filepath.Base(out[j].path)"
   },
   {
-   "name": "C11 переиспользованный inode не замечается",
+   "name": "C11 подменённый файл с тем же inode не замечается",
    "file": "internal/collector/collector.go",
-   "old": "\t\tif i >= 0 && c.pos.Offset > 0 && c.globHead != \"\" && fileHead(files[i].path) != c.globHead {",
-   "new": "\t\tif false {"
+   "old": "\treturn c.pos.Offset > 0 && head != \"\" && fileHead(path) != head",
+   "new": "\treturn false && head != \"\""
   },
   {
-   "name": "C12 следующий файл раньше, чем дочитан текущий",
+   "name": "C12 следующим берётся последний непрочитанный, а не первый",
    "file": "internal/collector/collector.go",
-   "old": "\t\tif err := c.switchTo(files[i+1]); err != nil {",
-   "new": "\t\tif err := c.switchTo(files[len(files)-1]); err != nil {"
+   "old": "\tfor i, f := range files {\n\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset {",
+   "new": "\tfor i, f := range slices.Backward(files) {\n\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset {"
   },
   {
    "name": "C13 удалённый файл без пропуска номера",
    "file": "internal/collector/collector.go",
-   "old": "\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n\t\t\tc.nextSeq++\n",
-   "new": "\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n"
+   "old": "\t\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n\t\t\t\tc.nextSeq++\n",
+   "new": "\t\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n"
+  },
+  {
+   "name": "C14 старт не ложится в буфер (A, B)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif err := c.appendSpool([]spoolRecord{{kind: kindStart, seq: st.LastSeq, pos: c.pos, body: files}}); err != nil {",
+   "new": "\tif err := error(nil); err != nil || files == nil {"
+  },
+  {
+   "name": "C15 позиция куска — начало строки (C)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t\t\tend = start + int64(cut+n) // кусок длинной строки: сразу за ним",
+   "new": "\t\t\t\tend = start // кусок длинной строки: сразу за ним"
+  },
+  {
+   "name": "C16 обрывок promises.jsonl не отрезается (E)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif tail[len(tail)-1] == '\\n' {",
+   "new": "\tif true {"
+  },
+  {
+   "name": "C17 нечитаемая строка обещаний прячет остальные (E)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t\tbad++\n\t\t\tcontinue",
+   "new": "\t\t\treturn nil, bad + 1, err"
+  },
+  {
+   "name": "C18 хранилище помнит больше выданного — не стоп (Y)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tcase st.LastSeq >= c.nextSeq:",
+   "new": "\t\tcase st.LastSeq >= c.nextSeq && false:"
+  },
+  {
+   "name": "C19 конфликт номера — повтор, а не стоп (Y)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t\tif errors.Is(err, ErrConflict) {\n\t\t\t\treturn err\n\t\t\t}\n",
+   "new": ""
+  },
+  {
+   "name": "C20 отказ seq_conflict не распознаётся (Y)",
+   "file": "internal/collector/collector.go",
+   "old": "resp.StatusCode == http.StatusConflict && e.Code == codeSeqConflict {",
+   "new": "resp.StatusCode == http.StatusConflict && e.Code == \"\" {"
+  },
+  {
+   "name": "C21 подпись обещания не проверяется (V)",
+   "file": "internal/collector/collector.go",
+   "old": "\t} else if err := proof.VerifyPromise(*p, c.storeKey); err != nil {",
+   "new": "\t} else if err := error(nil); err != nil {"
+  },
+  {
+   "name": "C22 обещание о другой записи принимается (V)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif p.Source != c.source || p.Seq != r.seq || p.Position != position {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "C23 ответ без обещания засчитывается (AG)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif p == nil {\n\t\tc.log.Error(",
+   "new": "\tif p == nil {\n\t\treturn nil\n\t}\n\tif p == nil {\n\t\tc.log.Error("
+  },
+  {
+   "name": "C24 неверное обещание не сохраняется отдельно (V)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\treturn errors.Join(bad, appendLine(filepath.Join(c.cfg.SpoolDir, rejectedFile), line))",
+   "new": "\t\treturn bad"
+  },
+  {
+   "name": "C25 файл из прошлого не читается (AD)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset {\n\t\t\treturn i",
+   "new": "\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset && (c.pos.Inode == 0 || i > slices.IndexFunc(files, func(g globFile) bool { return g.ino == c.pos.Inode })) {\n\t\t\treturn i"
+  },
+  {
+   "name": "C26 дочитанный файл не помнит, докуда прочитан (P)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\te.Inode, e.Offset, e.MTime = c.pos.Inode, c.pos.Offset, files[cur].mtime",
+   "new": "\t\te.Inode, e.Offset, e.MTime = c.pos.Inode, 0, files[cur].mtime"
+  },
+  {
+   "name": "C27 первый запуск по маске читает старое (A, B)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tc.files[f.ino] = fileState{Inode: f.ino, Offset: f.size, MTime: f.mtime, Head: fileHead(f.path)}",
+   "new": "\t\tc.files[f.ino] = fileState{Inode: f.ino, Offset: 0, MTime: f.mtime, Head: fileHead(f.path)}"
+  },
+  {
+   "name": "C28 files.json не поднимается из старта",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t\tif !filesFound {\n\t\t\t\tif err := json.Unmarshal(r.body, &files); err != nil {",
+   "new": "\t\t\tif false {\n\t\t\t\tif err := json.Unmarshal(r.body, &files); err != nil {"
+  },
+  {
+   "name": "C29 доставленное не удаляется из буфера (P1)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif err := c.spool.Release(c.sentPos); err != nil {",
+   "new": "\t\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "C30 после рестарта доставленное считается недоставленным",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif r.seq <= c.acked {\n\t\t\tc.sentPos = p\n\t\t} else if r.kind == kindLine {",
+   "new": "\t\tif false {\n\t\t\tc.sentPos = p\n\t\t} else if r.kind == kindLine {"
+  },
+  {
+   "name": "C31 номера в буфере не проверяются на рост",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tcase r.seq <= last.seq:",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "C32 запуск без буфера гадает место (A)",
+   "file": "internal/collector/collector.go",
+   "old": "\tcase n == 0 && (stateFound || filesFound):",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "C33 пачка больше 512 принимается (D)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif c.Batch < 1 || c.Batch > maxBatch {",
+   "new": "\tif c.Batch < 1 {"
+  },
+  {
+   "name": "C34 http:// принимается (F)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t} else if u.Scheme != \"https\" || u.Host == \"\" {",
+   "new": "\t\t} else if u.Host == \"\" {"
+  },
+  {
+   "name": "C35 отрицательная пауза принимается (G)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif c.FlushEvery < 0 {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "C36 store_key необязателен",
+   "file": "internal/collector/collector.go",
+   "old": "\"store_key\": c.StoreKey, ",
+   "new": "\"store_key\": \"set\", "
+  },
+  {
+   "name": "C37 подмена файла на месте (режим file) не замечается (H)",
+   "file": "internal/collector/collector.go",
+   "old": "\tcase fi.Size() < c.pos.Offset || c.replaced(c.cfg.File):",
+   "new": "\tcase fi.Size() < c.pos.Offset:"
+  },
+  {
+   "name": "C38 первая строка не запоминается (H)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif e.Head = fileHead(path); e.Head == \"\" {",
+   "new": "\tif e.Head = \"\"; e.Head == \"\" {"
+  },
+  {
+   "name": "V3 конфликт номера без кода для сборщика",
+   "file": "internal/server/server.go",
+   "old": "\t\t\tresp.Code = CodeSeqConflict",
+   "new": "\t\t\tresp.Code = \"\""
   }
  ],
  "note": "V3 (имя из сертификата не сверяется с реестром на входе) снят как равносильный: store.Ingest и store.LastSeq сами отказывают неизвестному источнику (ErrUnknownSource → 403)."

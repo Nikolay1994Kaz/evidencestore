@@ -27,8 +27,11 @@ func main() {
 	cfg, err := collector.LoadConfig(*path)
 	fail(err)
 	if *promises {
-		m, err := collector.Promises(cfg.SpoolDir)
+		m, bad, err := collector.Promises(cfg.SpoolDir)
 		fail(err)
+		if bad > 0 {
+			fmt.Fprintf(os.Stderr, "warning: %d unreadable lines in promises.jsonl skipped\n", bad)
+		}
 		fmt.Println(strings.Join(collector.SortedSeqs(m), " "))
 		return
 	}

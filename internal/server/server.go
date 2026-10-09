@@ -236,7 +236,11 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	results, err := s.store.Ingest(source, recs)
 	if err != nil {
-		writeErr(w, ingestStatus(err), err)
+		resp := ErrorResponse{Error: err.Error()}
+		if errors.Is(err, store.ErrSeqConflict) {
+			resp.Code = CodeSeqConflict
+		}
+		writeJSON(w, ingestStatus(err), resp)
 		if ingestStatus(err) >= 500 {
 			s.log.Error("ingest", "source", source, "err", err)
 		}
@@ -244,10 +248,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := IngestResponse{Results: make([]IngestResult, len(results))}
 	for i, res := range results {
-		resp.Results[i] = IngestResult{Seq: res.Seq, Status: res.Status, Position: res.Position, Promise: res.Promise}
-		if res.Status == store.StatusAccepted {
-			resp.Results[i].Digest = res.Digest[:]
-		}
+		resp.Results[i] = IngestResult{Seq: res.Seq, Status: res.Status, Position: res.Position, Digest: res.Digest[:], Promise: res.Promise}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -258,7 +259,7 @@ func ingestStatus(err error) int {
 		return http.StatusForbidden
 	case errors.Is(err, store.ErrBadRecord):
 		return http.StatusBadRequest
-	case errors.Is(err, store.ErrInFlight):
+	case errors.Is(err, store.ErrInFlight), errors.Is(err, store.ErrSeqConflict):
 		return http.StatusConflict
 	case errors.Is(err, keyring.ErrScopeClosed), errors.Is(err, keyring.ErrScopeDestroyed):
 		return http.StatusConflict
@@ -476,10 +477,16 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	enc.Encode(v)
 }
 
-// ErrorResponse — тело ответа с ошибкой.
+// ErrorResponse — тело ответа с ошибкой. Code — для программы, а не для
+// человека: повторять запрос или остановиться.
 type ErrorResponse struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
+
+// CodeSeqConflict — номер занят другим телом (store.ErrSeqConflict):
+// сборщику нельзя повторять, ему надо остановиться.
+const CodeSeqConflict = "seq_conflict"
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, ErrorResponse{Error: err.Error()})

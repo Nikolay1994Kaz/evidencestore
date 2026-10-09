@@ -1,12 +1,15 @@
 package store
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"time"
 
 	"evidencestore/internal/auditchain"
 	"evidencestore/internal/config"
 	"evidencestore/internal/evidence"
+	"evidencestore/internal/keyring"
 	"evidencestore/internal/proof"
 )
 
@@ -22,23 +25,27 @@ type Incoming struct {
 // Result — итог по одной записи.
 type Result struct {
 	Seq      uint64
-	Status   string // "accepted" — записана сейчас; "duplicate" — была принята раньше
+	Status   string
 	Position uint64
 	Digest   [32]byte
-	Promise  *proof.Promise // только у принятых сейчас
+	Promise  *proof.Promise
 }
 
 const (
-	StatusAccepted  = "accepted"
+	// StatusAccepted — записана сейчас.
+	StatusAccepted = "accepted"
+	// StatusDuplicate — это же тело принято раньше. Обещание — то же, что
+	// при приёме: сборщик, упавший до записи обещания, получает его на повторе.
 	StatusDuplicate = "duplicate"
 )
 
 // Ingest принимает пачку записей источника. Источник берётся из
 // клиентского сертификата (пакет server), никогда из тела запроса.
 //
-// Без ошибки — все записи пачки на диске (новые) или были там раньше
-// (повторы). С ошибкой — ни одна новая запись не подтверждена; повтор той
-// же пачки безопасен: принятые раньше ответят «duplicate».
+// Без ошибки — все записи пачки на диске (новые) или были там раньше с тем
+// же телом (повторы). С ошибкой — ни одна новая запись не подтверждена;
+// повтор той же пачки безопасен: принятые раньше ответят «duplicate».
+// Номер, занятый другим телом, — ErrSeqConflict для всей пачки.
 func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	defer func() {
 		if err != nil {
@@ -72,6 +79,7 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 		body   []byte
 	}
 	var news []fresh
+	var dups []int // номер уже занят: тело сверяется вне замка
 	s.mu.Lock()
 	st, ok := s.sources[source]
 	switch {
@@ -105,8 +113,8 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 		seen[r.Seq] = true
 		results[i].Seq = r.Seq
 		if pos := st.seqs.get(r.Seq); pos != 0 {
-			results[i].Status, results[i].Position = StatusDuplicate, pos
-			st.dups.Add(1)
+			results[i].Position = pos
+			dups = append(dups, i)
 			continue
 		}
 		news = append(news, fresh{i: i, header: evidence.Header{
@@ -124,6 +132,23 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 			delete(st.inflight, n.header.Seq)
 		}
 		s.mu.Unlock()
+	}
+	// 1а. Повторы номера: то же ли тело. Конфликт отвергает пачку целиком:
+	// иначе записи второго сборщика легли бы вперемешку с записями первого.
+	var conflicts []uint64
+	for _, i := range dups {
+		conflict, err := s.checkDuplicate(st, recs[i], &results[i])
+		if err != nil {
+			release()
+			return nil, err
+		}
+		if conflict {
+			conflicts = append(conflicts, recs[i].Seq)
+		}
+	}
+	if len(conflicts) > 0 {
+		release()
+		return nil, fmt.Errorf("%w: seq %v of %q", ErrSeqConflict, conflicts, source)
 	}
 	if len(news) == 0 {
 		return results, nil
@@ -164,7 +189,6 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	}
 
 	// 4. Индекс принятых, пропуски номеров, обещания.
-	mmd := s.cfg.Chain.PromiseMMD.D()
 	s.mu.Lock()
 	for j, n := range news {
 		pos := first + uint64(j)
@@ -172,12 +196,7 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 		s.indexLocked(st, n.header, pos)
 		r := &results[n.i]
 		r.Status, r.Position, r.Digest = StatusAccepted, pos, evidence.Digest(data[j])
-		p := proof.Promise{
-			Source: source, Seq: n.header.Seq, Position: pos, Digest: r.Digest[:],
-			ReceivedAt: n.header.ReceivedAt, Deadline: n.header.ReceivedAt + int64(mmd),
-			PublicKey: s.signer.PublicKeyString(),
-		}
-		p.Signature = s.signer.SignMessage(proof.PromiseBytes(p))
+		p := s.promise(n.header, pos, r.Digest)
 		r.Promise = &p
 	}
 	gaps := st.takeGaps()
@@ -187,6 +206,62 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 		s.log.Warn("sequence gap", "source", source, "from", g.From, "to", g.To)
 	}
 	return results, nil
+}
+
+// promise — подписанное обещание по принятой улике. Ed25519 детерминирован:
+// пока promise_mmd не менялся, повтор получает те же байты, что приём.
+func (s *Store) promise(h evidence.Header, pos uint64, digest [32]byte) proof.Promise {
+	p := proof.Promise{
+		Source: h.Source, Seq: h.Seq, Position: pos, Digest: digest[:],
+		ReceivedAt: h.ReceivedAt, Deadline: h.ReceivedAt + int64(s.cfg.Chain.PromiseMMD.D()),
+		PublicKey: s.signer.PublicKeyString(),
+	}
+	p.Signature = s.signer.SignMessage(proof.PromiseBytes(p))
+	return p
+}
+
+// checkDuplicate — номер уже занят (позиция — в res). Тело сверяется с
+// принятым: оно вскрывается ключом месяца. То же тело — «duplicate» с
+// обещанием. Другое тело (или стёртое: сверить нечем) — конфликт, событие в
+// цепи.
+func (s *Store) checkDuplicate(st *sourceState, r Incoming, res *Result) (conflict bool, _ error) {
+	data, err := s.evlog.Read(res.Position)
+	if err != nil {
+		return false, err
+	}
+	sealed, err := evidence.Unmarshal(data)
+	if err != nil {
+		return false, fmt.Errorf("evidence log position %d: %w", res.Position, err)
+	}
+	res.Digest = evidence.Digest(data)
+	body, err := sealed.Open(s.keys)
+	var reason string
+	switch {
+	case err == nil && bytes.Equal(body, r.Body):
+		res.Status = StatusDuplicate
+		p := s.promise(sealed.Header, res.Position, res.Digest)
+		res.Promise = &p
+		st.dups.Add(1)
+		return false, nil
+	case err == nil:
+		reason = "another body under a taken seq"
+	case errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):
+		reason = "the accepted body is erased, nothing to compare with"
+	default:
+		return false, err
+	}
+	st.conflicts.Add(1)
+	s.log.Error("seq conflict: the collector was rolled back to an old copy, or another collector uses the source certificate",
+		"source", sealed.Source, "seq", r.Seq, "position", res.Position, "reason", reason)
+	s.appendJSONEvent(auditchain.EventConflict, sealed.Source, "", seqConflict{Seq: r.Seq, Position: res.Position, Reason: reason})
+	return true, nil
+}
+
+// seqConflict — событие в цепи: под занятым номером пришло другое тело.
+type seqConflict struct {
+	Seq      uint64 `json:"seq"`
+	Position uint64 `json:"position"` // принятая улика с этим номером
+	Reason   string `json:"reason"`
 }
 
 // gap — пропуск номеров: записи [From, To] источник не прислал.

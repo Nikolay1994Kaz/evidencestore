@@ -47,13 +47,13 @@ esverify ─ cmd/esverify, internal/proof
 | `internal/keyring` | ключи: корень → ключ файла → KEK месяца → DEK записи; формат KRNG3 (корень заворачивает только ключ файла); уничтожение поворотом корня; состояния и двухэтапное уничтожение; зеркало корней и корни-сироты | `keyring.go`, `format.go`, `envelope.go`, `lifecycle.go`, `destroy.go`, `rootfile.go` | 27 тестов, 54 мутации |
 | `internal/gateway` | проверка бортового журнала Pipelock при приёме: хэш записи (проекции v1–v3), сцепка `prev_hash` по писателям, подписи контрольных точек | `pipelock.go`, `testdata/pipelock-v3.6.0` (настоящий вывод Pipelock) | 8 тестов, 12 мутаций |
 | `internal/metrics` | показатели в текстовом формате Prometheus, без зависимостей | `metrics.go` | формат вывода |
-| `internal/evlog` | журнал улик: групповой коммит, ответ после fsync, сегменты только дописываются, fail-stop | `evlog.go` | 9 тестов, 10 мутаций |
+| `internal/evlog` | журнал улик: групповой коммит, ответ после fsync, сегменты только дописываются, fail-stop; `Release` (удаление доставленных сегментов) — только для буфера сборщика | `evlog.go` | 13 тестов, 15 мутаций |
 | `internal/auditchain` | цепь (ядро): листья, звено с корнем Меркла, голова в двух слотах, подписанное заявление Ed25519 | `carrier.go`, `chain.go`, `merkle.go`, `export.go`, `query.go` | тесты ядра + `TestReadersDoNotTruncate`, `TestMissingLeavesAreLoud`; 4 мутации |
 | `internal/tsa` | RFC 3161: запрос, офлайн-проверка CMS до корня, встроенная демо-служба | `tsa.go`, `local.go`, `testdata/` (настоящий токен НУЦ) | 11 тестов (один — живой НУЦ, по переменным окружения), 10 мутаций |
 | `internal/proof` | пакет доказательств и его проверка; обещание при приёме; часть пакета для журналов гейтвея | `proof.go`, `promise.go`, `gateway.go` | синтетическая цепь: каждая проверка — свой тест |
-| `internal/store` | движок: приём, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `gateway.go`, `metrics.go` | 22 теста (падение, откат кейринга, стирание, копия, журнал Pipelock, окно отмены по TSA…) |
+| `internal/store` | движок: приём, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `gateway.go`, `metrics.go` | 23 теста (падение, откат кейринга, стирание, копия, журнал Pipelock, окно отмены по TSA, конфликт номера…) |
 | `internal/server` | HTTPS-приём с mTLS и админка через unix-сокет | `server.go` | mTLS, источник из сертификата, админка |
-| `internal/collector` | сборщик: файл или файлы по маске → буфер → пачки; обещания хранилища | `collector.go` | доставка, рестарт без дублей, ротация (с дочитыванием старого файла), переустановка, длинные строки, шарды Pipelock по маске |
+| `internal/collector` | сборщик: файл или файлы по маске → буфер (`evlog`) → пачки; обещания хранилища проверяются закреплённым ключом | `collector.go` | 32 теста: доставка, рестарт без дублей, ротация, переустановка, длинные строки, шарды Pipelock, старт после переустановки, откат буфера, второй сборщик, неверные обещания, часы назад, опасные настройки; 38 мутаций в наборе `edge` |
 | `internal/config` | конфигурация JSON и реестр источников | `config.go` | предел пути сокета; остальное — через тесты движка и сервера |
 | `internal/pki` | учебный УЦ для стенда | `pki.go` | через тесты сервера |
 | `cmd/evidencestore` | сервер и команды оператора | `main.go` | демо |
@@ -80,6 +80,16 @@ keys.backup_dir/       копии keyring.dat и sign.key (секреты; не 
 replica.url            копия: evidence/…, chain/… кусками по смещению, heads/<n>.json
 ```
 
+У сборщика (`spool_dir`):
+
+```
+spool/seg_*.log          буфер — экземпляр evlog; доставленные сегменты удаляются, граница — spool/floor
+state.json               докуда доставлено (acked)
+files.json               что известно о файлах: докуда прочитан, первая строка
+promises.jsonl           обещания хранилища, сошедшиеся с закреплённым ключом
+promises-rejected.jsonl  обещания, которые не сошлись: улика против хранилища
+```
+
 Копия `keyring.dat` в резерве безопасна: без корня она бесполезна. Копия, где лежат и `data_dir`, и `roots_dir`, открывает всё, поэтому `config.Validate` запрещает вкладывать один каталог в другой.
 
 ## Свойства и кто их стережёт
@@ -87,7 +97,8 @@ replica.url            копия: evidence/…, chain/… кусками по �
 | Свойство | Где обеспечено | Тест |
 |---|---|---|
 | «принято» только после fsync | `evlog.commit` | `TestFsyncFailureIsNotAcknowledged` |
-| повтор безопасен | `store.Ingest` (индекс `seqIndex`) | `TestDuplicatesAndLastSeq` |
+| повтор безопасен и получает то же обещание, что приём | `store.Ingest`, `store.checkDuplicate` | `TestDuplicatesAndLastSeq`, `TestResendGetsPromise` |
+| другое тело под занятым номером — отказ пачке и событие в цепи, а не «duplicate» | `store.checkDuplicate` (`ErrSeqConflict`, `EventConflict`) | `TestSeqConflict`, `TestIngestOverMTLS` |
 | источник только из сертификата | `server.source` | `TestSourceComesFromCertificate` |
 | время приёма не идёт назад | `store.clockLocked` | `TestReceivedAtIsMonotonic` |
 | после падения цепь досчитывается | `store.open` (хвост журнала → листья) | `TestCrashCatchUp` |
@@ -99,9 +110,14 @@ replica.url            копия: evidence/…, chain/… кусками по �
 | уничтожение — только двое и не раньше срока | `keyring.ScheduleDestroy` | `TestLifecycle`, `TestRetentionErasure` |
 | откат `keyring.dat` виден | `store.reconcileKeys` | `TestKeyringRollbackDetected` |
 | пропуски и молчание — в цепи | `store.indexLocked`, `store.CheckSilence` | `TestGapsAndSilence` |
-| сборщик не задваивает строки после падения | `collector` (позиция в буфере) | `TestRestartNoDuplicates` |
-| ротация не теряет хвост старого файла; потеря — пропуск номера, а не тишина | `collector.ReadOnce` | `TestRotationDrainsOldFile`, `TestLostRotatedTailLeavesGap` |
-| длинные строки не застревают в пределе запроса | `collector.SendOnce` (8 МиБ на пачку) | `TestBigLinesFitRequestLimit` |
+| сборщик не задваивает строки после падения | `collector` (позиция в буфере) | `TestRestartNoDuplicates`, `TestTornLongLineResumesAtChunk` |
+| первый запуск помнит место чтения; без буфера сборщик не гадает | `collector.Bootstrap` (запись «старт»), `collector.load` | `TestBootstrapPositionSurvivesRestart`, `TestLinesWrittenWhileDownAfterFirstStart`, `TestLostSpoolRefusesToGuess`, `TestGlobFirstStartSkipsExisting` |
+| буфер: fail-stop, доставленное уходит с диска, номера только растут | `evlog` (экземпляр сборщика), `collector.SendOnce` (`Release`) | `TestFailStop`, `TestReleaseDropsWholeSegments`, `TestSpoolReleasesDelivered`, `TestSpoolSeqMustGrow` |
+| ротация не теряет хвост старого файла; потеря — пропуск номера, а не тишина; подменённый на месте файл читается с начала | `collector.ReadOnce` | `TestRotationDrainsOldFile`, `TestLostRotatedTailLeavesGap`, `TestFileReplacedInPlaceIsReadFromStart` |
+| длинные строки не застревают в пределе запроса | `collector.SendOnce` (1 МиБ тел на пачку) | `TestBigLinesFitRequestLimit` |
+| доставлено — только с обещанием, которое сходится с закреплённым ключом; неверное обещание — улика, записи ждут | `collector.keepPromise` | `TestBadPromiseKeepsRecords`, `TestDeliveryAndPromises`, `TestTornPromiseLine` |
+| откат `spool_dir` и второй сборщик с тем же сертификатом останавливают сборщик, а не теряют строки | `collector.Bootstrap` (`ErrStoreAhead`), `collector.send` (`ErrConflict`) | `TestRolledBackSpoolStops`, `TestSecondCollectorWithSameCertificateStops` |
+| опасные настройки сборщика — ошибка при загрузке | `collector.Config.validate` | `TestConfigRejectsDangerousValues`, `TestBadServerAddressIsAnError` |
 | текущий месяц не закрывается случайно | `store.Deactivate` (`-force`) | `TestKeyringRollbackDetected`, `TestAdminProofAndKeys` |
 | копия восстанавливается и сверяется с подписанной головой | `store.RestoreReplica` | `TestReplicaRestore` |
 | копия `keyring.dat` в резерв не держит шифрование; ключ без копии не выдаётся | `keyring.persistLocked` (общий замок отпущен, изменения в очереди на `wmu`), `keyring.Seal` | `TestBackupDoesNotBlockSeal`, `TestNewKeyWaitsForBackup` |
@@ -116,7 +132,7 @@ replica.url            копия: evidence/…, chain/… кусками по �
 | хэши и подписи Pipelock повторяются байт в байт | `gateway.Entry.ComputeHash`, `gateway.Tracker` | `TestPipelockRecorderVectors`, `TestPipelockTamperedEntry`, `TestDetailBytesAreHashedAsWritten`, `TestTimestampNormalizedLikePipelock` |
 | запись журнала гейтвея: вердикт в цепи, после падения досчитывается | `store.recordGateway`, `store.open` (вердикты по телам) | `TestGatewayJournalProof`, `TestGatewayVerdictCatchUp` |
 | пакет: тело — та самая запись гейтвея, её накрывает подписанная точка | `proof.verifyGateway` | `TestGatewayJournalProof`, `TestGatewayBodyMustMatchVerdict`, `TestGatewayVerdictOfAnotherRecord`, `TestGatewayTamperedEntry` |
-| шарды по маске — по порядку, без повторов; удалённый файл — пропуск номера | `collector.readGlob` | `TestGlobFollowsPipelockShards`, `TestGlobEqualMTimesUseNaturalOrder`, `TestGlobCurrentFileGoneLeavesGap` |
+| шарды по маске — по порядку, без повторов; удалённый файл — пропуск номера; шард «из прошлого» по часам читается | `collector.readGlob` (`files.json`) | `TestGlobFollowsPipelockShards`, `TestGlobEqualMTimesUseNaturalOrder`, `TestGlobCurrentFileGoneLeavesGap`, `TestGlobFileFromThePastIsRead`, `TestGlobDeletedCurrentDoesNotRereadOlder` |
 | показатели для тревог | `store.Metrics`, `server.MetricsHandler` | `TestMetrics`, `TestMetricsEndpoint` |
 | из копии наружу ничего не удаляется | `ship.Remote`: метода удаления нет | — (держит тип) |
 | отчёт проверяющего называет верную причину, почему тело закрыто | `proof.Report.Notes` | `TestNotesTellWhyBodyIsClosed` |

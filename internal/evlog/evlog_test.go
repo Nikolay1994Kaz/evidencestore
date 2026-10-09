@@ -286,3 +286,131 @@ func TestRecordLimits(t *testing.T) {
 		t.Fatalf("запись на пределе: %v", err)
 	}
 }
+
+// fill пишет записи 1..n по одной: при пороге 64 байта сегменты по 2–3
+// записи.
+func fill(t *testing.T, l *Log, n int) {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		if _, err := l.Append([][]byte{rec(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Release удаляет сегменты целиком и только те, где всё не дальше upTo;
+// после переоткрытия журнал начинается с границы, позиции прежние.
+func TestReleaseDropsWholeSegments(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	fill(t, l, 10)
+	segs := l.Segments()
+	if len(segs) < 4 {
+		t.Fatalf("сегментов %d", len(segs))
+	}
+	// Конец второго сегмента плюс одна запись третьего: третий не весь
+	// подтверждён и остаётся.
+	upTo := segs[1].First + segs[1].Count
+	if err := l.Release(upTo); err != nil {
+		t.Fatal(err)
+	}
+	keep := segs[2].First
+	for i, s := range segs {
+		_, err := os.Stat(s.Path)
+		if gone := errors.Is(err, os.ErrNotExist); gone != (i < 2) {
+			t.Fatalf("сегмент %d (с %d): удалён = %v", i, s.First, gone)
+		}
+	}
+	if _, err := l.Read(keep - 1); !errors.Is(err, ErrNoPos) {
+		t.Fatalf("освобождённая позиция читается: %v", err)
+	}
+	if got, err := l.Read(keep); err != nil || !bytes.Equal(got, rec(int(keep))) {
+		t.Fatalf("read %d: %q, %v", keep, got, err)
+	}
+	l.Close()
+
+	var seen []uint64
+	l2 := openLog(t, dir, Options{SegmentBytes: 64}, func(pos uint64, data []byte) error {
+		if !bytes.Equal(data, rec(int(pos))) {
+			return fmt.Errorf("pos %d: %q", pos, data)
+		}
+		seen = append(seen, pos)
+		return nil
+	})
+	if len(seen) == 0 || seen[0] != keep || seen[len(seen)-1] != 10 || l2.Next() != 11 {
+		t.Fatalf("после переоткрытия: seen=%v next=%d", seen, l2.Next())
+	}
+	if first, err := l2.Append([][]byte{rec(11)}); err != nil || first != 11 {
+		t.Fatalf("append: %d, %v", first, err)
+	}
+}
+
+// Сегмент с последней записью не удаляется, даже когда всё подтверждено и
+// за ним уже открыт пустой сегмент (ротация, затем падение до записи).
+func TestReleaseKeepsLastRecord(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	fill(t, l, 10)
+	l.Close()
+	hdr := append([]byte(segMagic), 0, 0, 0, 0, 0, 0, 0, 11)
+	if err := os.WriteFile(segPath(dir, 11), hdr, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l2 := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	if err := l2.Release(10); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := l2.Read(10); err != nil || !bytes.Equal(got, rec(10)) {
+		t.Fatalf("последняя запись: %q, %v", got, err)
+	}
+	if _, err := l2.Read(1); !errors.Is(err, ErrNoPos) {
+		t.Fatalf("подтверждённое не освобождено: %v", err)
+	}
+}
+
+// Прерванный Release: граница на диске, файл сегмента ниже неё ещё лежит.
+// Open доводит удаление до конца, записи ниже границы не видны.
+func TestInterruptedReleaseFinishedOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	fill(t, l, 10)
+	first := l.Segments()[0]
+	saved, err := os.ReadFile(first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Release(first.Count); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	if err := os.WriteFile(first.Path, saved, 0o600); err != nil { // удаление «не дошло до диска»
+		t.Fatal(err)
+	}
+	var low []uint64
+	openLog(t, dir, Options{SegmentBytes: 64}, func(pos uint64, _ []byte) error {
+		if pos <= first.Count {
+			low = append(low, pos)
+		}
+		return nil
+	})
+	if len(low) != 0 {
+		t.Fatalf("видны освобождённые позиции %v", low)
+	}
+	if _, err := os.Stat(first.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("сегмент ниже границы не удалён: %v", err)
+	}
+}
+
+// Без файла границы журнал начинается с 1: пропавший первый сегмент журнала
+// улик — порча, а не освобождение.
+func TestMissingFirstSegmentIsLoud(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	fill(t, l, 10)
+	segs := l.Segments()
+	l.Close()
+	os.Remove(segs[0].Path)
+	if _, err := Open(dir, Options{SegmentBytes: 64}, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("пропал первый сегмент: %v", err)
+	}
+}

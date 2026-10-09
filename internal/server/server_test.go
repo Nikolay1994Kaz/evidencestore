@@ -166,6 +166,17 @@ func TestIngestOverMTLS(t *testing.T) {
 	if out.Results[0].Status != store.StatusDuplicate || out.Results[1].Status != store.StatusAccepted {
 		t.Fatalf("повтор: %s", body)
 	}
+	if p := out.Results[0].Promise; p == nil || proof.VerifyPromise(*p, ed25519.PublicKey(pub)) != nil {
+		t.Fatalf("повтор без обещания: %s", body)
+	}
+	other := records(4, 4)
+	other.Records[0].Body = []byte("another body under a taken seq")
+	resp, body = post(t, c, e.url+"/v1/ingest", other)
+	var er ErrorResponse
+	json.Unmarshal(body, &er)
+	if resp == nil || resp.StatusCode != 409 || er.Code != CodeSeqConflict {
+		t.Fatalf("другое тело под занятым номером: %v %s", resp, body)
+	}
 	r, err := c.Get(e.url + "/v1/state")
 	if err != nil {
 		t.Fatal(err)

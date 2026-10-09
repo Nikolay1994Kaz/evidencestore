@@ -153,8 +153,8 @@
   {
    "name": "S14 обещание без срока",
    "file": "internal/store/ingest.go",
-   "old": "\t\t\tReceivedAt: n.header.ReceivedAt, Deadline: n.header.ReceivedAt + int64(mmd),",
-   "new": "\t\t\tReceivedAt: n.header.ReceivedAt, Deadline: n.header.ReceivedAt - int64(mmd),"
+   "old": "\t\tReceivedAt: h.ReceivedAt, Deadline: h.ReceivedAt + int64(s.cfg.Chain.PromiseMMD.D()),",
+   "new": "\t\tReceivedAt: h.ReceivedAt, Deadline: h.ReceivedAt - int64(s.cfg.Chain.PromiseMMD.D()),"
   },
   {
    "name": "R1 восстановление не сверяет цепь с подписанной головой",
@@ -255,7 +255,7 @@
   {
    "name": "S25 повторы не считаются",
    "file": "internal/store/ingest.go",
-   "old": "\t\t\tst.dups.Add(1)\n",
+   "old": "\t\tst.dups.Add(1)\n",
    "new": ""
   },
   {
@@ -275,6 +275,36 @@
    "file": "internal/store/keys.go",
    "old": "\t\t\t\tat, stampErr = time.Time{}, fmt.Errorf(",
    "new": "\t\t\t\tstampErr = fmt.Errorf("
+  },
+  {
+   "name": "S29 повтор не сверяет тело",
+   "file": "internal/store/ingest.go",
+   "old": "\tcase err == nil && bytes.Equal(body, r.Body):",
+   "new": "\tcase err == nil && bytes.Equal(body, body):"
+  },
+  {
+   "name": "S30 повтор без обещания",
+   "file": "internal/store/ingest.go",
+   "old": "\t\tres.Promise = &p\n\t\tst.dups.Add(1)",
+   "new": "\t\t_ = p\n\t\tst.dups.Add(1)"
+  },
+  {
+   "name": "S31 конфликт без события в цепи",
+   "file": "internal/store/ingest.go",
+   "old": "\ts.appendJSONEvent(auditchain.EventConflict, sealed.Source, \"\", conflict{Seq: r.Seq, Position: res.Position, Reason: reason})\n",
+   "new": ""
+  },
+  {
+   "name": "S32 стёртое тело засчитывается повтором",
+   "file": "internal/store/ingest.go",
+   "old": "\tcase errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):\n\t\treason = \"the accepted body is erased, nothing to compare with\"",
+   "new": "\tcase errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):\n\t\treason = \"the accepted body is erased, nothing to compare with\"\n\t\tres.Status = StatusDuplicate\n\t\treturn nil"
+  },
+  {
+   "name": "S33 конфликты не считаются",
+   "file": "internal/store/ingest.go",
+   "old": "\tst.conflicts.Add(1)\n",
+   "new": ""
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

@@ -21,6 +21,14 @@
 // FAIL-STOP. Первая ошибка записи или fsync защёлкивается: дальше журнал
 // отказывает всем (Failed). После неудачного fsync нельзя знать, что на
 // диске, а отвечать «принято» про то, что, может быть, не записано, нельзя.
+//
+// ОСВОБОЖДЕНИЕ. Хранилище из журнала улик не удаляет ничего и Release не
+// зовёт. Release нужен буферу сборщика: там запись больше не нужна, когда её
+// приняло хранилище. Удаляются только целые закрытые сегменты. Сначала на
+// диск ложится нижняя граница (файл floor), потом удаляются файлы. Прерванное
+// удаление Open доводит до конца, а сегмент ниже границы не считается
+// пропавшим. Без файла floor журнал обязан начинаться с позиции 1:
+// пропавший первый сегмент — порча.
 package evlog
 
 import (
@@ -52,6 +60,9 @@ const (
 	DefaultSegmentBytes = 64 << 20
 
 	queueLen = 1024
+
+	// floorFile — первая позиция, оставшаяся после Release.
+	floorFile = "floor"
 )
 
 var (
@@ -171,7 +182,18 @@ func (l *Log) recover(visit func(uint64, []byte) error) error {
 	if err != nil {
 		return err
 	}
-	next := uint64(1)
+	floor, err := readFloor(l.dir)
+	if err != nil {
+		return err
+	}
+	// Сегменты целиком ниже границы — остаток прерванного Release.
+	for len(firsts) > 1 && firsts[1] <= floor {
+		if err := os.Remove(segPath(l.dir, firsts[0])); err != nil {
+			return fmt.Errorf("evlog: %w", err)
+		}
+		firsts = firsts[1:]
+	}
+	next := floor
 	for i, first := range firsts {
 		if first != next {
 			return fmt.Errorf("%w: segment starts at %d, expected %d", ErrCorrupt, first, next)
@@ -186,7 +208,7 @@ func (l *Log) recover(visit func(uint64, []byte) error) error {
 		next = seg.end()
 	}
 	if len(l.segs) == 0 {
-		if err := l.newSegment(1); err != nil {
+		if err := l.newSegment(floor); err != nil {
 			return err
 		}
 	} else {
@@ -202,8 +224,24 @@ func (l *Log) recover(visit func(uint64, []byte) error) error {
 		l.active = f
 	}
 	l.recovery.Segments = len(l.segs)
-	l.recovery.Records = l.segs[len(l.segs)-1].end() - 1
+	l.recovery.Records = l.segs[len(l.segs)-1].end() - floor
 	return nil
+}
+
+// readFloor — первая позиция журнала: из файла floor, без него — 1.
+func readFloor(dir string) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(dir, floorFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("evlog: %w", err)
+	}
+	floor, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || floor == 0 {
+		return 0, fmt.Errorf("%w: bad %s file", ErrCorrupt, floorFile)
+	}
+	return floor, nil
 }
 
 // scanSegment читает сегмент целиком. У последнего сегмента оборванный хвост
@@ -505,6 +543,58 @@ func (l *Log) Segments() []SegmentInfo {
 		}
 	}
 	return out
+}
+
+// Release удаляет закрытые сегменты, все записи которых лежат на позициях не
+// дальше upTo. Сегмент с последней записью остаётся всегда: по ней буфер
+// продолжает после рестарта. Журнал на время записи границы заперт: на
+// буфере сборщика это ничего не стоит, а хранилище Release не зовёт.
+func (l *Log) Release(upTo uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	last := l.segs[len(l.segs)-1].end() - 1
+	n := 0
+	for n < len(l.segs)-1 && l.segs[n].end()-1 <= upTo && l.segs[n].end()-1 < last {
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	if err := writeFloor(l.dir, l.segs[n].first); err != nil {
+		return err
+	}
+	// Граница на диске: сегменты ниже неё освобождены, даже если удаление
+	// файла сорвётся (его доудалит Open).
+	gone := l.segs[:n]
+	l.segs = append([]*segment(nil), l.segs[n:]...)
+	var errs []error
+	for _, s := range gone {
+		if err := os.Remove(s.path); err != nil {
+			errs = append(errs, fmt.Errorf("evlog: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// writeFloor записывает нижнюю границу: временный файл, fsync, переименование,
+// fsync каталога.
+func writeFloor(dir string, floor uint64) error {
+	tmp := filepath.Join(dir, floorFile+".tmp")
+	if err := os.WriteFile(tmp, []byte(strconv.FormatUint(floor, 10)+"\n"), 0o600); err != nil {
+		return fmt.Errorf("evlog: %w", err)
+	}
+	f, err := os.Open(tmp)
+	if err != nil {
+		return fmt.Errorf("evlog: %w", err)
+	}
+	err = errors.Join(f.Sync(), f.Close())
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(dir, floorFile))
+	}
+	if err != nil {
+		return fmt.Errorf("evlog: floor: %w", err)
+	}
+	return syncDir(dir)
 }
 
 // Close дожидается записи всех принятых в очередь пачек и закрывает файл.

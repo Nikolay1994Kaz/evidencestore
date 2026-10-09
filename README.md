@@ -35,6 +35,14 @@ The demo runs these steps:
 
 See [`configs/evidencestore.example.json`](configs/evidencestore.example.json) and [`configs/collector.example.json`](configs/collector.example.json). The example time-stamps with the public DigiCert TSA (`configs/tsa/digicert`); any RFC 3161 service works if its certificates are listed in `tsa.trust`, e.g. `http://tsp.pki.gov.kz` with `configs/tsa/nca-kz/*.cer` in Kazakhstan. Tokens are verified before they enter the chain. Every source is registered by name. The name must equal the CommonName of the collector's client certificate, and the certificate can be pinned by its SHA-256 fingerprint. The source is always taken from the certificate, never from the request.
 
+### Collector
+
+`escollect` needs the store's public key pinned as `store_key` (printed by `evidencestore init`) and an `https://` server address; risky values (`http://`, `batch` above 512, a negative `flush_every`) are rejected at load instead of being silently replaced. Lines wait in an on-disk spool (`spool_dir`), each with its file position, so a crash never renumbers them. A record counts as delivered only when the store answers with a signed promise that verifies against the pinned key and names that very record; otherwise the record stays in the spool and the bad promise is kept in `promises-rejected.jsonl` as evidence against the store.
+
+The collector stops instead of handing out numbers the store already holds: when `spool_dir` was restored from an old copy (a VM snapshot, a backup), or when a second collector runs with the same certificate. The store, in turn, compares the body of every resent number with the accepted one and refuses a batch carrying another body under a taken number (`409`, `"code": "seq_conflict"`, a conflict event in the chain).
+
+With `glob`, the collector remembers how far it has read every file under the mask (`files.json`), so a shard whose modification time lands in the past (clock stepped back) is still read. Limits: with `file`, two rotations between two reads (the collector stopped for longer than the rotation period) skip the middle file; compressed or moved-away rotations (`compress` without `delaycompress`, `olddir`) turn an unread tail into a sequence gap. The collector connects to the store directly and ignores `HTTPS_PROXY`.
+
 ### Keys
 
 Month keys live in `keyring.dat`. It is encrypted under a fresh file key on every write, and only that 32-byte file key is wrapped by the root key in `roots_dir`, so the root can move into an HSM or a KMS unchanged. Three places matter:
@@ -77,11 +85,12 @@ Set `metrics_listen` (for example `127.0.0.1:9464`) to expose `/metrics` in the 
 | `time() - evidencestore_replica_last_success_timestamp_seconds > 3 × replica.every` | the copy is falling behind |
 | `evidencestore_source_silent == 1` | a source has been quiet longer than its `expect_every` |
 | `increase(evidencestore_gateway_problems_total[1h]) > 0` | a gateway journal entry was broken, out of order or badly signed |
+| `increase(evidencestore_records_conflict_total[1h]) > 0` | a collector resent a taken number with another body: its spool was restored from an old copy, or two collectors share one certificate; the batch was refused |
 | `evidencestore_keys_due > 0` | months past retention wait for a destruction request (two approvers) |
 | `evidencestore_keyring_orphan_roots > 0` | key destruction is not final until orphan roots are dealt with |
 | `rate(evidencestore_ingest_errors_total[5m]) > 0` | ingest requests are failing |
 
-Also exported: records and duplicates per source, evidence-log batches and their fsync time, the chain head.
+Also exported: records, duplicates and conflicts per source, evidence-log batches and their fsync time, the chain head.
 
 ## What is proven, and what is not
 

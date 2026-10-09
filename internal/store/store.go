@@ -52,7 +52,12 @@ var (
 	ErrInFlight       = errors.New("store: record with this seq is being written right now")
 	ErrNotFound       = errors.New("store: no such record")
 	ErrBadRecord      = errors.New("store: bad record")
-	ErrClosed         = errors.New("store: closed")
+	// ErrSeqConflict — под занятым номером пришло другое тело (или принятое
+	// тело уже стёрто, и сверить нечем): сборщик откатили к старой копии, или
+	// второй сборщик работает с тем же сертификатом. Пачка не принята
+	// целиком, событие — в цепи.
+	ErrSeqConflict = errors.New("store: seq taken by another body")
+	ErrClosed      = errors.New("store: closed")
 	// ErrEvidenceLost — цепь знает улики, которых нет в журнале: журнал
 	// потерял подтверждённые записи. Запускаться в таком состоянии нельзя.
 	ErrEvidenceLost = errors.New("store: chain covers evidence missing from the log")
@@ -162,6 +167,7 @@ type sourceState struct {
 	gwVerified uint64        // последняя позиция с вердиктом в цепи
 	gwProblems atomic.Uint64 // записи с поломкой с момента запуска
 	dups       atomic.Uint64 // повторно присланные записи с момента запуска
+	conflicts  atomic.Uint64 // номер занят другим телом, с момента запуска
 }
 
 func (s *Store) nowTime() time.Time {

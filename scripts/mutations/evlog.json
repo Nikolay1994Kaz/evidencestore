@@ -62,6 +62,36 @@
    "file": "internal/evlog/evlog.go",
    "old": "\tif pos == 0 || i == len(l.segs) || pos < l.segs[i].first {",
    "new": "\tif i == len(l.segs) {"
+  },
+  {
+   "name": "E11 Release удаляет сегмент с последней записью",
+   "file": "internal/evlog/evlog.go",
+   "old": "l.segs[n].end()-1 <= upTo && l.segs[n].end()-1 < last {",
+   "new": "l.segs[n].end()-1 <= upTo && l.segs[n].end()-1 <= last {"
+  },
+  {
+   "name": "E12 Release удаляет недоставленное",
+   "file": "internal/evlog/evlog.go",
+   "old": "l.segs[n].end()-1 <= upTo && l.segs[n].end()-1 < last {",
+   "new": "l.segs[n].first <= upTo && l.segs[n].end()-1 < last {"
+  },
+  {
+   "name": "E13 граница не пишется",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif err := writeFloor(l.dir, l.segs[n].first); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "E14 Open не доудаляет сегменты ниже границы",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tfor len(firsts) > 1 && firsts[1] <= floor {",
+   "new": "\tfor len(firsts) > 1 && false {"
+  },
+  {
+   "name": "E15 без границы журнал может начинаться не с 1",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif errors.Is(err, os.ErrNotExist) {\n\t\treturn 1, nil",
+   "new": "\tif errors.Is(err, os.ErrNotExist) {\n\t\tfirsts, _ := listSegments(dir)\n\t\tif len(firsts) > 0 {\n\t\t\treturn firsts[0], nil\n\t\t}\n\t\treturn 1, nil"
   }
  ]
 }
