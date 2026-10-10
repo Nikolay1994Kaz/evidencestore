@@ -13,6 +13,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -129,6 +131,52 @@ func writePEM(path, typ string, der []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: der}), mode)
+}
+
+// LoadCA читает УЦ, сохранённый Save (ca.crt и ca.key в dir).
+func LoadCA(dir string) (*CA, error) {
+	cert, err := readPEM(filepath.Join(dir, "ca.crt"), "CERTIFICATE")
+	if err != nil {
+		return nil, err
+	}
+	c, err := x509.ParseCertificate(cert)
+	if err != nil {
+		return nil, err
+	}
+	keyDER, err := readPEM(filepath.Join(dir, "ca.key"), "PRIVATE KEY")
+	if err != nil {
+		return nil, err
+	}
+	k, err := x509.ParsePKCS8PrivateKey(keyDER)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := k.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("pki: ca.key is not an ECDSA key")
+	}
+	return &CA{Cert: c, Key: key}, nil
+}
+
+// Save кладёт УЦ в dir: ca.crt и ca.key (0600) — чтобы выпустить
+// сертификаты под тем же УЦ позже.
+func (ca *CA) Save(dir string) error {
+	if err := WriteCert(filepath.Join(dir, "ca.crt"), ca.Cert); err != nil {
+		return err
+	}
+	return WriteKey(filepath.Join(dir, "ca.key"), ca.Key)
+}
+
+func readPEM(path, typ string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	b, _ := pem.Decode(data)
+	if b == nil || b.Type != typ {
+		return nil, fmt.Errorf("pki: %s is not a PEM %s", path, typ)
+	}
+	return b.Bytes, nil
 }
 
 func serial() *big.Int {

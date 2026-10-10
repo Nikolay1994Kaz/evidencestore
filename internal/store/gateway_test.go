@@ -261,3 +261,58 @@ func TestGatewayVerdictCatchUp(t *testing.T) {
 		}
 	}
 }
+
+// ⭐ V-01: из пакета по улике журнала гейтвея вырезали часть gateway — вердикт
+// «запись не цела» больше не виден. Такой пакет не проходит: раньше
+// «ПРОВЕРКА ПРОЙДЕНА», а -gateway-key молча не использовался.
+func TestGatewayPartCannotBeStripped(t *testing.T) {
+	key := pipelockKey(t)
+	c := newClock()
+	cfg := testConfig(t, withGateway(key))
+	s := openStore(t, cfg, c)
+	ingestLines(t, s, 1, pipelockSession(t))
+	mustStamp(t, s)
+	b, err := s.Proof("agent-gw", 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := gatewayTrust(t, s, key)
+	if r := proof.Verify(b, tr); !r.Valid() {
+		t.Fatalf("ПАРНЫЙ КОНТРОЛЬ: целый пакет:\n%s", r.Text())
+	}
+	b.Gateway = nil
+	if r := proof.Verify(b, tr); r.Valid() {
+		t.Fatalf("пакет без части gateway прошёл:\n%s", r.Text())
+	}
+}
+
+// V-02: ключ гейтвея не закреплён в реестре источников — подпись контрольной
+// точки не проверял никто. Такая точка запись не накрывает, и отчёт говорит
+// об этом прямо (раньше: «Накрыта контрольной точкой… подпись проверило
+// хранилище»).
+func TestNoKeyCheckpointDoesNotCover(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t, withGateway(""))
+	s := openStore(t, cfg, c)
+	ingestLines(t, s, 1, pipelockSession(t))
+	mustStamp(t, s)
+	b, err := s.Proof("agent-gw", 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.Verify(b, trustOf(t, s))
+	if !r.Valid() {
+		t.Fatalf("пакет:\n%s", r.Text())
+	}
+	if r.GatewayCheckpoint != nil || !r.GatewayUnsigned {
+		t.Fatalf("точка без проверенной подписи накрывает запись: %+v", r.GatewayCheckpoint)
+	}
+	text := r.Text()
+	if strings.Contains(text, "Накрыта контрольной точкой") || !strings.Contains(text, "подпись не проверял никто") {
+		t.Fatalf("отчёт:\n%s", text)
+	}
+	// С ключом у проверяющего та же точка накрывает: подпись проверена им.
+	if r := proof.Verify(b, gatewayTrust(t, s, pipelockKey(t))); !r.Valid() || r.GatewayCheckpoint == nil {
+		t.Fatalf("с ключом проверяющего:\n%s", r.Text())
+	}
+}

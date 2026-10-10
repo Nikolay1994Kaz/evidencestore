@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -104,153 +103,6 @@ func TestStatement_RoundTripsThroughJSON(t *testing.T) {
 	}
 }
 
-// ⭐TestProof_EndToEnd — доказательство включения, каким его увидит аудитор.
-func TestProof_EndToEnd(t *testing.T) {
-	dir := t.TempDir()
-	c := mustOpen(t, dir)
-	for i := 0; i < 9; i++ {
-		c.Append(leafN(i))
-	}
-	head, err := c.Flush()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	s, _ := newSigner(t)
-	st := s.Sign(head, 1, 1_753_700_000)
-
-	link, leaves, idx, err := FindLeaf(dir, LeafQuery{
-		Type: EventEvidence, Scope: "user:nikolay", Subject: leafN(4).Subject,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if idx != 4 {
-		t.Fatalf("найден лист %d, ожидался 4", idx)
-	}
-	proof, err := BuildProof(link, leaves, idx, st)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := proof.Verify(s.PublicKey()); err != nil {
-		t.Fatalf("собственное доказательство не проходит проверку: %v", err)
-	}
-
-	// Через JSON — как оно и поедет аудитору.
-	b, err := proof.JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := ParseProof(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := got.Verify(s.PublicKey()); err != nil {
-		t.Fatalf("доказательство не пережило JSON: %v", err)
-	}
-
-	// ⭐И оно НЕ раскрывает соседей: в документе один лист, а не батч.
-	if got.Leaf.Subject != leafN(4).Subject {
-		t.Fatal("в доказательстве не тот лист")
-	}
-	for i := 0; i < 9; i++ {
-		if i == 4 {
-			continue
-		}
-		if containsSub(string(b), leafN(i).Subject) {
-			t.Fatalf("в доказательстве видно чужое событие %s — приватность батча нарушена", leafN(i).Subject)
-		}
-	}
-}
-
-func TestProof_DetectsEdits(t *testing.T) {
-	dir := t.TempDir()
-	c := mustOpen(t, dir)
-	for i := 0; i < 5; i++ {
-		c.Append(leafN(i))
-	}
-	head, _ := c.Flush()
-	c.Close()
-
-	s, _ := newSigner(t)
-	st := s.Sign(head, 1, 1_753_700_000)
-	link, leaves, idx, err := FindLeaf(dir, LeafQuery{Type: EventEvidence, Scope: "user:nikolay", Subject: leafN(2).Subject})
-	if err != nil {
-		t.Fatal(err)
-	}
-	good, err := BuildProof(link, leaves, idx, st)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, mut := range []struct {
-		name  string
-		apply func(*InclusionProof)
-	}{
-		{"предмет листа", func(p *InclusionProof) { p.Leaf.Subject = "другой факт" }},
-		{"время листа", func(p *InclusionProof) { p.Leaf.UnixNano++ }},
-		{"тип листа", func(p *InclusionProof) { p.Leaf.Type = uint8(EventGap) }},
-		{"скоуп листа", func(p *InclusionProof) { p.Leaf.Scope = "user:другой" }},
-		{"корень", func(p *InclusionProof) { p.Root = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }},
-		{"шаг пути", func(p *InclusionProof) { p.Path[0].Hash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }},
-		{"сторона соседа", func(p *InclusionProof) { p.Path[0].Left = !p.Path[0].Left }},
-		{"подпись заявления", func(p *InclusionProof) { p.Statement.HeadSeq += 5 }},
-	} {
-		edited := good
-		edited.Path = append([]proofStepJSON(nil), good.Path...)
-		mut.apply(&edited)
-		if err := edited.Verify(s.PublicKey()); err == nil {
-			t.Errorf("правка «%s» не обнаружена", mut.name)
-		}
-	}
-}
-
-// TestProof_RejectsLinkNewerThanStatement — доказательство про звено, которого
-// подписанная голова ещё не покрывала, ничего не доказывает: заявление о
-// прошлом не удостоверяет будущее.
-func TestProof_RejectsLinkNewerThanStatement(t *testing.T) {
-	dir := t.TempDir()
-	c := mustOpen(t, dir)
-	c.Append(leafN(0))
-	first, _ := c.Flush()
-	c.Append(leafN(1))
-	second, _ := c.Flush()
-	c.Close()
-
-	s, _ := newSigner(t)
-	stale := s.Sign(first, 1, 1_753_700_000) // заявление на момент ПЕРВОГО звена
-
-	link, leaves, idx, err := FindLeaf(dir, LeafQuery{Type: EventEvidence, Scope: "user:nikolay", Subject: leafN(1).Subject})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if link.Seq != second.Seq {
-		t.Fatalf("найдено звено %d, ожидалось %d", link.Seq, second.Seq)
-	}
-	proof, err := BuildProof(link, leaves, idx, stale)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := proof.Verify(s.PublicKey()); err == nil {
-		t.Fatal("доказательство про звено новее подписанной головы принято")
-	}
-}
-
-func TestFindLeaf_MissReportsWindow(t *testing.T) {
-	dir := t.TempDir()
-	c := mustOpen(t, dir)
-	c.Append(leafN(0))
-	c.Flush()
-	c.Close()
-
-	if _, _, _, err := FindLeaf(dir, LeafQuery{Type: EventKeyState, Scope: "нет такого"}); err == nil {
-		t.Fatal("несуществующее событие найдено")
-	}
-}
-
 func TestSigner_RejectsCorruptKeyFile(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, SignKeyFileName), []byte("не ключ"), 0o600); err != nil {
@@ -269,8 +121,4 @@ func TestVerifyStatement_RejectsRandomKeyOfRightSize(t *testing.T) {
 	if err := VerifyStatement(st, ed25519.PublicKey(other)); err == nil {
 		t.Fatal("заявление прошло проверку случайным ключом")
 	}
-}
-
-func containsSub(hay, needle string) bool {
-	return strings.Contains(hay, needle)
 }

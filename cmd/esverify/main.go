@@ -4,16 +4,21 @@
 //
 // Проверяющему не нужен ни сервер хранилища, ни доверие к нему: только
 // пакет, заранее закреплённый открытый ключ хранилища и сертификаты TSA (у
-// НУЦ РК — root_rsa_2020.cer и nca_rsa_2022.cer). Код выхода: 0 — пакет
-// проходит, 1 — нет, 2 — неверный вызов.
+// НУЦ РК — root_rsa_2020.cer и nca_rsa_2022.cer).
+//
+// Код выхода: 0 — пакет проходит; 1 — не проходит (в том числе пакет не
+// разбирается или обещание нарушено); 2 — неверный вызов или не читается
+// файл ключа, сертификатов или обещания.
 package main
 
 import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -22,46 +27,97 @@ import (
 	"evidencestore/internal/tsa"
 )
 
-func main() {
-	proofPath := flag.String("proof", "", "proof bundle (JSON)")
-	storeKey := flag.String("store-key", "", "pinned store public key (base64) or file containing it")
-	tsaTrust := flag.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM)")
-	promisePath := flag.String("promise", "", "signed promise received by the collector (JSON), optional")
-	gatewayKey := flag.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
-	asJSON := flag.Bool("json", false, "print the report as JSON")
-	flag.Parse()
-	if *proofPath == "" || *storeKey == "" || *tsaTrust == "" {
-		fmt.Fprintln(os.Stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY]")
-		os.Exit(2)
-	}
-	data, err := os.ReadFile(*proofPath)
-	fail(err)
-	bundle, err := proof.Parse(data)
-	fail(err)
-	key, err := readKey(*storeKey)
-	fail(err)
-	trust, err := tsa.LoadTrust(*tsaTrust)
-	fail(err)
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
-	pt := proof.Trust{StoreKey: key, TSA: trust}
+const (
+	exitValid   = 0
+	exitInvalid = 1
+	exitUsage   = 2
+)
+
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("esverify", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	proofPath := fs.String("proof", "", "proof bundle (JSON)")
+	storeKey := fs.String("store-key", "", "pinned store public key (base64) or file containing it")
+	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM)")
+	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
+	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
+	allowNoTSA := fs.Bool("allow-no-tsa", false, "accept a bundle without a TSA time-stamp after the record (then only the store's own signature vouches for it)")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-allow-no-tsa] [-json]")
+		fs.PrintDefaults()
+		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage or an unreadable key, certificate or promise file")
+	}
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	usageErr := func(err error) int {
+		fmt.Fprintln(stderr, "error:", err)
+		return exitUsage
+	}
+	if *proofPath == "" || *storeKey == "" || *tsaTrust == "" {
+		fs.Usage()
+		return exitUsage
+	}
+	key, err := readKey(*storeKey)
+	if err != nil {
+		return usageErr(err)
+	}
+	trust, err := tsa.LoadTrust(*tsaTrust)
+	if err != nil {
+		return usageErr(err)
+	}
+	pt := proof.Trust{StoreKey: key, TSA: trust, AllowNoTSA: *allowNoTSA}
 	if *gatewayKey != "" {
 		raw := *gatewayKey
 		if b, err := os.ReadFile(raw); err == nil {
 			raw = string(b)
 		}
-		pt.GatewayKey, err = gateway.ParseKey(raw)
-		fail(err)
+		if pt.GatewayKey, err = gateway.ParseKey(raw); err != nil {
+			return usageErr(err)
+		}
 	}
-	report := proof.Verify(bundle, pt)
-	valid := report.Valid()
-	var promiseErr error
+	var promise *proof.Promise
 	if *promisePath != "" {
-		promiseErr = checkPromise(*promisePath, key, report, bundle)
-		valid = valid && promiseErr == nil
+		data, err := os.ReadFile(*promisePath)
+		if err != nil {
+			return usageErr(fmt.Errorf("promise file: %w", err))
+		}
+		promise = new(proof.Promise)
+		if err := json.Unmarshal(data, promise); err != nil {
+			return usageErr(fmt.Errorf("promise file %s: %w", *promisePath, err))
+		}
+	}
+	data, err := os.ReadFile(*proofPath)
+	if err != nil {
+		return usageErr(err)
 	}
 
+	// Пакет, который не разбирается, — не неверный вызов, а провал проверки:
+	// отчёт об этом печатается так же, в том числе в JSON.
+	report := proof.Report{}
+	bundle, err := proof.Parse(data)
+	if err != nil {
+		report.Checks = []proof.Check{{Name: "пакет разбирается", Detail: err.Error()}}
+	} else {
+		report = proof.Verify(bundle, pt)
+		if promise != nil {
+			// Обещание — часть вердикта: шапка отчёта не может говорить
+			// «пройдена», когда обещание нарушено.
+			perr := checkPromise(*promise, key, report, bundle)
+			c := proof.Check{Name: "обещание при приёме выполнено: улика в цепи та же и вовремя", OK: perr == nil}
+			if perr != nil {
+				c.Detail = perr.Error()
+			}
+			report.Checks = append(report.Checks, c)
+		}
+	}
+	valid := report.Valid()
+
 	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", " ")
 		out := map[string]any{"valid": valid, "checks": report.Checks, "notes": report.Notes(),
 			"source": report.Header.Source, "seq": report.Header.Seq, "received_at": report.Header.ReceivedAt,
@@ -70,34 +126,17 @@ func main() {
 			out["gateway"] = report.Gateway
 			out["gateway_checkpoint"] = report.GatewayCheckpoint
 		}
-		if promiseErr != nil {
-			out["promise_error"] = promiseErr.Error()
-		}
 		enc.Encode(out)
 	} else {
-		fmt.Print(report.Text())
-		if *promisePath != "" {
-			if promiseErr != nil {
-				fmt.Printf("\n✘ обещание при приёме нарушено: %v\n", promiseErr)
-			} else {
-				fmt.Println("\n✔ обещание при приёме выполнено: улика в цепи та же и вовремя")
-			}
-		}
+		fmt.Fprint(stdout, report.Text())
 	}
 	if !valid {
-		os.Exit(1)
+		return exitInvalid
 	}
+	return exitValid
 }
 
-func checkPromise(path string, key ed25519.PublicKey, r proof.Report, b proof.Bundle) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var p proof.Promise
-	if err := json.Unmarshal(data, &p); err != nil {
-		return err
-	}
+func checkPromise(p proof.Promise, key ed25519.PublicKey, r proof.Report, b proof.Bundle) error {
 	if err := proof.VerifyPromise(p, key); err != nil {
 		return err
 	}
@@ -116,14 +155,7 @@ func readKey(v string) (ed25519.PublicKey, error) {
 	}
 	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(v, "="))
 	if err != nil || len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("store key must be a base64 Ed25519 public key")
+		return nil, errors.New("store key must be a base64 Ed25519 public key")
 	}
 	return ed25519.PublicKey(raw), nil
-}
-
-func fail(err error) {
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(2)
-	}
 }

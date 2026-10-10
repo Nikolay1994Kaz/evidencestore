@@ -27,31 +27,45 @@ The demo runs these steps:
 
 | Binary | Role |
 |---|---|
-| `evidencestore` | the store: `init`, `serve`, plus operator commands over a local admin socket (`status`, `stamp`, `proof`, `keys …`, `dev-pki`) |
+| `evidencestore` | the store: `init`, `serve`, plus operator commands over a local admin socket (`status`, `stamp`, `proof`, `keys …`, `sources bind`, `dev-pki`) |
 | `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
-| `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven |
+| `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; exit code 0 — verified, 1 — not verified (including an unparsable bundle or a broken promise), 2 — bad usage or an unreadable key, certificate or promise file |
 
 ## Configuration
 
 See [`configs/evidencestore.example.json`](configs/evidencestore.example.json) and [`configs/collector.example.json`](configs/collector.example.json). The example time-stamps with the public DigiCert TSA (`configs/tsa/digicert`); any RFC 3161 service works if its certificates are listed in `tsa.trust`, e.g. `http://tsp.pki.gov.kz` with `configs/tsa/nca-kz/*.cer` in Kazakhstan. Tokens are verified before they enter the chain. Every source is registered by name. The name must equal the CommonName of the collector's client certificate, and the certificate can be pinned by its SHA-256 fingerprint. The source is always taken from the certificate, never from the request.
 
+Risky values are rejected at start instead of being silently replaced: non-positive periods, `keys.min_wait` under one hour, `roots_dir` and `data_dir` nested in either direction, a `content_type` over 255 bytes, an empty `listen`. A demo stand that must destroy a key within minutes sets `"demo": true`; never in production, where it leaves seconds to cancel a destruction. Without a `tsa` section the store starts with a warning: its proofs then carry no time-stamp, and `esverify` rejects them unless told `-allow-no-tsa`.
+
+One process per `data_dir`: `serve`, `init` and `restore` take a lock on `data_dir/LOCK` before writing anything.
+
 ### Collector
 
 `escollect` needs the store's public key pinned as `store_key` (printed by `evidencestore init`) and an `https://` server address; risky values (`http://`, `batch` above 512, a negative `flush_every`) are rejected at load instead of being silently replaced. Lines wait in an on-disk spool (`spool_dir`), each with its file position, so a crash never renumbers them. A record counts as delivered only when the store answers with a signed promise that verifies against the pinned key and names that very record; otherwise the record stays in the spool and the bad promise is kept in `promises-rejected.jsonl` as evidence against the store.
 
-The collector stops instead of handing out numbers the store already holds: when `spool_dir` was restored from an old copy (a VM snapshot, a backup), or when a second collector runs with the same certificate. The store, in turn, compares the body of every resent number with the accepted one and refuses a batch carrying another body under a taken number (`409`, `"code": "seq_conflict"`, a conflict event in the chain).
+The collector stops instead of handing out numbers the store already holds: when `spool_dir` was restored from an old copy (a VM snapshot, a backup), or when a copy of the same installation runs next to it. The store, in turn, compares the body of every resent number with the accepted one and refuses a batch carrying another body under a taken number (`409`, `"code": "seq_conflict"`, a conflict event in the chain). It also refuses a resend it cannot compare, because the accepted body sits under a month key pending destruction (cancelling the destruction lets the resend through) or already destroyed; the store names the reason, and the collector logs it as is.
 
-With `glob`, the collector remembers how far it has read every file under the mask (`files.json`), so a shard whose modification time lands in the past (clock stepped back) is still read. Limits: with `file`, two rotations between two reads (the collector stopped for longer than the rotation period) skip the middle file; compressed or moved-away rotations (`compress` without `delaycompress`, `olddir`) turn an unread tail into a sequence gap. The collector connects to the store directly and ignores `HTTPS_PROXY`.
+Every collector installation has an epoch: a random id kept in `spool_dir/epoch.json` and sent with every request. The store binds a source to the first installation it hears from (an event in the chain) and refuses any other installation that uses the source certificate, already at start, before it reads a line (`409`, `"code": "epoch_mismatch"`). A legitimate reinstall (`spool_dir` lost or emptied) is accepted by the operator with `evidencestore sources bind -source S -epoch E`; the refusal names the command, and the previous installation is refused from then on. Copies of one installation (a VM snapshot, a copied `spool_dir`) share the epoch; the number checks above catch them.
+
+If `spool_dir` is lost while `state.json` or `files.json` survived, the collector refuses to start: restore `spool_dir` from a backup. Emptying it starts over as a new installation (bind it as above) from the store's last number and skips lines that were not delivered; with `from_start` the whole log is delivered again under new numbers, so the store holds duplicates.
+
+Upgrade the store before the collectors: collectors of this version expect a signed promise on a resend too, and older stores did not give one. An older collector sends no epoch; the store accepts it until the source is bound to an installation.
+
+The current file is held open. After a rotation the old file is read through that descriptor until it has been quiet for 10 seconds — applications keep writing into the rotated file until they reopen their log — and only then the collector takes a last line without a newline and moves on; a deleted file is read to its end the same way. A file truncated or replaced in place, or a rotated file that is gone after a collector restart, costs one sequence number: the store records the gap in the chain, so the loss is visible. A missing log file or an empty glob is logged once a minute.
+
+With `glob`, the collector remembers how far it has read every file under the mask (`files.json`), so a shard whose modification time lands in the past (clock stepped back) is still read. Limits: with `file`, two rotations between two reads (the collector stopped for longer than the rotation period) skip the middle file; after a restart, a compressed or moved-away rotation (`compress` without `delaycompress`, `olddir`) is not found, and its unread tail becomes a sequence gap. The collector connects to the store directly and ignores `HTTPS_PROXY`.
 
 ### Keys
 
 Month keys live in `keyring.dat`. It is encrypted under a fresh file key on every write, and only that 32-byte file key is wrapped by the root key in `roots_dir`, so the root can move into an HSM or a KMS unchanged. Three places matter:
 
 - `keys.backup_dir` receives a copy of `keyring.dat` after every change. A new month key is not used until that copy has landed, so losing `data_dir` never loses a key that sealed a record. The copy is useless without the root.
-- `keys.roots_mirror_dir` is a second copy of the roots on another disk or machine. Every root is written to both places and destroyed in both. Without a mirror, losing `roots_dir` makes every stored body unreadable for good; the chain and the proofs survive.
+- `keys.roots_mirror_dir` is a second copy of the roots on another disk or machine. Every root is written to both places and destroyed in both; a missing copy of the current root is restored at start and every minute, and a damaged copy is bypassed when reading. A missing directory is not created (it looks like an unmounted disk): create it yourself. An unreachable mirror does not stop the store, but destruction is not final until both directories can be listed (`roots_unreachable` in `status`). Without a mirror, losing `roots_dir` makes every stored body unreadable for good; the chain and the proofs survive.
 - Nothing else may hold a copy of `roots_dir` or of the mirror. An old root copy plus an old `keyring.dat` still opens a destroyed key, so destruction is only as final as your control over those copies. The config check rejects layouts where one directory would hold both `keyring.dat` (or its backup) and a root.
 
-The waiting period before a key is destroyed is measured by the store clock and by a fresh TSA time-stamp, whichever is earlier: moving the host clock forward does not shorten it, and without a time-stamp destruction waits. The time-stamp lands in the chain before the destruction receipt.
+The waiting period before a key is destroyed (at least `keys.min_wait`, which outside a demo stand is one hour or more, and at most ten years) starts at a TSA time-stamp taken with the request, and it ends by the store clock and by a fresh TSA time-stamp, whichever is earlier: a host clock that is behind at request time or moved forward later does not shorten it, and without a time-stamp destruction waits. The time-stamp lands in the chain before the destruction receipt.
+
+`init` refuses to run when `keys.backup_dir` already holds `keyring.dat` or `sign.key`: that is what a store that lost `data_dir` looks like, and a fresh keyring would overwrite the keys of every month. Put those files back into `data_dir` instead. The backup also remembers the generation of `keyring.dat`, so an older file (a disk rolled back) never overwrites a newer backup.
 
 A key state change enters the chain only after it has reached `keys.backup_dir`. If the backup is down, the change still takes effect, the operator gets an error saying the copy is pending, and the store retries every minute; `status` shows `keyring_backup_pending` meanwhile.
 
@@ -59,7 +73,7 @@ A key state change enters the chain only after it has reached `keys.backup_dir`.
 
 ### Copy and restore
 
-With `replica.url` set (`s3://bucket/prefix?endpoint=…&region=…` or `file:///path`), the evidence log and the chain are copied in immutable chunks, together with signed chain heads. Nothing is ever deleted from the copy, and keys never go there. `evidencestore restore` rebuilds the log and the chain from the copy and verifies them against the last signed head. `keyring.dat` and `sign.key` come back from `keys.backup_dir`, the roots from `keys.roots_mirror_dir`. On start the store checks that every record in the log is sealed with a key that `keyring.dat` knows: a wrong or too old `keyring.dat` stops the start instead of leaving bodies unreadable.
+With `replica.url` set (`s3://bucket/prefix?endpoint=…&region=…` or `file:///path`), the evidence log and the chain are copied in immutable chunks, together with signed chain heads. Nothing is ever deleted from the copy, and keys never go there. `evidencestore restore` rebuilds the log and the chain from the copy and verifies them against the latest signed head whose link the copy holds. `keyring.dat` and `sign.key` come back from `keys.backup_dir` (the store copies `sign.key` there on every start, and refuses to start with a chain but without `sign.key`), the roots from `keys.roots_mirror_dir`. On start the store checks that every record in the log is sealed with a key that `keyring.dat` knows: a wrong or too old `keyring.dat` stops the start instead of leaving bodies unreadable.
 
 ### Gateway journals (Pipelock)
 
@@ -79,15 +93,19 @@ Set `metrics_listen` (for example `127.0.0.1:9464`) to expose `/metrics` in the 
 
 | Condition | Meaning |
 |---|---|
-| `evidencestore_log_failed == 1` | the evidence log stopped after a write or fsync error; intake is refused until a human looks |
+| `evidencestore_log_failed == 1` | the evidence log or the chain stopped after a write or fsync error; intake is refused until a human looks (`evidencestore_chain_failed` tells which) |
+| `increase(evidencestore_receive_clock_capped_total[1h]) > 0` | the host clock runs ahead of TSA time; receive times follow the last time-stamp and the monotonic clock |
+| `evidencestore_receive_time_ahead_seconds > 60` | the log holds receive times ahead of the host clock (an earlier clock jump) |
 | `evidencestore_keyring_backup_pending == 1` for 10 minutes | `keyring.dat` changes are not reaching `keys.backup_dir`; new month keys are not issued |
 | `time() - evidencestore_tsa_last_stamp_timestamp_seconds > 2 × tsa.every` | time-stamps are not landing |
 | `time() - evidencestore_replica_last_success_timestamp_seconds > 3 × replica.every` | the copy is falling behind |
 | `evidencestore_source_silent == 1` | a source has been quiet longer than its `expect_every` |
 | `increase(evidencestore_gateway_problems_total[1h]) > 0` | a gateway journal entry was broken, out of order or badly signed |
-| `increase(evidencestore_records_conflict_total[1h]) > 0` | a collector resent a taken number with another body: its spool was restored from an old copy, or two collectors share one certificate; the batch was refused |
+| `increase(evidencestore_epoch_refused_total[1h]) > 0` | another collector installation used the source certificate and was refused: an impostor, or a reinstall waiting for `sources bind` |
+| `increase(evidencestore_records_conflict_total[1h]) > 0` | a resend was refused: another body under a taken number (a spool restored from an old copy, or two collectors share one certificate), or a body that cannot be compared (month key pending destruction or destroyed); the reason is in the chain event and in the collector log |
 | `evidencestore_keys_due > 0` | months past retention wait for a destruction request (two approvers) |
 | `evidencestore_keyring_orphan_roots > 0` | key destruction is not final until orphan roots are dealt with |
+| `evidencestore_keyring_roots_unreachable == 1` | the root directories cannot be listed (`keys.roots_mirror_dir` down?); key destruction is not final meanwhile |
 | `rate(evidencestore_ingest_errors_total[5m]) > 0` | ingest requests are failing |
 
 Also exported: records, duplicates and conflicts per source, evidence-log batches and their fsync time, the chain head.
@@ -100,8 +118,10 @@ Proven offline:
 - they have not been altered since;
 - they entered the chain between the two time-stamps T1 and T2;
 - the store committed to including them by the signed deadline it gave the collector;
-- with the record key: the body as received;
-- for gateway journals: the body is the gateway's own entry, and a checkpoint signed by the gateway covers it.
+- with the record key: the body as received; the key is bound to the record's digest, so the store cannot show two auditors two different bodies;
+- for gateway journals: the body is the gateway's own entry, and a checkpoint signed by the gateway covers it — when that signature was checked by the store with the pinned `gateway_key` or by you with `-gateway-key`. A gateway record whose bundle lacks the gateway part does not verify.
+
+T2 is required: a bundle without a time-stamp after the record only carries the store's own signature, and whoever holds `sign.key` can make up a record with any date. `esverify` rejects such a bundle unless told `-allow-no-tsa`. The verdict is printed first and last, and control characters in the body are escaped, so a body cannot paint a false verdict on the auditor's screen.
 
 Not proven:
 
@@ -116,7 +136,7 @@ Root on the store host can delete files. After the next time-stamp, deletion or 
 ```sh
 go build ./... && go vet ./... && go test -race ./...
 python3 scripts/mutate.py keyring     # mutation testing: every injected bug must fail a test
-                                      # sets: keyring, evlog, tsa, store, edge, auditchain, gateway
+                                      # sets: keyring, evlog, tsa, store, edge, auditchain, gateway, config
 ```
 
 Design notes in Russian: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (code map), [`docs/DECISIONS.md`](docs/DECISIONS.md) (decisions and open questions), [`docs/CONCEPT.md`](docs/CONCEPT.md), [`docs/PROVENANCE.md`](docs/PROVENANCE.md).

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Путь сокета длиннее предела ловится при проверке конфига, а не
@@ -78,5 +79,48 @@ func TestKeyDirsDoNotNest(t *testing.T) {
 	// Соседи с общим префиксом имени — не вложение.
 	if err := cfg(func(c *Config) { c.Keys.BackupDir = c.RootsDir + "-backup" }); err != nil {
 		t.Fatalf("соседний каталог с общим префиксом принят за вложенный: %v", err)
+	}
+}
+
+// S-10, K-07, S-09, S-11: опасные значения — ошибка проверки, а не беда
+// посреди работы: корни внутри данных (или данные внутри корней, или «..roots»
+// внутри data_dir), отрицательные и нулевые сроки, слишком короткое окно
+// отмены уничтожения вне стенда, тип содержимого длиннее предела улики.
+func TestValidateRejectsDangerousValues(t *testing.T) {
+	base := t.TempDir()
+	good := func() *Config {
+		c := &Config{DataDir: filepath.Join(base, "data"), RootsDir: filepath.Join(base, "roots"),
+			Sources: []Source{{Name: "abs-core", ContentType: "syslog", CertSHA256: strings.Repeat("AB", 32)}}}
+		c.Defaults()
+		return c
+	}
+	c := good()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Sources[0].CertSHA256 != strings.Repeat("ab", 32) {
+		t.Fatalf("отпечаток не приведён к нижнему регистру: %s", c.Sources[0].CertSHA256)
+	}
+	for name, spoil := range map[string]func(*Config){
+		"корни внутри данных":   func(c *Config) { c.RootsDir = filepath.Join(c.DataDir, "roots") },
+		"данные внутри корней":  func(c *Config) { c.DataDir = filepath.Join(c.RootsDir, "data") },
+		"..roots внутри данных": func(c *Config) { c.RootsDir = filepath.Join(c.DataDir, "..roots") },
+		"min_wait -24h":         func(c *Config) { c.Keys.MinWait = Duration(-24 * time.Hour) },
+		"min_wait 1s":           func(c *Config) { c.Keys.MinWait = Duration(time.Second) },
+		"tsa.every -1m":         func(c *Config) { c.TSA.Every = Duration(-time.Minute) },
+		"replica.every -1m":     func(c *Config) { c.Replica.Every = Duration(-time.Minute) },
+		"expect_every -1s":      func(c *Config) { c.Sources[0].ExpectEvery = Duration(-time.Second) },
+		"content_type 256 байт": func(c *Config) { c.Sources[0].ContentType = strings.Repeat("x", 256) },
+	} {
+		c := good()
+		spoil(c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: принято", name)
+		}
+	}
+	c = good()
+	c.Keys.MinWait, c.Demo = Duration(time.Second), true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("min_wait 1s на стенде: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package auditchain
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -292,6 +293,10 @@ func TestCarrier_TornTailIsNotTamper(t *testing.T) {
 	}
 	if c2.Head() != head {
 		t.Fatalf("оборванный хвост сдвинул голову: %+v", c2.Head())
+	}
+	// Отрезанное не уничтожено, а отложено рядом.
+	if aside, err := os.ReadFile(c2.Recovery().TornTailFile); err != nil || !bytes.Equal(aside, []byte{0, 0, 1, 44, 7, 7, 7}) {
+		t.Fatalf("хвост не отложен: %v, %v", aside, err)
 	}
 }
 
@@ -817,5 +822,123 @@ func TestReadersDoNotTruncate(t *testing.T) {
 	}
 	if after := sizes(); after != before {
 		t.Fatalf("читатель изменил файлы: %v → %v", before, after)
+	}
+}
+
+// ⭐TestCarrier_FailureLatches — после отказа любой фазы носитель не пишет
+// больше ничего, даже когда диск ожил: повтор дописал бы листья и звено
+// второй раз (голова «seq 1, ожидался 2», хранилище не стартует). Что на
+// диске, разбирает Open после рестарта — и разбирает без дублей.
+func TestCarrier_FailureLatches(t *testing.T) {
+	for _, failAt := range []string{"leaves", "link", "head"} {
+		t.Run(failAt, func(t *testing.T) {
+			dir := t.TempDir()
+			c := mustOpen(t, dir)
+			c.Append(leafN(0))
+			if _, err := c.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			c.beforeWrite = func(phase string) error {
+				if phase == failAt {
+					return errBoom
+				}
+				return nil
+			}
+			c.Append(leafN(1))
+			if _, err := c.Flush(); !errors.Is(err, errBoom) {
+				t.Fatalf("отказ не сработал: %v", err)
+			}
+			c.beforeWrite = nil // диск «ожил»
+			c.Append(leafN(2))
+			if _, err := c.Flush(); err == nil || c.Failed() == nil {
+				t.Fatal("после отказа носитель снова пишет")
+			}
+			if err := c.Close(); err == nil {
+				t.Fatal("Close после отказа отчитался об успехе")
+			}
+
+			c2 := mustOpen(t, dir)
+			c2.Append(leafN(3))
+			head, err := c2.Flush()
+			if err != nil {
+				t.Fatal(err)
+			}
+			c2.Close()
+			verifyOnDisk(t, dir, head)
+			links, err := ReadChain(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var leaves int
+			if err := ScanVerifiedLeaves(dir, links, func(uint64, Leaf) error { leaves++; return nil }); err != nil {
+				t.Fatalf("листья не сходятся со звеньями: %v", err)
+			}
+			if leaves > 3 {
+				t.Fatalf("листьев %d: записаны повторно", leaves)
+			}
+		})
+	}
+}
+
+// TestCarrier_FailedOpenWritesNothing — Open, споткнувшийся о негодный
+// непокрытый лист, закрывается без флаша: раньше он дописывал звено над
+// уже поднятыми листьями, и корень не сходился.
+func TestCarrier_FailedOpenWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir)
+	c.Append(leafN(0))
+	if _, err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	// Отказ между листьями и звеном: два целых листа без корня, третий —
+	// целый кадр, но не лист.
+	f, err := os.OpenFile(leafPath(dir, 0), os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write(frameLeaf(leafN(1)))
+	f.Write(frameLeaf(leafN(2)))
+	f.Write(frame([]byte{0x7f, 1, 2, 3}))
+	f.Close()
+	before, _ := os.ReadFile(filepath.Join(dir, chainFileName))
+	if _, err := Open(dir); err == nil {
+		t.Fatal("негодный лист принят")
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, chainFileName)); !bytes.Equal(after, before) {
+		t.Fatalf("неудачный Open дописал цепь: %d байт, было %d", len(after), len(before))
+	}
+}
+
+// TestCarrier_DamagedHeadSlotIsReported — слот головы, в который писали, не
+// сходится с CRC: Recovery говорит об этом (так выглядит и отказ посреди
+// записи головы, и отрезанное звено с испорченным слотом). Свежий файл из
+// нулей — не порча.
+func TestCarrier_DamagedHeadSlotIsReported(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir)
+	if c.Recovery().HeadSlotDamaged {
+		t.Fatal("свежая голова из нулей названа испорченной")
+	}
+	for i := 0; i < 2; i++ {
+		c.Append(leafN(i))
+		if _, err := c.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Close()
+	c2 := mustOpen(t, dir)
+	if c2.Recovery().HeadSlotDamaged {
+		t.Fatal("целые слоты названы испорченными")
+	}
+	c2.Close()
+	hp := filepath.Join(dir, headFileName)
+	data, _ := os.ReadFile(hp)
+	data[3] ^= 0xff // слот seq 2 (чётный — первый)
+	os.WriteFile(hp, data, 0o600)
+	c3 := mustOpen(t, dir)
+	defer c3.Close()
+	if !c3.Recovery().HeadSlotDamaged {
+		t.Fatal("испорченный слот головы не замечен")
 	}
 }

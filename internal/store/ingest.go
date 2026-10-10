@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"time"
 
 	"evidencestore/internal/auditchain"
@@ -135,20 +138,20 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	}
 	// 1а. Повторы номера: то же ли тело. Конфликт отвергает пачку целиком:
 	// иначе записи второго сборщика легли бы вперемешку с записями первого.
-	var conflicts []uint64
+	var conflicts []string
 	for _, i := range dups {
-		conflict, err := s.checkDuplicate(st, recs[i], &results[i])
+		reason, err := s.checkDuplicate(st, recs[i], &results[i])
 		if err != nil {
 			release()
 			return nil, err
 		}
-		if conflict {
-			conflicts = append(conflicts, recs[i].Seq)
+		if reason != "" {
+			conflicts = append(conflicts, fmt.Sprintf("seq %d: %s", recs[i].Seq, reason))
 		}
 	}
 	if len(conflicts) > 0 {
 		release()
-		return nil, fmt.Errorf("%w: seq %v of %q", ErrSeqConflict, conflicts, source)
+		return nil, fmt.Errorf("%w: source %q: %s", ErrSeqConflict, source, strings.Join(conflicts, "; "))
 	}
 	if len(news) == 0 {
 		return results, nil
@@ -222,39 +225,41 @@ func (s *Store) promise(h evidence.Header, pos uint64, digest [32]byte) proof.Pr
 
 // checkDuplicate — номер уже занят (позиция — в res). Тело сверяется с
 // принятым: оно вскрывается ключом месяца. То же тело — «duplicate» с
-// обещанием. Другое тело (или стёртое: сверить нечем) — конфликт, событие в
-// цепи.
-func (s *Store) checkDuplicate(st *sourceState, r Incoming, res *Result) (conflict bool, _ error) {
+// обещанием, reason пуст. Иначе reason — почему повтор не принят: другое
+// тело (сборщик откатили к старой копии или второй сборщик с тем же
+// сертификатом) или тело нечем сверить (ключ месяца ждёт уничтожения или
+// уничтожен); событие — в цепи.
+func (s *Store) checkDuplicate(st *sourceState, r Incoming, res *Result) (reason string, _ error) {
 	data, err := s.evlog.Read(res.Position)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	sealed, err := evidence.Unmarshal(data)
 	if err != nil {
-		return false, fmt.Errorf("evidence log position %d: %w", res.Position, err)
+		return "", fmt.Errorf("evidence log position %d: %w", res.Position, err)
 	}
 	res.Digest = evidence.Digest(data)
 	body, err := sealed.Open(s.keys)
-	var reason string
 	switch {
 	case err == nil && bytes.Equal(body, r.Body):
 		res.Status = StatusDuplicate
 		p := s.promise(sealed.Header, res.Position, res.Digest)
 		res.Promise = &p
 		st.dups.Add(1)
-		return false, nil
+		return "", nil
 	case err == nil:
-		reason = "another body under a taken seq"
-	case errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):
-		reason = "the accepted body is erased, nothing to compare with"
+		reason = "another body under a taken seq: the collector was rolled back to an old copy, or another collector uses the source certificate"
+	case errors.Is(err, keyring.ErrKeyPending):
+		reason = "the accepted body is sealed under a month key pending destruction and cannot be compared (cancelling the destruction lets the resend through)"
+	case errors.Is(err, keyring.ErrKeyDestroyed):
+		reason = "the accepted body is erased (month key destroyed) and cannot be compared"
 	default:
-		return false, err
+		return "", err
 	}
 	st.conflicts.Add(1)
-	s.log.Error("seq conflict: the collector was rolled back to an old copy, or another collector uses the source certificate",
-		"source", sealed.Source, "seq", r.Seq, "position", res.Position, "reason", reason)
+	s.log.Error("seq conflict", "source", sealed.Source, "seq", r.Seq, "position", res.Position, "reason", reason)
 	s.appendJSONEvent(auditchain.EventConflict, sealed.Source, "", seqConflict{Seq: r.Seq, Position: res.Position, Reason: reason})
-	return true, nil
+	return reason, nil
 }
 
 // seqConflict — событие в цепи: под занятым номером пришло другое тело.
@@ -295,28 +300,61 @@ func (s *Store) indexLocked(st *sourceState, h evidence.Header, pos uint64) {
 	if h.Seq > st.maxSeq {
 		// Пропуск — номера между прежним максимумом и этим, которых нет и
 		// которые не пишутся прямо сейчас другим запросом.
-		lo, hi := st.maxSeq+1, h.Seq-1
+		st.pendingGaps = append(st.pendingGaps, st.gapsIn(st.maxSeq+1, h.Seq-1)...)
+		st.maxSeq = h.Seq
+	}
+}
+
+// gapsIn — отрезки номеров из [lo, hi], которых нет в индексе и которые не
+// пишутся сейчас. Огромный прыжок — одним отрезком, без перебора.
+func (st *sourceState) gapsIn(lo, hi uint64) []gap {
+	switch {
+	case lo > hi:
+		return nil
+	case hi-lo+1 > maxGapScan:
+		return []gap{{lo, hi}}
+	}
+	var out []gap
+	var from uint64
+	for q := lo; q <= hi; q++ {
+		missing := st.seqs.get(q) == 0 && !st.inflight[q]
 		switch {
-		case lo > hi:
-		case hi-lo+1 > maxGapScan:
-			st.pendingGaps = append(st.pendingGaps, gap{lo, hi}) // огромный прыжок: целиком
-		default:
-			var from uint64
-			for q := lo; q <= hi; q++ {
-				missing := st.seqs.get(q) == 0 && !st.inflight[q]
-				switch {
-				case missing && from == 0:
-					from = q
-				case !missing && from != 0:
-					st.pendingGaps = append(st.pendingGaps, gap{from, q - 1})
-					from = 0
-				}
-			}
-			if from != 0 {
-				st.pendingGaps = append(st.pendingGaps, gap{from, hi})
+		case missing && from == 0:
+			from = q
+		case !missing && from != 0:
+			out = append(out, gap{from, q - 1})
+			from = 0
+		}
+	}
+	if from != 0 {
+		out = append(out, gap{from, hi})
+	}
+	return out
+}
+
+// announceTailGaps объявляет пропуски у улик, которые не успели лечь в цепь
+// до падения: событие о пропуске жило в памяти и пропало вместе с
+// процессом. Считается по индексу после подъёма всего журнала: номер, которого
+// нет между последним номером источника в цепи и наибольшим принятым, —
+// пропуск.
+func (s *Store) announceTailGaps(chainedMax map[string]uint64, tailSources map[string]bool) {
+	type ev struct {
+		source string
+		g      gap
+	}
+	var evs []ev
+	s.mu.Lock()
+	for _, name := range slices.Sorted(maps.Keys(tailSources)) {
+		if st := s.sources[name]; st != nil {
+			for _, g := range st.gapsIn(chainedMax[name]+1, st.maxSeq) {
+				evs = append(evs, ev{name, g})
 			}
 		}
-		st.maxSeq = h.Seq
+	}
+	s.mu.Unlock()
+	for _, e := range evs {
+		s.appendJSONEvent(auditchain.EventGap, e.source, "", e.g)
+		s.log.Warn("sequence gap (found on restart)", "source", e.source, "from", e.g.From, "to", e.g.To)
 	}
 }
 
@@ -342,32 +380,53 @@ func (s *Store) LastSeq(source string) (uint64, error) {
 }
 
 // seqIndex — номер у источника → позиция в журнале. Номера идут подряд,
-// поэтому хранятся плотными кусками, а не картой: 8 байт на запись.
+// поэтому хранятся плотными кусками по 4096: 8 байт на запись. Кусок
+// начинается картой и становится массивом, когда в нём набирается
+// seqDenseAt номеров: номера вразброс (1, 4097, 8193, …) не стоят по 32 КиБ.
 type seqIndex struct {
-	chunks map[uint64]*[seqChunk]uint64
+	chunks map[uint64]*seqChunkIdx
 }
 
-const seqChunk = 4096
+type seqChunkIdx struct {
+	dense  *[seqChunk]uint64
+	sparse map[uint16]uint64
+}
+
+const (
+	seqChunk   = 4096
+	seqDenseAt = 256
+)
 
 func (x *seqIndex) get(seq uint64) uint64 {
-	if x.chunks == nil {
-		return 0
-	}
 	c := x.chunks[seq/seqChunk]
-	if c == nil {
+	switch {
+	case c == nil:
 		return 0
+	case c.dense != nil:
+		return c.dense[seq%seqChunk]
 	}
-	return c[seq%seqChunk]
+	return c.sparse[uint16(seq%seqChunk)]
 }
 
 func (x *seqIndex) set(seq, pos uint64) {
 	if x.chunks == nil {
-		x.chunks = map[uint64]*[seqChunk]uint64{}
+		x.chunks = map[uint64]*seqChunkIdx{}
 	}
 	c := x.chunks[seq/seqChunk]
 	if c == nil {
-		c = new([seqChunk]uint64)
+		c = &seqChunkIdx{sparse: map[uint16]uint64{}}
 		x.chunks[seq/seqChunk] = c
 	}
-	c[seq%seqChunk] = pos
+	if c.dense != nil {
+		c.dense[seq%seqChunk] = pos
+		return
+	}
+	c.sparse[uint16(seq%seqChunk)] = pos
+	if len(c.sparse) >= seqDenseAt {
+		c.dense = new([seqChunk]uint64)
+		for i, p := range c.sparse {
+			c.dense[i] = p
+		}
+		c.sparse = nil
+	}
 }

@@ -99,10 +99,21 @@ func (k *Keyring) Deactivate(scopes ...string) error {
 	return err
 }
 
-// ScheduleDestroy — первый шаг уничтожения: Deactivated → Pending. Ключ
-// сразу перестаёт работать, но до срока уничтожение можно отменить. Срок не
-// короче Options.MinWait.
+// MaxWait — предел срока ожидания: дальше время в файле не поместится в
+// unix-нс, а срок «через 240 лет» после рестарта читался бы как 1681 год, и
+// ключ уничтожался бы сразу.
+const MaxWait = 10 * 365 * 24 * time.Hour
+
+// ScheduleDestroy — ScheduleDestroyFrom от часов кейринга.
 func (k *Keyring) ScheduleDestroy(scope string, wait time.Duration, approvals []Approval) (KeyInfo, error) {
+	return k.ScheduleDestroyFrom(scope, k.now(), wait, approvals)
+}
+
+// ScheduleDestroyFrom — первый шаг уничтожения: Deactivated → Pending. Ключ
+// сразу перестаёт работать, но до срока from + wait уничтожение можно
+// отменить. from — время, которому верят (движок берёт его от метки TSA).
+// Срок не короче Options.MinWait и не длиннее MaxWait.
+func (k *Keyring) ScheduleDestroyFrom(scope string, from time.Time, wait time.Duration, approvals []Approval) (KeyInfo, error) {
 	k.wmu.Lock()
 	defer k.wmu.Unlock()
 	k.mu.Lock()
@@ -120,12 +131,15 @@ func (k *Keyring) ScheduleDestroy(scope string, wait time.Duration, approvals []
 	if wait < k.opt.MinWait {
 		return e.info(k.safe), fmt.Errorf("%w: wait %v is shorter than minimum %v", ErrBadState, wait, k.opt.MinWait)
 	}
+	if wait > MaxWait {
+		return e.info(k.safe), fmt.Errorf("%w: wait %v is longer than maximum %v", ErrBadState, wait, MaxWait)
+	}
 	who, err := k.approve(OpScheduleDestroy, e, approvals)
 	if err != nil {
 		return e.info(k.safe), err
 	}
 	prev := *e
-	e.state, e.destroyAfter, e.approvals, e.changed = Pending, k.now().Add(wait), who, k.gen+1
+	e.state, e.destroyAfter, e.approvals, e.changed = Pending, from.Add(wait), who, k.gen+1
 	committed, err := k.persistLocked()
 	if !committed {
 		*e = prev

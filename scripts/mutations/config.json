@@ -1,0 +1,49 @@
+{
+ "packages": [
+  "./internal/config/"
+ ],
+ "mutations": [
+  {
+   "name": "F1 вложенность каталогов проверяется только в одну сторону",
+   "file": "internal/config/config.go",
+   "old": "\treturn inside(a, b) || inside(b, a)",
+   "new": "\treturn inside(a, b)"
+  },
+  {
+   "name": "F2 «..roots» принимается за выход из каталога",
+   "file": "internal/config/config.go",
+   "old": "rel != \"..\" && !strings.HasPrefix(rel, \"../\")",
+   "new": "!strings.HasPrefix(rel, \"..\")"
+  },
+  {
+   "name": "F3 отрицательные и нулевые сроки принимаются",
+   "file": "internal/config/config.go",
+   "old": "\t\tif d <= 0 {",
+   "new": "\t\tif false && d <= 0 {"
+  },
+  {
+   "name": "F4 min_wait короче часа вне режима demo",
+   "file": "internal/config/config.go",
+   "old": "\tif !c.Demo && c.Keys.MinWait > 0 && c.Keys.MinWait.D() < MinWaitFloor {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "F5 content_type длиннее предела улики",
+   "file": "internal/config/config.go",
+   "old": "len(s.ContentType) > MaxContentType {",
+   "new": "len(s.ContentType) > MaxContentType && false {"
+  },
+  {
+   "name": "F6 отпечаток сертификата не приводится к нижнему регистру",
+   "file": "internal/config/config.go",
+   "old": "\t\tc.Sources[i].CertSHA256 = strings.ToLower(c.Sources[i].CertSHA256)\n",
+   "new": ""
+  },
+  {
+   "name": "F7 отрицательный expect_every принимается",
+   "file": "internal/config/config.go",
+   "old": "\t\tif s.ExpectEvery < 0 {",
+   "new": "\t\tif false && s.ExpectEvery < 0 {"
+  }
+ ]
+}

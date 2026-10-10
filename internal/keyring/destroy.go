@@ -25,7 +25,12 @@ import (
 // прошла копия). Тогда память уже равна диску и не откатывается.
 // at — время уничтожения (то, по которому истёк срок).
 func (k *Keyring) rotateLocked(due []*entry, at time.Time) (committed bool, err error) {
+	// Корень заводится с отпущенным mu: хранилище корней бывает медленным
+	// (зеркало на NFS), а Seal ждать его не должен. Вызывающий держит wmu —
+	// состояние в этом окне не меняет никто.
+	k.mu.Unlock()
 	newRoot, err := k.newRoot()
+	k.mu.Lock()
 	if err != nil {
 		return false, err
 	}
@@ -76,15 +81,25 @@ func (k *Keyring) finishLocked() ([]*entry, error) {
 			return nil, err
 		}
 	}
+	// Уничтожение корней и их перечисление — ввод-вывод, бывает медленным
+	// (зеркало): идут с отпущенным mu, как копия в резерв. Вызывающий держит
+	// wmu.
 	var rest []string
 	var errs []error
-	for _, id := range k.retired {
+	prev := k.retired
+	k.mu.Unlock()
+	for _, id := range prev {
 		if err := k.roots.DestroyRoot(id); err != nil {
 			rest = append(rest, id)
 			errs = append(errs, fmt.Errorf("keyring destroy root %s: %w", id, err))
 		}
 	}
-	prev := k.retired
+	var all []string
+	var listErr error
+	if len(rest) == 0 && waiting {
+		all, listErr = k.roots.Roots()
+	}
+	k.mu.Lock()
 	k.retired = rest
 	type mark struct {
 		e       *entry
@@ -92,9 +107,9 @@ func (k *Keyring) finishLocked() ([]*entry, error) {
 	}
 	var marks []mark
 	if len(rest) == 0 && waiting {
-		switch orphans, err := k.orphansLocked(); {
-		case err != nil:
-			errs = append(errs, err)
+		switch orphans := orphansOf(all, k.knownRootsLocked()); {
+		case listErr != nil:
+			errs = append(errs, fmt.Errorf("keyring list roots: %w", listErr))
 		case len(orphans) > 0:
 			errs = append(errs, fmt.Errorf("%w: %s", ErrOrphanRoots, strings.Join(orphans, ", ")))
 		default:

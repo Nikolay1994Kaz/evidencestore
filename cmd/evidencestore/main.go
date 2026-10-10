@@ -69,6 +69,8 @@ func main() {
 		err = cmdTSARoot(args)
 	case "keys":
 		err = cmdKeys(args)
+	case "sources":
+		err = cmdSources(args)
 	case "restore":
 		err = cmdRestore(args)
 	case "help", "-h", "--help":
@@ -105,6 +107,9 @@ Operator (talks to the running server via its admin socket):
   keys complete      -config FILE
   keys destroy-orphan-roots -config FILE       destroy keyring roots unknown to keyring.dat
                                                (shown in status; they keep destruction non-final)
+  sources bind -config FILE -source S -epoch E bind the source to this collector installation:
+                                               accept a reinstalled collector (its error names E);
+                                               the previous installation is refused from then on
 
 Disaster recovery:
   restore   -config FILE -from URL -store-key KEY   rebuild evidence log and chain from the copy;
@@ -165,21 +170,39 @@ func cmdDevPKI(args []string) error {
 	if len(hosts) == 0 {
 		hosts = multiFlag{"localhost", "127.0.0.1"}
 	}
-	ca, err := pki.NewCA("evidencestore demo collectors CA")
-	if err != nil {
-		return err
+	// Учебный УЦ уже есть — сертификаты выпускаются под ним, ничего не
+	// затирается: новый УЦ сделал бы негодными все выданные сертификаты.
+	exists := func(name string) bool { _, err := os.Stat(filepath.Join(*out, name)); return err == nil }
+	var ca *pki.CA
+	var err error
+	switch {
+	case exists("ca.crt") && exists("ca.key"):
+		if ca, err = pki.LoadCA(*out); err != nil {
+			return err
+		}
+	case exists("ca.crt"):
+		return fmt.Errorf("dev-pki: %s holds ca.crt without ca.key: certificates cannot be issued under it, and it is not overwritten", *out)
+	default:
+		if ca, err = pki.NewCA("evidencestore demo collectors CA"); err != nil {
+			return err
+		}
+		if err := ca.Save(*out); err != nil {
+			return err
+		}
 	}
-	if err := pki.WriteCert(filepath.Join(*out, "ca.crt"), ca.Cert); err != nil {
-		return err
-	}
-	srv, err := ca.Server(hosts...)
-	if err != nil {
-		return err
-	}
-	if err := srv.Write(*out, "server"); err != nil {
-		return err
+	if !exists("server.crt") {
+		srv, err := ca.Server(hosts...)
+		if err != nil {
+			return err
+		}
+		if err := srv.Write(*out, "server"); err != nil {
+			return err
+		}
 	}
 	for _, s := range sources {
+		if exists(s + ".crt") {
+			return fmt.Errorf("dev-pki: %s already exists and is not overwritten", filepath.Join(*out, s+".crt"))
+		}
 		c, err := ca.Client(s)
 		if err != nil {
 			return err
@@ -298,6 +321,18 @@ func cmdKeys(args []string) error {
 	return fmt.Errorf("keys: unknown subcommand %q", sub)
 }
 
+func cmdSources(args []string) error {
+	if len(args) == 0 || args[0] != "bind" {
+		return errors.New("sources: bind")
+	}
+	fs := flag.NewFlagSet("sources bind", flag.ExitOnError)
+	source := fs.String("source", "", "source name")
+	epoch := fs.String("epoch", "", "collector epoch (32 hex digits, from the collector's error message)")
+	return adminPost(args[1:], "/admin/sources/bind", func() any {
+		return server.BindRequest{Source: *source, Epoch: *epoch}
+	}, fs)
+}
+
 func adminGet(args []string, path string, fs *flag.FlagSet) error {
 	if fs == nil {
 		fs = flag.NewFlagSet(path, flag.ExitOnError)
@@ -368,7 +403,8 @@ func output(path string, body []byte) error {
 		_, err := os.Stdout.Write(body)
 		return err
 	}
-	if err := os.WriteFile(path, body, 0o644); err != nil {
+	// Пакет с ключом записи открывает тело: файл — только владельцу.
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "written %s (%d bytes)\n", path, len(body))

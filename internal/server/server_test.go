@@ -57,6 +57,7 @@ func setup(t *testing.T) *env {
 		TLS:         config.TLS{Cert: filepath.Join(dir, "server.crt"), Key: filepath.Join(dir, "server.key"), ClientCA: filepath.Join(dir, "ca.crt")},
 		TSA:         config.TSA{URL: "local"},
 		Keys:        config.Keys{MinWait: config.Duration(time.Nanosecond)},
+		Demo:        true,
 		Sources: []config.Source{
 			{Name: "abs-core", ContentType: "syslog"},
 			{Name: "pinned-src", ContentType: "syslog", CertSHA256: config.CertFingerprint(pinned.Cert.Raw)},
@@ -338,5 +339,77 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `evidencestore_records{source="abs-core"} 2`+"\n") {
 		t.Fatalf("нет записей источника:\n%s", body)
+	}
+}
+
+// B-03: эпоха сборщика — в заголовке запроса. Первая закрепляется (и на
+// state, и на приёме), чужая получает 409 с кодом epoch_mismatch, кривая —
+// 400. Оператор закрепляет другую через админку: тогда отказ получает
+// прежняя.
+func TestEpochOverMTLS(t *testing.T) {
+	e := setup(t)
+	c := e.collector(t, "abs-core")
+	a, b := strings.Repeat("a", 32), strings.Repeat("b", 32)
+	do := func(method, path, epoch string, body any) (int, ErrorResponse) {
+		t.Helper()
+		var rd io.Reader
+		if body != nil {
+			data, _ := json.Marshal(body)
+			rd = bytes.NewReader(data)
+		}
+		req, err := http.NewRequest(method, e.url+path, rd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if epoch != "" {
+			req.Header.Set(EpochHeader, epoch)
+		}
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var er ErrorResponse
+		json.NewDecoder(resp.Body).Decode(&er)
+		return resp.StatusCode, er
+	}
+	if code, er := do("GET", "/v1/state", a, nil); code != 200 {
+		t.Fatalf("первая эпоха: %d %+v", code, er)
+	}
+	for _, path := range []string{"/v1/state", "/v1/ingest"} {
+		method, body := "GET", any(nil)
+		if path == "/v1/ingest" {
+			method, body = "POST", records(1, 1)
+		}
+		if code, er := do(method, path, b, body); code != 409 || er.Code != CodeEpochMismatch {
+			t.Fatalf("чужая эпоха, %s: %d %+v", path, code, er)
+		}
+		if code, er := do(method, path, "", body); code != 409 || er.Code != CodeEpochMismatch {
+			t.Fatalf("без эпохи при закреплённой, %s: %d %+v", path, code, er)
+		}
+	}
+	if code, _ := do("POST", "/v1/ingest", "xyz", records(1, 1)); code != 400 {
+		t.Fatalf("кривая эпоха: %d", code)
+	}
+	if code, er := do("POST", "/v1/ingest", a, records(1, 1)); code != 200 {
+		t.Fatalf("своя эпоха: %d %+v", code, er)
+	}
+
+	for name, req := range map[string]BindRequest{
+		"неизвестный источник": {Source: "nope", Epoch: b},
+		"кривая эпоха":         {Source: "abs-core", Epoch: "xyz"},
+	} {
+		if resp, body := post(t, e.admin, "http://admin/admin/sources/bind", req); resp == nil || resp.StatusCode == 200 {
+			t.Fatalf("bind, %s: %v %s", name, resp, body)
+		}
+	}
+	if resp, body := post(t, e.admin, "http://admin/admin/sources/bind", BindRequest{Source: "abs-core", Epoch: b}); resp == nil || resp.StatusCode != 200 {
+		t.Fatalf("bind: %v %s", resp, body)
+	}
+	if code, er := do("POST", "/v1/ingest", a, records(2, 2)); code != 409 || er.Code != CodeEpochMismatch {
+		t.Fatalf("прежняя эпоха после bind: %d %+v", code, er)
+	}
+	if code, er := do("POST", "/v1/ingest", b, records(2, 2)); code != 200 {
+		t.Fatalf("закреплённая оператором: %d %+v", code, er)
 	}
 }

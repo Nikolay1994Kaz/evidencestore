@@ -4,19 +4,31 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 )
 
-// envelopeOverhead — служебные байты конверта: 3+16+12+48+12+16.
-const envelopeOverhead = len(envelopeTag) + kekIDSize + 12 + dekSize + 16 + 12 + 16
+// envelopeOverhead — служебные байты конверта: 3+16+32+12+48+12+16.
+const envelopeOverhead = len(envelopeTag) + kekIDSize + commitSize + 12 + dekSize + 16 + 12 + 16
+
+// commitDomain — домен обязательства на ключ записи.
+const commitDomain = "evidencestore/dek-commit/v1"
 
 // Seal запечатывает открытый текст под ключом скоупа. Конверт:
 //
-//	"EV1" | kekID(16) | wrapNonce(12) | wrappedDEK(48) | dataNonce(12) | ct+tag
+//	"EV2" | kekID(16) | commit(32) | wrapNonce(12) | wrappedDEK(48) | dataNonce(12) | ct+tag
 //
 // У каждой записи свой DEK; он обёрнут ключом скоупа и едет в конверте.
 // kekID лежит открытым: по нему Unseal находит ключ, а после уничтожения
 // отличает «стёрто» от «повреждено». Он же входит в AAD обоих слоёв.
+//
+// commit = SHA-256(домен ‖ kekID ‖ DEK) — обязательство на ключ записи. Оно
+// внутри конверта, то есть под отпечатком улики. AES-GCM не связывает
+// шифротекст с ключом: без обязательства тот, кто готовит шифротекст,
+// подобрал бы два ключа записи с разными телами под одним отпечатком и
+// показал бы разным проверяющим разное. Ключ записи открывает тело, только
+// если сходится с обязательством (OpenWithDEK).
 //
 // Ключ, ещё не дошедший до резерва, Seal не выдаёт (ErrNotBackedUp): звать
 // после EnsureScope этого скоупа, он дожидается копии.
@@ -49,8 +61,34 @@ func (k *Keyring) Seal(scope string, plaintext []byte) ([]byte, error) {
 	out := make([]byte, 0, envelopeOverhead+len(plaintext))
 	out = append(out, envelopeTag...)
 	out = append(out, e.id[:]...)
+	commit := dekCommit(e.id, dek)
+	out = append(out, commit[:]...)
 	out = appendSealed(out, e.aead, dek, e.id[:])
 	return appendSealed(out, dataAEAD, plaintext, e.id[:]), nil
+}
+
+func dekCommit(id [kekIDSize]byte, dek []byte) [commitSize]byte {
+	h := sha256.New()
+	h.Write([]byte(commitDomain))
+	h.Write(id[:])
+	h.Write(dek)
+	var out [commitSize]byte
+	h.Sum(out[:0])
+	return out
+}
+
+// LegacyEnvelope — конверт прежнего формата (EV1): ключ записи в нём не
+// связан с отпечатком улики.
+func LegacyEnvelope(envelope []byte) bool {
+	return len(envelope) >= len(legacyTag) && string(envelope[:len(legacyTag)]) == legacyTag
+}
+
+// wrappedAt — где в конверте начинается обёрнутый DEK.
+func wrappedAt(envelope []byte) int {
+	if LegacyEnvelope(envelope) {
+		return len(legacyTag) + kekIDSize
+	}
+	return len(envelopeTag) + kekIDSize + commitSize
 }
 
 // Unseal вскрывает конверт. Исходы:
@@ -91,7 +129,11 @@ func (k *Keyring) UnwrapDEK(envelope []byte) ([]byte, error) {
 	case e.state == Pending:
 		return nil, ErrKeyPending
 	}
-	dek, _, err := openNext(e.aead, envelope[len(envelopeTag)+kekIDSize:], dekSize+e.aead.Overhead(), id[:])
+	at := wrappedAt(envelope)
+	if len(envelope) < at {
+		return nil, ErrMalformed
+	}
+	dek, _, err := openNext(e.aead, envelope[at:], dekSize+e.aead.Overhead(), id[:])
 	if err != nil {
 		return nil, ErrMalformed
 	}
@@ -99,19 +141,26 @@ func (k *Keyring) UnwrapDEK(envelope []byte) ([]byte, error) {
 }
 
 // OpenWithDEK вскрывает тело конверта ключом записи, без кейринга: так
-// проверяющий читает выданную ему улику офлайн. Тег GCM проверяет, что тело
-// не менялось.
+// проверяющий читает выданную ему улику офлайн. Ключ записи сверяется с
+// обязательством в конверте (EV2), тег GCM проверяет, что тело не менялось.
 func OpenWithDEK(envelope, dek []byte) ([]byte, error) {
 	id, ok := KEKIDOf(envelope)
 	if !ok || len(dek) != dekSize {
 		return nil, ErrMalformed
+	}
+	if !LegacyEnvelope(envelope) {
+		want := envelope[len(envelopeTag)+kekIDSize:]
+		got := dekCommit(id, dek)
+		if len(want) < commitSize || subtle.ConstantTimeCompare(want[:commitSize], got[:]) != 1 {
+			return nil, fmt.Errorf("%w: record key does not match the commitment in the envelope", ErrMalformed)
+		}
 	}
 	dataAEAD, err := newAEAD(dek)
 	if err != nil {
 		return nil, ErrMalformed
 	}
 	// Обёрнутый DEK пропускаем: nonce(12) | wrappedDEK(48).
-	p := envelope[len(envelopeTag)+kekIDSize:]
+	p := envelope[wrappedAt(envelope):]
 	wrapped := dataAEAD.NonceSize() + dekSize + dataAEAD.Overhead()
 	if len(p) < wrapped {
 		return nil, ErrMalformed
@@ -128,7 +177,10 @@ func OpenWithDEK(envelope, dek []byte) ([]byte, error) {
 // в том числе после уничтожения ключа.
 func KEKIDOf(envelope []byte) ([kekIDSize]byte, bool) {
 	var id [kekIDSize]byte
-	if len(envelope) < len(envelopeTag)+kekIDSize || string(envelope[:len(envelopeTag)]) != envelopeTag {
+	if len(envelope) < len(envelopeTag)+kekIDSize {
+		return id, false
+	}
+	if tag := string(envelope[:len(envelopeTag)]); tag != envelopeTag && tag != legacyTag {
 		return id, false
 	}
 	copy(id[:], envelope[len(envelopeTag):])

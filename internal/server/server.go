@@ -77,6 +77,9 @@ func TLSConfig(cfg *config.Config) (*tls.Config, error) {
 
 // Run слушает оба входа до отмены ctx, затем мягко останавливается.
 func (s *Server) Run(ctx context.Context) error {
+	if s.cfg.Listen == "" {
+		return errors.New("listen is required: without it the intake would bind every interface on a random port")
+	}
 	tlsCfg, err := TLSConfig(s.cfg)
 	if err != nil {
 		return err
@@ -220,6 +223,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, err)
 		return
 	}
+	if err := s.store.Admit(source, r.Header.Get(EpochHeader)); err != nil {
+		s.writeIngestErr(w, source, err)
+		return
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequest))
 	if err != nil {
 		writeErr(w, http.StatusRequestEntityTooLarge, err)
@@ -236,14 +243,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	results, err := s.store.Ingest(source, recs)
 	if err != nil {
-		resp := ErrorResponse{Error: err.Error()}
-		if errors.Is(err, store.ErrSeqConflict) {
-			resp.Code = CodeSeqConflict
-		}
-		writeJSON(w, ingestStatus(err), resp)
-		if ingestStatus(err) >= 500 {
-			s.log.Error("ingest", "source", source, "err", err)
-		}
+		s.writeIngestErr(w, source, err)
 		return
 	}
 	resp := IngestResponse{Results: make([]IngestResult, len(results))}
@@ -253,13 +253,29 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// writeIngestErr — ответ сборщику с ошибкой приёма; Code говорит
+// программе, что повторять нельзя.
+func (s *Server) writeIngestErr(w http.ResponseWriter, source string, err error) {
+	resp := ErrorResponse{Error: err.Error()}
+	switch {
+	case errors.Is(err, store.ErrSeqConflict):
+		resp.Code = CodeSeqConflict
+	case errors.Is(err, store.ErrEpochMismatch):
+		resp.Code = CodeEpochMismatch
+	}
+	writeJSON(w, ingestStatus(err), resp)
+	if ingestStatus(err) >= 500 {
+		s.log.Error("ingest", "source", source, "err", err)
+	}
+}
+
 func ingestStatus(err error) int {
 	switch {
 	case errors.Is(err, store.ErrUnknownSource), errors.Is(err, store.ErrSourceDisabled):
 		return http.StatusForbidden
 	case errors.Is(err, store.ErrBadRecord):
 		return http.StatusBadRequest
-	case errors.Is(err, store.ErrInFlight), errors.Is(err, store.ErrSeqConflict):
+	case errors.Is(err, store.ErrInFlight), errors.Is(err, store.ErrSeqConflict), errors.Is(err, store.ErrEpochMismatch):
 		return http.StatusConflict
 	case errors.Is(err, keyring.ErrScopeClosed), errors.Is(err, keyring.ErrScopeDestroyed):
 		return http.StatusConflict
@@ -275,6 +291,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	source, err := s.source(r)
 	if err != nil {
 		writeErr(w, http.StatusForbidden, err)
+		return
+	}
+	// Сборщик спрашивает state при каждом запуске: чужая установка
+	// получает отказ раньше, чем начнёт читать журнал.
+	if err := s.store.Admit(source, r.Header.Get(EpochHeader)); err != nil {
+		s.writeIngestErr(w, source, err)
 		return
 	}
 	last, err := s.store.LastSeq(source)
@@ -370,7 +392,7 @@ func (s *Server) AdminHandler() http.Handler {
 			}
 			wait = d
 		}
-		ki, err := s.store.ScheduleDestroy(req.Scope, wait, approvals(req.Approvals))
+		ki, err := s.store.ScheduleDestroy(r.Context(), req.Scope, wait, approvals(req.Approvals))
 		if err != nil {
 			writeErr(w, keyStatus(err), err)
 			return
@@ -396,6 +418,24 @@ func (s *Server) AdminHandler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string][]string{"destroyed": done})
+	})
+	mux.HandleFunc("POST /admin/sources/bind", func(w http.ResponseWriter, r *http.Request) {
+		var req BindRequest
+		if !readJSON(w, r, &req) {
+			return
+		}
+		if err := s.store.BindEpoch(req.Source, req.Epoch); err != nil {
+			code := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, store.ErrUnknownSource):
+				code = http.StatusNotFound
+			case errors.Is(err, store.ErrBadRecord):
+				code = http.StatusBadRequest
+			}
+			writeErr(w, code, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, req)
 	})
 	mux.HandleFunc("POST /admin/keys/complete", func(w http.ResponseWriter, r *http.Request) {
 		changed, err := s.store.CompleteDue(r.Context())
@@ -487,6 +527,21 @@ type ErrorResponse struct {
 // CodeSeqConflict — номер занят другим телом (store.ErrSeqConflict):
 // сборщику нельзя повторять, ему надо остановиться.
 const CodeSeqConflict = "seq_conflict"
+
+// CodeEpochMismatch — источник закреплён за другой установкой сборщика
+// (store.ErrEpochMismatch): этой установке надо остановиться.
+const CodeEpochMismatch = "epoch_mismatch"
+
+// EpochHeader — заголовок запроса сборщика: эпоха его установки
+// (store.Admit). Без заголовка — сборщик прежней версии.
+const EpochHeader = "Collector-Epoch"
+
+// BindRequest — оператор закрепляет за источником эпоху сборщика: так
+// принимается законная переустановка.
+type BindRequest struct {
+	Source string `json:"source"`
+	Epoch  string `json:"collector_epoch"`
+}
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, ErrorResponse{Error: err.Error()})

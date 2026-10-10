@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -34,6 +35,8 @@ type Authority struct {
 	policy  asn1.ObjectIdentifier
 	essCert *x509.Certificate     // тесты: чей хэш вписать в signingCertificateV2
 	ctype   asn1.ObjectIdentifier // тесты: тип содержимого в подписанных атрибутах
+	essV1   int                   // тесты: 1 — атрибут signingCertificate (v1, SHA-1) вместо v2, -1 — никакого
+	acc     accuracy              // тесты: точность метки
 
 	mu     sync.Mutex
 	serial int64
@@ -136,6 +139,7 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 		MessageImprint: messageImprint{HashAlgorithm: pkix.AlgorithmIdentifier{Algorithm: oidSHA256}, HashedMessage: imprint},
 		SerialNumber:   big.NewInt(serial),
 		GenTime:        a.now().UTC().Truncate(time.Second),
+		Accuracy:       a.acc,
 		Nonce:          nonce,
 	})
 	if err != nil {
@@ -147,11 +151,16 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 		ess = a.essCert
 	}
 	certHash := sha256.Sum256(ess.Raw)
-	attrs, err := attributesSet(
-		attr(oidContentType, a.contentType()),
-		attr(oidMessageDigst, digest[:]),
-		attr(oidSigningCertV2, signingCertificateV2{Certs: []essCertIDv2{{CertHash: certHash[:]}}}),
-	)
+	essAttr := attr(oidSigningCertV2, signingCertificateV2{Certs: []essCertIDv2{{CertHash: certHash[:]}}})
+	if a.essV1 == 1 {
+		h1 := sha1.Sum(ess.Raw)
+		essAttr = attr(oidSigningCertV1, signingCertificateV1{Certs: []essCertIDv1{{CertHash: h1[:]}}})
+	}
+	all := []rawAttr{attr(oidContentType, a.contentType()), attr(oidMessageDigst, digest[:])}
+	if a.essV1 >= 0 {
+		all = append(all, essAttr)
+	}
+	attrs, err := attributesSet(all...)
 	if err != nil {
 		return nil, err
 	}

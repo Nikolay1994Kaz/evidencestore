@@ -3,7 +3,8 @@
   "./internal/proof/",
   "./internal/store/",
   "./internal/server/",
-  "./internal/collector/"
+  "./internal/collector/",
+  "./cmd/esverify/"
  ],
  "mutations": [
   {
@@ -165,14 +166,14 @@
   {
    "name": "R2 восстановление не замечает дыр в кусках",
    "file": "internal/store/replica.go",
-   "old": "\t\t\tif (i == 0 && c.start != 0) || (i > 0 && c.start != chunks[i-1].end) {",
-   "new": "\t\t\tif ((i == 0 && c.start != 0) || (i > 0 && c.start != chunks[i-1].end)) && false {"
+   "old": "\t\t\tif c.start > have {",
+   "new": "\t\t\tif false && c.start > have {"
   },
   {
    "name": "R3 копия повторяет уже отправленное",
    "file": "internal/store/replica.go",
-   "old": "\t\tsize, from := files[name], s.replica.Offsets[name]",
-   "new": "\t\tsize, from := files[name], int64(0)"
+   "old": "\t\tsize, from := snap.sizes[name], s.replica.Offsets[name]",
+   "new": "\t\tsize, from := snap.sizes[name], int64(0)"
   },
   {
    "name": "S15 текущий месяц закрывается без force",
@@ -200,9 +201,9 @@
   },
   {
    "name": "S19 при старте копия кейринга не подтверждается",
-   "file": "internal/store/store.go",
-   "old": "\tif err := s.keys.Confirm(); err != nil {\n\t\ts.log.Warn(\"keyring backup pending\", \"err\", err)\n\t}\n\tif orphans",
-   "new": "\tif orphans"
+   "file": "internal/store/keys.go",
+   "old": "\tif err := s.keys.Confirm(); err != nil {\n\t\ts.log.Warn(\"keyring backup pending\", \"err\", err)\n\t}\n\tfor _, scope := range ahead {",
+   "new": "\tfor _, scope := range ahead {"
   },
   {
    "name": "S20 вердикт гейтвея не ложится в цепь",
@@ -243,8 +244,8 @@
   {
    "name": "P13 подпись точки не проверяется ключом проверяющего",
    "file": "internal/proof/gateway.go",
-   "old": "\t\tadd(\"контрольная точка подписана закреплённым ключом гейтвея\", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf(\"seq %d\", cv.Seq))",
-   "new": "\t\tadd(\"контрольная точка подписана закреплённым ключом гейтвея\", nil, fmt.Sprintf(\"seq %d\", cv.Seq))"
+   "old": "\t\tif add(\"контрольная точка подписана закреплённым ключом гейтвея\", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf(\"seq %d\", cv.Seq)) {",
+   "new": "\t\tif add(\"контрольная точка подписана закреплённым ключом гейтвея\", nil, fmt.Sprintf(\"seq %d\", cv.Seq)) {"
   },
   {
    "name": "P14 поломка записи гейтвея не валит пакет",
@@ -291,19 +292,277 @@
   {
    "name": "S31 конфликт без события в цепи",
    "file": "internal/store/ingest.go",
-   "old": "\ts.appendJSONEvent(auditchain.EventConflict, sealed.Source, \"\", conflict{Seq: r.Seq, Position: res.Position, Reason: reason})\n",
+   "old": "\ts.appendJSONEvent(auditchain.EventConflict, sealed.Source, \"\", seqConflict{Seq: r.Seq, Position: res.Position, Reason: reason})\n",
    "new": ""
   },
   {
-   "name": "S32 стёртое тело засчитывается повтором",
+   "name": "S32 тело под ключом, ждущим уничтожения, засчитывается повтором",
    "file": "internal/store/ingest.go",
-   "old": "\tcase errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):\n\t\treason = \"the accepted body is erased, nothing to compare with\"",
-   "new": "\tcase errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):\n\t\treason = \"the accepted body is erased, nothing to compare with\"\n\t\tres.Status = StatusDuplicate\n\t\treturn nil"
+   "old": "\tcase errors.Is(err, keyring.ErrKeyPending):\n\t\treason = \"the accepted body is sealed under a month key pending destruction",
+   "new": "\tcase errors.Is(err, keyring.ErrKeyPending):\n\t\tres.Status = StatusDuplicate\n\t\treturn \"\", nil\n\tcase false:\n\t\treason = \"the accepted body is sealed under a month key pending destruction"
   },
   {
    "name": "S33 конфликты не считаются",
    "file": "internal/store/ingest.go",
    "old": "\tst.conflicts.Add(1)\n",
+   "new": ""
+  },
+  {
+   "name": "S34 второй процесс над data_dir не отсекается",
+   "file": "internal/store/store.go",
+   "old": "\tif err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "S35 журнал улик открывается с правом Release",
+   "file": "internal/store/store.go",
+   "old": "evlog.Options{OnCommit: s.onCommit}",
+   "new": "evlog.Options{OnCommit: s.onCommit, AllowRelease: true}"
+  },
+  {
+   "name": "S36 отказ цепи не останавливает приём",
+   "file": "internal/store/store.go",
+   "old": "\treturn s.chain.Failed()\n}",
+   "new": "\treturn nil\n}"
+  },
+  {
+   "name": "S37 листья при подъёме не сверяются с корнями",
+   "file": "internal/store/chain.go",
+   "old": "\terr = auditchain.ScanVerifiedLeaves(s.chainDir, links, func(num uint64, l auditchain.Leaf) error {",
+   "new": "\terr = auditchain.ScanLeaves(s.chainDir, func(num uint64, l auditchain.Leaf) error {"
+  },
+  {
+   "name": "S38 пропуски хвоста не объявляются после падения",
+   "file": "internal/store/store.go",
+   "old": "\t\ts.announceTailGaps(cs.maxSeq, tailSources)\n",
+   "new": ""
+  },
+  {
+   "name": "S39 прыжок часов вперёд не ограничен якорем TSA",
+   "file": "internal/store/store.go",
+   "old": "\t\t\ts.clockCapped.Add(1)\n\t\t\tt = est\n",
+   "new": "\t\t\ts.clockCapped.Add(1)\n"
+  },
+  {
+   "name": "S40 метка TSA не ставит якорь часов",
+   "file": "internal/store/jobs.go",
+   "old": "\ts.anchorClock(info.GenTime)",
+   "new": "\t_ = info.GenTime"
+  },
+  {
+   "name": "S41 метка ставится и без новых листьев",
+   "file": "internal/store/jobs.go",
+   "old": " || (!force && s.nextLeaf <= s.stampedLeaves)",
+   "new": ""
+  },
+  {
+   "name": "S42 молчание после рестарта объявляется заново",
+   "file": "internal/store/store.go",
+   "old": "\t\tif st := s.sources[name]; st != nil && !tailSources[name] {",
+   "new": "\t\tif st := s.sources[name]; false && st != nil && !tailSources[name] {"
+  },
+  {
+   "name": "S43 окно отмены от часов хоста, а не от TSA",
+   "file": "internal/store/keys.go",
+   "old": "\t\tif t.After(from) {\n\t\t\tfrom = t\n\t\t}",
+   "new": "\t\t_ = t"
+  },
+  {
+   "name": "S44 недоступное зеркало корней валит старт",
+   "file": "internal/store/store.go",
+   "old": "\t\ts.log.Warn(\"keyring roots cannot be listed (is keys.roots_mirror_dir reachable?): key destruction stays non-final meanwhile\", \"err\", err)",
+   "new": "\t\treturn err"
+  },
+  {
+   "name": "S45 цепь без sign.key стартует с новым ключом",
+   "file": "internal/store/store.go",
+   "old": "errors.Is(err, os.ErrNotExist) && s.chain.Head().Seq > 0 {",
+   "new": "errors.Is(err, os.ErrNotExist) && false {"
+  },
+  {
+   "name": "S46 init затирает резерв ключей",
+   "file": "internal/store/store.go",
+   "old": "\t\t\tif _, err := os.Stat(filepath.Join(dir, name)); err == nil {\n\t\t\t\treturn \"\", fmt.Errorf(\"%w: %s — this store lost data_dir?",
+   "new": "\t\t\tif _, err := os.Stat(filepath.Join(dir, name)); false && err == nil {\n\t\t\t\treturn \"\", fmt.Errorf(\"%w: %s — this store lost data_dir?"
+  },
+  {
+   "name": "S47 младшее поколение кейринга ложится в резерв",
+   "file": "internal/store/store.go",
+   "old": "err == nil && have > gen {",
+   "new": "err == nil && false && have > gen {"
+  },
+  {
+   "name": "S48 копия кейринга в резерв до сверки с цепью",
+   "file": "internal/store/keys.go",
+   "old": "\tif len(errs) > 0 {\n\t\treturn errors.Join(errs...)\n\t}\n\tif err := s.keys.Confirm(); err != nil {\n\t\ts.log.Warn(\"keyring backup pending\", \"err\", err)\n\t}\n",
+   "new": "\tif err := s.keys.Confirm(); err != nil {\n\t\ts.log.Warn(\"keyring backup pending\", \"err\", err)\n\t}\n\tif len(errs) > 0 {\n\t\treturn errors.Join(errs...)\n\t}\n"
+  },
+  {
+   "name": "R4 цепь уезжает в копию раньше журнала улик",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\treturn ei\n",
+   "new": "\t\t\treturn ej\n"
+  },
+  {
+   "name": "R5 голова копии новее её звеньев",
+   "file": "internal/store/replica.go",
+   "old": "err == nil && seq <= uint64(len(links)) {",
+   "new": "err == nil && seq > 0 {"
+  },
+  {
+   "name": "R6 кусок внахлёст не сверяется",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\tif !bytes.Equal(data[c.start:c.start+overlap], b[:overlap]) {",
+   "new": "\t\t\tif false && !bytes.Equal(data[c.start:c.start+overlap], b[:overlap]) {"
+  },
+  {
+   "name": "R7 кусок внахлёст дописывается целиком",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\tdata = append(data, b[overlap:]...)",
+   "new": "\t\t\tdata = append(data, b...)"
+  },
+  {
+   "name": "P15 пакет без метки TSA проходит по умолчанию",
+   "file": "internal/proof/proof.go",
+   "old": "\t} else if !trust.AllowNoTSA {",
+   "new": "\t} else if false {"
+  },
+  {
+   "name": "P16 улика гейтвея без части gateway проходит",
+   "file": "internal/proof/proof.go",
+   "old": "\tcase sealed.ContentType == gateway.ContentType:\n",
+   "new": "\tcase false:\n"
+  },
+  {
+   "name": "P17 непроверенная подпись точки накрывает запись",
+   "file": "internal/proof/gateway.go",
+   "old": "\t\tr.GatewayUnsigned = true",
+   "new": "\t\tr.GatewayCheckpoint = &cv"
+  },
+  {
+   "name": "S49 недоступные каталоги корней не видны в статусе",
+   "file": "internal/store/proofs.go",
+   "old": "\tif orphans, err := s.keys.OrphanRoots(); err != nil {\n\t\tout.RootsUnreachable = err.Error()\n\t} else {",
+   "new": "\tif orphans, err := s.keys.OrphanRoots(); err != nil {\n\t\t_ = err\n\t} else {"
+  },
+  {
+   "name": "P18 управляющие символы в отчёте не экранируются",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tcase unicode.IsControl(c) || unicode.Is(unicode.Bidi_Control, c):",
+   "new": "\t\tcase false && (unicode.IsControl(c) || unicode.Is(unicode.Bidi_Control, c)):"
+  },
+  {
+   "name": "P19 вердикт не повторяется последней строкой",
+   "file": "internal/proof/proof.go",
+   "old": "\treturn Printable(s) + \"\\n\" + verdict + \"\\n\"",
+   "new": "\treturn Printable(s)"
+  },
+  {
+   "name": "P20 нарушенное обещание не меняет вердикт",
+   "file": "cmd/esverify/main.go",
+   "old": "\t\t\treport.Checks = append(report.Checks, c)\n",
+   "new": "\t\t\t_ = c\n"
+  },
+  {
+   "name": "P21 пакет, который не разбирается, — код 2",
+   "file": "cmd/esverify/main.go",
+   "old": "\t\treport.Checks = []proof.Check{{Name: \"пакет разбирается\", Detail: err.Error()}}",
+   "new": "\t\treturn exitUsage"
+  },
+  {
+   "name": "P22 нечитаемый файл обещания — провал проверки, а не код 2",
+   "file": "cmd/esverify/main.go",
+   "old": "\t\t\treturn usageErr(fmt.Errorf(\"promise file: %w\", err))",
+   "new": "\t\t\treturn exitInvalid"
+  },
+  {
+   "name": "S50 чужая эпоха принимается",
+   "file": "internal/store/epoch.go",
+   "old": "\treturn s.refuseEpoch(st, source, epoch, bound)\n}",
+   "new": "\treturn nil\n}"
+  },
+  {
+   "name": "S51 эпоха не закрепляется при первом контакте",
+   "file": "internal/store/epoch.go",
+   "old": "\t\t\treturn s.setEpochLocked(st, source, epochEvent{Epoch: epoch, Reason: epochFirstContact})",
+   "new": "\t\t\treturn nil"
+  },
+  {
+   "name": "S52 сборщик без эпохи проходит при закреплённой",
+   "file": "internal/store/epoch.go",
+   "old": "\tif err != nil || epoch == bound {\n\t\treturn err\n\t}\n\tif bound == \"\" {",
+   "new": "\tif err != nil || epoch == bound || epoch == \"\" {\n\t\treturn err\n\t}\n\tif bound == \"\" {"
+  },
+  {
+   "name": "S53 закрепление эпохи не ложится в цепь сразу",
+   "file": "internal/store/epoch.go",
+   "old": "\terr = s.flushLocked()\n\ts.chainMu.Unlock()",
+   "new": "\terr = nil\n\ts.chainMu.Unlock()"
+  },
+  {
+   "name": "S54 закрепление эпохи не поднимается из цепи",
+   "file": "internal/store/chain.go",
+   "old": "\t\t\t\tst.epoch = ev.Epoch\n",
+   "new": ""
+  },
+  {
+   "name": "S55 отказ поднимается из цепи как закрепление",
+   "file": "internal/store/chain.go",
+   "old": " && ev.Reason != epochRefused {",
+   "new": " {"
+  },
+  {
+   "name": "S56 первый контакт без повторной сверки под замком",
+   "file": "internal/store/epoch.go",
+   "old": "\t\tif _, bound, err = s.epochOf(source); err != nil || epoch == bound {\n\t\t\treturn err\n\t\t}\n",
+   "new": ""
+  },
+  {
+   "name": "S57 отказ эпохе не пишется в цепь",
+   "file": "internal/store/epoch.go",
+   "old": "\t\ts.appendJSONEvent(auditchain.EventEpoch, source, \"\", epochEvent{Epoch: epoch, Bound: bound, Reason: epochRefused})\n",
+   "new": ""
+  },
+  {
+   "name": "S58 отказ эпохе пишется в цепь при каждом повторе",
+   "file": "internal/store/epoch.go",
+   "old": "\tfirst := !st.refusedEpochs[epoch]",
+   "new": "\tfirst := true"
+  },
+  {
+   "name": "S59 отказы эпохе не считаются",
+   "file": "internal/store/epoch.go",
+   "old": "\tst.epochRefused.Add(1)\n",
+   "new": ""
+  },
+  {
+   "name": "S60 оператор не закрепляет эпоху",
+   "file": "internal/store/epoch.go",
+   "old": "\treturn s.setEpochLocked(st, source, epochEvent{Epoch: epoch, Previous: bound, Reason: epochOperator})",
+   "new": "\t_ = st\n\treturn nil"
+  },
+  {
+   "name": "S61 сервер не сверяет эпоху на приёме",
+   "file": "internal/server/server.go",
+   "old": "\tif err := s.store.Admit(source, r.Header.Get(EpochHeader)); err != nil {\n\t\ts.writeIngestErr(w, source, err)\n\t\treturn\n\t}\n\tbody, err := io.ReadAll",
+   "new": "\tbody, err := io.ReadAll"
+  },
+  {
+   "name": "S62 сервер не сверяет эпоху на state",
+   "file": "internal/server/server.go",
+   "old": "\tif err := s.store.Admit(source, r.Header.Get(EpochHeader)); err != nil {\n\t\ts.writeIngestErr(w, source, err)\n\t\treturn\n\t}\n\tlast, err := s.store.LastSeq(source)",
+   "new": "\tlast, err := s.store.LastSeq(source)"
+  },
+  {
+   "name": "S63 отказ эпохи без кода для сборщика",
+   "file": "internal/server/server.go",
+   "old": "\tcase errors.Is(err, store.ErrEpochMismatch):\n\t\tresp.Code = CodeEpochMismatch\n",
+   "new": ""
+  },
+  {
+   "name": "S64 отказы выдуманным эпохам раздувают цепь",
+   "file": "internal/store/epoch.go",
+   "old": " && len(st.refusedEpochs) < maxRefusedEpochs",
    "new": ""
   }
  ],

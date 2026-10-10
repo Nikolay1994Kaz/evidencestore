@@ -120,10 +120,19 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	if !add("контрольная точка гейтвея после записи входит в цепь", err, fmt.Sprintf("seq %d", cv.Seq)) {
 		return
 	}
-	r.GatewayCheckpoint = &cv
-	if trust.GatewayKey != nil {
+	// Накрывает запись только точка, чью подпись кто-то проверил: сам
+	// проверяющий своим ключом или хранилище при приёме закреплённым ключом
+	// гейтвея. Подпись без проверки — просто байты.
+	switch {
+	case trust.GatewayKey != nil:
 		r.GatewayKeyChecked = true
-		add("контрольная точка подписана закреплённым ключом гейтвея", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf("seq %d", cv.Seq))
+		if add("контрольная точка подписана закреплённым ключом гейтвея", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf("seq %d", cv.Seq)) {
+			r.GatewayCheckpoint = &cv
+		}
+	case cv.Signature == gateway.SigValid:
+		r.GatewayCheckpoint = &cv
+	default:
+		r.GatewayUnsigned = true
 	}
 }
 
@@ -137,6 +146,8 @@ func (r Report) gatewayNotes() []string {
 		n = append(n, "цепочка гейтвея началась раньше первой полученной записи: предыдущих записей хранилище не видело")
 	}
 	switch {
+	case r.GatewayUnsigned:
+		n = append(n, "контрольная точка после записи есть, но её подпись не проверял никто: ключ гейтвея не закреплён ни в реестре хранилища, ни у вас (esverify -gateway-key) — подпись гейтвея эту запись не накрывает")
 	case r.GatewayCheckpoint == nil:
 		n = append(n, "контрольной точки гейтвея после записи в пакете нет: подпись гейтвея эту запись не накрывает (точка ещё не пришла или в цепочке до неё есть поломка)")
 	case !r.GatewayKeyChecked:

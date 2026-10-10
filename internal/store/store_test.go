@@ -45,6 +45,7 @@ func testConfig(t *testing.T, opts ...func(*config.Config)) *config.Config {
 		RootsDir: filepath.Join(t.TempDir(), "roots"),
 		TSA:      config.TSA{URL: "local"},
 		Keys:     config.Keys{MinWait: config.Duration(time.Nanosecond)},
+		Demo:     true,
 		Sources: []config.Source{
 			{Name: "abs-core", ContentType: "syslog", RetentionMonths: 1, ExpectEvery: config.Duration(10 * time.Minute)},
 			{Name: "pipelock", ContentType: "pipelock/receipt"},
@@ -330,13 +331,13 @@ func TestSeqConflict(t *testing.T) {
 		t.Fatalf("конфликтов %d", n)
 	}
 
-	// Тело стёрто (ключ месяца ждёт уничтожения): повтор того же тела сверить
-	// нечем, «duplicate» сказать нельзя.
+	// Ключ месяца ждёт уничтожения: повтор того же тела сверить нечем,
+	// «duplicate» сказать нельзя, и причина названа как есть, а не «стёрто».
 	scope := "abs-core/2026-09"
 	if err := s.Deactivate(true, scope); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ScheduleDestroy(scope, time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
+	if _, err := s.ScheduleDestroy(context.Background(), scope, time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Ingest("abs-core", []Incoming{{Seq: 1, Body: []byte("abs-core event 1")}}); !errors.Is(err, ErrSeqConflict) {
@@ -345,7 +346,7 @@ func TestSeqConflict(t *testing.T) {
 	s.Close()
 	events := leavesOf(t, cfg, auditchain.EventConflict)
 	if len(events) != 2 || events[0].Scope != "abs-core" || !strings.Contains(string(events[0].Payload), `"seq":2`) ||
-		!strings.Contains(string(events[1].Payload), "erased") {
+		!strings.Contains(string(events[1].Payload), "pending destruction") {
 		t.Fatalf("события конфликта в цепи: %+v", events)
 	}
 }
@@ -459,10 +460,10 @@ func TestRetentionErasure(t *testing.T) {
 	if len(due) != 1 || due[0].Scope != scope {
 		t.Fatalf("к уничтожению: %+v", due)
 	}
-	if _, err := s.ScheduleDestroy(scope, time.Hour, []keyring.Approval{{Who: "operator"}}); !errors.Is(err, keyring.ErrApproval) {
+	if _, err := s.ScheduleDestroy(context.Background(), scope, time.Hour, []keyring.Approval{{Who: "operator"}}); !errors.Is(err, keyring.ErrApproval) {
 		t.Fatalf("одно подтверждение: %v", err)
 	}
-	if _, err := s.ScheduleDestroy(scope, time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
+	if _, err := s.ScheduleDestroy(context.Background(), scope, time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
 		t.Fatal(err)
 	}
 	c.add(2 * time.Hour)
@@ -894,7 +895,7 @@ func TestDestroyWaitsForTSATime(t *testing.T) {
 		t.Fatal(err)
 	}
 	const wait = 7 * 24 * time.Hour
-	ki, err := s.ScheduleDestroy(scope, wait, []keyring.Approval{{Who: "operator"}, {Who: "security"}})
+	ki, err := s.ScheduleDestroy(context.Background(), scope, wait, []keyring.Approval{{Who: "operator"}, {Who: "security"}})
 	if err != nil {
 		t.Fatal(err)
 	}

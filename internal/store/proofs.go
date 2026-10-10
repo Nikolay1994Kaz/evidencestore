@@ -155,6 +155,8 @@ type SourceStatus struct {
 	MaxSeq   uint64    `json:"max_seq"`
 	LastAt   time.Time `json:"last_at"`
 	Silent   bool      `json:"silent"`
+	// Epoch — эпоха сборщика, закреплённая за источником (epoch.go).
+	Epoch string `json:"collector_epoch,omitempty"`
 }
 
 // Status — сводка для оператора.
@@ -169,12 +171,18 @@ type Status struct {
 	PublicKey  string         `json:"public_key"`
 	Sources    []SourceStatus `json:"sources"`
 	LogFailure string         `json:"log_failure,omitempty"`
+	// ChainFailure — цепь защёлкнута ошибкой записи (входит и в LogFailure:
+	// приём отказывает так же).
+	ChainFailure string `json:"chain_failure,omitempty"`
 	// KeyringBackupPending — последняя запись keyring.dat не дошла до
 	// резерва (keys.backup_dir); Confirm повторяет копию раз в минуту.
 	KeyringBackupPending bool `json:"keyring_backup_pending,omitempty"`
 	// OrphanRoots — корни, которых не знает keyring.dat: уничтожение не
 	// окончательно, пока оператор их не уничтожит.
 	OrphanRoots []string `json:"orphan_roots,omitempty"`
+	// RootsUnreachable — каталоги корней не перечисляются (зеркало на
+	// упавшей машине): сирот не видно, уничтожение не окончательно.
+	RootsUnreachable string `json:"roots_unreachable,omitempty"`
 }
 
 func (s *Store) Status() Status {
@@ -183,7 +191,7 @@ func (s *Store) Status() Status {
 	for name, st := range s.sources {
 		out.Sources = append(out.Sources, SourceStatus{
 			Name: name, Known: st.known, Disabled: st.cfg.Disabled, Records: st.count,
-			MaxSeq: st.maxSeq, LastAt: st.lastAt.UTC(), Silent: st.silent,
+			MaxSeq: st.maxSeq, LastAt: st.lastAt.UTC(), Silent: st.silent, Epoch: st.epoch,
 		})
 		out.Records += st.count
 	}
@@ -201,8 +209,13 @@ func (s *Store) Status() Status {
 	if err := s.Healthy(); err != nil {
 		out.LogFailure = err.Error()
 	}
+	if err := s.chain.Failed(); err != nil {
+		out.ChainFailure = err.Error()
+	}
 	out.KeyringBackupPending = s.keys.BackupPending()
-	if orphans, err := s.keys.OrphanRoots(); err == nil {
+	if orphans, err := s.keys.OrphanRoots(); err != nil {
+		out.RootsUnreachable = err.Error()
+	} else {
 		out.OrphanRoots = orphans
 	}
 	return out

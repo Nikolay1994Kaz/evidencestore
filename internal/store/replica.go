@@ -1,9 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,30 +30,38 @@ import (
 // keyring.dat, корни и ключ подписи не уезжают: в копии только шифротекст и
 // открытые доказательства, стирание по-прежнему сводится к одному ключу.
 // Отставание копии (RPO) — до replica.every.
-
-const replicaStateFile = "replica.json"
+//
+// Докуда доехала копия, знает сама копия: первый проход после запуска берёт
+// смещения из её листинга, дальше они живут в памяти. Своего файла
+// состояния нет: файл, откатившийся после сбоя, слал бы куски внахлёст.
 
 type replicaState struct {
-	Offsets map[string]int64 `json:"offsets"`
-	Head    uint64           `json:"head"`
+	Offsets map[string]int64
+	Head    uint64
 }
 
-// replicaFiles — дописываемые файлы и сколько байт в каждом уже можно
-// копировать: у цепи — прочитанное под замком цепи (только целые кадры), у
-// журнала — подтверждённое fsync.
+// replicaSnapshot — что можно копировать сейчас: размер каждого
+// дописываемого файла и подписанная голова, снятые согласованно.
+type replicaSnapshot struct {
+	sizes map[string]int64
+	head  auditchain.Statement
+}
+
+// replicaFiles снимает размеры файлов: у цепи — под замком цепи (только целые
+// кадры) вместе с подписанной головой, у журнала — подтверждённое fsync.
 //
 // ⚠ Порядок снимков — сначала цепь, потом журнал. Лист улики ложится в цепь
 // только после fsync улики, поэтому всё, что знает снятая цепь, уже есть в
-// снятом позже журнале. В обратном порядке между снимками могла прийти
-// улика: цепь в копии знала бы её, а журнал нет, и восстановленное
-// хранилище отказалось бы стартовать (ErrEvidenceLost).
-func (s *Store) replicaFiles() (map[string]int64, error) {
-	out := map[string]int64{}
+// снятом позже журнале. Голова подписывается под тем же замком, что
+// снимаются размеры цепи: иначе тик успевал добавить звено, и голова в копии
+// указывала на звено, которого в ней нет.
+func (s *Store) replicaFiles() (replicaSnapshot, error) {
+	snap := replicaSnapshot{sizes: map[string]int64{}}
 	s.chainMu.Lock()
 	entries, err := os.ReadDir(s.chainDir)
 	if err != nil {
 		s.chainMu.Unlock()
-		return nil, err
+		return snap, err
 	}
 	for _, e := range entries {
 		name := e.Name()
@@ -63,54 +71,44 @@ func (s *Store) replicaFiles() (map[string]int64, error) {
 		fi, err := e.Info()
 		if err != nil {
 			s.chainMu.Unlock()
-			return nil, err
+			return snap, err
 		}
-		out["chain/"+name] = fi.Size()
+		snap.sizes["chain/"+name] = fi.Size()
 	}
+	snap.head = s.signer.Sign(s.chain.Head(), len(s.links), s.nowTime().Unix())
 	s.chainMu.Unlock()
 	for _, seg := range s.evlog.Segments() {
-		out["evidence/"+filepath.Base(seg.Path)] = seg.Size
+		snap.sizes["evidence/"+filepath.Base(seg.Path)] = seg.Size
 	}
-	return out, nil
+	return snap, nil
 }
 
+// loadReplicaState узнаёт у копии, докуда она доехала: конец последнего
+// куска каждого файла и последняя голова.
 func (s *Store) loadReplicaState(ctx context.Context, r ship.Remote) error {
 	if s.replica != nil {
 		return nil
 	}
-	st := &replicaState{Offsets: map[string]int64{}}
-	data, err := os.ReadFile(filepath.Join(s.cfg.DataDir, replicaStateFile))
-	switch {
-	case err == nil:
-		if err := json.Unmarshal(data, st); err != nil {
-			return fmt.Errorf("replica state: %w", err)
-		}
-	case errors.Is(err, os.ErrNotExist):
-		// Состояния нет (первый запуск или новая машина): докуда доехало,
-		// узнаём у самой копии.
-		files, _, err := listReplica(ctx, r)
-		if err != nil {
-			return err
-		}
-		for name, chunks := range files {
-			if n := len(chunks); n > 0 {
-				st.Offsets[name] = chunks[n-1].end
-			}
-		}
-	default:
+	files, heads, err := listReplica(ctx, r)
+	if err != nil {
 		return err
+	}
+	st := &replicaState{Offsets: map[string]int64{}}
+	for name, chunks := range files {
+		for _, c := range chunks {
+			st.Offsets[name] = max(st.Offsets[name], c.end)
+		}
+	}
+	if n := len(heads); n > 0 {
+		st.Head, _ = headSeqOf(heads[n-1])
 	}
 	s.replica = st
 	return nil
 }
 
-func (s *Store) saveReplicaState() error {
-	data, _ := json.Marshal(s.replica)
-	p := filepath.Join(s.cfg.DataDir, replicaStateFile)
-	if err := os.WriteFile(p+".tmp", data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(p+".tmp", p)
+// headSeqOf — номер головы из имени heads/<номер>.json.
+func headSeqOf(key string) (uint64, error) {
+	return strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(key, "heads/"), ".json"), 10, 64)
 }
 
 // ShipOnce дотягивает копию: новые байты каждого файла и подписанную
@@ -128,18 +126,27 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 	if err := s.loadReplicaState(ctx, r); err != nil {
 		return 0, err
 	}
-	files, err := s.replicaFiles()
+	snap, err := s.replicaFiles()
 	if err != nil {
 		return 0, err
 	}
-	names := make([]string, 0, len(files))
-	for n := range files {
+	// Журнал улик уезжает раньше цепи: прерванный проход не оставляет в копии
+	// цепь, которая знает улики, которых в копии нет (восстановленное
+	// хранилище отказалось бы стартовать с ErrEvidenceLost).
+	names := make([]string, 0, len(snap.sizes))
+	for n := range snap.sizes {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		ei, ej := strings.HasPrefix(names[i], "evidence/"), strings.HasPrefix(names[j], "evidence/")
+		if ei != ej {
+			return ei
+		}
+		return names[i] < names[j]
+	})
 	var total int64
 	for _, name := range names {
-		size, from := files[name], s.replica.Offsets[name]
+		size, from := snap.sizes[name], s.replica.Offsets[name]
 		if size < from {
 			// Файл стал короче отправленного: так бывает, только если его
 			// обрезали. Молча догонять нельзя — кусок в копии уже другой.
@@ -158,21 +165,14 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 			total += end - from
 			from = end
 			s.replica.Offsets[name] = from
-			if err := s.saveReplicaState(); err != nil {
-				return total, err
-			}
 		}
 	}
-	st := s.Statement()
-	if st.HeadSeq > s.replica.Head {
+	if st := snap.head; st.HeadSeq > s.replica.Head {
 		data, _ := st.JSON()
 		if err := r.Put(ctx, fmt.Sprintf("heads/%020d.json", st.HeadSeq), data); err != nil {
 			return total, err
 		}
 		s.replica.Head = st.HeadSeq
-		if err := s.saveReplicaState(); err != nil {
-			return total, err
-		}
 	}
 	return total, nil
 }
@@ -247,6 +247,11 @@ type RestoreReport struct {
 // их кладут из резерва ключей отдельно.
 func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned ed25519.PublicKey) (RestoreReport, error) {
 	var rep RestoreReport
+	lock, err := lockDataDir(dataDir)
+	if err != nil {
+		return rep, err
+	}
+	defer lock.Close()
 	for _, sub := range []string{"evidence", "chain"} {
 		if entries, err := os.ReadDir(filepath.Join(dataDir, sub)); err == nil && len(entries) > 0 {
 			return rep, fmt.Errorf("replica restore: %s is not empty — refusing to overwrite", filepath.Join(dataDir, sub))
@@ -261,9 +266,13 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 	}
 	for name, chunks := range files {
 		var data []byte
-		for i, c := range chunks {
-			if (i == 0 && c.start != 0) || (i > 0 && c.start != chunks[i-1].end) {
-				return rep, fmt.Errorf("replica restore: %s: hole at %d", name, c.start)
+		for _, c := range chunks {
+			// Куски внахлёст бывают (копия прежней версии повторяла кусок с
+			// откатившегося смещения): общая часть обязана совпасть байт в
+			// байт, дописывается только новое.
+			have := int64(len(data))
+			if c.start > have {
+				return rep, fmt.Errorf("replica restore: %s: hole at %d", name, have)
 			}
 			b, err := r.Get(ctx, c.key)
 			if err != nil {
@@ -272,7 +281,11 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 			if int64(len(b)) != c.end-c.start {
 				return rep, fmt.Errorf("replica restore: %s is %d bytes, name says %d", c.key, len(b), c.end-c.start)
 			}
-			data = append(data, b...)
+			overlap := min(have, c.end) - c.start
+			if !bytes.Equal(data[c.start:c.start+overlap], b[:overlap]) {
+				return rep, fmt.Errorf("replica restore: %s: chunk %s disagrees with the bytes already in the copy", name, c.key)
+			}
+			data = append(data, b[overlap:]...)
 		}
 		dst := filepath.Join(dataDir, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
@@ -284,23 +297,31 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 		rep.Files++
 		rep.Bytes += int64(len(data))
 	}
-	stData, err := r.Get(ctx, heads[len(heads)-1])
-	if err != nil {
-		return rep, err
-	}
-	st, err := auditchain.ParseStatement(stData)
-	if err != nil {
-		return rep, err
-	}
-	if err := auditchain.VerifyStatement(st, pinned); err != nil {
-		return rep, fmt.Errorf("replica restore: last head in the copy: %w", err)
-	}
 	links, err := auditchain.ReadChain(filepath.Join(dataDir, "chain"))
 	if err != nil {
 		return rep, err
 	}
-	if uint64(len(links)) < st.HeadSeq {
-		return rep, fmt.Errorf("replica restore: copy holds %d links, signed head is %d — copy is incomplete", len(links), st.HeadSeq)
+	// Голова — последняя из тех, чьё звено есть в копии: голова новее
+	// звеньев копии (кусок цепи не доехал) не повод отказывать, если есть
+	// подписанная голова пораньше.
+	var st auditchain.Statement
+	for i := len(heads) - 1; i >= 0; i-- {
+		if seq, err := headSeqOf(heads[i]); err == nil && seq <= uint64(len(links)) {
+			stData, err := r.Get(ctx, heads[i])
+			if err != nil {
+				return rep, err
+			}
+			if st, err = auditchain.ParseStatement(stData); err != nil {
+				return rep, err
+			}
+			break
+		}
+	}
+	if st.HeadSeq == 0 {
+		return rep, fmt.Errorf("replica restore: copy holds %d links, every signed head is newer — copy is incomplete", len(links))
+	}
+	if err := auditchain.VerifyStatement(st, pinned); err != nil {
+		return rep, fmt.Errorf("replica restore: head %d in the copy: %w", st.HeadSeq, err)
 	}
 	head, err := auditchain.Verify(links[:st.HeadSeq], nil)
 	if err != nil {

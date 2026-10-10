@@ -50,6 +50,7 @@ cat >"$WORK/evidencestore.json" <<EOF
   "tls": {"cert": "pki/server.crt", "key": "pki/server.key", "client_ca": "pki/ca.crt"},
   "chain": {"tick": "200ms", "promise_mmd": "10s"},
   "tsa": {"url": "local", "every": "1h"},
+  "demo": true,
   "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},
   "sources": [
     {"name": "agent-gw", "content_type": "pipelock/recorder", "gateway_key": "$GW_KEY", "retention_months": 36}
@@ -138,6 +139,10 @@ cat >"$WORK/collector-forged.json" <<EOF
   "spool_dir": "spool-forged", "file": "forged.jsonl", "from_start": true
 }
 EOF
+# Тот же сборщик (та же установка — его эпоха), только файл другой:
+# хранилище закрепило источник за установкой из шага выше, чужую не пустит.
+mkdir -p "$WORK/spool-forged"
+cp "$WORK/spool/epoch.json" "$WORK/spool-forged/epoch.json"
 "$BIN/escollect" -config "$WORK/collector-forged.json" -once
 "$BIN/evidencestore" stamp -config "$CFG" >/dev/null
 FORGED=$((TOTAL + 1))

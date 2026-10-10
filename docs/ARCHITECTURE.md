@@ -14,7 +14,8 @@ escollect ─ cmd/escollect, internal/collector
    │  HTTPS, TLS 1.3, клиентский сертификат (CN = источник)
    ▼
 server ─ internal/server
-   источник берётся из сертификата; JSON → store.Ingest
+   источник берётся из сертификата, эпоха установки сборщика —
+   из заголовка (store.Admit); JSON → store.Ingest
    │
    ▼
 store.Ingest ─ internal/store/ingest.go           ┐
@@ -44,20 +45,20 @@ esverify ─ cmd/esverify, internal/proof
 | Пакет | Что делает | Главные файлы | Тесты |
 |---|---|---|---|
 | `internal/evidence` | формат улики: заголовок открыто, тело конвертом; отпечаток `SHA-256("evidencestore/sealed/v1" ‖ байты)` | `record.go`, `seal.go` | золотые байты, обрезки, фазз, стирание |
-| `internal/keyring` | ключи: корень → ключ файла → KEK месяца → DEK записи; формат KRNG3 (корень заворачивает только ключ файла); уничтожение поворотом корня; состояния и двухэтапное уничтожение; зеркало корней и корни-сироты | `keyring.go`, `format.go`, `envelope.go`, `lifecycle.go`, `destroy.go`, `rootfile.go` | 27 тестов, 54 мутации |
-| `internal/gateway` | проверка бортового журнала Pipelock при приёме: хэш записи (проекции v1–v3), сцепка `prev_hash` по писателям, подписи контрольных точек | `pipelock.go`, `testdata/pipelock-v3.6.0` (настоящий вывод Pipelock) | 8 тестов, 12 мутаций |
+| `internal/keyring` | ключи: корень → ключ файла → KEK месяца → DEK записи; формат KRNG3 (корень заворачивает только ключ файла); конверт EV2 (обязательство на DEK); уничтожение поворотом корня; состояния и двухэтапное уничтожение; зеркало корней, починка копий и корни-сироты | `keyring.go`, `format.go`, `envelope.go`, `lifecycle.go`, `destroy.go`, `rootfile.go` | 32 теста, 60 мутаций |
+| `internal/gateway` | проверка бортового журнала Pipelock при приёме: хэш записи (проекции v1–v3), сцепка `prev_hash` по писателям, подписи контрольных точек | `pipelock.go`, `testdata/pipelock-v3.6.0` (настоящий вывод Pipelock) | 9 тестов, 15 мутаций |
 | `internal/metrics` | показатели в текстовом формате Prometheus, без зависимостей | `metrics.go` | формат вывода |
-| `internal/evlog` | журнал улик: групповой коммит, ответ после fsync, сегменты только дописываются, fail-stop; `Release` (удаление доставленных сегментов) — только для буфера сборщика | `evlog.go` | 13 тестов, 15 мутаций |
-| `internal/auditchain` | цепь (ядро): листья, звено с корнем Меркла, голова в двух слотах, подписанное заявление Ed25519 | `carrier.go`, `chain.go`, `merkle.go`, `export.go`, `query.go` | тесты ядра + `TestReadersDoNotTruncate`, `TestMissingLeavesAreLoud`; 4 мутации |
-| `internal/tsa` | RFC 3161: запрос, офлайн-проверка CMS до корня, встроенная демо-служба | `tsa.go`, `local.go`, `testdata/` (настоящий токен НУЦ) | 11 тестов (один — живой НУЦ, по переменным окружения), 10 мутаций |
+| `internal/evlog` | журнал улик: групповой коммит, ответ после fsync, сегменты только дописываются, fail-stop; хвост режется, только если за ним нет целой записи, и откладывается рядом; `Release` и `floor` — только у буфера сборщика (`AllowRelease`) | `evlog.go` | 17 тестов, 20 мутаций |
+| `internal/auditchain` | цепь (ядро): листья, звено с корнем Меркла, голова в двух слотах, подписанное заявление Ed25519; защёлка отказа записи; сверка листьев с корнями (`ScanVerifiedLeaves`) | `carrier.go`, `chain.go`, `merkle.go`, `export.go`, `query.go` | тесты ядра + `TestReadersDoNotTruncate`, `TestMissingLeavesAreLoud`, `TestLeafTamperIsSeenOnScan`, `TestCarrier_FailureLatches`; 9 мутаций |
+| `internal/tsa` | RFC 3161: запрос, офлайн-проверка CMS до корня, встроенная демо-служба | `tsa.go`, `local.go`, `testdata/` (настоящий токен НУЦ) | 13 тестов (один — живой НУЦ, по переменным окружения), 14 мутаций |
 | `internal/proof` | пакет доказательств и его проверка; обещание при приёме; часть пакета для журналов гейтвея | `proof.go`, `promise.go`, `gateway.go` | синтетическая цепь: каждая проверка — свой тест |
-| `internal/store` | движок: приём, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `gateway.go`, `metrics.go` | 23 теста (падение, откат кейринга, стирание, копия, журнал Pipelock, окно отмены по TSA, конфликт номера…) |
-| `internal/server` | HTTPS-приём с mTLS и админка через unix-сокет | `server.go` | mTLS, источник из сертификата, админка |
-| `internal/collector` | сборщик: файл или файлы по маске → буфер (`evlog`) → пачки; обещания хранилища проверяются закреплённым ключом | `collector.go` | 32 теста: доставка, рестарт без дублей, ротация, переустановка, длинные строки, шарды Pipelock, старт после переустановки, откат буфера, второй сборщик, неверные обещания, часы назад, опасные настройки; 38 мутаций в наборе `edge` |
-| `internal/config` | конфигурация JSON и реестр источников | `config.go` | предел пути сокета; остальное — через тесты движка и сервера |
+| `internal/store` | движок: приём, эпоха установки сборщика, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `epoch.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `gateway.go`, `metrics.go` | 48 тестов (падение, откат кейринга, стирание, копия, журнал Pipelock, окно отмены по TSA, конфликт номера, эпоха сборщика, замок `data_dir`, отказ цепи, часы…; находки 09.10 — `hardening_test.go`); набор мутаций `store` — 93 (вместе с `proof`, сервером, сборщиком и `esverify`) |
+| `internal/server` | HTTPS-приём с mTLS (эпоха сборщика — заголовок `Collector-Epoch`) и админка через unix-сокет | `server.go` | mTLS, источник из сертификата, эпоха, админка |
+| `internal/collector` | сборщик: файл или файлы по маске → буфер (`evlog`) → пачки; обещания хранилища проверяются закреплённым ключом; эпоха установки — с каждым запросом | `collector.go` | 46 тестов: доставка, рестарт без дублей, ротация (дочитывание до тишины), переустановка, длинные строки, шарды Pipelock, старт после переустановки, откат буфера, второй сборщик и копия установки, неверные обещания, часы назад, опасные настройки, смена места после падения; 58 мутаций в наборе `edge` |
+| `internal/config` | конфигурация JSON и реестр источников; режим `demo` | `config.go` | предел пути сокета, опасные значения, вложенность каталогов; 7 мутаций (набор `config`); остальное — через тесты движка и сервера |
 | `internal/pki` | учебный УЦ для стенда | `pki.go` | через тесты сервера |
-| `cmd/evidencestore` | сервер и команды оператора | `main.go` | демо |
-| `cmd/esverify` | утилита проверяющего | `main.go` | демо |
+| `cmd/evidencestore` | сервер и команды оператора | `main.go` | `dev-pki` хранит УЦ; демо |
+| `cmd/esverify` | утилита проверяющего: коды выхода 0/1/2, `-allow-no-tsa` | `main.go` | коды выхода, обещание в вердикте, пакет без TSA; демо |
 | `cmd/escollect` | сборщик | `main.go` | демо |
 | `internal/ship` | ядро: транспорт копии наружу `Remote` (S3 с SigV4, каталог), без удаления | `remote.go`, `s3_remote.go`, `file_remote.go` | S3 — свои тесты; каталог — через `TestReplicaRestore` |
 
@@ -65,27 +66,31 @@ esverify ─ cmd/esverify, internal/proof
 
 ```
 data_dir/
+  LOCK                 замок (flock): один процесс на data_dir — serve, init, restore
   keyring.dat          ключи месяцев, заперты корнем; копия → keys.backup_dir
-  evidence/seg_*.log   журнал улик; сегменты только дописываются
+  evidence/seg_*.log   журнал улик; сегменты только дописываются; floor здесь — порча
   chain/chain.log      звенья (append-only)
   chain/chain.head     голова, два слота с CRC
   chain/leaves_*.log   листья (не удаляются никогда)
   chain/sign.key       ключ подписи хранилища (Ed25519)
   tsa-local/           демо-TSA, если tsa.url = "local"
   admin.sock           админка, права 0600
-  replica.json         докуда доехала копия наружу
+  *.torn-<смещение>    рядом с сегментом или файлом цепи: отрезанный оборванный хвост (не удаляется)
 roots_dir/             корни кейринга (FileRoots), отдельно от data_dir
 keys.roots_mirror_dir/ вторая копия корней (другой диск или машина): пишется и уничтожается вместе с roots_dir
-keys.backup_dir/       копии keyring.dat и sign.key (секреты; не в копию наружу)
-replica.url            копия: evidence/…, chain/… кусками по смещению, heads/<n>.json
+keys.backup_dir/       копии keyring.dat (+ keyring.dat.gen — поколение) и sign.key (секреты; не в копию наружу)
+replica.url            копия: evidence/…, chain/… кусками по смещению, heads/<n>.json; докуда доехала — по листингу
 ```
 
 У сборщика (`spool_dir`):
 
 ```
-spool/seg_*.log          буфер — экземпляр evlog; доставленные сегменты удаляются, граница — spool/floor
+spool/seg_*.log          буфер — экземпляр evlog: записи L (строка), S («старт»), P (место чтения);
+                         доставленные сегменты удаляются, граница — spool/floor
 state.json               докуда доставлено (acked)
 files.json               что известно о файлах: докуда прочитан, первая строка
+start-files.json         реестр файлов на момент первого запуска (пишется раньше записи «старт»)
+epoch.json               эпоха этой установки сборщика: с каждым запросом; потерян — новая установка
 promises.jsonl           обещания хранилища, сошедшиеся с закреплённым ключом
 promises-rejected.jsonl  обещания, которые не сошлись: улика против хранилища
 ```
@@ -100,49 +105,60 @@ promises-rejected.jsonl  обещания, которые не сошлись: �
 | повтор безопасен и получает то же обещание, что приём | `store.Ingest`, `store.checkDuplicate` | `TestDuplicatesAndLastSeq`, `TestResendGetsPromise` |
 | другое тело под занятым номером — отказ пачке и событие в цепи, а не «duplicate» | `store.checkDuplicate` (`ErrSeqConflict`, `EventConflict`) | `TestSeqConflict`, `TestIngestOverMTLS` |
 | источник только из сертификата | `server.source` | `TestSourceComesFromCertificate` |
-| время приёма не идёт назад | `store.clockLocked` | `TestReceivedAtIsMonotonic` |
+| время приёма не идёт назад и не убегает вперёд дальше якоря TSA | `store.clockLocked`, `store.anchorClock` | `TestReceivedAtIsMonotonic`, `TestReceiveTimeHeldByTSAAnchor` |
 | после падения цепь досчитывается | `store.open` (хвост журнала → листья) | `TestCrashCatchUp` |
 | потеря подтверждённой улики не скрывается | `store.open` (`ErrEvidenceLost`) | `TestLostEvidenceStopsStart` |
+| один бит порчи не стирает подтверждённое: порча середины — отказ, оборванный хвост откладывается рядом | `evlog.scanSegment` (`findFrame`), `auditchain.scanFrames` (`frameAfter`) | `TestCorruptionInLastSegmentIsNotCut`, `TestTornTailIsCut`, `TestCarrier_TornTailIsNotTamper`, `TestChainCorruptionIsLoud`, `TestBitRotInEvidenceLogRefused` |
+| `floor` — только у буфера сборщика, и граница — начало сегмента; сбой посреди создания сегмента не валит запуск | `evlog.readFloor`, `evlog.newSegment` | `TestFloorRefusedWithoutAllowRelease`, `TestFloorMustStartASegment`, `TestFloorInEvidenceLogRefused`, `TestHeaderlessLastSegmentRecovered` |
+| отказ записи цепи защёлкивается, и приём стоит; неудачный `Open` цепи ничего не пишет | `auditchain.Carrier.flushLocked`, `auditchain.Open`, `store.Healthy` | `TestCarrier_FailureLatches`, `TestCarrier_FailedOpenWritesNothing`, `TestChainFailureStopsIntake` |
+| подменённый лист цепи не проходит запуск; испорченный слот головы виден | `auditchain.ScanVerifiedLeaves`, `store.scanChain`, `auditchain.readHead` | `TestLeafTamperIsSeenOnScan`, `TestTamperedLeafStopsStart`, `TestCarrier_DamagedHeadSlotIsReported` |
+| второй процесс над `data_dir` не стартует | `store.lockDataDir` | `TestDataDirLocked` |
 | подделка в пакете ловится | `proof.Verify` | `TestTamperingIsDetected`, тесты `internal/proof` |
+| пакет без T2 не проходит, пока не сказано `-allow-no-tsa`; улика гейтвея без части `gateway` не проходит; непроверенная подпись точки запись не накрывает | `proof.Verify`, `proof.verifyGateway` | `TestBundleWithoutUpperFailsByDefault`, `TestBundleWithoutTSAIsRefused`, `TestGatewayPartCannotBeStripped`, `TestNoKeyCheckpointDoesNotCover` |
+| отчёт: вердикт первой и последней строкой, управляющие символы экранированы, обещание — часть вердикта; код выхода 0/1/2 | `proof.Report.Text`, `cmd/esverify` | `TestReportTextEscapesControls`, `TestExitCodesAndPromiseVerdict` |
+| ключ записи из пакета связан с отпечатком улики (EV2) | `keyring.OpenWithDEK` | `TestDEKCommitment` |
 | токен TSA проверяется до цепи | `store.Stamp` | `TestStampRejectsUntrustedToken` |
-| правка любого байта токена ловится | `tsa.Verify` | `TestEveryByteOfTokenMatters` (и токен НУЦ) |
+| правка любого подписанного байта токена ловится; атрибут сертификата подписанта (v1 или v2) обязателен; точность метки не хуже минуты | `tsa.Verify` | `TestEveryByteOfTokenMatters` (и токен НУЦ), `TestSigningCertificateV1AndRequired`, `TestAccuracyBound` |
+| метка TSA — только когда после прошлой в цепь легло новое | `store.stamp` | `TestStampOnlyAfterNewLeaves` |
 | уничтоженный ключ не открывается ни в одной копии | `keyring` (поворот корня) | `TestDestroy`, `TestDestroyWaitsForBackup` |
-| уничтожение — только двое и не раньше срока | `keyring.ScheduleDestroy` | `TestLifecycle`, `TestRetentionErasure` |
-| откат `keyring.dat` виден | `store.reconcileKeys` | `TestKeyringRollbackDetected` |
-| пропуски и молчание — в цепи | `store.indexLocked`, `store.CheckSilence` | `TestGapsAndSilence` |
+| уничтожение — только двое и не раньше срока; срок от времени TSA при заявке, не длиннее 10 лет | `keyring.ScheduleDestroyFrom`, `store.ScheduleDestroy` | `TestLifecycle`, `TestRetentionErasure`, `TestDestroyWindowFromTSATime`, `TestWaitLimitAndTimeRange` |
+| откат `keyring.dat` виден и не затирает свежий резерв; `init` не затирает резерв; цепь без `sign.key` не стартует | `store.reconcileKeys` (копия после сверки), `store.backupFile` (`.gen`), `store.Init`, `store.open` | `TestKeyringRollbackDetected`, `TestOldKeyringDoesNotOverwriteBackup`, `TestInitRefusesWithKeysInBackup`, `TestSigningKeyGuarded` |
+| пропуски и молчание — в цепи; пропуск, найденный перед падением, объявляется после; молчание — одно событие на эпизод и через рестарт; индекс номеров вразброс не раздувается | `store.indexLocked`, `store.announceTailGaps`, `store.CheckSilence`, `store.seqIndex` | `TestGapsAndSilence`, `TestGapSurvivesCrash`, `TestSilenceSurvivesRestart`, `TestSeqIndexSparse` |
 | сборщик не задваивает строки после падения | `collector` (позиция в буфере) | `TestRestartNoDuplicates`, `TestTornLongLineResumesAtChunk` |
-| первый запуск помнит место чтения; без буфера сборщик не гадает | `collector.Bootstrap` (запись «старт»), `collector.load` | `TestBootstrapPositionSurvivesRestart`, `TestLinesWrittenWhileDownAfterFirstStart`, `TestLostSpoolRefusesToGuess`, `TestGlobFirstStartSkipsExisting` |
+| первый запуск помнит место чтения и встаёт на конец целой строки; без буфера сборщик не гадает | `collector.Bootstrap` (запись «старт», `start-files.json`), `collector.load` | `TestBootstrapPositionSurvivesRestart`, `TestLinesWrittenWhileDownAfterFirstStart`, `TestLostSpoolRefusesToGuess`, `TestGlobFirstStartSkipsExisting`, `TestStartRecordCarriesNoRegistry`, `TestFirstStartMidLineTakesWholeLine`, `TestFirstStartRemembersHead` |
 | буфер: fail-stop, доставленное уходит с диска, номера только растут | `evlog` (экземпляр сборщика), `collector.SendOnce` (`Release`) | `TestFailStop`, `TestReleaseDropsWholeSegments`, `TestSpoolReleasesDelivered`, `TestSpoolSeqMustGrow` |
-| ротация не теряет хвост старого файла; потеря — пропуск номера, а не тишина; подменённый на месте файл читается с начала | `collector.ReadOnce` | `TestRotationDrainsOldFile`, `TestLostRotatedTailLeavesGap`, `TestFileReplacedInPlaceIsReadFromStart` |
+| ротация не теряет хвост старого файла: он дочитывается через дескриптор, пока не замолчит; потеря — пропуск номера, а не тишина; подменённый на месте файл читается с начала; нечитаемая первая строка — не подмена; смена места переживает падение (запись `P`); нет файла — предупреждение | `collector.ReadOnce`, `collector.drainRotated`, `collector.replacedFD`, `collector.markPos`, `collector.warnMissing` | `TestRotationDrainsOldFile`, `TestRotationWaitsForQuietOldFile`, `TestRotatedFileFoundByInodeAfterRestart`, `TestLostRotatedTailLeavesGap`, `TestFileReplacedInPlaceIsReadFromStart`, `TestUnreadableHeadIsNotReplacement`, `TestPositionSwitchSurvivesCrash`, `TestMissingSourceIsReported` |
 | длинные строки не застревают в пределе запроса | `collector.SendOnce` (1 МиБ тел на пачку) | `TestBigLinesFitRequestLimit` |
-| доставлено — только с обещанием, которое сходится с закреплённым ключом; неверное обещание — улика, записи ждут | `collector.keepPromise` | `TestBadPromiseKeepsRecords`, `TestDeliveryAndPromises`, `TestTornPromiseLine` |
-| откат `spool_dir` и второй сборщик с тем же сертификатом останавливают сборщик, а не теряют строки | `collector.Bootstrap` (`ErrStoreAhead`), `collector.send` (`ErrConflict`) | `TestRolledBackSpoolStops`, `TestSecondCollectorWithSameCertificateStops` |
-| опасные настройки сборщика — ошибка при загрузке | `collector.Config.validate` | `TestConfigRejectsDangerousValues`, `TestBadServerAddressIsAnError` |
+| доставлено — только с обещанием, которое сходится с закреплённым ключом; неверное обещание — улика, записи ждут | `collector.keepPromise` | `TestBadPromiseKeepsRecords`, `TestDeliveryAndPromises`, `TestTornPromiseLine`, `TestTornPromiseWriteIsCut` |
+| второй сборщик с тем же сертификатом (другая установка) получает отказ уже при запуске; законную переустановку принимает оператор, и тогда отказ — прежней установке; закрепление переживает падение; одновременный первый контакт закрепляет ровно одну; выдуманные эпохи не раздувают цепь | `store.Admit`, `store.BindEpoch`, `server.handleState`, `server.handleIngest`, `collector.loadEpoch` | `TestEpochBindsSource`, `TestEpochBindingSurvivesCrash`, `TestEpochFirstContactRace`, `TestEpochRefusalsBounded`, `TestEpochOverMTLS`, `TestSecondCollectorWithSameCertificateStops`, `TestRunStopsWhenRebound`, `TestLostEpochFileIsNewInstallation` |
+| откат `spool_dir` и копия одной установки останавливают сборщик, а не теряют строки | `collector.Bootstrap` (`ErrStoreAhead`), `collector.send` (`ErrConflict`) | `TestRolledBackSpoolStops`, `TestInstallationCloneStopsOnConflict` |
+| опасные настройки сборщика и хранилища — ошибка при загрузке | `collector.Config.validate`, `config.Validate` | `TestConfigRejectsDangerousValues`, `TestBadServerAddressIsAnError`, `TestValidateRejectsDangerousValues` |
 | текущий месяц не закрывается случайно | `store.Deactivate` (`-force`) | `TestKeyringRollbackDetected`, `TestAdminProofAndKeys` |
-| копия восстанавливается и сверяется с подписанной головой | `store.RestoreReplica` | `TestReplicaRestore` |
+| копия восстанавливается и сверяется с подписанной головой; прерванный проход не ломает восстановление; голова копии не новее её звеньев; куски внахлёст сверяются | `store.ShipOnce` (журнал раньше цепи, голова под замком цепи), `store.RestoreReplica` | `TestReplicaRestore`, `TestReplicaInterruptedPassRestores`, `TestReplicaHeadNotAheadOfShippedChain`, `TestRestoreSkipsHeadAheadOfLinks`, `TestReplicaRestoreToleratesOverlap` |
 | копия `keyring.dat` в резерв не держит шифрование; ключ без копии не выдаётся | `keyring.persistLocked` (общий замок отпущен, изменения в очереди на `wmu`), `keyring.Seal` | `TestBackupDoesNotBlockSeal`, `TestNewKeyWaitsForBackup` |
-| пропавшие листья цепи — громкая ошибка, а не «истёкшие» | `auditchain.ReadLeaves` (`ErrLeavesMissing`) | `TestMissingLeavesAreLoud` |
+| пропавшие листья цепи — громкая ошибка, а не «истёкшие» | `auditchain.ReadLeaves`, `ScanLeaves`, `ScanVerifiedLeaves`, `Open` (`ErrLeavesMissing`) | `TestMissingLeavesAreLoud` |
 | квитанция ключа — только по состоянию, дошедшему до резерва; восстановление после сбоя резерва стартует | `store.logKeyLocked` (`KeyInfo.Confirmed`), `keyring.Confirm` | `TestRestoreAfterFailedKeyringBackup`, `TestKeyReceiptWaitsForBackup`, `TestConfirmWaitsForBackup` |
 | улики под ключом, которого не знает `keyring.dat`, останавливают старт | `store.checkKeyUse` | `TestWrongKeyringStopsStart` |
 | пока есть корни-сироты, уничтожение не окончательно | `keyring.finishLocked`, `keyring.OrphanRoots` | `TestOrphanRootBlocksEffective`, `TestOrphanRootAfterStaleRestore`, `TestOrphanRootsAdmin` |
-| потеря каталога корней не уносит ключи, уничтожение затирает обе копии | `keyring.FileRoots` (`Mirror`) | `TestRootsMirror`, `TestFileRootsMirrorFailures` |
+| потеря каталога корней не уносит ключи, уничтожение затирает обе копии; недостающая копия докладывается (пропавший каталог не создаётся), испорченная обходится, расходящимися не заворачивают; недоступное зеркало не мешает старту; медленные корни не держат приём | `keyring.FileRoots` (`Mirror`, `RepairRoots`, `Wrap`, `Unwrap`), `store.open` | `TestRootsMirror`, `TestFileRootsMirrorFailures`, `TestRootCopiesRepairedAndChecked`, `TestRepairDoesNotCreateMissingDir`, `TestMirrorDownDoesNotStopStart`, `TestSlowRootsDoNotBlockSeal` |
 | каталоги ключей не вкладываются друг в друга | `config.Validate` | `TestKeyDirsDoNotNest` |
 | хранилищу корней (HSM, KMS) уходит только ключ файла, 32 байта | `keyring.persistLocked` (KRNG3) | `TestRootSeesOnlyFileKey`, `TestFileKeyIsFreshPerWrite`, `TestLegacyFormatRefused` |
 | окно отмены отмеряется и по метке TSA; без метки уничтожение ждёт | `store.CompleteDue`, `keyring.CompleteDueAt` | `TestDestroyWaitsForTSATime` |
-| хэши и подписи Pipelock повторяются байт в байт | `gateway.Entry.ComputeHash`, `gateway.Tracker` | `TestPipelockRecorderVectors`, `TestPipelockTamperedEntry`, `TestDetailBytesAreHashedAsWritten`, `TestTimestampNormalizedLikePipelock` |
+| хэши и подписи Pipelock повторяются байт в байт; ключ, повторённый со свёрткой регистра, и невалидный UTF-8 — ошибка | `gateway.Entry.ComputeHash`, `gateway.Tracker`, `gateway.ParseEntry` | `TestPipelockRecorderVectors`, `TestPipelockTamperedEntry`, `TestDetailBytesAreHashedAsWritten`, `TestTimestampNormalizedLikePipelock`, `TestCaseFoldedDuplicateKeyAndBadUTF8` |
 | запись журнала гейтвея: вердикт в цепи, после падения досчитывается | `store.recordGateway`, `store.open` (вердикты по телам) | `TestGatewayJournalProof`, `TestGatewayVerdictCatchUp` |
 | пакет: тело — та самая запись гейтвея, её накрывает подписанная точка | `proof.verifyGateway` | `TestGatewayJournalProof`, `TestGatewayBodyMustMatchVerdict`, `TestGatewayVerdictOfAnotherRecord`, `TestGatewayTamperedEntry` |
-| шарды по маске — по порядку, без повторов; удалённый файл — пропуск номера; шард «из прошлого» по часам читается | `collector.readGlob` (`files.json`) | `TestGlobFollowsPipelockShards`, `TestGlobEqualMTimesUseNaturalOrder`, `TestGlobCurrentFileGoneLeavesGap`, `TestGlobFileFromThePastIsRead`, `TestGlobDeletedCurrentDoesNotRereadOlder` |
+| шарды по маске — по порядку, без повторов; удалённый текущий файл дочитывается через дескриптор, пропуск — только после перезапуска; подменённый на месте — пропуск и чтение с начала, без дубля; файл с чужим inode забывается; шард «из прошлого» по часам читается | `collector.readGlob` (`files.json`) | `TestGlobFollowsPipelockShards`, `TestGlobEqualMTimesUseNaturalOrder`, `TestGlobCurrentFileGoneLeavesGap`, `TestGlobFileFromThePastIsRead`, `TestGlobDeletedCurrentDoesNotRereadOlder`, `TestGlobReplacedInPlaceIsGapNotDuplicate`, `TestGlobForgetsFileWithReusedInode` |
 | показатели для тревог | `store.Metrics`, `server.MetricsHandler` | `TestMetrics`, `TestMetricsEndpoint` |
 | из копии наружу ничего не удаляется | `ship.Remote`: метода удаления нет | — (держит тип) |
 | отчёт проверяющего называет верную причину, почему тело закрыто | `proof.Report.Notes` | `TestNotesTellWhyBodyIsClosed` |
 | слишком длинный путь сокета админки — ошибка конфига, а не `bind: invalid argument` | `config.Validate` | `TestAdminSocketPathLimit` |
+| `dev-pki` повторно не ломает выданные сертификаты: ключ УЦ хранится | `cmd/evidencestore` (`pki.LoadCA`) | `TestDevPKIKeepsCA` |
 
 ## Как проверить
 
 ```
 go build ./... && go vet ./... && go test -race ./...     # гейт
-python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway   # мутации: каждая поломка должна уронить тест
+python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config   # мутации: каждая поломка должна уронить тест
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # демо с настоящим Pipelock
 scripts/demo.sh                                           # демо на бинарниках, без интернета
 DEMO_TSA=nca scripts/demo.sh                              # то же с настоящей TSA НУЦ РК

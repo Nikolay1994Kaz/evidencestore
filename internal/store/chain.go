@@ -12,30 +12,37 @@ import (
 	"evidencestore/internal/tsa"
 )
 
+// chainScan — что подъём узнал из цепи.
+type chainScan struct {
+	keyEvents map[string]string // последнее событие каждого ключа
+	maxPos    uint64            // наибольшая позиция улики в цепи
+	maxSeq    map[string]uint64 // наибольший номер в цепи у каждого источника
+	silent    map[string]bool   // источники, чьё последнее событие в цепи — «молчит»
+}
+
 // scanChain поднимает индексы цепи одним проходом по листьям: где лежит
 // лист каждой улики, какие метки TSA уже в цепи, какое последнее событие у
-// каждого ключа. Отдаёт последние события ключей и наибольшую позицию
-// улики в цепи.
-func (s *Store) scanChain() (map[string]string, uint64, error) {
+// каждого ключа. Листья каждого звена сверяются с его корнем: подменённый
+// лист не попадает в индексы и в сверку кейринга.
+func (s *Store) scanChain() (chainScan, error) {
+	cs := chainScan{keyEvents: map[string]string{}, maxSeq: map[string]uint64{}, silent: map[string]bool{}}
 	links, err := auditchain.ReadChain(s.chainDir)
 	if err != nil {
-		return nil, 0, err
+		return cs, err
 	}
 	for _, l := range links {
 		p, err := auditchain.DecodeBatchPayload(l.Payload)
 		if err != nil {
-			return nil, 0, fmt.Errorf("chain link %d: %w", l.Seq, err)
+			return cs, fmt.Errorf("chain link %d: %w", l.Seq, err)
 		}
 		if p.FirstLeaf != s.linked {
-			return nil, 0, fmt.Errorf("chain link %d covers leaves from %d, expected %d", l.Seq, p.FirstLeaf, s.linked)
+			return cs, fmt.Errorf("chain link %d covers leaves from %d, expected %d", l.Seq, p.FirstLeaf, s.linked)
 		}
 		s.links = append(s.links, linkRef{seq: l.Seq, first: p.FirstLeaf, count: uint64(p.Count)})
 		s.linked = p.FirstLeaf + uint64(p.Count)
 	}
 
-	keyEvents := map[string]string{}
-	var maxPos uint64
-	err = auditchain.ScanLeaves(s.chainDir, func(num uint64, l auditchain.Leaf) error {
+	err = auditchain.ScanVerifiedLeaves(s.chainDir, links, func(num uint64, l auditchain.Leaf) error {
 		s.nextLeaf = num + 1
 		switch l.Type {
 		case auditchain.EventEvidence:
@@ -44,7 +51,13 @@ func (s *Store) scanChain() (map[string]string, uint64, error) {
 				return fmt.Errorf("chain leaf %d: %w", num, err)
 			}
 			s.setEvLeaf(pos, num)
-			maxPos = max(maxPos, pos)
+			cs.maxPos = max(cs.maxPos, pos)
+			if seq, err := strconv.ParseUint(l.Subject, 10, 64); err == nil {
+				cs.maxSeq[l.Scope] = max(cs.maxSeq[l.Scope], seq)
+			}
+			delete(cs.silent, l.Scope)
+		case auditchain.EventSilence:
+			cs.silent[l.Scope] = true
 		case auditchain.EventTimestamp:
 			head, err := strconv.ParseUint(l.Subject, 10, 64)
 			if err != nil {
@@ -56,8 +69,17 @@ func (s *Store) scanChain() (map[string]string, uint64, error) {
 			}
 			s.tokens = append(s.tokens, tokenRef{head: head, leaf: num, gen: gen})
 			s.lastStamped = max(s.lastStamped, head)
+			s.stampedLeaves = num + 1
 		case auditchain.EventKeyState:
-			keyEvents[l.Scope] = l.Subject
+			cs.keyEvents[l.Scope] = l.Subject
+		case auditchain.EventEpoch:
+			var ev epochEvent
+			if err := json.Unmarshal(l.Payload, &ev); err != nil {
+				return fmt.Errorf("chain leaf %d: collector epoch: %w", num, err)
+			}
+			if st := s.sources[l.Scope]; st != nil && ev.Reason != epochRefused {
+				st.epoch = ev.Epoch
+			}
 		case auditchain.EventGateway:
 			pos, v, err := proof.ParseGatewayLeaf(l)
 			if err != nil {
@@ -72,12 +94,12 @@ func (s *Store) scanChain() (map[string]string, uint64, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, 0, err
+		return cs, err
 	}
 	if got, want := s.nextLeaf-s.linked, uint64(s.chain.Pending()); got != want {
-		return nil, 0, fmt.Errorf("chain: %d leaves without a link on disk, carrier holds %d", got, want)
+		return cs, fmt.Errorf("chain: %d leaves without a link on disk, carrier holds %d", got, want)
 	}
-	return keyEvents, maxPos, nil
+	return cs, nil
 }
 
 func (s *Store) setEvLeaf(pos, leaf uint64) {

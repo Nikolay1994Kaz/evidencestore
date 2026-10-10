@@ -154,8 +154,13 @@ func (s *s3Remote) List(ctx context.Context, prefix string) ([]string, error) {
 			// Возвращаем ключи относительно prefix'а URL — как file-бэкенд.
 			keys = append(keys, strings.TrimPrefix(strings.TrimPrefix(c.Key, s.prefix), "/"))
 		}
-		if !result.IsTruncated || result.NextContinuationToken == "" {
+		if !result.IsTruncated {
 			return keys, nil
+		}
+		// Листинг не весь, а продолжить нечем (несовместимый S3): молча
+		// отдать часть нельзя — копия решила бы, что её объектов нет.
+		if result.NextContinuationToken == "" {
+			return nil, fmt.Errorf("ship: s3 list %s: truncated listing without a continuation token", prefix)
 		}
 		token = result.NextContinuationToken
 	}

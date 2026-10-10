@@ -119,3 +119,24 @@ func TestParseKey(t *testing.T) {
 		}
 	}
 }
+
+// V-03: ключ, отличающийся только регистром (или ſ вместо s), encoding/json
+// считает тем же полем, а Python, jq и map читают оба. Хэш сошёлся бы над
+// одним значением, а другие читатели видели бы другое. Повтор ключа по
+// свёртке регистра — ошибка, как и невалидный UTF-8 (разные байты → один
+// хэш).
+func TestCaseFoldedDuplicateKeyAndBadUTF8(t *testing.T) {
+	good := []byte(`{"v":1,"seq":0,"summary":"a"}`)
+	if _, err := ParseEntry(good); err != nil {
+		t.Fatalf("ПАРНЫЙ КОНТРОЛЬ: %v", err)
+	}
+	for name, line := range map[string]string{
+		"регистр":   `{"v":1,"seq":0,"summary":"BENIGN","SUMMARY":"rm -rf"}`,
+		"длинная s": `{"v":1,"seq":0,"summary":"BENIGN","ſummary":"rm -rf"}`,
+		"\\xff":     "{\"v\":1,\"seq\":0,\"summary\":\"\xff\"}",
+	} {
+		if _, err := ParseEntry([]byte(line)); err == nil {
+			t.Errorf("%s: принято", name)
+		}
+	}
+}

@@ -21,8 +21,9 @@
   - типы событий улик вместо событий памяти агентов;
   - домен подписи `evidencestore/statement/v1`;
   - читатели больше не обрезают файл (читатель во время записи мог отрезать недописанный кадр);
-  - пропавшие листья — ошибка `ErrLeavesMissing`, а не «истёкшие по сроку хранения»: `ForEachLeaf` и `FindLeaf` их больше не пропускают;
-  - добавлены `ScanLeaves`, `SignMessage`, `EncodeHash`.
+  - пропавшие листья — ошибка `ErrLeavesMissing`, а не «истёкшие по сроку хранения»;
+  - добавлены `ScanLeaves`, `ScanVerifiedLeaves`, `SignMessage`, `EncodeHash`;
+  - 09.10: защёлка отказа записи, неудачный `Open` не флашит, порча середины файла — отказ вместо среза хвоста, отрезанный хвост откладывается рядом; удалены `InclusionProof`, `BuildProof`, `ForEachLeaf`, `FindLeaf`, `VerifyRange` (в продукте не вызывались, `InclusionProof.Verify` принимал выдуманный лист).
 - `internal/wal` удалён: журнал улик — новый пакет `internal/evlog`.
 - `internal/ship`: оставлен только транспорт `Remote`; `Shipper` (снапшоты, манифесты, удаление старых объектов) удалён вместе с `wal`, из `Remote` убран `Delete`.
 - `internal/monitoring` удалён: все три его метрики относились к `wal` и `Shipper`. С ним из `go.mod` ушла `VictoriaMetrics/metrics`, осталась одна зависимость — `golang.org/x/sys`.

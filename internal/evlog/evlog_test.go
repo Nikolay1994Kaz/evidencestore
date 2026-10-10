@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -183,6 +184,9 @@ func TestTornTailIsCut(t *testing.T) {
 		if st, _ := os.Stat(path); st.Size() != int64(len(good)) {
 			t.Fatalf("хвост не отрезан: %d байт вместо %d", st.Size(), len(good))
 		}
+		if aside, err := os.ReadFile(l2.Recovery().TornTailFile); err != nil || !bytes.Equal(aside, tail) {
+			t.Fatalf("отрезанный хвост не отложен: %q, %v", aside, err)
+		}
 		if first, err := l2.Append([][]byte{rec(3)}); err != nil || first != 3 {
 			t.Fatalf("append после обрезки: %d, %v", first, err)
 		}
@@ -302,7 +306,7 @@ func fill(t *testing.T, l *Log, n int) {
 // после переоткрытия журнал начинается с границы, позиции прежние.
 func TestReleaseDropsWholeSegments(t *testing.T) {
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	l := openLog(t, dir, Options{SegmentBytes: 64, AllowRelease: true}, nil)
 	fill(t, l, 10)
 	segs := l.Segments()
 	if len(segs) < 4 {
@@ -330,7 +334,7 @@ func TestReleaseDropsWholeSegments(t *testing.T) {
 	l.Close()
 
 	var seen []uint64
-	l2 := openLog(t, dir, Options{SegmentBytes: 64}, func(pos uint64, data []byte) error {
+	l2 := openLog(t, dir, Options{SegmentBytes: 64, AllowRelease: true}, func(pos uint64, data []byte) error {
 		if !bytes.Equal(data, rec(int(pos))) {
 			return fmt.Errorf("pos %d: %q", pos, data)
 		}
@@ -349,14 +353,14 @@ func TestReleaseDropsWholeSegments(t *testing.T) {
 // за ним уже открыт пустой сегмент (ротация, затем падение до записи).
 func TestReleaseKeepsLastRecord(t *testing.T) {
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	l := openLog(t, dir, Options{SegmentBytes: 64, AllowRelease: true}, nil)
 	fill(t, l, 10)
 	l.Close()
 	hdr := append([]byte(segMagic), 0, 0, 0, 0, 0, 0, 0, 11)
 	if err := os.WriteFile(segPath(dir, 11), hdr, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	l2 := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	l2 := openLog(t, dir, Options{SegmentBytes: 64, AllowRelease: true}, nil)
 	if err := l2.Release(10); err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +376,7 @@ func TestReleaseKeepsLastRecord(t *testing.T) {
 // Open доводит удаление до конца, записи ниже границы не видны.
 func TestInterruptedReleaseFinishedOnOpen(t *testing.T) {
 	dir := t.TempDir()
-	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	l := openLog(t, dir, Options{SegmentBytes: 64, AllowRelease: true}, nil)
 	fill(t, l, 10)
 	first := l.Segments()[0]
 	saved, err := os.ReadFile(first.Path)
@@ -387,7 +391,7 @@ func TestInterruptedReleaseFinishedOnOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	var low []uint64
-	openLog(t, dir, Options{SegmentBytes: 64}, func(pos uint64, _ []byte) error {
+	openLog(t, dir, Options{SegmentBytes: 64, AllowRelease: true}, func(pos uint64, _ []byte) error {
 		if pos <= first.Count {
 			low = append(low, pos)
 		}
@@ -412,5 +416,103 @@ func TestMissingFirstSegmentIsLoud(t *testing.T) {
 	os.Remove(segs[0].Path)
 	if _, err := Open(dir, Options{SegmentBytes: 64}, nil); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("пропал первый сегмент: %v", err)
+	}
+}
+
+// ⭐ Файл floor в журнале улик — порча, а не граница: подложенный floor не
+// удаляет улики при старте (журнал улик Release не зовёт никогда).
+func TestFloorRefusedWithoutAllowRelease(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	fill(t, l, 10)
+	if err := l.Release(5); !errors.Is(err, ErrNoRelease) {
+		t.Fatalf("Release у журнала улик: %v", err)
+	}
+	segs := l.Segments()
+	l.Close()
+	if err := os.WriteFile(filepath.Join(dir, floorFile), []byte("4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{SegmentBytes: 64}, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("floor в журнале улик: %v", err)
+	}
+	for _, s := range segs {
+		if _, err := os.Stat(s.Path); err != nil {
+			t.Fatalf("сегмент с %d удалён: %v", s.First, err)
+		}
+	}
+}
+
+// Граница, которая не совпадает с началом ни одного сегмента, — порча, и по
+// ней ничего не удаляется.
+func TestFloorMustStartASegment(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{SegmentBytes: 64, AllowRelease: true}, nil)
+	fill(t, l, 10)
+	segs := l.Segments()
+	l.Close()
+	if err := os.WriteFile(filepath.Join(dir, floorFile), []byte("5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{SegmentBytes: 64, AllowRelease: true}, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("граница посреди сегмента: %v", err)
+	}
+	for _, s := range segs {
+		if _, err := os.Stat(s.Path); err != nil {
+			t.Fatalf("сегмент с %d удалён: %v", s.First, err)
+		}
+	}
+}
+
+// ⭐ Испорчена запись в середине последнего сегмента, за ней целые: это не
+// оборванный хвост. Открытие отказывает и ничего не режет (раньше один бит
+// стирал все подтверждённые записи после него).
+func TestCorruptionInLastSegmentIsNotCut(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{}, nil)
+	fill(t, l, 10)
+	l.Close()
+	path := segPath(dir, 1)
+	data, _ := os.ReadFile(path)
+	bad := bytes.Clone(data)
+	bad[segHeader+3*(frameHead+len(rec(1)))+frameHead+2] ^= 1 // тело четвёртой записи
+	if err := os.WriteFile(path, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{}, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("порча середины последнего сегмента: %v", err)
+	}
+	if after, _ := os.ReadFile(path); !bytes.Equal(after, bad) {
+		t.Fatalf("сегмент изменён: %d байт, было %d", len(after), len(bad))
+	}
+}
+
+// Сбой посреди создания сегмента старой версией: последний сегмент без
+// заголовка. Записей в нём нет — он убирается, журнал открывается (раньше —
+// отказ «bad header» и ручная правка). Так и с самым первым сегментом.
+func TestHeaderlessLastSegmentRecovered(t *testing.T) {
+	dir := t.TempDir()
+	l := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	fill(t, l, 10)
+	next := l.Next()
+	l.Close()
+	if err := os.WriteFile(segPath(dir, next), []byte("EVLO"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l2 := openLog(t, dir, Options{SegmentBytes: 64}, nil)
+	if l2.Next() != next {
+		t.Fatalf("next %d, ожидали %d", l2.Next(), next)
+	}
+	if first, err := l2.Append([][]byte{rec(int(next))}); err != nil || first != next {
+		t.Fatalf("append: %d, %v", first, err)
+	}
+
+	fresh := t.TempDir()
+	if err := os.WriteFile(segPath(fresh, 1), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l3 := openLog(t, fresh, Options{}, nil)
+	if first, err := l3.Append([][]byte{rec(1)}); err != nil || first != 1 {
+		t.Fatalf("append в пустой журнал: %d, %v", first, err)
 	}
 }

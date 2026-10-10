@@ -24,94 +24,6 @@ func chainOfLinks(t *testing.T, dir string, n int) Head {
 	return head
 }
 
-func TestVerifyRange_FullPassMatchesHead(t *testing.T) {
-	dir := t.TempDir()
-	head := chainOfLinks(t, dir, 6)
-
-	got, checked, err := VerifyRange(dir, 0, &head)
-	if err != nil {
-		t.Fatalf("полный проход отверг целую цепь: %v", err)
-	}
-	if got != head || checked != 6 {
-		t.Fatalf("проверено %d звеньев, голова %+v", checked, got)
-	}
-}
-
-// ⭐TestVerifyRange_FromOporаCatchesLaterTampering — окно обязано ловить
-// правку ПОСЛЕ опоры. То, что до неё, оно не проверяет по построению, и это
-// названо: аудитор опирается на прошлое подписанное заявление.
-func TestVerifyRange_FromCatchesLaterTampering(t *testing.T) {
-	dir := t.TempDir()
-	head := chainOfLinks(t, dir, 6)
-
-	// ПАРНЫЙ КОНТРОЛЬ: на целой цепи сверка с середины проходит.
-	if _, checked, err := VerifyRange(dir, 3, &head); err != nil || checked != 3 {
-		t.Fatalf("целая цепь не прошла сверку с звена 3: checked=%d err=%v", checked, err)
-	}
-
-	// Портим ПЯТОЕ звено — оно внутри окна.
-	path := filepath.Join(dir, chainFileName)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	frame := len(data) / 6
-	data[4*frame+20] ^= 0xff
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := VerifyRange(dir, 3, &head); err == nil {
-		t.Fatal("правка внутри окна не обнаружена")
-	}
-}
-
-// ⭐TestVerifyRange_CatchesRelinkedChain — правка, СОХРАНЯЮЩАЯ кадры валидными.
-//
-// ⚠Тест выше портил байт и был зелёным по неверной причине: ошибку возвращал
-// разбор кадра по CRC, а сама проверка связи PrevHash оставалась непокрытой.
-// Мутация «не сверять PrevHash» проходила насквозь. Здесь звено
-// ПЕРЕСОБИРАЕТСЯ с корректным CRC и корректным seq — ровно то, что сделает
-// тот, кто переписывает прошлое, а не тот, у кого побился диск.
-func TestVerifyRange_CatchesRelinkedChain(t *testing.T) {
-	dir := t.TempDir()
-	head := chainOfLinks(t, dir, 6)
-
-	links, err := ReadChain(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Пятое звено получает ЧУЖОГО предка. Seq не трогаем — иначе упадёт
-	// проверка пропуска, и снова окажется, что проверяли не то.
-	links[4].PrevHash[0] ^= 0xff
-
-	var buf []byte
-	for _, l := range links {
-		buf = append(buf, frameRecord(l)...)
-	}
-	if err := os.WriteFile(filepath.Join(dir, chainFileName), buf, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// ПАРНЫЙ КОНТРОЛЬ: кадры остались валидными — ReadChain не жалуется.
-	if _, err := ReadChain(dir); err != nil {
-		t.Fatalf("пересобранная цепь не читается, значит тест проверяет разбор, а не связность: %v", err)
-	}
-	if _, _, err := VerifyRange(dir, 3, &head); err == nil {
-		t.Fatal("разорванная связь PrevHash не обнаружена при сверке с опоры")
-	}
-	if _, _, err := VerifyRange(dir, 0, &head); err == nil {
-		t.Fatal("разорванная связь PrevHash не обнаружена при полном проходе")
-	}
-}
-
-func TestVerifyRange_RejectsImpossibleStart(t *testing.T) {
-	dir := t.TempDir()
-	chainOfLinks(t, dir, 3)
-	if _, _, err := VerifyRange(dir, 99, nil); err == nil {
-		t.Fatal("сверка с несуществующего звена принята")
-	}
-}
-
 // ⭐TestMissingLeavesAreLoud — листья не удаляются никогда, и пропавший файл
 // листьев — потеря, а не «срок хранения». В ядре, откуда пришёл этот код,
 // пропажа считалась штатной; для улик она обязана быть ошибкой у всех
@@ -129,45 +41,93 @@ func TestMissingLeavesAreLoud(t *testing.T) {
 	c.Close()
 
 	// ПАРНЫЙ КОНТРОЛЬ: пока файлы на месте, видно всё.
-	var seen int
-	cov, err := ForEachLeaf(dir, func(Leaf) { seen++ })
-	if err != nil {
-		t.Fatal(err)
+	links, err := ReadChain(dir)
+	if err != nil || len(links) != 4 {
+		t.Fatalf("звеньев %d, %v", len(links), err)
 	}
-	if seen != 4 || cov.LeavesRead != 4 || cov.Links != 4 {
-		t.Fatalf("до пропажи: прочитано %d, cov=%+v", seen, cov)
+	var seen int
+	if err := ScanVerifiedLeaves(dir, links, func(uint64, Leaf) error { seen++; return nil }); err != nil || seen != 4 {
+		t.Fatalf("до пропажи: прочитано %d, %v", seen, err)
 	}
 	segs, err := leafSegments(dir)
 	if err != nil || len(segs) != 4 {
 		t.Fatalf("файлов листьев %d, %v", len(segs), err)
 	}
-	absent := LeafQuery{Type: EventEvidence, Scope: "нет такого"} // поиск пройдёт всю цепь
 
 	// Пропал файл в середине: листья ищутся в соседнем и не находятся.
-	// Пропал самый старый: искать не в чем. Оба случая — ErrLeavesMissing.
-	for _, gone := range []int{2, 0} {
-		if err := os.Remove(leafPath(dir, segs[gone])); err != nil {
+	// Пропал самый старый: искать не в чем. Пропал последний: звено
+	// обещает листья, которых нет. Все случаи — ErrLeavesMissing. Каждый
+	// случай — отдельно: пропавший файл возвращается на место.
+	for _, gone := range []int{2, 0, 3} {
+		p := leafPath(dir, segs[gone])
+		if err := os.Rename(p, p+".away"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := ReadLeaves(dir, segs[gone], 1); !errors.Is(err, ErrLeavesMissing) {
 			t.Errorf("файл %d: ReadLeaves: %v", gone, err)
 		}
-		if _, err := ForEachLeaf(dir, func(Leaf) {}); !errors.Is(err, ErrLeavesMissing) {
-			t.Errorf("файл %d: ForEachLeaf: %v", gone, err)
+		if err := ScanVerifiedLeaves(dir, links, func(uint64, Leaf) error { return nil }); !errors.Is(err, ErrLeavesMissing) {
+			t.Errorf("файл %d: ScanVerifiedLeaves: %v", gone, err)
 		}
-		if _, _, _, err := FindLeaf(dir, absent); !errors.Is(err, ErrLeavesMissing) {
-			t.Errorf("файл %d: FindLeaf: %v", gone, err)
+		if err := os.Rename(p+".away", p); err != nil {
+			t.Fatal(err)
 		}
+	}
+	// Пропали все файлы листьев: носитель не начинает с чистого листа.
+	for _, first := range segs {
+		if err := os.Remove(leafPath(dir, first)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Open(dir); !errors.Is(err, ErrLeavesMissing) {
+		t.Errorf("все листья пропали, Open: %v", err)
 	}
 }
 
-// ⭐TestForEachLeaf_LoudOnCorruptLeafFile — порча ФАЙЛА ЛИСТЬЕВ — громкая
+// ⭐TestLeafTamperIsSeenOnScan — лист подменён вместе с CRC кадра: кадр
+// цел, но корень звена не сходится. Сверка корней при чтении это видит
+// (раньше не видел никто, кроме сборки пакета по этому звену).
+func TestLeafTamperIsSeenOnScan(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir)
+	for i := 0; i < 3; i++ {
+		c.Append(leafN(i))
+	}
+	if _, err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	links, err := ReadChain(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaves, err := ReadLeaves(dir, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaves[1].Subject = "подменён"
+	var buf []byte
+	for _, l := range leaves {
+		buf = append(buf, frameLeaf(l)...)
+	}
+	if err := os.WriteFile(leafPath(dir, 0), buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ScanLeaves(dir, func(uint64, Leaf) error { return nil }); err != nil {
+		t.Fatalf("ПАРНЫЙ КОНТРОЛЬ: кадры целы, а ScanLeaves отказал: %v", err)
+	}
+	if err := ScanVerifiedLeaves(dir, links, func(uint64, Leaf) error { return nil }); err == nil {
+		t.Fatal("подменённый лист прошёл сверку с корнем")
+	}
+}
+
+// ⭐TestScan_LoudOnCorruptLeafFile — порча ФАЙЛА ЛИСТЬЕВ — громкая
 // ошибка, и не та, что у пропажи.
 //
 // ⚠Первая версия этого набора портила chain.log и была зелёной по неверной
 // причине: ошибку возвращал ReadChain, а чтение листьев оставалось
 // непроверенным.
-func TestForEachLeaf_LoudOnCorruptLeafFile(t *testing.T) {
+func TestScan_LoudOnCorruptLeafFile(t *testing.T) {
 	dir := t.TempDir()
 	c := mustOpen(t, dir)
 	for i := 0; i < 3; i++ {
@@ -179,9 +139,13 @@ func TestForEachLeaf_LoudOnCorruptLeafFile(t *testing.T) {
 	c.Close()
 
 	// ПАРНЫЙ КОНТРОЛЬ: до порчи листья читаются.
-	var seen int
-	if cov, err := ForEachLeaf(dir, func(Leaf) { seen++ }); err != nil || seen != 3 || cov.LeavesRead != 3 {
-		t.Fatalf("до порчи: seen=%d cov=%+v err=%v", seen, cov, err)
+	links, err := ReadChain(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan := func() error { return ScanVerifiedLeaves(dir, links, func(uint64, Leaf) error { return nil }) }
+	if err := scan(); err != nil {
+		t.Fatalf("до порчи: %v", err)
 	}
 
 	// Портим тело кадра ВНУТРИ файла листьев, не трогая цепь.
@@ -195,30 +159,41 @@ func TestForEachLeaf_LoudOnCorruptLeafFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cov, err := ForEachLeaf(dir, func(Leaf) {})
+	err = scan()
 	if err == nil {
-		t.Fatalf("порча файла листьев принята молча (cov=%+v)", cov)
+		t.Fatal("порча файла листьев принята молча")
 	}
 	if errors.Is(err, ErrLeavesMissing) {
 		t.Fatalf("порча названа пропажей: %v", err)
 	}
 }
 
-func TestForEachLeaf_LoudOnRealCorruption(t *testing.T) {
-	dir := t.TempDir()
-	chainOfLinks(t, dir, 3)
-
-	// Порча ЗВЕНА — молчать нельзя.
-	path := filepath.Join(dir, chainFileName)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data[10] ^= 0xff
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ForEachLeaf(dir, func(Leaf) {}); err == nil {
-		t.Fatal("порча цепи принята молча")
+// Порча ЗВЕНА в середине цепи — громкая ошибка и у читателя, и у носителя;
+// носитель при этом ничего не режет (раньше считал всё после порчи
+// оборванным хвостом и стирал).
+func TestChainCorruptionIsLoud(t *testing.T) {
+	for name, at := range map[string]int{"тело звена": 10, "длина кадра": 1} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			chainOfLinks(t, dir, 3)
+			path := filepath.Join(dir, chainFileName)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data[at] ^= 0xff // в длине: заявлено больше, чем есть в файле
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadChain(dir); err == nil {
+				t.Fatal("порча цепи принята читателем молча")
+			}
+			if _, err := Open(dir); err == nil {
+				t.Fatal("порча цепи принята носителем молча")
+			}
+			if after, _ := os.ReadFile(path); len(after) != len(data) {
+				t.Fatalf("цепь обрезана: %d байт, было %d", len(after), len(data))
+			}
+		})
 	}
 }

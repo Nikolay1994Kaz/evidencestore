@@ -304,3 +304,65 @@ func TestSigningCertificateBinding(t *testing.T) {
 		t.Fatalf("согласованный токен: %v", err)
 	}
 }
+
+// T-09: сертификат подписанта обязан быть назван подписанным атрибутом —
+// signingCertificateV2 или signingCertificate (v1, SHA-1, как у НУЦ РК). v1
+// сверяется так же строго; токен без обоих атрибутов не принимается
+// (раньше проверялся только v2 и только если он был).
+func TestSigningCertificateV1AndRequired(t *testing.T) {
+	a, _ := authority(t, false)
+	imprint := Imprint("d", []byte("head"))
+	a.essV1 = 1
+	token, err := a.Sign(imprint[:], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(token, imprint, a.Trust()); err != nil {
+		t.Fatalf("токен с атрибутом v1: %v", err)
+	}
+
+	tmpl := *a.cert
+	tmpl.SerialNumber = big.NewInt(99)
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, a.root, a.key.Public(), a.rootKeyForTest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	twin, _ := x509.ParseCertificate(der)
+	orig := a.cert
+	a.cert, a.essCert = twin, orig // v1 называет настоящий, предъявлен двойник
+	token, _ = a.Sign(imprint[:], nil)
+	if _, err := Verify(token, imprint, a.Trust()); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("двойник при атрибуте v1: %v", err)
+	}
+	a.cert, a.essCert = orig, nil
+
+	a.essV1 = -1
+	token, _ = a.Sign(imprint[:], nil)
+	if _, err := Verify(token, imprint, a.Trust()); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("токен без атрибута сертификата: %v", err)
+	}
+}
+
+// T-11: точность метки разбирается и проверяется: «плюс-минус час» не
+// годится в границы времени улики.
+func TestAccuracyBound(t *testing.T) {
+	a, _ := authority(t, false)
+	imprint := Imprint("d", []byte("head"))
+	a.acc = accuracy{Seconds: 1}
+	token, _ := a.Sign(imprint[:], nil)
+	if _, err := Verify(token, imprint, a.Trust()); err != nil {
+		t.Fatalf("точность 1 с: %v", err)
+	}
+	a.acc = accuracy{Seconds: 3600}
+	token, _ = a.Sign(imprint[:], nil)
+	if _, err := Verify(token, imprint, a.Trust()); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("точность час: %v", err)
+	}
+	// Отрицательная часть не вычитается из остальных: 120 с минус 60 000 мс
+	// — не «минута», а негодная метка.
+	a.acc = accuracy{Seconds: 120, Millis: -60000}
+	token, _ = a.Sign(imprint[:], nil)
+	if _, err := Verify(token, imprint, a.Trust()); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("отрицательная точность: %v", err)
+	}
+}

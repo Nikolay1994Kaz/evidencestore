@@ -115,6 +115,11 @@ func (s *Store) syncKeys(op string, approvals []keyring.Approval) {
 // Кейринг может быть впереди цепи на одну операцию (упали между записью
 // кейринга и квитанцией) — тогда квитанция дописывается. Позади цепи он
 // быть не может: это откат или подмена keyring.dat.
+//
+// Копия keyring.dat в резерв — только после сверки: файл после рестарта не
+// знает, что из него уже в резерве, и копия это подтверждает (квитанции
+// ждут подтверждения). Раньше копия шла до сверки, и keyring.dat, старший
+// цепи, затирал свежий резерв, а сверка отказывала уже потом.
 func (s *Store) reconcileKeys(chainLast map[string]string) error {
 	s.scopeMu.Lock()
 	defer s.scopeMu.Unlock()
@@ -123,6 +128,7 @@ func (s *Store) reconcileKeys(chainLast map[string]string) error {
 		s.keyLabels[scope] = label
 	}
 	var errs []error
+	var ahead []string
 	for _, ki := range s.keys.List() {
 		s.scopes[ki.Scope] = true
 		cur := keyLabel(ki)
@@ -132,7 +138,7 @@ func (s *Store) reconcileKeys(chainLast map[string]string) error {
 		case cur == last:
 		case !inChain, labelRank[cur] > labelRank[last],
 			last == "pending-destruction" && cur == "deactivated": // отмена, квитанция не успела
-			s.logKeyLocked(ki, "", nil, true)
+			ahead = append(ahead, ki.Scope)
 		default:
 			errs = append(errs, fmt.Errorf("%w: %s is %q in keyring, chain says %q", ErrKeyringMismatch, ki.Scope, cur, last))
 		}
@@ -140,7 +146,18 @@ func (s *Store) reconcileKeys(chainLast map[string]string) error {
 	for scope, last := range chainLast {
 		errs = append(errs, fmt.Errorf("%w: %s is %q in chain but missing from keyring", ErrKeyringMismatch, scope, last))
 	}
-	return errors.Join(errs...)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	if err := s.keys.Confirm(); err != nil {
+		s.log.Warn("keyring backup pending", "err", err)
+	}
+	for _, scope := range ahead {
+		if ki, ok := s.keyInfo(scope); ok {
+			s.logKeyLocked(ki, "", nil, true)
+		}
+	}
+	return nil
 }
 
 // ensureScope заводит ключ скоупа с квитанцией в цепи. Быстрый путь — без
@@ -274,6 +291,9 @@ func (s *Store) confirmKeys() {
 		s.log.Warn("keyring backup pending", "err", err)
 	}
 	s.syncKeys("", nil)
+	if err := s.keys.RepairRoots(); err != nil {
+		s.log.Warn("keyring root copies", "err", err)
+	}
 }
 
 // ErrCurrentMonth — попытка закрыть текущий или будущий месяц без force:
@@ -299,8 +319,29 @@ func (s *Store) Deactivate(force bool, scopes ...string) error {
 
 // ScheduleDestroy — заявка на уничтожение ключа скоупа (два подтверждения,
 // срок ожидания не короче keys.min_wait).
-func (s *Store) ScheduleDestroy(scope string, wait time.Duration, approvals []keyring.Approval) (keyring.KeyInfo, error) {
-	ki, err := s.keys.ScheduleDestroy(scope, wait, approvals)
+//
+// Срок отмеряется от доверенного времени: от свежей метки TSA, если она
+// позже наших часов (и не раньше последнего времени приёма). Уничтожение
+// сверяется с TSA (CompleteDue), и часы, отставшие в момент заявки, иначе
+// сжимали окно отмены: срок = отставшие часы + ожидание давно прошёл по TSA.
+// Метки не получить — заявка не принимается.
+func (s *Store) ScheduleDestroy(ctx context.Context, scope string, wait time.Duration, approvals []keyring.Approval) (keyring.KeyInfo, error) {
+	from := s.nowTime()
+	if s.tsaURL != "" || s.tsaLocal != nil {
+		t, err := s.stampNow(ctx)
+		if err != nil {
+			return keyring.KeyInfo{}, fmt.Errorf("store: a destruction request needs TSA time: %w", err)
+		}
+		if t.After(from) {
+			from = t
+		}
+	}
+	s.mu.Lock()
+	if lr := time.Unix(0, s.lastRecv); lr.After(from) {
+		from = lr
+	}
+	s.mu.Unlock()
+	ki, err := s.keys.ScheduleDestroyFrom(scope, from, wait, approvals)
 	s.syncKeys(string(keyring.OpScheduleDestroy), approvals)
 	return ki, err
 }

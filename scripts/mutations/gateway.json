@@ -34,12 +34,6 @@
    "new": "\tcase ed25519.Verify(t.key, []byte(e.Hash), sig):"
   },
   {
-   "name": "G6 повтор ключа не ловится",
-   "file": "internal/gateway/pipelock.go",
-   "old": "\t\tif seen[k] {",
-   "new": "\t\tif false && seen[k] {"
-  },
-  {
    "name": "G7 нулевой байт в поле не ловится",
    "file": "internal/gateway/pipelock.go",
    "old": "\t\tif strings.ContainsRune(v, 0) {",
@@ -74,6 +68,30 @@
    "file": "internal/gateway/pipelock.go",
    "old": "\treturn e.SessionID + \"\\x00\" + e.ChainKind + \"\\x00\" + e.WriterInstanceID\n}",
    "new": "\treturn \"\"\n}"
+  },
+  {
+   "name": "G6 повтор ключа не ловится",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\t\tif f := foldKey(k); seen[f] {",
+   "new": "\t\tif f := foldKey(k); false && seen[f] {"
+  },
+  {
+   "name": "G13 ключи сравниваются без свёртки регистра",
+   "file": "internal/gateway/pipelock.go",
+   "old": "func foldKey(s string) string {\n",
+   "new": "func foldKey(s string) string {\n\tif true {\n\t\treturn s\n\t}\n"
+  },
+  {
+   "name": "G14 свёртка только ToLower: ſ проходит",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\t\tfor f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {\n\t\t\tlow = min(low, f)\n\t\t}",
+   "new": "\t\tlow = unicode.ToLower(r)"
+  },
+  {
+   "name": "G15 невалидный UTF-8 принимается",
+   "file": "internal/gateway/pipelock.go",
+   "old": "\tif !utf8.Valid(line) {",
+   "new": "\tif false && !utf8.Valid(line) {"
   }
  ]
 }

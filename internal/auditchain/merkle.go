@@ -54,13 +54,19 @@ func nodeHash(left, right [32]byte) [32]byte {
 // Пустой батч даёт нулевой корень; звено над ним не строится (см. LinkBatch),
 // поэтому наружу это значение не выходит.
 func MerkleRoot(leaves []Leaf) [32]byte {
-	if len(leaves) == 0 {
-		return [32]byte{}
-	}
 	level := make([][32]byte, len(leaves))
 	for i, l := range leaves {
 		level[i] = LeafHash(l)
 	}
+	return merkleRootOf(level)
+}
+
+// merkleRootOf — корень над уже посчитанными хешами листьев.
+func merkleRootOf(hashes [][32]byte) [32]byte {
+	if len(hashes) == 0 {
+		return [32]byte{}
+	}
+	level := append([][32]byte(nil), hashes...)
 	for len(level) > 1 {
 		level = nextLevel(level)
 	}

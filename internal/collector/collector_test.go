@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +43,9 @@ type rig struct {
 // оборачивает обработчик сервера (подменить ответ).
 func newRig(t *testing.T, wrap ...func(http.Handler) http.Handler) *rig {
 	t.Helper()
+	saved := rotateQuiet
+	rotateQuiet = 0 // ротированный файл считается замолчавшим сразу; тест на тишину ставит своё
+	t.Cleanup(func() { rotateQuiet = saved })
 	dir := t.TempDir()
 	ca, _ := pki.NewCA("ca")
 	srvCert, _ := ca.Server("127.0.0.1")
@@ -124,6 +128,28 @@ func cycle(t *testing.T, c *Collector) {
 	if err := c.SendOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// reinstalled — сборщик на новом spool_dir для источника, за которым
+// хранилище уже закрепило прежнюю установку: отказ, пока оператор не
+// примет новую (evidencestore sources bind), потом — запуск.
+func (r *rig) reinstalled(t *testing.T, log *slog.Logger) *Collector {
+	t.Helper()
+	c, err := New(r.cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if err := c.Bootstrap(context.Background()); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("новая установка без слова оператора: %v", err)
+	}
+	if err := r.st.BindEpoch("abs-core", c.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
 
 // bodies — что хранилище приняло от источника, по номерам.
@@ -217,7 +243,7 @@ func TestReinstallContinuesNumbering(t *testing.T) {
 	c.Close()
 	os.RemoveAll(r.cfg.SpoolDir)
 	r.cfg.FromStart = false
-	c2 := r.collector(t)
+	c2 := r.reinstalled(t, quiet)
 	appendLines(t, r.cfg.File, "z\n")
 	cycle(t, c2)
 	if got := strings.Join(r.bodies(t), ""); got != "xyz" {
@@ -279,17 +305,21 @@ func TestRotationDrainsOldFile(t *testing.T) {
 	}
 }
 
-// Ротированный файл удалили раньше, чем его дочитали: потеря не тихая — в
-// нумерации пропуск, который хранилище запишет в цепь.
+// Ротированный файл удалили раньше, чем его дочитали, и дочитать нечем:
+// сборщик стоял (дескриптора нет). Потеря не тихая — в нумерации пропуск,
+// который хранилище запишет в цепь. (Работающий сборщик дочитывает и
+// удалённый файл — через свой дескриптор.)
 func TestLostRotatedTailLeavesGap(t *testing.T) {
 	r := newRig(t)
 	c := r.collector(t)
 	appendLines(t, r.cfg.File, "1\n")
 	cycle(t, c)
+	c.Close() // сборщик остановлен
 	appendLines(t, r.cfg.File, "lost\n")
 	os.Rename(r.cfg.File, r.cfg.File+".1")
 	appendLines(t, r.cfg.File, "2\n") // новый файл создан, пока старый ещё есть: inode другой
 	os.Remove(r.cfg.File + ".1")
+	c = r.collector(t)
 	cycle(t, c)
 	if last, _ := r.st.LastSeq("abs-core"); last != 3 {
 		t.Fatalf("последний номер %d, ожидали 3 (номер 2 пропущен)", last)
@@ -299,6 +329,26 @@ func TestLostRotatedTailLeavesGap(t *testing.T) {
 	}
 	if got := r.bodies(t); got[2] != "2" {
 		t.Fatalf("принято: %q", got)
+	}
+}
+
+// Сборщик стоял, пока журнал ротировали, а ротированный файл остался рядом
+// (audit.log.1): после рестарта он находится по inode и дочитывается —
+// хвост не теряется, пропуска нет. (Работающий сборщик дочитывает через
+// свой дескриптор, этот путь он не проходит.)
+func TestRotatedFileFoundByInodeAfterRestart(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "1\n")
+	cycle(t, c)
+	c.Close() // сборщик остановлен
+	appendLines(t, r.cfg.File, "tail\n")
+	os.Rename(r.cfg.File, r.cfg.File+".1")
+	appendLines(t, r.cfg.File, "2\n")
+	c = r.collector(t)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), ","); got != "1,tail,2" {
+		t.Fatalf("после ротации, пока сборщик стоял: %q", got)
 	}
 }
 
@@ -392,23 +442,85 @@ func TestGlobEqualMTimesUseNaturalOrder(t *testing.T) {
 	}
 }
 
-// Текущий файл удалили недочитанным: потеря видна пропуском номера, чтение
-// продолжается со следующего файла.
+// Текущий файл удалили недочитанным, пока сборщик стоял: потеря видна
+// пропуском номера, чтение продолжается со следующего файла. Два порядка:
+// новый файл создан до удаления старого — inode у него точно другой, и
+// старого под маской нет; после удаления — ФС может отдать ему inode
+// старого (ext4 отдаёт), и тогда подмену видно по первой строке.
 func TestGlobCurrentFileGoneLeavesGap(t *testing.T) {
+	for _, createFirst := range []bool{true, false} {
+		r := globRig(t)
+		base := time.Now().Add(-time.Hour)
+		first := filepath.Join(r.logDir, "evidence-a-0.jsonl")
+		appendLines(t, first, "one\n")
+		os.Chtimes(first, base, base)
+		c := r.collector(t)
+		cycle(t, c)
+		c.Close()
+		appendLines(t, first, "two\n") // не прочитана
+		second := filepath.Join(r.logDir, "evidence-a-2.jsonl")
+		if createFirst {
+			appendLines(t, second, "three\n")
+			os.Remove(first)
+		} else {
+			os.Remove(first)
+			appendLines(t, second, "three\n")
+		}
+		c = r.collector(t)
+		cycle(t, c)
+		if got := r.bodies(t); len(got) != 3 || got[0] != "one" || !strings.HasPrefix(got[1], "<нет 2") || got[2] != "three" {
+			t.Fatalf("новый файл до удаления старого: %v; принято %q", createFirst, got)
+		}
+	}
+}
+
+// Текущий файл под маской подменён на месте (copytruncate, файл дорос):
+// пропуск номера и чтение нового содержимого с начала — как в режиме file.
+// Раньше подмена принималась за «файла нет»: новое содержимое дочитывалось
+// со старого смещения, а потом читалось ещё раз с начала (дубль, пропуска
+// нет).
+func TestGlobReplacedInPlaceIsGapNotDuplicate(t *testing.T) {
 	r := globRig(t)
-	base := time.Now().Add(-time.Hour)
-	first := filepath.Join(r.logDir, "evidence-a-0.jsonl")
-	appendLines(t, first, "one\n")
-	os.Chtimes(first, base, base)
+	f := filepath.Join(r.logDir, "evidence-a-0.jsonl")
+	appendLines(t, f, "one\n", "two\n")
 	c := r.collector(t)
 	cycle(t, c)
-	appendLines(t, first, "two\n") // не прочитана
-	os.Remove(first)
-	second := filepath.Join(r.logDir, "evidence-a-2.jsonl")
-	appendLines(t, second, "three\n")
+	if err := os.WriteFile(f, []byte("x-first\nx-second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cycle(t, c)
-	if got := r.bodies(t); len(got) != 3 || got[0] != "one" || !strings.HasPrefix(got[1], "<нет 2") || got[2] != "three" {
+	got := r.bodies(t)
+	if len(got) != 5 || got[0] != "one" || got[1] != "two" || !strings.HasPrefix(got[2], "<нет 3") ||
+		got[3] != "x-first" || got[4] != "x-second" {
 		t.Fatalf("принято %q", got)
+	}
+}
+
+// Файл под маской, известный реестру, но уже не тот (его inode ядро отдало
+// новому файлу, первая строка другая), забывается: новый файл читается с
+// начала, а не с места прежнего.
+func TestGlobForgetsFileWithReusedInode(t *testing.T) {
+	r := globRig(t)
+	c := r.collector(t)
+	p := filepath.Join(r.logDir, "evidence-b-0.jsonl")
+	appendLines(t, p, "new file, first line\n")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino := inode(fi)
+	// Реестр помнит прежний файл с этим inode: прочитан до 8, первая строка
+	// другая.
+	c.files[ino] = fileState{Inode: ino, Offset: 8, MTime: 1, Head: "old file"}
+	c.forgetGone([]globFile{{path: p, ino: ino, size: fi.Size(), mtime: fi.ModTime().UnixNano()}})
+	if _, ok := c.files[ino]; ok {
+		t.Fatal("файл с чужой первой строкой остался в реестре: его начало не прочитается")
+	}
+	// ПАРНЫЙ КОНТРОЛЬ: тот же файл, дописанный, — помнится.
+	c.files[ino] = fileState{Inode: ino, Offset: 8, MTime: 1, Head: "new file, first line"}
+	c.forgetGone([]globFile{{path: p, ino: ino, size: fi.Size(), mtime: fi.ModTime().UnixNano()}})
+	if e, ok := c.files[ino]; !ok || e.Offset != 8 {
+		t.Fatalf("дописанный файл забыт: %+v", e)
 	}
 }
 
@@ -520,8 +632,8 @@ func TestBootstrapPositionSurvivesRestart(t *testing.T) {
 	c.Close()
 	os.RemoveAll(r.cfg.SpoolDir) // переустановка
 	r.cfg.FromStart = false
-	r.collector(t).Close() // запуск; новых строк нет
-	c = r.collector(t)     // перезапуск
+	r.reinstalled(t, quiet).Close() // запуск; новых строк нет
+	c = r.collector(t)              // перезапуск
 	appendLines(t, r.cfg.File, "z\n")
 	cycle(t, c)
 	if got := strings.Join(r.bodies(t), ""); got != "xyz" {
@@ -587,11 +699,13 @@ func TestTornLongLineResumesAtChunk(t *testing.T) {
 	}
 	c.Close()
 	segs := spoolSegments(t, r.cfg.SpoolDir)
-	fi, err := os.Stat(segs[len(segs)-1])
-	if err != nil {
-		t.Fatal(err)
+	last := segs[len(segs)-1]
+	frames := spoolFrames(t, last)
+	cut := frames[len(frames)-1]
+	for i := len(frames) - 1; i >= 0 && frames[i].kind != kindLine; i-- {
+		cut = frames[i-1] // последний кусок строки — за ним только метки места
 	}
-	if err := os.Truncate(segs[len(segs)-1], fi.Size()-2); err != nil { // последний кусок оборван
+	if err := os.Truncate(last, cut.off+2); err != nil { // последний кусок оборван
 		t.Fatal(err)
 	}
 	c = r.collector(t)
@@ -675,16 +789,155 @@ func TestRolledBackSpoolStops(t *testing.T) {
 	}
 }
 
-// ⭐ Два сборщика с одним сертификатом (скопированный конфиг): второй
-// получает отказ «номер занят другим телом» и останавливается. Его строки
-// не пропадают молча, а ждут в буфере; хранилище хранит строки первого и
-// ничего из пачки второго.
+// ⭐ B-03: второй сборщик с тем же сертификатом (скопированный конфиг, свой
+// spool_dir) — другая установка, другая эпоха. Хранилище отказывает ему при
+// запуске, раньше, чем он прочтёт строку, кто бы ни отправил первым; первый
+// работает дальше (раньше вставал тот, кто отправил позже, — и законный
+// тоже). Если второй — законная замена, его принимает оператор, и отказ
+// получает прежний.
 func TestSecondCollectorWithSameCertificateStops(t *testing.T) {
 	r := newRig(t)
 	a := r.collector(t)
 	cfgB := *r.cfg
 	cfgB.SpoolDir = filepath.Join(t.TempDir(), "spool-b")
 	cfgB.File = filepath.Join(r.logDir, "other.log")
+	b, err := New(&cfgB, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	ctx := context.Background()
+	err = b.Bootstrap(ctx)
+	if !errors.Is(err, ErrEpoch) || !strings.Contains(err.Error(), "sources bind -source abs-core -epoch "+b.epoch) {
+		t.Fatalf("второй сборщик: %v", err)
+	}
+	appendLines(t, r.cfg.File, "from-a\n")
+	cycle(t, a)
+	if got := strings.Join(r.bodies(t), "|"); got != "from-a" {
+		t.Fatalf("у хранилища: %q", got)
+	}
+	// Оператор принимает второго как замену: отказ теперь у первого.
+	if err := r.st.BindEpoch("abs-core", b.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Bootstrap(ctx); err != nil {
+		t.Fatalf("принятая установка: %v", err)
+	}
+	appendLines(t, r.cfg.File, "from-a-late\n")
+	if _, err := a.ReadOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SendOnce(ctx); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("прежняя установка после замены: %v", err)
+	}
+	a.Close()
+	a2, err := New(r.cfg, quiet) // прежняя установка перезапущена
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Close()
+	if err := a2.Bootstrap(ctx); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("прежняя установка при перезапуске: %v", err)
+	}
+	appendLines(t, cfgB.File, "from-b\n")
+	cycle(t, b)
+	if got := strings.Join(r.bodies(t), "|"); got != "from-a|from-b" {
+		t.Fatalf("у хранилища: %q", got)
+	}
+}
+
+// Эпоха живёт в spool_dir и переживает перезапуск. Потерян epoch.json —
+// это новая установка: новая эпоха и отказ хранилища, пока её не примет
+// оператор (как после потери всего spool_dir).
+func TestLostEpochFileIsNewInstallation(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "a\n")
+	cycle(t, c)
+	first := c.epoch
+	c.Close()
+	c = r.collector(t) // перезапуск: та же эпоха, хранилище принимает
+	if c.epoch != first {
+		t.Fatalf("эпоха сменилась при перезапуске: %s → %s", first, c.epoch)
+	}
+	c.Close()
+	if err := os.Remove(filepath.Join(r.cfg.SpoolDir, "epoch.json")); err != nil {
+		t.Fatal(err)
+	}
+	c = r.reinstalled(t, quiet)
+	if c.epoch == first {
+		t.Fatal("без epoch.json эпоха прежняя")
+	}
+	appendLines(t, r.cfg.File, "b\n")
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), ","); got != "a,b" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Оператор принял другую установку, пока эта работает: на следующей
+// отправке хранилище ей отказывает, и Run останавливается, а не повторяет
+// вечно.
+func TestRunStopsWhenRebound(t *testing.T) {
+	r := newRig(t)
+	c, err := New(r.cfg, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	done := make(chan error, 1)
+	appendLines(t, r.cfg.File, "a\n")
+	go func() { done <- c.Run(ctx) }()
+	stopped := false
+	defer func() {
+		cancel()
+		if !stopped {
+			<-done
+		}
+		c.Close()
+	}()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if last, _ := r.st.LastSeq("abs-core"); last == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("строка не доставлена")
+		}
+	}
+	if err := r.st.BindEpoch("abs-core", strings.Repeat("b", 32)); err != nil {
+		t.Fatal(err)
+	}
+	appendLines(t, r.cfg.File, "b\n")
+	select {
+	case err := <-done:
+		stopped = true
+		if !errors.Is(err, ErrEpoch) {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Run не остановился после отказа")
+	}
+}
+
+// Копия одной установки (снимок ВМ, скопированный spool_dir) несёт ту же
+// эпоху, и эпоха их не различает. Различает сверка номеров: второй
+// получает отказ «номер занят другим телом» и останавливается. Его строки
+// не пропадают молча, а ждут в буфере; хранилище хранит строки первого и
+// ничего из пачки второго.
+func TestInstallationCloneStopsOnConflict(t *testing.T) {
+	r := newRig(t)
+	a := r.collector(t)
+	cfgB := *r.cfg
+	cfgB.SpoolDir = filepath.Join(t.TempDir(), "spool-b")
+	cfgB.File = filepath.Join(r.logDir, "other.log")
+	epoch, err := os.ReadFile(filepath.Join(r.cfg.SpoolDir, "epoch.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(cfgB.SpoolDir, 0o700)
+	if err := os.WriteFile(filepath.Join(cfgB.SpoolDir, "epoch.json"), epoch, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	b, err := New(&cfgB, quiet)
 	if err != nil {
 		t.Fatal(err)
@@ -703,8 +956,14 @@ func TestSecondCollectorWithSameCertificateStops(t *testing.T) {
 	// видно на отправке.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := b.Run(ctx); !errors.Is(err, ErrConflict) {
+	err = b.Run(ctx)
+	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("второй сборщик: %v", err)
+	}
+	// Причину называет хранилище (G-05): при ключе, ждущем уничтожения, она
+	// другая, и диагноз «второй сборщик» от себя сборщик не добавляет.
+	if !strings.Contains(err.Error(), "another collector uses the source certificate") {
+		t.Fatalf("причина хранилища не дошла: %v", err)
 	}
 	if b.Pending() != 2 || b.Acked() != 0 {
 		t.Fatalf("у второго в буфере %d, подтверждено до %d", b.Pending(), b.Acked())
@@ -843,7 +1102,9 @@ func TestSpoolReleasesDelivered(t *testing.T) {
 		}
 		cycle(t, c)
 	}
-	if segs := spoolSegments(t, r.cfg.SpoolDir); len(segs) != 1 {
+	// Остаётся сегмент с последней записью (и, может быть, сегмент с повторённой
+	// меткой места), остальное доставлено и удалено.
+	if segs := spoolSegments(t, r.cfg.SpoolDir); len(segs) > 2 {
 		t.Fatalf("сегментов буфера %d: доставленное не удалено", len(segs))
 	}
 	c.Close()
@@ -869,14 +1130,7 @@ func TestFromStartOverKnownSourceWarns(t *testing.T) {
 	c.Close()
 	os.RemoveAll(r.cfg.SpoolDir)
 	var buf bytes.Buffer
-	c, err := New(r.cfg, slog.New(slog.NewTextHandler(&buf, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	if err := c.Bootstrap(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	r.reinstalled(t, slog.New(slog.NewTextHandler(&buf, nil)))
 	if !strings.Contains(buf.String(), "from_start") {
 		t.Fatalf("предупреждения нет:\n%s", buf.String())
 	}
@@ -955,8 +1209,9 @@ func TestGlobDeletedCurrentDoesNotRereadOlder(t *testing.T) {
 	os.Remove(a1)
 	appendLines(t, filepath.Join(r.logDir, "evidence-a-2.jsonl"), "3\n")
 	cycle(t, c)
-	got := r.bodies(t)
-	if len(got) != 4 || got[0] != "1" || got[1] != "2" || !strings.HasPrefix(got[2], "<нет 3") || got[3] != "3" {
+	// «lost» дописан в текущий файл перед удалением: работающий сборщик
+	// дочитывает его через дескриптор. Пропуска нет, «1» не перечитан.
+	if got := strings.Join(r.bodies(t), ","); got != "1,2,lost,3" {
 		t.Fatalf("принято %q", got)
 	}
 }
@@ -965,7 +1220,7 @@ func TestGlobDeletedCurrentDoesNotRereadOlder(t *testing.T) {
 // сборщик из него не шлёт.
 func TestSpoolSeqMustGrow(t *testing.T) {
 	r := newRig(t)
-	l, err := evlog.Open(filepath.Join(r.cfg.SpoolDir, "spool"), evlog.Options{}, nil)
+	l, err := evlog.Open(filepath.Join(r.cfg.SpoolDir, "spool"), evlog.Options{AllowRelease: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -977,8 +1232,231 @@ func TestSpoolSeqMustGrow(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.Close()
-	if c, err := New(r.cfg, quiet); err == nil {
+	// Всё остальное в порядке: files.json на месте.
+	if err := os.WriteFile(filepath.Join(r.cfg.SpoolDir, "files.json"), []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(r.cfg, quiet)
+	if err == nil {
 		c.Close()
 		t.Fatal("буфер с убывающими номерами принят")
+	}
+	if !strings.Contains(err.Error(), "seq 3 after 5") {
+		t.Fatalf("отказ не о номерах: %v", err)
+	}
+}
+
+type spoolFrame struct {
+	off  int64
+	kind byte
+}
+
+// spoolFrames — записи сегмента буфера: смещение и вид.
+func spoolFrames(t *testing.T, path string) []spoolFrame {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []spoolFrame
+	for off := 16; off+8 <= len(data); { // заголовок сегмента evlog — 16 байт
+		n := int(binary.BigEndian.Uint32(data[off:]))
+		out = append(out, spoolFrame{off: int64(off), kind: data[off+8]})
+		off += 8 + n
+	}
+	return out
+}
+
+// ⭐ C-01: logrotate create (так по умолчанию в дистрибутивах): журнал
+// переименован, создан новый, а приложение до переоткрытия пишет в старый
+// — дописывает недописанную строку и следующие. Старый файл читается через
+// дескриптор, пока не замолчит, — даже удалённый. Раньше он дочитывался
+// сразу (с обрывком строки) и забывался: «half» вместо «half line», «late»
+// терялась без пропуска в цепи.
+func TestRotationWaitsForQuietOldFile(t *testing.T) {
+	r := newRig(t)
+	rotateQuiet = 300 * time.Millisecond
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "a\n", "half")
+	cycle(t, c)
+	os.Rename(r.cfg.File, r.cfg.File+".1")
+	appendLines(t, r.cfg.File) // create: новый пустой журнал
+	cycle(t, c)
+	appendLines(t, r.cfg.File+".1", " line\n", "late\n") // приложение ещё пишет в старый
+	os.Remove(r.cfg.File + ".1")                         // и его даже удалили
+	cycle(t, c)
+	appendLines(t, r.cfg.File, "b\n") // переоткрыло журнал (HUP)
+	cycle(t, c)
+	time.Sleep(rotateQuiet + 100*time.Millisecond)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a|half line|late|b" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// C-02: первую строку текущего файла на миг не прочитать (права, ротация в
+// окне) — это «не знаю», а не «файл подменён»: ни ложного пропуска, ни
+// чтения всего файла заново. Первая строка читается через открытый
+// дескриптор.
+func TestUnreadableHeadIsNotReplacement(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "a\n", "b\n")
+	cycle(t, c)
+	os.Chmod(r.cfg.File, 0)
+	cycle(t, c)
+	os.Chmod(r.cfg.File, 0o600)
+	appendLines(t, r.cfg.File, "c\n")
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a|b|c" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// C-03: смена места после подмены файла ложится в буфер записью 'P' вместе
+// с пропуском номера. Упали сразу после неё — после рестарта чтение идёт с
+// начала нового содержимого и пропуск на месте (раньше смена жила в
+// памяти: чтение со старого смещения в новом содержимом, пропуска нет).
+func TestPositionSwitchSurvivesCrash(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "hdr\n", "old-2\n")
+	cycle(t, c)
+	if err := os.WriteFile(r.cfg.File, []byte("hdr\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// То, что делает обнаружение обрезки (файл короче места чтения), — и
+	// падение до чтения.
+	c.nextSeq++
+	if err := c.follow(c.pos.Inode); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	// Пока сборщик стоял, файл дорос за прежнее место, а первая строка та
+	// же (заголовок журнала): ни размер, ни первая строка подмену уже не
+	// выдают — новое место знает только запись 'P'.
+	appendLines(t, r.cfg.File, "new-2, a longer line\n")
+	c = r.collector(t)
+	cycle(t, c)
+	got := r.bodies(t)
+	if len(got) != 5 || got[0] != "hdr" || got[1] != "old-2" || !strings.HasPrefix(got[2], "<нет 3") ||
+		got[3] != "hdr" || got[4] != "new-2, a longer line" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// C-04: первый запуск без from_start посреди недописанной строки встаёт на
+// конец последней целой: первая улика — вся строка, а не её обрывок.
+func TestFirstStartMidLineTakesWholeLine(t *testing.T) {
+	r := newRig(t)
+	r.cfg.FromStart = false
+	appendLines(t, r.cfg.File, "admin\n", "hal")
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "f line\n")
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "half line" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Первый запуск без from_start сразу запоминает первую строку файла:
+// подмена на месте до первой новой строки видна — пропуск и чтение с
+// начала, а не со старого места в новом содержимом.
+func TestFirstStartRemembersHead(t *testing.T) {
+	r := newRig(t)
+	r.cfg.FromStart = false
+	appendLines(t, r.cfg.File, "a\n", "b\n")
+	c := r.collector(t)
+	if err := os.WriteFile(r.cfg.File, []byte("x-line-1\n"), 0o600); err != nil { // тот же inode
+		t.Fatal(err)
+	}
+	cycle(t, c)
+	got := r.bodies(t)
+	if len(got) != 2 || !strings.HasPrefix(got[0], "<нет 1") || got[1] != "x-line-1" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// tornWriter обрывает запись посередине — как кончившееся место на диске.
+type tornWriter struct {
+	*os.File
+	fail bool
+}
+
+func (w *tornWriter) Write(p []byte) (int, error) {
+	if w.fail {
+		w.fail = false
+		n, _ := w.File.Write(p[:len(p)/2])
+		return n, errors.New("no space left on device (тест)")
+	}
+	return w.File.Write(p)
+}
+
+// C-07: запись обещания оборвалась во время работы — обрывок отрезается,
+// следующее обещание к нему не приклеивается, запись остаётся в буфере и
+// получает обещание на повторе.
+func TestTornPromiseWriteIsCut(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "a\n")
+	cycle(t, c)
+	w := &tornWriter{File: c.promises.(*os.File), fail: true}
+	c.promises = w
+	appendLines(t, r.cfg.File, "b\n")
+	if _, err := c.ReadOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SendOnce(context.Background()); err == nil || c.Pending() != 1 {
+		t.Fatalf("оборванная запись обещания: %v, в буфере %d", err, c.Pending())
+	}
+	cycle(t, c)
+	ps, bad, err := Promises(r.cfg.SpoolDir)
+	if err != nil || bad != 0 || len(ps) != 2 {
+		t.Fatalf("обещания: %d, нечитаемых %d, %v", len(ps), bad, err)
+	}
+}
+
+// B-05: файла источника нет (опечатка в пути) или маска пуста — об этом
+// говорится в журнал, а не молча «прочитано 0».
+func TestMissingSourceIsReported(t *testing.T) {
+	r := newRig(t)
+	var buf bytes.Buffer
+	c, err := New(r.cfg, slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ReadOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "does not exist") {
+		t.Fatalf("о пропавшем файле ни слова:\n%s", buf.String())
+	}
+}
+
+// G-04: реестр первого запуска лежит не в записи «старт» (тысячи файлов под
+// маской в запись буфера не помещались — первый запуск был невозможен), а в
+// start-files.json, записанном раньше неё.
+func TestStartRecordCarriesNoRegistry(t *testing.T) {
+	r := globRig(t)
+	r.cfg.FromStart = false
+	for i := range 50 {
+		appendLines(t, filepath.Join(r.logDir, fmt.Sprintf("evidence-a-%d.jsonl", i)), strings.Repeat("x", 100)+"\n")
+	}
+	r.collector(t).Close()
+	frames := spoolFrames(t, spoolSegments(t, r.cfg.SpoolDir)[0])
+	if frames[0].kind != kindStart {
+		t.Fatalf("первая запись буфера — %q", frames[0].kind)
+	}
+	data, _ := os.ReadFile(spoolSegments(t, r.cfg.SpoolDir)[0])
+	if n := int(binary.BigEndian.Uint32(data[frames[0].off:])); n != recHead {
+		t.Fatalf("запись «старт» несёт %d байт тела", n-recHead)
+	}
+	var files []fileState
+	if ok, err := readJSON(filepath.Join(r.cfg.SpoolDir, "start-files.json"), &files); !ok || err != nil || len(files) != 50 {
+		t.Fatalf("start-files.json: %d файлов, %v, %v", len(files), ok, err)
 	}
 }

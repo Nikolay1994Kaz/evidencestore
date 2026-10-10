@@ -81,7 +81,15 @@ func LoadOrCreateSigner(dir string) (*Signer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, priv, 0o600); err != nil {
+	// Временный файл с fsync, потом переименование: отказ питания не
+	// оставит на месте ключа обрывок, который не разбирается.
+	tmp := path + ".tmp"
+	if err := writeSynced(tmp, priv); err != nil {
+		os.Remove(tmp)
+		return nil, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		return nil, err
 	}
 	// Каталог тоже: без fsync каталога новый файл может не пережить отказ
@@ -195,123 +203,12 @@ func VerifyStatement(st Statement, pinned ed25519.PublicKey) error {
 	return nil
 }
 
-// InclusionProof — доказательство того, что конкретное событие лежит в цепи.
-//
-// ⭐Показывает ТОЛЬКО своё событие: путь Меркла сходится к корню, не раскрывая
-// соседних листьев. Можно доказать «эта улика есть и не менялась», не
-// предъявляя проверяющему чужих улик из того же батча.
-type InclusionProof struct {
-	Version int `json:"v"`
-	Leaf    struct {
-		UnixNano int64  `json:"t"`
-		Type     uint8  `json:"type"`
-		Scope    string `json:"scope"`
-		Subject  string `json:"subject"`
-		Payload  string `json:"payload"` // base64: это байты, а не текст
-	} `json:"leaf"`
-	Path      []proofStepJSON `json:"path"`
-	Root      string          `json:"root"`
-	LinkSeq   uint64          `json:"link_seq"`
-	Statement Statement       `json:"statement"`
-}
+// JSON — заявление текстом: так оно уходит наружу.
+func (st Statement) JSON() ([]byte, error) { return json.MarshalIndent(st, "", "  ") }
 
-type proofStepJSON struct {
-	Hash string `json:"h"`
-	Left bool   `json:"left"`
-}
-
-// BuildProof собирает доказательство включения листа с индексом idx внутри
-// батча звена link.
-func BuildProof(link Record, leaves []Leaf, idx int, st Statement) (InclusionProof, error) {
-	var out InclusionProof
-	p, err := DecodeBatchPayload(link.Payload)
-	if err != nil {
-		return out, err
-	}
-	path, err := MerkleProof(leaves, idx)
-	if err != nil {
-		return out, err
-	}
-	out.Version = StatementVersion
-	l := leaves[idx]
-	out.Leaf.UnixNano = l.UnixNano
-	out.Leaf.Type = uint8(l.Type)
-	out.Leaf.Scope = l.Scope
-	out.Leaf.Subject = l.Subject
-	out.Leaf.Payload = base64.RawStdEncoding.EncodeToString(l.Payload)
-	for _, s := range path {
-		out.Path = append(out.Path, proofStepJSON{
-			Hash: base64.RawStdEncoding.EncodeToString(s.Hash[:]),
-			Left: s.SiblingLeft,
-		})
-	}
-	out.Root = base64.RawStdEncoding.EncodeToString(p.Root[:])
-	out.LinkSeq = link.Seq
-	out.Statement = st
-	return out, nil
-}
-
-// VerifyProof проверяет доказательство включения целиком: подпись заявления и
-// путь Меркла от листа к корню.
-//
-// ⚠ЧЕГО ОН НЕ ПРОВЕРЯЕТ: что звено с этим корнем действительно является
-// предком подписанной головы. Для этого нужен сам файл цепи — документ
-// маленький как раз потому, что не тащит её с собой. Проверяющий делает второй
-// шаг сам: берёт chain.log, находит звено LinkSeq, сверяет корень и
-// прогоняет Verify до головы из заявления. Полный пакет доказательств со
-// звеньями до головы и метками TSA собирает пакет proof.
-func (pr InclusionProof) Verify(pinned ed25519.PublicKey) error {
-	if err := VerifyStatement(pr.Statement, pinned); err != nil {
-		return err
-	}
-	payload, err := base64.RawStdEncoding.DecodeString(pr.Leaf.Payload)
-	if err != nil {
-		return fmt.Errorf("auditchain: предмет листа неразбираем")
-	}
-	leaf := Leaf{
-		UnixNano: pr.Leaf.UnixNano,
-		Type:     EventType(pr.Leaf.Type),
-		Scope:    pr.Leaf.Scope,
-		Subject:  pr.Leaf.Subject,
-		Payload:  payload,
-	}
-	path := make([]ProofStep, 0, len(pr.Path))
-	for _, s := range pr.Path {
-		h, err := base64.RawStdEncoding.DecodeString(s.Hash)
-		if err != nil || len(h) != hashSize {
-			return fmt.Errorf("auditchain: шаг пути неразбираем")
-		}
-		var step ProofStep
-		copy(step.Hash[:], h)
-		step.SiblingLeft = s.Left
-		path = append(path, step)
-	}
-	rootB, err := base64.RawStdEncoding.DecodeString(pr.Root)
-	if err != nil || len(rootB) != hashSize {
-		return fmt.Errorf("auditchain: корень неразбираем")
-	}
-	var root [32]byte
-	copy(root[:], rootB)
-	if !VerifyProof(leaf, path, root) {
-		return errors.New("auditchain: путь не сходится с корнем — событие в этом батче не лежит")
-	}
-	if pr.LinkSeq > pr.Statement.HeadSeq {
-		return fmt.Errorf("auditchain: звено %d новее подписанной головы %d — заявление к этому доказательству не относится",
-			pr.LinkSeq, pr.Statement.HeadSeq)
-	}
-	return nil
-}
-
-// MarshalJSON-обёртки: наружу оба документа уходят текстом.
-func (st Statement) JSON() ([]byte, error)      { return json.MarshalIndent(st, "", "  ") }
-func (pr InclusionProof) JSON() ([]byte, error) { return json.MarshalIndent(pr, "", "  ") }
+// ParseStatement разбирает заявление.
 func ParseStatement(b []byte) (Statement, error) {
 	var st Statement
 	err := json.Unmarshal(b, &st)
 	return st, err
-}
-func ParseProof(b []byte) (InclusionProof, error) {
-	var pr InclusionProof
-	err := json.Unmarshal(b, &pr)
-	return pr, err
 }

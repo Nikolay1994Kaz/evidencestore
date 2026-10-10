@@ -42,6 +42,11 @@ type Config struct {
 	Keys    Keys     `json:"keys"`
 	Replica Replica  `json:"replica"`
 	Sources []Source `json:"sources"`
+
+	// Demo — стенд для показа: разрешает короткие сроки (keys.min_wait меньше
+	// часа), чтобы уничтожение ключа уложилось в демо. В бою — никогда:
+	// окно отмены уничтожения тогда — секунды.
+	Demo bool `json:"demo"`
 }
 
 // Replica — копия журнала улик и цепи наружу (S3 или каталог). keyring.dat
@@ -131,6 +136,10 @@ const GatewayContentType = "pipelock/recorder"
 // MaxSourceName совпадает с evidence.MaxSourceLen.
 const MaxSourceName = 255
 
+// MaxContentType совпадает с evidence.MaxContentTypeLen: длиннее улику не
+// запечатать, и приём отвечал бы 503 на каждую запись.
+const MaxContentType = 255
+
 // MaxSocketPath — предел пути unix-сокета в Linux (sun_path, 108 байт с
 // завершающим нулём). Длиннее bind отвечает невнятным «invalid argument».
 const MaxSocketPath = 107
@@ -215,7 +224,15 @@ func (c *Config) Defaults() {
 	if c.AdminSocket == "" && c.DataDir != "" {
 		c.AdminSocket = filepath.Join(c.DataDir, "admin.sock")
 	}
+	// Отпечатки и ключи — hex в любом регистре: сравнение идёт строками.
+	for i := range c.Sources {
+		c.Sources[i].CertSHA256 = strings.ToLower(c.Sources[i].CertSHA256)
+		c.Sources[i].GatewayKey = strings.ToLower(c.Sources[i].GatewayKey)
+	}
 }
+
+// MinWaitFloor — наименьший keys.min_wait вне режима demo.
+const MinWaitFloor = time.Hour
 
 // Validate проверяет то, что иначе всплыло бы посреди работы.
 func (c *Config) Validate() error {
@@ -226,10 +243,8 @@ func (c *Config) Validate() error {
 	if c.RootsDir == "" {
 		errs = append(errs, errors.New("roots_dir is required"))
 	}
-	if c.DataDir != "" && c.RootsDir != "" {
-		if rel, err := filepath.Rel(c.DataDir, c.RootsDir); err == nil && !strings.HasPrefix(rel, "..") {
-			errs = append(errs, errors.New("roots_dir must be outside data_dir: a copy holding both opens every key"))
-		}
+	if nested(c.DataDir, c.RootsDir) {
+		errs = append(errs, errors.New("roots_dir and data_dir must not share a directory or contain one another: a copy holding both opens every key"))
 	}
 	// Копия, где лежат и keyring.dat (data_dir или его резерв), и корень,
 	// открывает все ключи. Поэтому корни и их зеркало не делят каталог ни с
@@ -258,6 +273,16 @@ func (c *Config) Validate() error {
 	if c.Chain.PromiseMMD.D() < 2*c.Chain.Tick.D() {
 		errs = append(errs, errors.New("chain.promise_mmd must be at least two ticks"))
 	}
+	// Сроки: отрицательный тикер — паника посреди работы, отрицательное
+	// окно отмены — уничтожение ключа без окна.
+	for name, d := range map[string]Duration{"tsa.every": c.TSA.Every, "replica.every": c.Replica.Every, "keys.min_wait": c.Keys.MinWait} {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be positive", name))
+		}
+	}
+	if !c.Demo && c.Keys.MinWait > 0 && c.Keys.MinWait.D() < MinWaitFloor {
+		errs = append(errs, fmt.Errorf("keys.min_wait %v is shorter than %v: the window to cancel a key destruction would be too short (set \"demo\": true for a demo stand)", c.Keys.MinWait.D(), MinWaitFloor))
+	}
 	if c.TSA.URL != "" && c.TSA.URL != "local" && len(c.TSA.Trust) == 0 {
 		errs = append(errs, errors.New("tsa.trust is required for a real TSA: tokens are verified before they enter the chain"))
 	}
@@ -272,8 +297,11 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("sources[%d]: duplicate name %q", i, s.Name))
 		}
 		seen[s.Name] = true
-		if s.ContentType == "" {
-			errs = append(errs, fmt.Errorf("sources[%d] %s: content_type is required", i, s.Name))
+		if s.ContentType == "" || len(s.ContentType) > MaxContentType {
+			errs = append(errs, fmt.Errorf("sources[%d] %s: content_type is required, at most %d bytes", i, s.Name, MaxContentType))
+		}
+		if s.ExpectEvery < 0 {
+			errs = append(errs, fmt.Errorf("sources[%d] %s: expect_every must not be negative (0 — off)", i, s.Name))
 		}
 		if s.CertSHA256 != "" {
 			if b, err := hex.DecodeString(s.CertSHA256); err != nil || len(b) != sha256.Size {

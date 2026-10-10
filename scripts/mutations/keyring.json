@@ -125,12 +125,6 @@
    "new": "\treturn k.infos(changed), nil"
   },
   {
-   "name": "M20 EffectiveAt при неуничтоженных корнях",
-   "file": "internal/keyring/destroy.go",
-   "old": "\tif len(rest) == 0 && waiting {",
-   "new": "\tif waiting {"
-  },
-  {
    "name": "M21 EnsureScopes откатывает память после записи (P5)",
    "file": "internal/keyring/keyring.go",
    "old": "\tcommitted, err := k.persistLocked()\n\tif !committed {\n\t\tk.dropLocked(fresh)",
@@ -275,18 +269,6 @@
    "new": "\tknown := map[string]bool{}"
   },
   {
-   "name": "M46 уничтожение не затирает зеркало",
-   "file": "internal/keyring/rootfile.go",
-   "old": "\tvar errs []error\n\tfor _, dir := range f.dirs() {",
-   "new": "\tvar errs []error\n\tfor _, dir := range f.dirs()[:1] {"
-  },
-  {
-   "name": "M47 корень не читается из зеркала",
-   "file": "internal/keyring/rootfile.go",
-   "old": "\tvar first error\n\tfor _, dir := range f.dirs() {",
-   "new": "\tvar first error\n\tfor _, dir := range f.dirs()[:1] {"
-  },
-  {
    "name": "M48 новый корень не пишется в зеркало",
    "file": "internal/keyring/rootfile.go",
    "old": "\tfor i, dir := range f.dirs() {",
@@ -327,6 +309,60 @@
    "file": "internal/keyring/lifecycle.go",
    "old": "\t\tif e.state == Pending && !at.IsZero() && !at.Before(e.destroyAfter) {",
    "new": "\t\tif e.state == Pending && !k.now().Before(e.destroyAfter) {"
+  },
+  {
+   "name": "M20 EffectiveAt при неуничтоженных корнях",
+   "file": "internal/keyring/destroy.go",
+   "old": "\tvar marks []mark\n\tif len(rest) == 0 && waiting {",
+   "new": "\tvar marks []mark\n\tif waiting {"
+  },
+  {
+   "name": "M46 уничтожение не затирает зеркало",
+   "file": "internal/keyring/rootfile.go",
+   "old": "func (f FileRoots) DestroyRoot(id string) error {\n\tvar errs []error\n\tfor _, dir := range f.dirs() {",
+   "new": "func (f FileRoots) DestroyRoot(id string) error {\n\tvar errs []error\n\tfor _, dir := range f.dirs()[:1] {"
+  },
+  {
+   "name": "M47 испорченная копия корня не обходится зеркалом",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\tvar errs []error\n\tfor _, dir := range f.dirs() {\n\t\tk, err := f.keyIn(dir, id)\n\t\tif err != nil {",
+   "new": "\tvar errs []error\n\tfor _, dir := range f.dirs()[:1] {\n\t\tk, err := f.keyIn(dir, id)\n\t\tif err != nil {"
+  },
+  {
+   "name": "K4 Wrap заворачивает при расходящихся копиях корня",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\t\tif root != nil && !bytes.Equal(root, k) {",
+   "new": "\t\tif false && root != nil && !bytes.Equal(root, k) {"
+  },
+  {
+   "name": "K5 пропавшая копия корня не докладывается",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\t\tfor _, dir := range missing {",
+   "new": "\t\tfor _, dir := range missing[:0] {"
+  },
+  {
+   "name": "K6 срок ожидания без верхнего предела",
+   "file": "internal/keyring/lifecycle.go",
+   "old": "\tif wait > MaxWait {",
+   "new": "\tif false && wait > MaxWait {"
+  },
+  {
+   "name": "K7 время до 1970 в файле принимается",
+   "file": "internal/keyring/format.go",
+   "old": "\tcase ns < 0:\n",
+   "new": "\tcase false:\n"
+  },
+  {
+   "name": "K8 ключ записи не сверяется с обязательством",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tif !LegacyEnvelope(envelope) {\n\t\twant := envelope[len(envelopeTag)+kekIDSize:]",
+   "new": "\tif false {\n\t\twant := envelope[len(envelopeTag)+kekIDSize:]"
+  },
+  {
+   "name": "K9 пропавший каталог корней создаётся заново",
+   "file": "internal/keyring/rootfile.go",
+   "old": "\t\tif err != nil {\n\t\t\treturn fmt.Errorf(\"keyring root copies: %s: %w (is the disk mounted?)\", dir, err)\n\t\t}",
+   "new": "\t\tif err != nil {\n\t\t\tos.MkdirAll(dir, 0o700)\n\t\t}"
   }
  ]
 }

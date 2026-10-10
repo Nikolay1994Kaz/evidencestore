@@ -16,16 +16,46 @@
    "new": "fmt.Errorf(\"в файле листьев %d записей, запрошены %d..%d\",\n\t\t\tlen(bodies), from, from+count)"
   },
   {
-   "name": "A3 ForEachLeaf молчит о пропавших листьях",
+   "name": "A3 листья звена не сверяются с его корнем",
    "file": "internal/auditchain/query.go",
-   "old": "\t\t\treturn cov, fmt.Errorf(\"auditchain: листья звена %d: %w\", i, err)",
-   "new": "\t\t\tcontinue"
+   "old": "\t\t\t\tif merkleRootOf(hashes) != batches[cur].root {",
+   "new": "\t\t\t\tif false {"
   },
   {
-   "name": "A4 FindLeaf молчит о пропавших листьях",
+   "name": "A4 недостача листьев в конце молчит",
    "file": "internal/auditchain/query.go",
-   "old": "\t\t\treturn Record{}, nil, 0, fmt.Errorf(\"auditchain: листья звена %d: %w\", i, err)",
-   "new": "\t\t\tcontinue"
+   "old": "\tif cur < len(batches) {\n\t\treturn fmt.Errorf(\"%w: звено %d обещает",
+   "new": "\tif false {\n\t\treturn fmt.Errorf(\"%w: звено %d обещает"
+  },
+  {
+   "name": "A5 ошибка записи тика не защёлкивается",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\t\tc.failed = fmt.Errorf(\"auditchain: запись тика: %w\", err)\n\t\treturn c.headState, c.failed",
+   "new": "\t\treturn c.headState, fmt.Errorf(\"auditchain: запись тика: %w\", err)"
+  },
+  {
+   "name": "A6 порча середины файла срезается как хвост",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\tif at, ok := frameAfter(data, off+1); ok {",
+   "new": "\tif at, ok := frameAfter(data, off+1); false && ok {"
+  },
+  {
+   "name": "A7 хвост срезается без копии",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\t\tif err := writeSynced(aside, data[off:]); err != nil {",
+   "new": "\t\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "A8 испорченный слот головы не отмечается",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\t\tif !ok && !allZero(slot) {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "A9 неудачный Open сбрасывает поднятые листья в цепь",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\tif err = c.recover(); err != nil {\n\t\tc.closeFiles()",
+   "new": "\tif err = c.recover(); err != nil {\n\t\tc.Close()"
   }
  ]
 }

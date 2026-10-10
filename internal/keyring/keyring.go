@@ -59,7 +59,9 @@ const (
 	kekSize       = 32  // AES-256
 	kekIDSize     = 16
 	dekSize       = 32
-	envelopeTag   = "EV1"
+	envelopeTag   = "EV2"
+	legacyTag     = "EV1" // прежний конверт: без обязательства на ключ записи
+	commitSize    = 32
 )
 
 // State — состояние ключа скоупа. Значения записываются в файл.
@@ -456,24 +458,35 @@ func (k *Keyring) Confirm() error {
 // втором случае сиротой заперт файл умершей машины, и копия того файла из её
 // бэкапов открывает ключи, уничтоженные позже. Поэтому, пока сироты есть,
 // уничтожение не становится окончательным (EffectiveAt не ставится).
+//
+// Перечисление корней (ввод-вывод, зеркало бывает медленным) идёт без
+// замка: Seal его не ждёт.
 func (k *Keyring) OrphanRoots() ([]string, error) {
 	k.mu.RLock()
-	defer k.mu.RUnlock()
 	if k.closed {
+		k.mu.RUnlock()
 		return nil, ErrClosed
 	}
-	return k.orphansLocked()
-}
-
-func (k *Keyring) orphansLocked() ([]string, error) {
+	known := k.knownRootsLocked()
+	k.mu.RUnlock()
 	all, err := k.roots.Roots()
 	if err != nil {
 		return nil, fmt.Errorf("keyring list roots: %w", err)
 	}
+	return orphansOf(all, known), nil
+}
+
+// knownRootsLocked — корни, которые знает keyring.dat: корень файла и ждущие
+// уничтожения.
+func (k *Keyring) knownRootsLocked() map[string]bool {
 	known := map[string]bool{k.rootID: true}
 	for _, r := range k.retired {
 		known[r] = true
 	}
+	return known
+}
+
+func orphansOf(all []string, known map[string]bool) []string {
 	var out []string
 	for _, id := range all {
 		if !known[id] {
@@ -481,7 +494,30 @@ func (k *Keyring) orphansLocked() ([]string, error) {
 		}
 	}
 	sort.Strings(out)
-	return out, nil
+	return out
+}
+
+// RootRepairer — хранилище корней, которое умеет доложить недостающие копии
+// корня (FileRoots: Dir и Mirror).
+type RootRepairer interface {
+	RepairRoots(ids []string) error
+}
+
+// RepairRoots докладывает недостающие копии корня файла, если хранилище
+// корней это умеет. Звать при запуске и по расписанию.
+func (k *Keyring) RepairRoots() error {
+	r, ok := k.roots.(RootRepairer)
+	if !ok {
+		return nil
+	}
+	k.mu.RLock()
+	if k.closed {
+		k.mu.RUnlock()
+		return ErrClosed
+	}
+	id := k.rootID
+	k.mu.RUnlock()
+	return r.RepairRoots([]string{id})
 }
 
 // DestroyOrphanRoots уничтожает корни-сироты и отдаёт уничтоженные. Только по
@@ -498,11 +534,13 @@ func (k *Keyring) DestroyOrphanRoots() ([]string, error) {
 		k.mu.RUnlock()
 		return nil, ErrClosed
 	}
-	orphans, err := k.orphansLocked()
+	known := k.knownRootsLocked()
 	k.mu.RUnlock()
+	all, err := k.roots.Roots()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("keyring list roots: %w", err)
 	}
+	orphans := orphansOf(all, known)
 	var done []string
 	var errs []error
 	for _, id := range orphans {

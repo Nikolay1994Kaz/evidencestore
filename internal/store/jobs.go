@@ -22,13 +22,16 @@ func (s *Store) startBackground() {
 		}
 	})
 	if s.tsaURL != "" || s.tsaLocal != nil {
-		s.loop(s.cfg.TSA.Every.D(), func() {
+		// Первая метка — сразу после старта: она же якорь часов приёма.
+		s.loopNow(s.cfg.TSA.Every.D(), func() {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
 			if _, err := s.Stamp(ctx); err != nil {
 				s.log.Error("tsa stamp", "err", err)
 			}
 		})
+	} else {
+		s.log.Warn("no TSA configured (tsa.url): proofs carry no external time-stamp, and esverify rejects them unless told -allow-no-tsa")
 	}
 	if s.replicaRemote != nil {
 		s.loop(s.cfg.Replica.Every.D(), func() {
@@ -43,10 +46,18 @@ func (s *Store) startBackground() {
 	s.loop(10*time.Second, func() { s.CheckSilence(s.nowTime()) })
 }
 
-func (s *Store) loop(every time.Duration, fn func()) {
+func (s *Store) loop(every time.Duration, fn func()) { s.runLoop(every, false, fn) }
+
+// loopNow — loop, первый раз сразу.
+func (s *Store) loopNow(every time.Duration, fn func()) { s.runLoop(every, true, fn) }
+
+func (s *Store) runLoop(every time.Duration, now bool, fn func()) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		if now {
+			fn()
+		}
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
@@ -101,7 +112,7 @@ func (s *Store) CheckSilence(now time.Time) {
 			continue
 		}
 		last := st.lastAt
-		if last.IsZero() || last.Before(s.opened) && st.count == 0 {
+		if last.IsZero() {
 			last = s.opened
 		}
 		if now.Sub(last) > every {
@@ -119,21 +130,23 @@ func (s *Store) CheckSilence(now time.Time) {
 }
 
 // Stamp заверяет текущую голову цепи у TSA и кладёт токен в цепь листом.
-// Отдаёт заверенную голову; ноль — заверять нечего (голова не менялась).
+// Отдаёт заверенную голову; ноль — заверять нечего: после прошлой метки в
+// цепь не легло ничего, кроме неё самой (иначе метка ставилась бы каждые
+// tsa.every вечно — сам токен двигает голову).
 func (s *Store) Stamp(ctx context.Context) (uint64, error) {
-	head, _, err := s.stamp(ctx)
+	head, _, err := s.stamp(ctx, false)
 	return head, err
 }
 
 // stampNow ставит метку над текущей головой и отдаёт её время: так берётся
-// доверенное время для уничтожения ключей. Голова после прошлой метки всегда
-// новее заверенной — в ней лежит сам прошлый токен, — поэтому метка будет.
+// доверенное время для уничтожения ключей. Ставится всегда: голова после
+// прошлой метки новее заверенной — в ней лежит сам прошлый токен.
 func (s *Store) stampNow(ctx context.Context) (time.Time, error) {
-	_, gen, err := s.stamp(ctx)
+	_, gen, err := s.stamp(ctx, true)
 	return gen, err
 }
 
-func (s *Store) stamp(ctx context.Context) (_ uint64, gen time.Time, err error) {
+func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time, err error) {
 	defer func() {
 		if err != nil {
 			s.stampErrors.Add(1)
@@ -149,7 +162,7 @@ func (s *Store) stamp(ctx context.Context) (_ uint64, gen time.Time, err error) 
 	}
 	s.chainMu.Lock()
 	head := s.chain.Head()
-	already := head.Seq == 0 || head.Seq <= s.lastStamped
+	already := head.Seq == 0 || head.Seq <= s.lastStamped || (!force && s.nextLeaf <= s.stampedLeaves)
 	s.chainMu.Unlock()
 	if already {
 		return 0, gen, nil
@@ -179,8 +192,10 @@ func (s *Store) stamp(ctx context.Context) (_ uint64, gen time.Time, err error) 
 	})
 	s.tokens = append(s.tokens, tokenRef{head: head.Seq, leaf: num, gen: info.GenTime})
 	s.lastStamped = max(s.lastStamped, head.Seq)
+	s.stampedLeaves = num + 1
 	err = s.flushLocked()
 	s.chainMu.Unlock()
+	s.anchorClock(info.GenTime)
 	s.log.Info("tsa stamp", "head", head.Seq, "gen_time", info.GenTime)
 	return head.Seq, info.GenTime, err
 }

@@ -1,7 +1,7 @@
 package keyring
 
 import (
-	"crypto/cipher"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -75,49 +75,131 @@ func (f FileRoots) NewRoot() (string, error) {
 	return id, nil
 }
 
-func (f FileRoots) aead(id string) (cipher.AEAD, error) {
-	var first error
+// keyIn — корень из одного каталога. Вызывающий обнуляет ключ сам.
+func (f FileRoots) keyIn(dir, id string) ([]byte, error) {
+	p, err := f.path(dir, id)
+	if err != nil {
+		return nil, err
+	}
+	key, err := os.ReadFile(p)
+	if err != nil {
+		return nil, fmt.Errorf("keyring root %s: %w", id, err)
+	}
+	if len(key) != kekSize {
+		zeroize(key)
+		return nil, fmt.Errorf("keyring root %s in %s: bad size %d", id, dir, len(key))
+	}
+	return key, nil
+}
+
+// Wrap заворачивает ключ файла корнем (AES-256-GCM). Копии корня в Dir и
+// Mirror обязаны совпадать: завернуть испорченной копией — запереть файл
+// тем, чего во второй копии нет.
+func (f FileRoots) Wrap(id string, key, aad []byte) ([]byte, error) {
+	var root []byte
+	defer func() { zeroize(root) }()
 	for _, dir := range f.dirs() {
-		p, err := f.path(dir, id)
-		if err != nil {
-			return nil, err
-		}
-		key, err := os.ReadFile(p)
+		k, err := f.keyIn(dir, id)
 		if errors.Is(err, os.ErrNotExist) {
-			if first == nil {
-				first = fmt.Errorf("keyring root %s: %w", id, err)
-			}
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("keyring root %s: %w", id, err)
+			return nil, err
 		}
-		defer zeroize(key)
-		if len(key) != kekSize {
-			return nil, fmt.Errorf("keyring root %s: bad size %d", id, len(key))
+		if root != nil && !bytes.Equal(root, k) {
+			zeroize(k)
+			return nil, fmt.Errorf("keyring root %s: the copies in %s and %s differ", id, f.Dir, f.Mirror)
 		}
-		return newAEAD(key)
+		if root == nil {
+			root = k
+		} else {
+			zeroize(k)
+		}
 	}
-	return nil, first
-}
-
-// Wrap заворачивает ключ файла корнем (AES-256-GCM).
-func (f FileRoots) Wrap(id string, key, aad []byte) ([]byte, error) {
-	a, err := f.aead(id)
+	if root == nil {
+		return nil, fmt.Errorf("keyring root %s: %w", id, os.ErrNotExist)
+	}
+	a, err := newAEAD(root)
 	if err != nil {
 		return nil, err
 	}
 	return appendSealed(nil, a, key, aad), nil
 }
 
-// Unwrap разворачивает ключ файла.
+// Unwrap разворачивает ключ файла. Копия, которая не открывает (испорчена
+// или пропала), обходится второй.
 func (f FileRoots) Unwrap(id string, wrapped, aad []byte) ([]byte, error) {
-	a, err := f.aead(id)
-	if err != nil {
-		return nil, err
+	var errs []error
+	for _, dir := range f.dirs() {
+		k, err := f.keyIn(dir, id)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		a, err := newAEAD(k)
+		zeroize(k)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		key, _, err := openNext(a, wrapped, len(wrapped)-a.NonceSize(), aad)
+		if err == nil {
+			return key, nil
+		}
+		errs = append(errs, fmt.Errorf("keyring root %s in %s: %w", id, dir, err))
 	}
-	key, _, err := openNext(a, wrapped, len(wrapped)-a.NonceSize(), aad)
-	return key, err
+	return nil, errors.Join(errs...)
+}
+
+// RepairRoots докладывает недостающие копии корней: корень, лежащий только в
+// одном из каталогов (диск с Dir заменили, зеркало поднимали с нуля),
+// копируется во второй. Иначе после потери roots_dir текущий корень месяцами
+// жил бы в одной копии. Копии, которые есть в обоих каталогах, не трогаются.
+//
+// Пропавший каталог не создаётся: так выглядит и не смонтированный диск, и
+// копия легла бы на тот же диск, что и первая. Каталог заводит оператор.
+func (f FileRoots) RepairRoots(ids []string) error {
+	if f.Mirror == "" {
+		return nil
+	}
+	for _, dir := range f.dirs() {
+		fi, err := os.Stat(dir)
+		if err == nil && !fi.IsDir() {
+			err = errors.New("not a directory")
+		}
+		if err != nil {
+			return fmt.Errorf("keyring root copies: %s: %w (is the disk mounted?)", dir, err)
+		}
+	}
+	var errs []error
+	for _, id := range ids {
+		var have []byte
+		var missing []string
+		for _, dir := range f.dirs() {
+			k, err := f.keyIn(dir, id)
+			switch {
+			case errors.Is(err, os.ErrNotExist):
+				missing = append(missing, dir)
+			case err != nil:
+				errs = append(errs, err)
+			case have == nil:
+				have = k
+			default:
+				zeroize(k)
+			}
+		}
+		for _, dir := range missing {
+			if have == nil {
+				break
+			}
+			p, _ := f.path(dir, id)
+			if _, err := writeFileAtomic(p, have); err != nil {
+				errs = append(errs, fmt.Errorf("keyring repair root %s in %s: %w", id, dir, err))
+			}
+		}
+		zeroize(have)
+	}
+	return errors.Join(errs...)
 }
 
 // DestroyRoot затирает файл нулями и удаляет — в Dir и в Mirror. Затирание —

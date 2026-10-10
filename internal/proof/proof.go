@@ -26,7 +26,9 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"evidencestore/internal/auditchain"
@@ -181,6 +183,10 @@ type Trust struct {
 	// GatewayKey — закреплённый открытый ключ гейтвея: им проверяется подпись
 	// контрольной точки. nil — подпись проверило только хранилище при приёме.
 	GatewayKey ed25519.PublicKey
+	// AllowNoTSA — принять пакет без метки TSA над цепью после улики. Без неё
+	// время и неизменность подтверждает только подпись хранилища, а держатель
+	// ключа подписи сочинит улику с любой датой. По умолчанию — провал.
+	AllowNoTSA bool
 }
 
 // Check — один пункт отчёта.
@@ -205,8 +211,15 @@ type Report struct {
 	BodyKey    bool // в пакете был ключ записи (подошёл он или нет)
 
 	Gateway           *gateway.Verdict // вердикт хранилища по записи журнала гейтвея
-	GatewayCheckpoint *gateway.Verdict // контрольная точка, накрывшая запись
+	GatewayCheckpoint *gateway.Verdict // контрольная точка, накрывшая запись (подпись проверена)
 	GatewayKeyChecked bool             // подпись точки проверена ключом проверяющего
+	// GatewayUnsigned — точка после записи в пакете есть, но её подпись не
+	// проверял никто: ключ гейтвея не закреплён ни в хранилище, ни у
+	// проверяющего. Такая точка запись не накрывает.
+	GatewayUnsigned bool
+	// LegacyEnvelope — конверт старого формата (EV1): ключ записи не связан с
+	// отпечатком улики.
+	LegacyEnvelope bool
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -228,6 +241,9 @@ func (r Report) Notes() []string {
 	}
 	if r.Lower.IsZero() {
 		n = append(n, "нет метки TSA раньше улики: нижняя граница времени не доказана")
+	}
+	if r.LegacyEnvelope {
+		n = append(n, "конверт старого формата (EV1): выданный ключ записи не связан с отпечатком улики")
 	}
 	switch {
 	case r.BodyOpened:
@@ -307,10 +323,14 @@ func Verify(b Bundle, trust Trust) Report {
 	r.LinkSeq = b.Inclusion.LinkSeq
 	add("улика входит в звено цепи (путь Меркла)", checkInclusion(b.Inclusion, linkAt), fmt.Sprintf("звено %d", b.Inclusion.LinkSeq))
 
-	// 6. Верхняя граница: TSA заверила голову m ≥ n.
+	// 6. Верхняя граница: TSA заверила голову m ≥ n. Без неё пакет — только
+	// слово хранилища: держатель ключа подписи сочинит улику с любой датой.
 	if b.Upper != nil {
 		r.Upper, err = checkUpper(*b.Upper, b.Inclusion.LinkSeq, linkAt, trust.TSA)
 		add("метка TSA над цепью после улики (не позже T2)", err, fmt.Sprintf("T2 = %s, голова %d", fmtTime(r.Upper), b.Upper.HeadSeq))
+	} else if !trust.AllowNoTSA {
+		add("метка TSA над цепью после улики (не позже T2)",
+			errors.New("в пакете её нет: время и неизменность подтверждает только подпись хранилища (запросите пакет после следующей метки — evidencestore stamp; принять без неё — esverify -allow-no-tsa)"), "")
 	}
 
 	// 7. Нижняя граница: токен TSA лежит в цепи раньше звена улики.
@@ -336,19 +356,26 @@ func Verify(b Bundle, trust Trust) Report {
 		add("время приёма между метками TSA", err, fmtTime(recv))
 	}
 
-	// 9. Тело, если выдан ключ записи.
+	// 9. Тело, если выдан ключ записи. Конверт EV2 несёт обязательство на
+	// ключ записи под отпечатком улики: другой ключ (и другое тело при
+	// том же отпечатке) не пройдёт.
 	if len(b.DEK) > 0 {
 		r.BodyKey = true
+		r.LegacyEnvelope = keyring.LegacyEnvelope(sealed.Envelope)
 		body, err := keyring.OpenWithDEK(sealed.Envelope, b.DEK)
-		if add("тело вскрывается выданным ключом записи, тег GCM сходится", err, fmt.Sprintf("%d байт", len(body))) {
+		if add("тело вскрывается выданным ключом записи, ключ связан с отпечатком, тег GCM сходится", err, fmt.Sprintf("%d байт", len(body))) {
 			r.Body, r.BodyOpened = body, true
 		}
 	}
 
 	// 10. Улика из журнала гейтвея: вердикт при приёме, хэш тела, подпись
-	// контрольной точки.
-	if b.Gateway != nil {
+	// контрольной точки. Без этой части запись журнала гейтвея не проверить:
+	// убрать её из пакета — значит спрятать, что запись не цела.
+	switch {
+	case b.Gateway != nil:
 		verifyGateway(b.Gateway, sealed, &r, trust, linkAt, add)
+	case sealed.ContentType == gateway.ContentType:
+		add("вердикт гейтвея описывает эту улику", errors.New("улика из журнала гейтвея, а части gateway в пакете нет"), "")
 	}
 	return r
 }
@@ -456,13 +483,22 @@ func fmtTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05 UTC")
 }
 
+// Verdict — итог одной строкой.
+func (r Report) Verdict() string {
+	if r.Valid() {
+		return "ПРОВЕРКА ПРОЙДЕНА"
+	}
+	return "ПРОВЕРКА НЕ ПРОЙДЕНА"
+}
+
 // Text — отчёт человеческим языком: что доказано, что нет и где пределы.
+// Всё, что пришло из пакета (тело, источник, поля журнала гейтвея, тексты
+// ошибок), печатается с экранированными управляющими символами: иначе тело
+// с ESC-последовательностями рисовало бы на экране проверяющего ложный
+// вердикт. Вердикт повторён последней строкой.
 func (r Report) Text() string {
 	var s string
-	verdict := "ПРОВЕРКА ПРОЙДЕНА"
-	if !r.Valid() {
-		verdict = "ПРОВЕРКА НЕ ПРОЙДЕНА"
-	}
+	verdict := r.Verdict()
 	s += verdict + "\n\n"
 	if r.Header.Source != "" {
 		s += fmt.Sprintf("Улика: источник %s, номер %d, тип %q\n", r.Header.Source, r.Header.Seq, r.Header.ContentType)
@@ -501,5 +537,23 @@ func (r Report) Text() string {
 	for _, n := range r.Notes() {
 		s += "  — " + n + "\n"
 	}
-	return s
+	return Printable(s) + "\n" + verdict + "\n"
+}
+
+// Printable экранирует управляющие символы (C0, C1, DEL) и символы
+// управления направлением текста, кроме перевода строки и табуляции: текст
+// из пакета не управляет терминалом проверяющего.
+func Printable(s string) string {
+	var b strings.Builder
+	for _, c := range s {
+		switch {
+		case c == '\n' || c == '\t':
+			b.WriteRune(c)
+		case unicode.IsControl(c) || unicode.Is(unicode.Bidi_Control, c):
+			fmt.Fprintf(&b, "\\u%04x", c)
+		default:
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
 }

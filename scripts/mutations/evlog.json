@@ -84,14 +84,44 @@
   {
    "name": "E14 Open не доудаляет сегменты ниже границы",
    "file": "internal/evlog/evlog.go",
-   "old": "\tfor len(firsts) > 1 && firsts[1] <= floor {",
-   "new": "\tfor len(firsts) > 1 && false {"
+   "old": "\t\tfor firsts[0] < floor {",
+   "new": "\t\tfor false && firsts[0] < floor {"
   },
   {
-   "name": "E15 без границы журнал может начинаться не с 1",
+   "name": "E15 floor в журнале без Release принимается",
    "file": "internal/evlog/evlog.go",
-   "old": "\tif errors.Is(err, os.ErrNotExist) {\n\t\treturn 1, nil",
-   "new": "\tif errors.Is(err, os.ErrNotExist) {\n\t\tfirsts, _ := listSegments(dir)\n\t\tif len(firsts) > 0 {\n\t\t\treturn firsts[0], nil\n\t\t}\n\t\treturn 1, nil"
+   "old": "\tcase !l.release:\n",
+   "new": "\tcase false:\n"
+  },
+  {
+   "name": "E16 граница не обязана начинать сегмент",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\tif !slices.Contains(firsts, floor) {",
+   "new": "\t\tif false && !slices.Contains(firsts, floor) {"
+  },
+  {
+   "name": "E17 Release работает без AllowRelease",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif !l.release {\n\t\treturn ErrNoRelease",
+   "new": "\tif false {\n\t\treturn ErrNoRelease"
+  },
+  {
+   "name": "E18 последний сегмент без заголовка не убирается",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\tif fi, err := os.Stat(p); err == nil && fi.Size() < int64(segHeader) {",
+   "new": "\t\tif fi, err := os.Stat(p); err == nil && false && fi.Size() < int64(segHeader) {"
+  },
+  {
+   "name": "E19 порча середины последнего сегмента срезается как хвост",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\t\tif found {\n",
+   "new": "\t\t\tif false && found {\n"
+  },
+  {
+   "name": "E20 срезанный хвост не откладывается",
+   "file": "internal/evlog/evlog.go",
+   "old": "\t\t\tif aside, err = setAside(f, path, seg.size, st.Size()); err != nil {",
+   "new": "\t\t\tif aside, err = \"\", nil; err != nil {"
   }
  ]
 }

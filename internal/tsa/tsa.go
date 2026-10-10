@@ -29,6 +29,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -50,6 +51,7 @@ var (
 	oidContentType   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
 	oidMessageDigst  = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
 	oidSigningCertV2 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 47}
+	oidSigningCertV1 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 12}
 	oidSHA256        = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
 	oidSHA384        = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
 	oidSHA512        = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
@@ -156,6 +158,21 @@ type signingCertificateV2 struct {
 	Certs    []essCertIDv2
 	Policies asn1.RawValue `asn1:"optional"`
 }
+
+// essCertIDv1 — ESSCertID (RFC 2634): хэш сертификата только SHA-1.
+type essCertIDv1 struct {
+	CertHash     []byte
+	IssuerSerial asn1.RawValue `asn1:"optional"`
+}
+
+type signingCertificateV1 struct {
+	Certs    []essCertIDv1
+	Policies asn1.RawValue `asn1:"optional"`
+}
+
+// MaxAccuracy — точность метки хуже этой не принимается: метка «плюс-минус
+// час» не годится в границы времени улики.
+const MaxAccuracy = time.Minute
 
 // Imprint — хэш, который уходит в TSA. Домен отделяет метку головы цепи от
 // меток над чем-то ещё: токен не предъявить как заверение других байтов.
@@ -406,10 +423,24 @@ func Verify(token []byte, imprint [32]byte, trust Trust) (Info, error) {
 	if err := checkSignature(signer, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature); err != nil {
 		return Info{}, err
 	}
+	// RFC 3161, 2.4.1: сертификат подписанта называется подписанным
+	// атрибутом — signingCertificateV2 (RFC 5816) или signingCertificate
+	// (v1, SHA-1; так подписывает НУЦ РК). Без него подпись можно было бы
+	// приписать другому сертификату с тем же ключом.
 	if raw, ok := p.attr(oidSigningCertV2); ok {
 		if err := checkSigningCert(raw, signer); err != nil {
 			return Info{}, err
 		}
+	} else if raw, ok := p.attr(oidSigningCertV1); ok {
+		if err := checkSigningCertV1(raw, signer); err != nil {
+			return Info{}, err
+		}
+	} else {
+		return Info{}, fmt.Errorf("%w: no signing-certificate attribute", ErrInvalid)
+	}
+	if acc := p.tst.Accuracy; acc.Seconds < 0 || acc.Millis < 0 || acc.Micros < 0 ||
+		time.Duration(acc.Seconds)*time.Second+time.Duration(acc.Millis)*time.Millisecond+time.Duration(acc.Micros)*time.Microsecond > MaxAccuracy {
+		return Info{}, fmt.Errorf("%w: accuracy %ds %dms %dus is worse than %v", ErrInvalid, acc.Seconds, acc.Millis, acc.Micros, MaxAccuracy)
 	}
 	// RFC 3161, 2.3: у сертификата службы ровно одно назначение — метки
 	// времени. Go считает сертификат без EKU годным для всего, поэтому
@@ -542,6 +573,19 @@ func checkSigningCert(raw []byte, signer *x509.Certificate) error {
 	h := hash.New()
 	h.Write(signer.Raw)
 	if !bytes.Equal(h.Sum(nil), id.CertHash) {
+		return fmt.Errorf("%w: signing-certificate attribute names another certificate", ErrInvalid)
+	}
+	return nil
+}
+
+// checkSigningCertV1 — то же для signingCertificate (v1): хэш SHA-1.
+func checkSigningCertV1(raw []byte, signer *x509.Certificate) error {
+	var sc signingCertificateV1
+	if _, err := asn1.Unmarshal(raw, &sc); err != nil || len(sc.Certs) == 0 {
+		return fmt.Errorf("%w: bad signing-certificate attribute", ErrInvalid)
+	}
+	h := sha1.Sum(signer.Raw)
+	if !bytes.Equal(h[:], sc.Certs[0].CertHash) {
 		return fmt.Errorf("%w: signing-certificate attribute names another certificate", ErrInvalid)
 	}
 	return nil

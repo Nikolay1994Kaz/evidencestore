@@ -62,6 +62,30 @@
    "file": "internal/tsa/tsa.go",
    "old": "\t\tif !ecdsa.VerifyASN1(pub, digest, sig) {",
    "new": "\t\tif false {"
+  },
+  {
+   "name": "T11 метка без атрибута сертификата подписанта принимается",
+   "file": "internal/tsa/tsa.go",
+   "old": "\t} else {\n\t\treturn Info{}, fmt.Errorf(\"%w: no signing-certificate attribute\", ErrInvalid)\n\t}",
+   "new": "\t}"
+  },
+  {
+   "name": "T12 signingCertificate v1 не сверяется",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif !bytes.Equal(h[:], sc.Certs[0].CertHash) {",
+   "new": "\tif false && !bytes.Equal(h[:], sc.Certs[0].CertHash) {"
+  },
+  {
+   "name": "T13 точность метки не ограничена",
+   "file": "internal/tsa/tsa.go",
+   "old": "time.Duration(acc.Micros)*time.Microsecond > MaxAccuracy {",
+   "new": "time.Duration(acc.Micros)*time.Microsecond > MaxAccuracy && false {"
+  },
+  {
+   "name": "T14 отрицательная точность принимается",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tif acc := p.tst.Accuracy; acc.Seconds < 0 || acc.Millis < 0 || acc.Micros < 0 ||",
+   "new": "\tif acc := p.tst.Accuracy; false ||"
   }
  ]
 }

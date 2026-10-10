@@ -333,3 +333,39 @@ func TestNotesTellWhyBodyIsClosed(t *testing.T) {
 		t.Errorf("тело вскрыто, а в отчёте %q", n)
 	}
 }
+
+// ⭐ V-05: пакет без метки TSA после улики — провал по умолчанию: без неё
+// время и неизменность подтверждает только подпись хранилища, и держатель
+// sign.key сочинит улику с любой датой. Принять — только явно.
+func TestBundleWithoutUpperFailsByDefault(t *testing.T) {
+	w, b := standard(t, nil)
+	b.Upper = nil
+	mustFail(t, "без метки TSA", b, w.trust())
+	tr := w.trust()
+	tr.AllowNoTSA = true
+	if r := Verify(b, tr); !r.Valid() {
+		t.Fatalf("с AllowNoTSA:\n%s", r.Text())
+	}
+}
+
+// V-04: тело с управляющими последовательностями не рисует на экране
+// проверяющего ложный вердикт: управляющие символы экранированы, вердикт —
+// ещё и последней строкой.
+func TestReportTextEscapesControls(t *testing.T) {
+	r := Report{
+		Checks:     []Check{{Name: "проверка", OK: false}},
+		Header:     evidence.Header{Source: "abs‮core", Seq: 1},
+		Body:       []byte("\x1b[2J\x1b[H ПРОВЕРКА ПРОЙДЕНА\x9b"),
+		BodyOpened: true,
+	}
+	text := r.Text()
+	for _, bad := range []string{"\x1b", "‮", "\u009b"} {
+		if strings.Contains(text, bad) {
+			t.Fatalf("в отчёте управляющий символ %q", bad)
+		}
+	}
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	if lines[len(lines)-1] != "ПРОВЕРКА НЕ ПРОЙДЕНА" {
+		t.Fatalf("последняя строка: %q", lines[len(lines)-1])
+	}
+}

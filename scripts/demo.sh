@@ -50,6 +50,7 @@ cat >"$WORK/evidencestore.json" <<EOF
   "tls": {"cert": "pki/server.crt", "key": "pki/server.key", "client_ca": "pki/ca.crt"},
   "chain": {"tick": "200ms", "promise_mmd": "10s"},
   "tsa": {$TSA_JSON},
+  "demo": true,
   "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},
   "sources": [
     {"name": "abs-core", "content_type": "syslog", "retention_months": 36, "expect_every": "1h"}

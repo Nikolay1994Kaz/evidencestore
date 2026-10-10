@@ -58,6 +58,11 @@ type Carrier struct {
 	segmentBytes int64 // порог ротации; поле, а не константа, чтобы тест мог его опустить
 	recovery     Recovery
 
+	// failed — первая ошибка записи тика. Дальше носитель не пишет ничего:
+	// после неудачной фазы неизвестно, что на диске, а повтор дописал бы
+	// листья и звено второй раз. Что на диске, разберёт Open после рестарта.
+	failed error
+
 	// beforeWrite — крючок отказа: зовётся перед каждой записью тика с именем
 	// фазы ("leaves"/"link"/"head"). В проде nil.
 	//
@@ -100,6 +105,11 @@ type Recovery struct {
 	HeadAdvanced      uint64 // на сколько звеньев голова отставала от журнала
 	LeavesWithoutRoot int    // листья, не покрытые звеном: уйдут в следующее
 	TornTailBytes     int64  // байт оборванного хвоста отброшено
+	TornTailFile      string // куда отложен последний отрезанный хвост
+	// HeadSlotDamaged — один из слотов головы записан и не сходится с CRC.
+	// Так бывает при отказе посреди записи головы, но так же выглядит и
+	// подмена: звено, отрезанное вместе с порчей слота, не видно ничем.
+	HeadSlotDamaged bool
 }
 
 // ErrTruncatedChain — журнал короче, чем помнит голова.
@@ -116,26 +126,29 @@ func Open(dir string) (*Carrier, error) {
 	}
 	c := &Carrier{dir: dir, segmentBytes: defaultSegmentBytes}
 
+	// На пути ошибки файлы закрываются без флаша: недоразобранный носитель
+	// не пишет ничего, иначе поднятые листья легли бы под звено, которое не
+	// сходится с ними.
 	var err error
 	if c.head, err = os.OpenFile(filepath.Join(dir, headFileName), os.O_CREATE|os.O_RDWR, 0o600); err != nil {
 		return nil, err
 	}
 	if err = c.head.Truncate(2 * headSlotSize); err != nil {
-		c.Close()
+		c.closeFiles()
 		return nil, err
 	}
 	if c.chain, err = os.OpenFile(filepath.Join(dir, chainFileName), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600); err != nil {
-		c.Close()
+		c.closeFiles()
 		return nil, err
 	}
 	// Каталог с только что созданными файлами: без этого fsync отказ питания
 	// может оставить записи без имён.
 	if err = syncDir(dir); err != nil {
-		c.Close()
+		c.closeFiles()
 		return nil, err
 	}
 	if err = c.recover(); err != nil {
-		c.Close()
+		c.closeFiles()
 		return nil, err
 	}
 	return c, nil
@@ -149,11 +162,14 @@ func (c *Carrier) recover() error {
 		return err
 	}
 
-	bodies, torn, err := readFrames(c.chain)
+	bodies, torn, aside, err := readFrames(c.chain)
 	if err != nil {
 		return err
 	}
 	c.recovery.TornTailBytes += torn
+	if aside != "" {
+		c.recovery.TornTailFile = aside
+	}
 
 	links := make([]Record, 0, len(bodies))
 	for i, body := range bodies {
@@ -218,6 +234,9 @@ func (c *Carrier) openLeafSegment(covered uint64) error {
 		return err
 	}
 	if len(segs) == 0 {
+		if covered > 0 {
+			return fmt.Errorf("%w: звенья покрывают %d листьев, а файлов листьев нет", ErrLeavesMissing, covered)
+		}
 		c.segFirst = covered
 		c.nextLeaf = covered
 		return c.createLeafSegment(covered)
@@ -229,16 +248,19 @@ func (c *Carrier) openLeafSegment(covered uint64) error {
 	}
 	c.leaves = f
 
-	bodies, torn, err := readFrames(f)
+	bodies, torn, aside, err := readFrames(f)
 	if err != nil {
 		return err
 	}
 	c.recovery.TornTailBytes += torn
+	if aside != "" {
+		c.recovery.TornTailFile = aside
+	}
 	c.nextLeaf = c.segFirst + uint64(len(bodies))
 
 	if c.nextLeaf < covered {
-		return fmt.Errorf("auditchain: звено покрывает лист %d, а в файлах листьев их %d — листья потеряны",
-			covered-1, c.nextLeaf)
+		return fmt.Errorf("%w: звено покрывает лист %d, а в файлах листьев их %d — листья потеряны",
+			ErrLeavesMissing, covered-1, c.nextLeaf)
 	}
 	// ⭐Листья без корня: отказ случился между их fsync и записью звена.
 	// Они не потеряны — поднимаем в буфер, следующее звено их накроет.
@@ -316,10 +338,31 @@ func (c *Carrier) Flush() (Head, error) {
 }
 
 func (c *Carrier) flushLocked() (Head, error) {
+	if c.failed != nil {
+		return c.headState, c.failed
+	}
 	if len(c.pending) == 0 {
 		return c.headState, nil
 	}
+	head, err := c.writeTick()
+	if err != nil {
+		c.failed = fmt.Errorf("auditchain: запись тика: %w", err)
+		return c.headState, c.failed
+	}
+	return head, nil
+}
 
+// Failed — защёлкнутая ошибка записи: не nil — носитель больше не пишет, и
+// принимать улики, которые не лягут в цепь, нельзя.
+func (c *Carrier) Failed() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed
+}
+
+// writeTick — листья, звено, голова. Любая ошибка защёлкивает носитель
+// (flushLocked).
+func (c *Carrier) writeTick() (Head, error) {
 	if err := c.rotateIfNeeded(); err != nil {
 		return c.headState, err
 	}
@@ -414,6 +457,14 @@ func (c *Carrier) rotateIfNeeded() error {
 	return c.createLeafSegment(c.nextLeaf - uint64(len(c.pending)))
 }
 
+// SetBeforeWrite ставит крючок отказа (см. beforeWrite): им тест движка
+// устраивает отказ записи цепи. В проде не зовётся.
+func (c *Carrier) SetBeforeWrite(fn func(phase string) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.beforeWrite = fn
+}
+
 func (c *Carrier) fail(phase string) error {
 	if c.beforeWrite == nil {
 		return nil
@@ -434,7 +485,8 @@ func (c *Carrier) writeHead(h Head) error {
 }
 
 // readHead берёт валидный слот с большим seq — правило, ради которого слотов
-// два. Оба невалидны (свежий файл из нулей) — голова нулевая.
+// два. Оба невалидны (свежий файл из нулей) — голова нулевая. Слот, в
+// который писали (не нули), но с несходящимся CRC, отмечается в Recovery.
 func (c *Carrier) readHead() (Head, error) {
 	buf := make([]byte, 2*headSlotSize)
 	if _, err := c.head.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
@@ -442,12 +494,25 @@ func (c *Carrier) readHead() (Head, error) {
 	}
 	var best Head
 	for i := 0; i < 2; i++ {
-		h, ok := decodeHead(buf[i*headSlotSize : (i+1)*headSlotSize])
+		slot := buf[i*headSlotSize : (i+1)*headSlotSize]
+		h, ok := decodeHead(slot)
+		if !ok && !allZero(slot) {
+			c.recovery.HeadSlotDamaged = true
+		}
 		if ok && h.Seq >= best.Seq {
 			best = h
 		}
 	}
 	return best, nil
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Close сбрасывает буфер и закрывает файлы.
@@ -465,6 +530,15 @@ func (c *Carrier) Close() error {
 			firstErr = err
 		}
 	}
+	if err := c.closeFiles(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// closeFiles закрывает файлы без флаша.
+func (c *Carrier) closeFiles() error {
+	var firstErr error
 	for _, f := range []*os.File{c.leaves, c.chain, c.head} {
 		if f == nil {
 			continue
@@ -571,11 +645,13 @@ func frameRecord(r Record) []byte { return frame(encodeForHash(r)) }
 func frameLeaf(l Leaf) []byte     { return frame(encodeLeafForHash(l)) }
 
 // readFrames читает файл кадр за кадром и ОБРЕЗАЕТ оборванный хвост,
-// возвращая число отброшенных байт.
+// возвращая число отброшенных байт и файл, куда хвост отложен.
 //
-// ⚠Обрыв допускается только в последнем кадре. Битый кадр в середине — это
-// либо порча, либо правка; молчать о нём нельзя, поэтому это ошибка.
-func readFrames(f *os.File) ([][]byte, int64, error) {
+// ⚠Обрыв допускается только в конце файла: если за плохим кадром есть хоть
+// один целый, это порча середины или правка, и молчать о ней нельзя —
+// ошибка. Отрезанное не уничтожается: оно ложится рядом, в
+// <файл>.torn-<смещение>.
+func readFrames(f *os.File) ([][]byte, int64, string, error) {
 	return scanFrames(f, true)
 }
 
@@ -584,53 +660,100 @@ func readFrames(f *os.File) ([][]byte, int64, error) {
 // только носитель при открытии: читатель, запущенный во время записи,
 // увидел бы недописанный кадр и отрезал бы его у пишущего.
 func readFramesRO(f *os.File) ([][]byte, error) {
-	bodies, _, err := scanFrames(f, false)
+	bodies, _, _, err := scanFrames(f, false)
 	return bodies, err
 }
 
-func scanFrames(f *os.File, truncate bool) ([][]byte, int64, error) {
+// maxFrame — предел тела кадра при поиске целого кадра за плохим: события
+// цепи — сотни байт, токен TSA — единицы килобайт.
+const maxFrame = 1 << 20
+
+func scanFrames(f *os.File, truncate bool) ([][]byte, int64, string, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 
 	var bodies [][]byte
 	off := 0
 	for off < len(data) {
-		if off+4 > len(data) {
-			break
+		if off+8 > len(data) {
+			break // хвост короче заголовка и CRC
 		}
 		n := int(binary.BigEndian.Uint32(data[off : off+4]))
-		if n < 0 || off+8+n > len(data) {
-			break // хвост оборван на теле
+		if n == 0 || off+8+n > len(data) {
+			break // пустых кадров не бывает (нули после сбоя питания), или длина за концом файла
 		}
 		body := data[off+4 : off+4+n]
-		want := binary.BigEndian.Uint32(data[off+4+n : off+8+n])
-		if crc32.ChecksumIEEE(body) != want {
-			if off+8+n == len(data) {
-				break // последний кадр записан не целиком
-			}
-			return nil, 0, fmt.Errorf("auditchain: кадр по смещению %d не сходится с CRC — файл повреждён", off)
+		if crc32.ChecksumIEEE(body) != binary.BigEndian.Uint32(data[off+4+n:off+8+n]) {
+			break
 		}
 		bodies = append(bodies, body)
 		off += 8 + n
 	}
-
+	if off == len(data) {
+		return bodies, 0, "", nil
+	}
+	// Плохой кадр. Обрыв записи бывает только в конце: целый кадр дальше
+	// значит порчу середины.
+	if at, ok := frameAfter(data, off+1); ok {
+		return nil, 0, "", fmt.Errorf("auditchain: %s: кадр по смещению %d испорчен, а по смещению %d — целый кадр: файл повреждён, это не оборванный хвост",
+			f.Name(), off, at)
+	}
 	torn := int64(len(data) - off)
-	if torn > 0 && truncate {
+	var aside string
+	if truncate {
 		// Хвост отрезаем физически: иначе следующая запись пристроится за
-		// мусором и разъедется навсегда.
+		// мусором и разъедется навсегда. Но сначала откладываем его рядом.
+		aside = fmt.Sprintf("%s.torn-%d", f.Name(), off)
+		if err := writeSynced(aside, data[off:]); err != nil {
+			return nil, 0, "", fmt.Errorf("auditchain: отложить хвост: %w", err)
+		}
+		if err := syncDir(filepath.Dir(f.Name())); err != nil {
+			return nil, 0, "", err
+		}
 		if err := f.Truncate(int64(off)); err != nil {
-			return nil, 0, err
+			return nil, 0, "", err
 		}
 		if _, err := f.Seek(0, io.SeekEnd); err != nil {
-			return nil, 0, err
+			return nil, 0, "", err
 		}
 	}
-	return bodies, torn, nil
+	return bodies, torn, aside, nil
+}
+
+// frameAfter ищет целый кадр (длина в пределах maxFrame, CRC сходится),
+// начинающийся в [from, from+8+maxFrame): если кадр испорчен, следующий
+// настоящий начинается не дальше. Объём проверки ограничен: исчерпав его,
+// frameAfter отвечает «нашёлся» — отказ безопаснее, чем срезать целое.
+func frameAfter(data []byte, from int) (int, bool) {
+	budget := 1 << 30
+	for i := from; i+8 <= len(data) && i < from+8+maxFrame; i++ {
+		n := int(binary.BigEndian.Uint32(data[i:]))
+		if n == 0 || n > maxFrame || i+8+n > len(data) {
+			continue
+		}
+		if budget -= n; budget < 0 {
+			return i, true
+		}
+		if crc32.ChecksumIEEE(data[i+4:i+4+n]) == binary.BigEndian.Uint32(data[i+4+n:]) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// writeSynced создаёт файл с содержимым и сбрасывает его на диск.
+func writeSynced(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(data)
+	return errors.Join(werr, f.Sync(), f.Close())
 }
 
 func encodeHead(h Head) []byte {
@@ -772,7 +895,7 @@ func ScanLeaves(dir string, fn func(num uint64, l Leaf) error) error {
 	var next uint64
 	for _, first := range segs {
 		if first != next {
-			return fmt.Errorf("auditchain: нет листьев %d…%d — файл листьев утрачен", next, first-1)
+			return fmt.Errorf("%w: нет листьев %d…%d — файл листьев утрачен", ErrLeavesMissing, next, first-1)
 		}
 		f, err := os.Open(leafPath(dir, first))
 		if err != nil {

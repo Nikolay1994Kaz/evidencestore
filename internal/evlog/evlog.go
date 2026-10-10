@@ -22,13 +22,19 @@
 // отказывает всем (Failed). После неудачного fsync нельзя знать, что на
 // диске, а отвечать «принято» про то, что, может быть, не записано, нельзя.
 //
-// ОСВОБОЖДЕНИЕ. Хранилище из журнала улик не удаляет ничего и Release не
-// зовёт. Release нужен буферу сборщика: там запись больше не нужна, когда её
-// приняло хранилище. Удаляются только целые закрытые сегменты. Сначала на
-// диск ложится нижняя граница (файл floor), потом удаляются файлы. Прерванное
-// удаление Open доводит до конца, а сегмент ниже границы не считается
-// пропавшим. Без файла floor журнал обязан начинаться с позиции 1:
-// пропавший первый сегмент — порча.
+// ОСВОБОЖДЕНИЕ. Хранилище из журнала улик не удаляет ничего. Release нужен
+// буферу сборщика: там запись больше не нужна, когда её приняло хранилище.
+// Удаляются только целые закрытые сегменты. Сначала на диск ложится нижняя
+// граница (файл floor), потом удаляются файлы. Прерванное удаление Open
+// доводит до конца, а сегмент ниже границы не считается пропавшим. Всё это —
+// только у журнала, открытого с AllowRelease. Журнал улик обязан начинаться
+// с позиции 1, а файл floor в нём — порча: иначе подложенный floor удалял бы
+// улики при старте.
+//
+// ОБОРВАННЫЙ ХВОСТ — только в конце последнего сегмента и только если за
+// плохой записью нет ни одной целой: целая запись дальше значит порчу
+// середины, а за ней подтверждённые улики. Отрезанные байты не
+// уничтожаются, а откладываются в файл рядом (seg_….log.torn-<смещение>).
 package evlog
 
 import (
@@ -40,6 +46,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,10 +73,12 @@ const (
 )
 
 var (
-	ErrClosed  = errors.New("evlog: closed")
-	ErrCorrupt = errors.New("evlog: corrupt")
-	ErrTooBig  = errors.New("evlog: record too big")
-	ErrNoPos   = errors.New("evlog: no such position")
+	ErrClosed = errors.New("evlog: closed")
+	// ErrNoRelease — Release у журнала, открытого без AllowRelease.
+	ErrNoRelease = errors.New("evlog: this log never releases records")
+	ErrCorrupt   = errors.New("evlog: corrupt")
+	ErrTooBig    = errors.New("evlog: record too big")
+	ErrNoPos     = errors.New("evlog: no such position")
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -82,13 +91,17 @@ type Options struct {
 	// позиций и до того, как писатели получат ответ. Сюда движок вешает
 	// листья цепи: порядок листьев совпадает с порядком журнала.
 	OnCommit func(first uint64, records [][]byte)
+	// AllowRelease — журнал может удалять доставленные сегменты (Release) и
+	// начинаться не с 1 (файл floor). Только для буфера сборщика.
+	AllowRelease bool
 }
 
 // Recovery — что журнал нашёл при открытии.
 type Recovery struct {
 	Records       uint64 // записей в журнале
 	Segments      int
-	TornTailBytes int64 // отброшенный оборванный хвост последнего сегмента
+	TornTailBytes int64  // отброшенный оборванный хвост последнего сегмента
+	TornTailFile  string // куда отложен отрезанный хвост
 }
 
 type segment struct {
@@ -115,6 +128,7 @@ type Log struct {
 	dir      string
 	segBytes int64
 	onCommit func(uint64, [][]byte)
+	release  bool
 	recovery Recovery
 
 	mu       sync.RWMutex // segs и failed; запись — только поток журнала
@@ -153,8 +167,9 @@ func (l *Log) Stats() Stats {
 // поднимает индекс принятых и досчитывает цепь.
 //
 // Оборванный хвост последнего сегмента (отказ посреди записи пачки)
-// отрезается: эти байты никогда не подтверждались. Порча в любом другом месте —
-// ErrCorrupt: молча терять подтверждённые улики нельзя.
+// отрезается и откладывается рядом: эти байты никогда не подтверждались.
+// Порча в любом другом месте — ErrCorrupt: молча терять подтверждённые улики
+// нельзя.
 func Open(dir string, opt Options, visit func(pos uint64, data []byte) error) (*Log, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("evlog: %w", err)
@@ -163,6 +178,7 @@ func Open(dir string, opt Options, visit func(pos uint64, data []byte) error) (*
 		dir:      dir,
 		segBytes: opt.SegmentBytes,
 		onCommit: opt.OnCommit,
+		release:  opt.AllowRelease,
 		reqs:     make(chan *request, queueLen),
 		stopped:  make(chan struct{}),
 		syncFile: (*os.File).Sync,
@@ -182,16 +198,34 @@ func (l *Log) recover(visit func(uint64, []byte) error) error {
 	if err != nil {
 		return err
 	}
-	floor, err := readFloor(l.dir)
+	floor, err := l.readFloor()
 	if err != nil {
 		return err
 	}
-	// Сегменты целиком ниже границы — остаток прерванного Release.
-	for len(firsts) > 1 && firsts[1] <= floor {
-		if err := os.Remove(segPath(l.dir, firsts[0])); err != nil {
-			return fmt.Errorf("evlog: %w", err)
+	// Сегменты ниже границы — остаток прерванного Release. Граница обязана
+	// быть началом сегмента, который есть, — иначе файл floor не наш, и по
+	// нему ничего не удаляется.
+	if floor > 1 && len(firsts) > 0 {
+		if !slices.Contains(firsts, floor) {
+			return fmt.Errorf("%w: %s says the log starts at %d, no segment starts there", ErrCorrupt, floorFile, floor)
 		}
-		firsts = firsts[1:]
+		for firsts[0] < floor {
+			if err := os.Remove(segPath(l.dir, firsts[0])); err != nil {
+				return fmt.Errorf("evlog: %w", err)
+			}
+			firsts = firsts[1:]
+		}
+	}
+	// Последний сегмент без заголовка — сбой посреди создания сегмента
+	// прежней версией (без переименования): записей в нём нет.
+	if n := len(firsts); n > 0 {
+		p := segPath(l.dir, firsts[n-1])
+		if fi, err := os.Stat(p); err == nil && fi.Size() < int64(segHeader) {
+			if err := os.Remove(p); err != nil {
+				return fmt.Errorf("evlog: %w", err)
+			}
+			firsts = firsts[:n-1]
+		}
 	}
 	next := floor
 	for i, first := range firsts {
@@ -199,11 +233,14 @@ func (l *Log) recover(visit func(uint64, []byte) error) error {
 			return fmt.Errorf("%w: segment starts at %d, expected %d", ErrCorrupt, first, next)
 		}
 		last := i == len(firsts)-1
-		seg, torn, err := scanSegment(l.dir, first, last, visit)
+		seg, torn, aside, err := scanSegment(l.dir, first, last, visit)
 		if err != nil {
 			return err
 		}
 		l.recovery.TornTailBytes += torn
+		if aside != "" {
+			l.recovery.TornTailFile = aside
+		}
 		l.segs = append(l.segs, seg)
 		next = seg.end()
 	}
@@ -228,14 +265,17 @@ func (l *Log) recover(visit func(uint64, []byte) error) error {
 	return nil
 }
 
-// readFloor — первая позиция журнала: из файла floor, без него — 1.
-func readFloor(dir string) (uint64, error) {
-	data, err := os.ReadFile(filepath.Join(dir, floorFile))
-	if errors.Is(err, os.ErrNotExist) {
+// readFloor — первая позиция журнала: из файла floor, без него — 1. Журнал
+// без AllowRelease начинается с 1 всегда, а floor в нём — порча.
+func (l *Log) readFloor() (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(l.dir, floorFile))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
 		return 1, nil
-	}
-	if err != nil {
+	case err != nil:
 		return 0, fmt.Errorf("evlog: %w", err)
+	case !l.release:
+		return 0, fmt.Errorf("%w: %s file in a log that never releases records", ErrCorrupt, floorFile)
 	}
 	floor, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 	if err != nil || floor == 0 {
@@ -245,23 +285,24 @@ func readFloor(dir string) (uint64, error) {
 }
 
 // scanSegment читает сегмент целиком. У последнего сегмента оборванный хвост
-// отрезается, у остальных любая неисправность — порча.
-func scanSegment(dir string, first uint64, last bool, visit func(uint64, []byte) error) (*segment, int64, error) {
+// отрезается (и откладывается в файл aside), у остальных любая
+// неисправность — порча.
+func scanSegment(dir string, first uint64, last bool, visit func(uint64, []byte) error) (_ *segment, torn int64, aside string, _ error) {
 	path := segPath(dir, first)
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, 0, fmt.Errorf("evlog: %w", err)
+		return nil, 0, "", fmt.Errorf("evlog: %w", err)
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return nil, 0, fmt.Errorf("evlog: %w", err)
+		return nil, 0, "", fmt.Errorf("evlog: %w", err)
 	}
 	r := bufio.NewReaderSize(f, 1<<20)
 	var hdr [segHeader]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil || string(hdr[:len(segMagic)]) != segMagic ||
 		binary.BigEndian.Uint64(hdr[len(segMagic):]) != first {
-		return nil, 0, fmt.Errorf("%w: %s: bad header", ErrCorrupt, path)
+		return nil, 0, "", fmt.Errorf("%w: %s: bad header", ErrCorrupt, path)
 	}
 	seg := &segment{first: first, path: path, size: int64(segHeader)}
 	for {
@@ -271,27 +312,83 @@ func scanSegment(dir string, first uint64, last bool, visit func(uint64, []byte)
 		}
 		if err != nil {
 			if !last {
-				return nil, 0, fmt.Errorf("%w: %s at offset %d: %v", ErrCorrupt, path, seg.size, err)
+				return nil, 0, "", fmt.Errorf("%w: %s at offset %d: %v", ErrCorrupt, path, seg.size, err)
 			}
-			torn := st.Size() - seg.size
+			// Обрыв пачки бывает только в самом конце: целая запись дальше —
+			// порча середины, за которой подтверждённые улики.
+			at, found, ferr := findFrame(f, seg.size+1, st.Size())
+			if ferr != nil {
+				return nil, 0, "", fmt.Errorf("evlog: %w", ferr)
+			}
+			if found {
+				return nil, 0, "", fmt.Errorf("%w: %s at offset %d: %v, and a whole record follows at offset %d: not a torn tail", ErrCorrupt, path, seg.size, err, at)
+			}
+			if aside, err = setAside(f, path, seg.size, st.Size()); err != nil {
+				return nil, 0, "", err
+			}
 			if err := f.Truncate(seg.size); err != nil {
-				return nil, 0, fmt.Errorf("evlog: truncate torn tail: %w", err)
+				return nil, 0, "", fmt.Errorf("evlog: truncate torn tail: %w", err)
 			}
 			if err := f.Sync(); err != nil {
-				return nil, 0, fmt.Errorf("evlog: %w", err)
+				return nil, 0, "", fmt.Errorf("evlog: %w", err)
 			}
-			return seg, torn, nil
+			return seg, st.Size() - seg.size, aside, nil
 		}
 		pos := seg.end()
 		seg.offsets = append(seg.offsets, uint32(seg.size))
 		seg.size += int64(n)
 		if visit != nil {
 			if err := visit(pos, data); err != nil {
-				return nil, 0, err
+				return nil, 0, "", err
 			}
 		}
 	}
-	return seg, 0, nil
+	return seg, 0, "", nil
+}
+
+// findFrame ищет целую запись (длина в пределах, CRC сходится), которая
+// начинается в [from, from+frameHead+MaxRecord): если середина испорчена,
+// следующая настоящая запись начинается не дальше. На случай мусора,
+// похожего на длины, проверка ограничена объёмом: исчерпав его, findFrame
+// отвечает «нашлась» — отказ стартовать безопаснее, чем срезать
+// подтверждённое.
+func findFrame(f *os.File, from, size int64) (int64, bool, error) {
+	end := min(size, from+2*(frameHead+MaxRecord))
+	if end-from < frameHead {
+		return 0, false, nil
+	}
+	buf := make([]byte, end-from)
+	if _, err := f.ReadAt(buf, from); err != nil && !errors.Is(err, io.EOF) {
+		return 0, false, err
+	}
+	budget := 1 << 30
+	for i := 0; i+frameHead <= len(buf) && i < frameHead+MaxRecord; i++ {
+		n := int(binary.BigEndian.Uint32(buf[i:]))
+		if n == 0 || n > MaxRecord || i+frameHead+n > len(buf) {
+			continue
+		}
+		if budget -= n; budget < 0 {
+			return from + int64(i), true, nil
+		}
+		if crc32.Checksum(buf[i+frameHead:i+frameHead+n], castagnoli) == binary.BigEndian.Uint32(buf[i+4:]) {
+			return from + int64(i), true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// setAside откладывает отрезаемый хвост [from, size) в файл рядом с
+// сегментом: отрезанное не уничтожается, его можно разобрать.
+func setAside(f *os.File, path string, from, size int64) (string, error) {
+	buf := make([]byte, size-from)
+	if _, err := f.ReadAt(buf, from); err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("evlog: read torn tail: %w", err)
+	}
+	aside := fmt.Sprintf("%s.torn-%d", path, from)
+	if err := writeSynced(aside, buf); err != nil {
+		return "", fmt.Errorf("evlog: set torn tail aside: %w", err)
+	}
+	return aside, syncDir(filepath.Dir(path))
 }
 
 // readFrame читает одну запись. io.EOF — ровно на границе записи.
@@ -445,25 +542,35 @@ func (l *Log) rotate(first uint64) error {
 	return l.newSegment(first)
 }
 
+// newSegment заводит сегмент: заголовок пишется во временный файл и только
+// потом получает имя сегмента — сбой посреди создания не оставляет сегмента
+// без заголовка.
 func (l *Log) newSegment(first uint64) error {
 	path := segPath(l.dir, first)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("evlog: new segment: %w", err)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("evlog: new segment %s: exists or unreadable: %v", path, err)
 	}
 	hdr := append([]byte(segMagic), make([]byte, 8)...)
 	binary.BigEndian.PutUint64(hdr[len(segMagic):], first)
-	if _, err := f.Write(hdr); err != nil {
-		f.Close()
+	tmp := path + ".tmp"
+	if err := writeSynced(tmp, hdr); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("evlog: new segment: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("evlog: new segment: %w", err)
 	}
 	if err := syncDir(l.dir); err != nil {
-		f.Close()
 		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("evlog: new segment: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		f.Close()
+		return fmt.Errorf("evlog: new segment: %w", err)
 	}
 	l.mu.Lock()
 	l.segs = append(l.segs, &segment{first: first, path: path, size: int64(segHeader)})
@@ -486,6 +593,13 @@ func (l *Log) Failed() error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.failed
+}
+
+// First — первая позиция, которая ещё есть в журнале (после Release — выше 1).
+func (l *Log) First() uint64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.segs[0].first
 }
 
 // Next — позиция, которую получит следующая запись.
@@ -550,6 +664,9 @@ func (l *Log) Segments() []SegmentInfo {
 // продолжает после рестарта. Журнал на время записи границы заперт: на
 // буфере сборщика это ничего не стоит, а хранилище Release не зовёт.
 func (l *Log) Release(upTo uint64) error {
+	if !l.release {
+		return ErrNoRelease
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	last := l.segs[len(l.segs)-1].end() - 1
@@ -580,14 +697,7 @@ func (l *Log) Release(upTo uint64) error {
 // fsync каталога.
 func writeFloor(dir string, floor uint64) error {
 	tmp := filepath.Join(dir, floorFile+".tmp")
-	if err := os.WriteFile(tmp, []byte(strconv.FormatUint(floor, 10)+"\n"), 0o600); err != nil {
-		return fmt.Errorf("evlog: %w", err)
-	}
-	f, err := os.Open(tmp)
-	if err != nil {
-		return fmt.Errorf("evlog: %w", err)
-	}
-	err = errors.Join(f.Sync(), f.Close())
+	err := writeSynced(tmp, []byte(strconv.FormatUint(floor, 10)+"\n"))
 	if err == nil {
 		err = os.Rename(tmp, filepath.Join(dir, floorFile))
 	}
@@ -595,6 +705,16 @@ func writeFloor(dir string, floor uint64) error {
 		return fmt.Errorf("evlog: floor: %w", err)
 	}
 	return syncDir(dir)
+}
+
+// writeSynced создаёт файл с содержимым и сбрасывает его на диск.
+func writeSynced(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(data)
+	return errors.Join(werr, f.Sync(), f.Close())
 }
 
 // Close дожидается записи всех принятых в очередь пачек и закрывает файл.

@@ -288,8 +288,17 @@ func (d *dec) str(limit int) string {
 	return string(d.take(int(n)))
 }
 
+// time читает время. До 1970 года времени в файле не бывает: отрицательное
+// число — порча или переполнение при записи.
 func (d *dec) time() time.Time {
-	if ns := int64(d.u64()); ns != 0 {
+	ns := int64(d.u64())
+	switch {
+	case ns < 0:
+		if d.err == nil {
+			d.err = fmt.Errorf("%w: time before 1970", ErrCorrupt)
+		}
+		return time.Time{}
+	case ns != 0:
 		return time.Unix(0, ns)
 	}
 	return time.Time{}

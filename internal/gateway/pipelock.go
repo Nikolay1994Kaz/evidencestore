@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // ContentType — тип улики для строк бортового журнала Pipelock.
@@ -73,9 +75,13 @@ type wire struct {
 
 // ParseEntry разбирает строку журнала. Повтор ключа — ошибка: разные
 // разборщики взяли бы разные значения, и хэш проверялся бы не над тем, что
-// увидит другой.
+// увидит другой. Невалидный UTF-8 — тоже: encoding/json заменяет такие
+// байты на U+FFFD, и разные строки давали бы один хэш.
 func ParseEntry(line []byte) (Entry, error) {
 	line = bytes.TrimRight(line, "\r\n")
+	if !utf8.Valid(line) {
+		return Entry{}, errors.New("gateway: entry is not valid UTF-8")
+	}
 	if err := noDuplicateKeys(line); err != nil {
 		return Entry{}, err
 	}
@@ -102,16 +108,35 @@ func noDuplicateKeys(line []byte) error {
 			return fmt.Errorf("gateway: entry: %w", err)
 		}
 		k, _ := t.(string)
-		if seen[k] {
+		// encoding/json сопоставляет ключи с полями без учёта регистра
+		// (Unicode-свёртка: «ſ» — это «s»): «summary» и «SUMMARY» для него
+		// одно поле, для Python и jq — два.
+		if f := foldKey(k); seen[f] {
 			return fmt.Errorf("gateway: entry: duplicate key %q", k)
+		} else {
+			seen[f] = true
 		}
-		seen[k] = true
 		var skip json.RawMessage
 		if err := dec.Decode(&skip); err != nil {
 			return fmt.Errorf("gateway: entry: %w", err)
 		}
 	}
 	return nil
+}
+
+// foldKey — ключ после простой Unicode-свёртки регистра: у каждой буквы —
+// наименьшая из её орбиты unicode.SimpleFold. Две строки равны после
+// свёртки ровно тогда, когда равны по strings.EqualFold.
+func foldKey(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		low := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			low = min(low, f)
+		}
+		b.WriteRune(low)
+	}
+	return b.String()
 }
 
 // fields — проекция записи для хэша в порядке её версии. ok == false —
