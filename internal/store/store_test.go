@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -187,7 +188,7 @@ func TestIngestProofVerify(t *testing.T) {
 		t.Fatalf("ключ записи выдан без просьбы: %d байт, %v", len(nb.DEK), err)
 	}
 	// Пакет переживает JSON.
-	data, _ := b.JSON()
+	data, _ := json.Marshal(b)
 	b2, err := proof.Parse(data)
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +216,7 @@ func TestTamperingIsDetected(t *testing.T) {
 		t.Fatalf("исходный пакет:\n%s", r.Text())
 	}
 	clone := func() proof.Bundle {
-		data, _ := good.JSON()
+		data, _ := json.Marshal(good)
 		b, _ := proof.Parse(data)
 		return b
 	}
@@ -950,3 +951,16 @@ func TestDestroyWaitsForTSATime(t *testing.T) {
 		t.Fatal("квитанции уничтожения в цепи нет")
 	}
 }
+
+// Только для тестов: продукт берёт голову и доверие к TSA изнутри.
+
+// Head — голова цепи.
+func (s *Store) Head() auditchain.Head {
+	s.chainMu.Lock()
+	defer s.chainMu.Unlock()
+	return s.chain.Head()
+}
+
+// TSATrust — доверие к службе меток, которым пользуется хранилище. Для
+// встроенной демо-службы — её корень.
+func (s *Store) TSATrust() tsa.Trust { return s.tsaTrust }

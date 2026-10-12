@@ -268,9 +268,6 @@ func (s *Store) deactivatePastMonths(now time.Time) error {
 // Keys — состояние всех ключей.
 func (s *Store) Keys() []keyring.KeyInfo { return s.keys.List() }
 
-// OrphanRoots — корни, которых не знает keyring.dat (keyring.OrphanRoots).
-func (s *Store) OrphanRoots() ([]string, error) { return s.keys.OrphanRoots() }
-
 // DestroyOrphanRoots уничтожает корни-сироты по решению оператора и пишет
 // это событием в цепь. Безопасно для улик: при запуске хранилище проверило,
 // что каждая улика журнала запечатана ключом из keyring.dat, а им заперт его

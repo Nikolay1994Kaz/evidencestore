@@ -381,11 +381,16 @@ func TestEpochOverMTLS(t *testing.T) {
 		if path == "/v1/ingest" {
 			method, body = "POST", records(1, 1)
 		}
-		if code, er := do(method, path, b, body); code != 409 || er.Code != CodeEpochMismatch {
-			t.Fatalf("чужая эпоха, %s: %d %+v", path, code, er)
-		}
-		if code, er := do(method, path, "", body); code != 409 || er.Code != CodeEpochMismatch {
-			t.Fatalf("без эпохи при закреплённой, %s: %d %+v", path, code, er)
+		for _, epoch := range []string{b, ""} {
+			code, er := do(method, path, epoch, body)
+			if code != 409 || er.Code != CodeEpochMismatch {
+				t.Fatalf("эпоха %q при закреплённой, %s: %d %+v", epoch, path, code, er)
+			}
+			// Закреплённая эпоха в ответе работала бы паролем: самозванец
+			// с тем же сертификатом повторил бы запрос с ней.
+			if strings.Contains(er.Error, a) {
+				t.Fatalf("ответ %s называет закреплённую эпоху: %s", path, er.Error)
+			}
 		}
 	}
 	if code, _ := do("POST", "/v1/ingest", "xyz", records(1, 1)); code != 400 {

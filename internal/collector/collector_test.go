@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -509,18 +510,92 @@ func TestGlobForgetsFileWithReusedInode(t *testing.T) {
 		t.Fatal(err)
 	}
 	ino := inode(fi)
-	// Реестр помнит прежний файл с этим inode: прочитан до 8, первая строка
-	// другая.
-	c.files[ino] = fileState{Inode: ino, Offset: 8, MTime: 1, Head: "old file"}
-	c.forgetGone([]globFile{{path: p, ino: ino, size: fi.Size(), mtime: fi.ModTime().UnixNano()}})
-	if _, ok := c.files[ino]; ok {
-		t.Fatal("файл с чужой первой строкой остался в реестре: его начало не прочитается")
+	listing := []globFile{{path: p, ino: ino, size: fi.Size(), mtime: fi.ModTime().UnixNano()}}
+	// Реестр помнит прежний файл с этим inode (закрыт за простоем): прочитан
+	// до 8, первая строка другая.
+	c.files[ino] = &tracked{ino: ino, off: 8, mtime: 1, head: "old file", idle: true, size: -1}
+	if err := c.reconcile(listing); err != nil {
+		t.Fatal(err)
+	}
+	if e := c.files[ino]; e == nil || e.off != 0 || e.head != "" {
+		t.Fatalf("файл с чужой первой строкой читается не с начала: %+v", e)
 	}
 	// ПАРНЫЙ КОНТРОЛЬ: тот же файл, дописанный, — помнится.
-	c.files[ino] = fileState{Inode: ino, Offset: 8, MTime: 1, Head: "new file, first line"}
-	c.forgetGone([]globFile{{path: p, ino: ino, size: fi.Size(), mtime: fi.ModTime().UnixNano()}})
-	if e, ok := c.files[ino]; !ok || e.Offset != 8 {
+	c.files[ino].f.Close()
+	c.files[ino] = &tracked{ino: ino, off: 8, mtime: 1, head: "new file, first line", idle: true, size: -1}
+	if err := c.reconcile(listing); err != nil {
+		t.Fatal(err)
+	}
+	if e := c.files[ino]; e == nil || e.off != 8 {
 		t.Fatalf("дописанный файл забыт: %+v", e)
+	}
+}
+
+// Y-01…Y-05: inode удалённого файла ядро отдаёт новому. Запись реестра
+// узнаёт свой файл по времени рождения, даже если первая строка та же
+// (заголовок журнала): другое рождение — другой файл, читается с начала.
+func TestRegistryKnowsFileByBirth(t *testing.T) {
+	r := globRig(t)
+	c := r.collector(t)
+	p := filepath.Join(r.logDir, "evidence-b-0.jsonl")
+	appendLines(t, p, "header\n", "body\n")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino := inode(fi)
+	f, _ := os.Open(p)
+	birth := birthOf(f)
+	f.Close()
+	if birth == 0 {
+		t.Skip("файловая система не знает времени рождения")
+	}
+	listing := []globFile{{path: p, ino: ino, size: fi.Size(), mtime: fi.ModTime().UnixNano()}}
+	// Реестр помнит другой файл с этим inode и той же первой строкой.
+	c.files[ino] = &tracked{ino: ino, off: 7, mtime: 1, head: "header", birth: birth + 1, idle: true, size: -1}
+	if err := c.reconcile(listing); err != nil {
+		t.Fatal(err)
+	}
+	if e := c.files[ino]; e == nil || e.off != 0 || e.birth != birth {
+		t.Fatalf("чужой файл с тем же inode и первой строкой не узнан: %+v", e)
+	}
+	// ПАРНЫЙ КОНТРОЛЬ: то же рождение — тот же файл.
+	c.files[ino].f.Close()
+	c.files[ino] = &tracked{ino: ino, off: 7, mtime: 1, head: "header", birth: birth, idle: true, size: -1}
+	if err := c.reconcile(listing); err != nil {
+		t.Fatal(err)
+	}
+	if e := c.files[ino]; e == nil || e.off != 7 {
+		t.Fatalf("свой файл забыт: %+v", e)
+	}
+}
+
+// Z-04: то же, когда файл не открыть (права): рождение сверяется по пути,
+// без открытия. Раньше «не открыть» значило «тот же файл»: чужой файл жил в
+// реестре под чужим местом, а ротированный — «пропадал» с пропуском, и его
+// строки терялись (симуляция с правами).
+func TestRegistryKnowsUnreadableFileByBirth(t *testing.T) {
+	r := globRig(t)
+	c := r.collector(t)
+	p := filepath.Join(r.logDir, "evidence-b-0.jsonl")
+	appendLines(t, p, "header\n", "body\n")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino := inode(fi)
+	birth := birthAt(p, ino)
+	if birth == 0 {
+		t.Skip("файловая система не знает времени рождения")
+	}
+	os.Chmod(p, 0o200)
+	listing := []globFile{{path: p, ino: ino, size: fi.Size(), mtime: fi.ModTime().UnixNano()}}
+	c.files[ino] = &tracked{ino: ino, off: 7, mtime: 1, head: "header", birth: birth + 1, idle: true, size: -1}
+	if err := c.reconcile(listing); err != nil {
+		t.Fatal(err)
+	}
+	if e := c.files[ino]; e == nil || e.off != 0 || e.birth != birth || e.f != nil {
+		t.Fatalf("чужой файл, которого не открыть, не узнан: %+v", e)
 	}
 }
 
@@ -543,10 +618,11 @@ func TestNaturalLess(t *testing.T) {
 
 func TestGlobConfig(t *testing.T) {
 	base := Config{Server: "https://x", CA: "ca", Cert: "c", Key: "k", SpoolDir: "s", StoreKey: anyKey}
-	both, none, bad := base, base, base
+	both, none, bad, dirs := base, base, base, base
 	both.File, both.Glob = "/a.log", "/b/*.log"
 	bad.Glob = "/b/[*.log"
-	for name, c := range map[string]Config{"file и glob": both, "ни того ни другого": none, "кривая маска": bad} {
+	dirs.Glob = "/var/log/*/audit.log" // каталог маски — один, без подстановок
+	for name, c := range map[string]Config{"file и glob": both, "ни того ни другого": none, "кривая маска": bad, "подстановка в каталоге": dirs} {
 		if err := c.validate(); err == nil {
 			t.Errorf("%s: принято", name)
 		}
@@ -1216,6 +1292,176 @@ func TestGlobDeletedCurrentDoesNotRereadOlder(t *testing.T) {
 	}
 }
 
+// ⭐ W-02: ротация уводит текущий файл из-под маски (`*.jsonl`,
+// evidence-a.jsonl → evidence-a.jsonl.1), а приложение до переоткрытия
+// пишет в него. Ушедший файл дочитывается через дескриптор, пока не
+// замолчит, как в режиме file. Раньше он дочитывался сразу и забывался:
+// «two» терялась без пропуска в цепи.
+func TestGlobRotatedOutOfMaskWaitsForQuiet(t *testing.T) {
+	r := globRig(t)
+	rotateQuiet = 300 * time.Millisecond
+	log := filepath.Join(r.logDir, "evidence-a.jsonl")
+	appendLines(t, log, "one\n")
+	c := r.collector(t)
+	cycle(t, c)
+	os.Rename(log, log+".1")
+	appendLines(t, log) // create: новый пустой журнал
+	cycle(t, c)
+	appendLines(t, log+".1", "two\n") // приложение ещё пишет в старый
+	cycle(t, c)
+	appendLines(t, log, "three\n") // переоткрыло журнал (HUP)
+	cycle(t, c)
+	time.Sleep(rotateQuiet + 100*time.Millisecond)
+	cycle(t, c)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), ","); got != "one,two,three" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// ⭐ X-02: маска над ротируемым журналом, вторая ротация, пока ушедший
+// из-под маски файл ждёт тишины. Новый файл (b) уходит из-под маски, не
+// став текущим. Раньше он не читался никогда, без пропуска в цепи; теперь
+// непрочитанные файлы под маской держатся открытыми, пока ушедший ждёт, и
+// читаются по очереди, даже ушедшие.
+func TestGlobSecondRotationWhileDrainingKeepsMiddleFile(t *testing.T) {
+	r := globRig(t)
+	rotateQuiet = 300 * time.Millisecond
+	log := filepath.Join(r.logDir, "evidence-a.jsonl")
+	appendLines(t, log, "a1\n")
+	c := r.collector(t)
+	cycle(t, c)
+	os.Rename(log, log+".1")
+	appendLines(t, log, "b1\n")
+	appendLines(t, log+".1", "a2\n")
+	cycle(t, c) // a ушёл из-под маски и ждёт тишины; b замечен
+	os.Rename(log+".1", log+".2")
+	os.Rename(log, log+".1")
+	appendLines(t, log, "c1\n")
+	appendLines(t, log+".1", "b2\n")
+	cycle(t, c)
+	for range 3 {
+		time.Sleep(rotateQuiet + 100*time.Millisecond)
+		cycle(t, c)
+	}
+	if got := strings.Join(r.bodies(t), ","); got != "a1,a2,b1,b2,c1" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// X-02: файл из очереди, уже частично прочитанный, ушёл из-под маски, пока
+// ждал: его место не забывается (forgetGone), и он дочитывается с него, без
+// повтора доставленного.
+func TestGlobQueuedFileKeepsItsOffset(t *testing.T) {
+	r := globRig(t)
+	rotateQuiet = 300 * time.Millisecond
+	old := time.Now().Add(-time.Hour)
+	f1 := filepath.Join(r.logDir, "evidence-1.jsonl")
+	f2 := filepath.Join(r.logDir, "evidence-2.jsonl")
+	appendLines(t, f1, "one\n")
+	appendLines(t, f2, "two\n")
+	os.Chtimes(f1, old, old)
+	os.Chtimes(f2, old.Add(time.Second), old.Add(time.Second))
+	c := r.collector(t)
+	cycle(t, c) // прочитаны оба, текущий — f2
+	appendLines(t, f1, "late\n")
+	os.Rename(f2, f2+".gone") // текущий ушёл из-под маски
+	cycle(t, c)               // f2 ждёт тишины, f1 (с непрочитанным) — в очереди
+	os.Rename(f1, f1+".gone") // и f1 ушёл, не дождавшись
+	cycle(t, c)
+	for range 3 {
+		time.Sleep(rotateQuiet + 100*time.Millisecond)
+		cycle(t, c)
+	}
+	if got := strings.Join(r.bodies(t), ","); got != "one,two,late" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// X-03: новый файл на пути журнала не открыть (logrotate create с правами,
+// которых у сборщика нет). Это не мешает дочитать ротированный: раньше
+// ошибка открытия нового файла обрывала проход раньше дочитывания, и
+// поздние строки ждали, пока починят права.
+func TestUnopenableNewFileDoesNotBlockDrain(t *testing.T) {
+	r := newRig(t)
+	rotateQuiet = 300 * time.Millisecond
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	os.Rename(f, f+".1")
+	if err := os.WriteFile(f, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	appendLines(t, f+".1", "a2\n")
+	pass := func() {
+		c.ReadOnce() // ошибка нового файла ожидаема
+		if err := c.SendOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 3 {
+		pass()
+		time.Sleep(rotateQuiet + 100*time.Millisecond)
+	}
+	pass()
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|a2" {
+		t.Fatalf("ротированный не дочитан, пока новый не открыть: %q", got)
+	}
+	os.Chmod(f, 0o600)
+	appendLines(t, f, "b1\n")
+	pass()
+	pass()
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|a2|b1" {
+		t.Fatalf("после починки прав: %q", got)
+	}
+}
+
+// onLog — обработчик журнала, который зовёт fn на каждой записи: тест
+// вклинивается в окно между шагами сборщика.
+type onLog struct {
+	slog.Handler
+	fn func(slog.Record)
+}
+
+func (h onLog) Handle(ctx context.Context, r slog.Record) error { h.fn(r); return nil }
+
+// W-06: файл под маской переименован в другое имя под той же маской между
+// листингом и открытием. По устаревшему листингу он не открывается — это
+// повод перечитать каталог, а не «файл пропал»: раньше каждый такой виток
+// оставлял ложный пропуск номера, а файл под новым именем читался с начала
+// (повтор доставленного под новыми номерами).
+func TestGlobRenameBetweenListingAndOpen(t *testing.T) {
+	r := globRig(t)
+	same := time.Now().Add(-time.Hour)
+	var paths []string
+	for i, body := range []string{"1\n", "2\n", "3\n"} {
+		p := filepath.Join(r.logDir, fmt.Sprintf("evidence-a-%d.jsonl", i))
+		appendLines(t, p, body)
+		os.Chtimes(p, same, same)
+		paths = append(paths, p)
+	}
+	renamed := filepath.Join(r.logDir, "evidence-a-9.jsonl")
+	c := r.collector(t) // первый запуск вносит три файла в реестр, по путям
+	// Строка первого файла ложится в буфер раньше, чем открывается третий:
+	// здесь третий переименовывают — листинг этого прохода устарел.
+	var done atomic.Bool
+	c.persistHook = func(what string) error {
+		if what == "spool" && done.CompareAndSwap(false, true) {
+			os.Rename(paths[2], renamed)
+		}
+		return nil
+	}
+	cycle(t, c)
+	cycle(t, c)
+	if !done.Load() {
+		t.Fatal("переименование не случилось: сценарий не воспроизведён")
+	}
+	if got := strings.Join(r.bodies(t), ","); got != "1,2,3" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
 // Номера в буфере только растут; буфер, где это не так, испорчен, и
 // сборщик из него не шлёт.
 func TestSpoolSeqMustGrow(t *testing.T) {
@@ -1294,6 +1540,180 @@ func TestRotationWaitsForQuietOldFile(t *testing.T) {
 	}
 }
 
+// ⭐ W-03: вторая ротация, пока сборщик ждёт тишины на первом ротированном
+// файле. Раньше по тишине чтение переходило к тому, что лежит на пути
+// сейчас, и средний файл не читался никогда, без пропуска в цепи (у
+// работающего сборщика, не только у остановленного). Каждый новый файл на
+// пути открывается, как только замечен, и ждёт своей очереди; поздняя
+// строка в нём тоже не теряется.
+func TestSecondRotationWhileDrainingKeepsMiddleFile(t *testing.T) {
+	r := newRig(t)
+	rotateQuiet = 300 * time.Millisecond
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	os.Rename(f, f+".1")
+	appendLines(t, f, "b1\n")
+	cycle(t, c) // замечен b; a ещё не замолчал
+	os.Rename(f+".1", f+".2")
+	os.Rename(f, f+".1")
+	appendLines(t, f, "c1\n")
+	cycle(t, c)
+	appendLines(t, f+".1", "b2\n") // приложение ещё пишет в b
+	cycle(t, c)
+	for range 3 {
+		time.Sleep(rotateQuiet + 100*time.Millisecond)
+		cycle(t, c)
+	}
+	// Файлы читаются каждый сам по себе: строки разных файлов перемежаются,
+	// внутри файла — порядок записи.
+	if got := r.bodies(t); !perFile(got, "a1", "b1|b2", "c1") {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// perFile — got содержит ровно строки files (каждый — строки одного файла
+// через «|») и строки каждого файла идут в своём порядке.
+func perFile(got []string, files ...string) bool {
+	n := 0
+	for _, f := range files {
+		lines := strings.Split(f, "|")
+		n += len(lines)
+		at := -1
+		for _, l := range lines {
+			i := slices.Index(got, l)
+			if i <= at {
+				return false
+			}
+			at = i
+		}
+	}
+	return n == len(got)
+}
+
+// W-03: хранилище недоступно — отправка ждёт с растущей паузой (до минуты),
+// а чтение идёт прежним шагом: иначе две ротации за паузу теряли средний
+// файл. Ротации каждые 200 мс, пока хранилище отказывает; потом всё
+// доставлено.
+func TestReadingGoesOnWhileStoreIsDown(t *testing.T) {
+	var down atomic.Bool
+	down.Store(true)
+	r := newRig(t, func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if down.Load() && req.URL.Path == "/v1/ingest" {
+				http.Error(w, "down", http.StatusServiceUnavailable)
+				return
+			}
+			h.ServeHTTP(w, req)
+		})
+	})
+	rotateQuiet = 50 * time.Millisecond
+	r.cfg.FlushEvery = config.Duration(20 * time.Millisecond)
+	c := r.collector(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	f := r.cfg.File
+	var want []string
+	for i := range 6 {
+		line := fmt.Sprintf("line %d", i)
+		want = append(want, line)
+		appendLines(t, f, line+"\n")
+		time.Sleep(200 * time.Millisecond)
+		for j := 5; j >= 1; j-- {
+			os.Rename(fmt.Sprintf("%s.%d", f, j), fmt.Sprintf("%s.%d", f, j+1))
+		}
+		os.Rename(f, f+".1")
+	}
+	appendLines(t, f, "last\n")
+	want = append(want, "last")
+	down.Store(false)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if last, _ := r.st.LastSeq("abs-core"); last >= uint64(len(want)) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(r.bodies(t), "|"); got != strings.Join(want, "|") {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Y-02 (класс): файл молчал дольше rotateQuiet ещё до ротации — тишина
+// после ротации всё равно отсчитывается от ухода с пути: приложение пишет в
+// ротированный файл до HUP. Раньше такой файл считался давно замолчавшим и
+// закрывался сразу, поздняя строка терялась без пропуска (симуляция нашла
+// это в новой модели; в гейте её сценариев мало — нужен свой тест).
+func TestQuietCountsFromRotation(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	vt := time.Now()
+	c.now, c.quietFor = func() time.Time { return vt }, 10*time.Second
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	vt = vt.Add(30 * time.Second) // файл молчит 30 с
+	cycle(t, c)
+	os.Rename(f, f+".1")
+	cycle(t, c) // замечен уход
+	// Приложение ещё пишет в ротированный.
+	appendLines(t, f+".1", "a2\n")
+	vt = vt.Add(time.Second)
+	cycle(t, c)
+	for range 3 {
+		vt = vt.Add(11 * time.Second)
+		cycle(t, c)
+	}
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|a2" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Первая строка файла ложится в буфер в одной пачке с его первыми строками.
+// Раньше — отдельной записью после них: упал между ними, файл обрезали
+// (copytruncate) и он дорос за прежнее место — после перезапуска первая
+// строка неизвестна, подмену не видно, чтение шло с середины нового
+// содержимого (обрывок вместо строк, потеря без пропуска). Нашла длинная
+// симуляция: 13 сценариев из 1000.
+func TestHeadSurvivesCrashAfterFirstLines(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a-1\n", "b-2\n")
+	// Записи прохода: 'P' нового файла, его строки, (раньше) отдельная 'P' с
+	// первой строкой — перед ней процесс и падал. Считаются точки перед
+	// записью.
+	n := 0
+	c.persistHook = func(what string) error {
+		if strings.HasSuffix(what, "+") {
+			return nil
+		}
+		if n++; n == 3 {
+			return errors.New("падение")
+		}
+		return nil
+	}
+	c.ReadOnce() // строки — в буфере; дальше процесс падает
+	c.Close()
+	// Пока сборщик стоял: copytruncate, и файл дорос за прежнее место.
+	if err := os.WriteFile(f, []byte("c-3, a line longer than both old ones together\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c = r.collector(t)
+	cycle(t, c)
+	cycle(t, c)
+	got := r.bodies(t)
+	if len(got) != 4 || got[0] != "a-1" || got[1] != "b-2" || !strings.HasPrefix(got[2], "<нет 3") || got[3] != "c-3, a line longer than both old ones together" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
 // C-02: первую строку текущего файла на миг не прочитать (права, ротация в
 // окне) — это «не знаю», а не «файл подменён»: ни ложного пропуска, ни
 // чтения всего файла заново. Первая строка читается через открытый
@@ -1327,8 +1747,14 @@ func TestPositionSwitchSurvivesCrash(t *testing.T) {
 	}
 	// То, что делает обнаружение обрезки (файл короче места чтения), — и
 	// падение до чтения.
+	fi, err := os.Stat(r.cfg.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := c.files[inode(fi)]
 	c.nextSeq++
-	if err := c.follow(c.pos.Inode); err != nil {
+	tr.off, tr.head = 0, ""
+	if err := c.mark(tr); err != nil {
 		t.Fatal(err)
 	}
 	c.Close()
@@ -1341,6 +1767,293 @@ func TestPositionSwitchSurvivesCrash(t *testing.T) {
 	got := r.bodies(t)
 	if len(got) != 5 || got[0] != "hdr" || got[1] != "old-2" || !strings.HasPrefix(got[2], "<нет 3") ||
 		got[3] != "hdr" || got[4] != "new-2, a longer line" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// copytruncate, после которого приложение снова пишет ту же первую строку
+// (заголовок журнала): первая строка подмену не выдаёт, выдаёт только размер —
+// файл короче места чтения. Пропуск номера и чтение с начала; иначе чтение
+// продолжилось бы с прежнего места в новом содержимом — с обрывка строки, а
+// строки до него пропали бы молча (мутация C37).
+func TestTruncatedWithSameHeadSeenBySize(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "hdr\n", "old-2\n", "old-3\n")
+	cycle(t, c)
+	if err := os.Truncate(r.cfg.File, 0); err != nil {
+		t.Fatal(err)
+	}
+	appendLines(t, r.cfg.File, "hdr\n", "new-2\n") // короче прежнего места
+	cycle(t, c)
+	appendLines(t, r.cfg.File, "new-3, a longer line\n") // дорос за прежнее место
+	cycle(t, c)
+	got := r.bodies(t)
+	if len(got) != 7 || got[2] != "old-3" || !strings.HasPrefix(got[3], "<нет 4") ||
+		got[4] != "hdr" || got[5] != "new-2" || got[6] != "new-3, a longer line" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Новый файл ложится в реестр записью 'P' до своей первой строки (Y-03).
+// Сборщик упал, когда новый журнал ещё пуст и files.json его не знает; пока
+// сборщик стоял, в журнал записали строку и ротировали его. После рестарта
+// файл находится по inode под новым именем; без 'P' о нём не знал бы никто,
+// и строка пропала бы молча (мутация C42).
+func TestNewFileKnownAfterCrashBeforeFirstLine(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	os.Rename(f, f+".1")
+	if err := os.WriteFile(f, nil, 0o600); err != nil { // logrotate create
+		t.Fatal(err)
+	}
+	cycle(t, c) // новый журнал пуст: о нём знает только буфер
+	c.Close()   // упал
+	appendLines(t, f, "b1\n")
+	os.Rename(f+".1", f+".2")
+	os.Rename(f, f+".1")
+	appendLines(t, f, "c1\n")
+	c = r.collector(t)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|b1|c1" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Первая строка файла после рестарта поднимается из записи 'P' буфера, а не
+// только из files.json: сборщик упал раньше, чем снимок реестра её узнал, а
+// пока стоял, файл подменили на месте (copytruncate, новое содержимое
+// длиннее прежнего места). По первой строке подмена видна: пропуск и чтение
+// с начала, а не с прежнего места в чужом содержимом (мутация C48).
+func TestHeadRestoredFromSpool(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "hdr-1\n", "a-2\n")
+	if _, err := c.ReadOnce(); err != nil { // в буфере, не отправлено: files.json файла не знает
+		t.Fatal(err)
+	}
+	c.Close() // упал
+	// Тот же inode, новое содержимое.
+	if err := os.WriteFile(r.cfg.File, []byte("new-1, another first line\nnew-2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c = r.collector(t)
+	cycle(t, c)
+	got := r.bodies(t)
+	if len(got) != 5 || got[0] != "hdr-1" || got[1] != "a-2" || !strings.HasPrefix(got[2], "<нет 3") ||
+		got[3] != "new-1, another first line" || got[4] != "new-2" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// spoolInodes — файлы, о которых есть записи в буфере (по всем сегментам).
+func spoolInodes(t *testing.T, spoolDir string) map[uint64]bool {
+	t.Helper()
+	out := map[uint64]bool{}
+	for _, seg := range spoolSegments(t, spoolDir) {
+		data, err := os.ReadFile(seg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for off := 16; off+8 <= len(data); { // заголовок сегмента evlog — 16 байт
+			n := int(binary.BigEndian.Uint32(data[off:]))
+			if r, err := parseRecord(data[off+8 : off+8+n]); err == nil && r.pos.Inode != 0 {
+				out[r.pos.Inode] = true
+			}
+			off += 8 + n
+		}
+	}
+	return out
+}
+
+// Доставленное уходит из буфера только после снимка реестра (files.json):
+// место файла, о котором в буфере ничего не осталось, живёт в снимке. Без
+// снимка такой файл после рестарта читался бы с начала — повтор под новыми
+// номерами (мутация C66).
+func TestReleasedRecordsKeptInRegistrySnapshot(t *testing.T) {
+	saved := spoolSegmentBytes
+	spoolSegmentBytes = 256
+	t.Cleanup(func() { spoolSegmentBytes = saved })
+	r := globRig(t)
+	c := r.collector(t)
+	c.quietFor = time.Hour // файл a не закрывается за простоем: это тоже пишет снимок
+	a := filepath.Join(r.logDir, "evidence-a-1.jsonl")
+	b := filepath.Join(r.logDir, "evidence-b-1.jsonl")
+	appendLines(t, a, "a1\n", "a2\n")
+	cycle(t, c)
+	want := []string{"a1", "a2"}
+	for i := range 8 {
+		line := fmt.Sprintf("b%d", i)
+		appendLines(t, b, line+"\n")
+		want = append(want, line)
+		cycle(t, c)
+	}
+	fi, err := os.Stat(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spoolInodes(t, r.cfg.SpoolDir)[inode(fi)] {
+		t.Fatal("о файле a в буфере ещё есть записи: сценарий не воспроизведён")
+	}
+	c.Close()
+	c = r.collector(t)
+	appendLines(t, a, "a3\n")
+	cycle(t, c)
+	if got, w := strings.Join(r.bodies(t), ","), strings.Join(append(want, "a3"), ","); got != w {
+		t.Fatalf("принято %q, ожидали %q", got, w)
+	}
+}
+
+// Дочитанный файл уходит из реестра записью 'D': ротированный журнал
+// дочитан, потом удалён (logrotate rotate N), сборщик перезапущен — ложного
+// пропуска номера нет. Без 'D' файл поднимался бы из своих записей в буфере
+// и после рестарта считался пропавшим недочитанным (мутация C67).
+func TestDoneFileGoneAfterRestartIsNoGap(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	os.Rename(f, f+".1")
+	appendLines(t, f, "b1\n")
+	cycle(t, c) // a дочитан и замолчал (rotateQuiet = 0): из реестра
+	c.Close()
+	os.Remove(f + ".1")
+	c = r.collector(t)
+	appendLines(t, f, "b2\n")
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|b1|b2" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Z-01: ушедший с пути файл, который после рестарта не открыть (права),
+// ждёт в реестре, а остальные файлы читаются. Раньше проход прерывался
+// ошибкой, и сборщик стоял, пока права не вернут.
+func TestUnreadableRotatedFileDoesNotBlockReading(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	c.Close()
+	appendLines(t, f, "a2\n")
+	os.Rename(f, f+".1")
+	os.Chmod(f+".1", 0o200)
+	appendLines(t, f, "b1\n")
+	c = r.collector(t)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|b1" {
+		t.Fatalf("пока ротированный не открыть: %q", got)
+	}
+	os.Chmod(f+".1", 0o600)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|b1|a2" {
+		t.Fatalf("после починки прав: %q", got)
+	}
+}
+
+// Z-02: новый журнал, который сборщику не открыть (logrotate create с
+// чужими правами), всё равно в реестре. Ротирован раньше, чем права
+// исправили, — дочитывается по inode под новым именем. Раньше он не
+// попадал в реестр, и его строки пропадали молча.
+func TestUnreadableNewFileIsFollowed(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	os.Rename(f, f+".1")
+	if err := os.WriteFile(f, nil, 0o200); err != nil { // приложению писать, сборщику не прочитать
+		t.Fatal(err)
+	}
+	cycle(t, c)
+	appendLines(t, f, "b1\n")
+	cycle(t, c)
+	os.Rename(f+".1", f+".2")
+	os.Rename(f, f+".1") // ротирован, права всё ещё не те
+	appendLines(t, f, "c1\n")
+	cycle(t, c)
+	os.Chmod(f+".1", 0o600)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|c1|b1" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Z-02: неоткрытый файл пропал раньше, чем его прочитали, — пропуск номера,
+// а не тихая потеря.
+func TestUnreadableNewFileGoneIsGap(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	os.Rename(f, f+".1")
+	if err := os.WriteFile(f, nil, 0o200); err != nil {
+		t.Fatal(err)
+	}
+	cycle(t, c)
+	appendLines(t, f, "b1\n")
+	os.Remove(f) // удалён, не будучи прочитан
+	appendLines(t, f, "c1\n")
+	cycle(t, c)
+	got := r.bodies(t)
+	if len(got) != 3 || got[0] != "a1" || !strings.HasPrefix(got[1], "<нет 2") || got[2] != "c1" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Z-03: каталог журнала на время не прочитать (права, нехватка
+// дескрипторов, сбой ФС) — это не «файлов нет». Раньше все файлы под маской
+// считались ушедшими, дочитанные выписывались из реестра, а когда каталог
+// снова читался — вносились как новые и читались с начала: повторы под
+// новыми номерами.
+func TestUnreadableLogDirIsNotEmpty(t *testing.T) {
+	r := globRig(t)
+	c := r.collector(t)
+	a := filepath.Join(r.logDir, "evidence-a-1.jsonl")
+	appendLines(t, a, "a1\n")
+	cycle(t, c)
+	os.Chmod(r.logDir, 0o300) // файлы открываются, листинга нет
+	t.Cleanup(func() { os.Chmod(r.logDir, 0o700) })
+	for range 3 {
+		c.ReadOnce() // ошибка листинга ожидаема
+		if err := c.SendOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	os.Chmod(r.logDir, 0o700)
+	appendLines(t, a, "a2\n")
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|a2" {
+		t.Fatalf("принято %q", got)
+	}
+}
+
+// Z-03, режим file: после рестарта ротированный файл ищется по inode в
+// каталоге; каталог не прочитать — файл не «пропал». Раньше он забывался с
+// пропуском номера, и непрочитанный хвост терялся, хотя лежал на месте.
+func TestUnreadableDirKeepsRotatedFile(t *testing.T) {
+	r := newRig(t)
+	c := r.collector(t)
+	f := r.cfg.File
+	appendLines(t, f, "a1\n")
+	cycle(t, c)
+	c.Close()
+	appendLines(t, f, "a2\n")
+	os.Rename(f, f+".1")
+	appendLines(t, f, "b1\n")
+	os.Chmod(r.logDir, 0o300)
+	t.Cleanup(func() { os.Chmod(r.logDir, 0o700) })
+	c = r.collector(t)
+	cycle(t, c)
+	os.Chmod(r.logDir, 0o700)
+	cycle(t, c)
+	if got := strings.Join(r.bodies(t), "|"); got != "a1|b1|a2" {
 		t.Fatalf("принято %q", got)
 	}
 }

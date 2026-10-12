@@ -414,50 +414,6 @@ func TestCarrier_ForeignHeadRejected(t *testing.T) {
 	}
 }
 
-// ⭐TestCarrier_AppendSyncClosesWindow — форс-флаш на доказываемых событиях.
-//
-// Смысл не в скорости SHRED, а в том, что его квитанция обязана покрывать ВСЁ,
-// что было раньше. Если события, накопленные до него, останутся в буфере, окно
-// недоказуемости накроет ровно тот момент, который продаётся как доказанный.
-func TestCarrier_AppendSyncClosesWindow(t *testing.T) {
-	dir := t.TempDir()
-	c := mustOpen(t, dir)
-	defer c.Close()
-
-	c.Append(leafN(0))
-	c.Append(leafN(1))
-
-	shred := Leaf{
-		UnixNano: 1_753_700_000_000_000_099,
-		Type:     EventKeyState,
-		Scope:    "user:nikolay",
-		Payload:  []byte(`{"kek_id":"k1","facts_removed":7}`),
-	}
-	head, err := c.AppendSync(shred)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Pending() != 0 {
-		t.Fatalf("после синхронного события в буфере осталось %d — окно не закрыто", c.Pending())
-	}
-	if head.Seq != 1 {
-		t.Fatalf("seq=%d", head.Seq)
-	}
-
-	links, err := ReadChain(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := DecodeBatchPayload(links[0].Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.Count != 3 || p.FirstLeaf != 0 {
-		t.Fatalf("звено покрывает %d листьев с %d, ожидалось 3 с 0 — события до квитанции не покрыты",
-			p.Count, p.FirstLeaf)
-	}
-}
-
 // ⭐TestCarrier_ProofFromDisk — сквозной путь квитанции: звено даёт корень,
 // файл листьев даёт лист, путь Меркла связывает их. Аудитору не нужна вся
 // цепь и не видны чужие события.
@@ -621,6 +577,78 @@ func TestCarrier_Rotation(t *testing.T) {
 	}
 	if LeafHash(leaves[0]) != LeafHash(leafN(0)) {
 		t.Fatal("лист из первого файла прочитан неверно")
+	}
+}
+
+// TestTrimToHead — после обрезки по звену head в каталоге ровно цепь по это
+// звено: звеньев после него, листьев без звена и оборванного кадра нет, при
+// любой границе файлов листьев (звено кончается посреди файла и ровно на его
+// конце). Обрезанная цепь открывается без листьев без звена и сходится с
+// головой того времени.
+func TestTrimToHead(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir)
+	var heads []Head
+	n := 0
+	for tick := range 6 {
+		c.segmentBytes = 1 << 30
+		if tick%2 == 1 {
+			c.segmentBytes = 1 // файл листьев — на два звена
+		}
+		for range tick%3 + 1 {
+			c.Append(leafN(n))
+			n++
+		}
+		if _, err := c.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		heads = append(heads, c.Head())
+	}
+	// Хвост, который голова не заверяет: лист без звена и оборванный кадр
+	// звена.
+	if _, err := c.leaves.Write(frameLeaf(leafN(n))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.chain.Write([]byte{0, 0, 1, 0, 7, 7}); err != nil {
+		t.Fatal(err)
+	}
+	closeHard(c)
+	// По файлу на два звена и последний — с одним листом без звена.
+	if segs, _ := leafSegments(dir); len(segs) != 4 {
+		t.Fatalf("файлов листьев %d, ожидалось 4", len(segs))
+	}
+	for k := 1; k <= len(heads); k++ {
+		cp := t.TempDir()
+		if err := os.CopyFS(cp, os.DirFS(dir)); err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(filepath.Join(cp, headFileName)) // в копию наружу голова не уезжает
+		if err := TrimToHead(cp, uint64(k)); err != nil {
+			t.Fatalf("голова %d: %v", k, err)
+		}
+		links, err := ReadChain(cp)
+		if err != nil || len(links) != k {
+			t.Fatalf("голова %d: звеньев %d (%v)", k, len(links), err)
+		}
+		p, err := DecodeBatchPayload(links[k-1].Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaves := 0
+		if err := ScanLeaves(cp, func(uint64, Leaf) error { leaves++; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if want := int(p.FirstLeaf) + int(p.Count); leaves != want {
+			t.Fatalf("голова %d: листьев %d, звенья накрывают %d", k, leaves, want)
+		}
+		c2 := mustOpen(t, cp)
+		if c2.Pending() != 0 || c2.Head() != heads[k-1] {
+			t.Fatalf("голова %d: после обрезки листьев без звена %d, голова %+v против %+v", k, c2.Pending(), c2.Head(), heads[k-1])
+		}
+		c2.Close()
+		if torn, _ := filepath.Glob(filepath.Join(cp, "*.torn-*")); len(torn) > 0 {
+			t.Fatalf("голова %d: после обрезки остался оборванный хвост %v", k, torn)
+		}
 	}
 }
 

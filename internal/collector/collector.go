@@ -56,7 +56,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,6 +66,8 @@ import (
 	"evidencestore/internal/evidence"
 	"evidencestore/internal/evlog"
 	"evidencestore/internal/proof"
+
+	"golang.org/x/sys/unix"
 )
 
 // Config — настройки сборщика.
@@ -158,8 +159,12 @@ func (c *Config) validate() error {
 		errs = append(errs, errors.New("exactly one of file and glob is required"))
 	}
 	if c.Glob != "" {
+		// Каталог маски — один и без подстановок: его сборщик читает целиком
+		// и в нём же ищет ротированный файл по inode.
 		if _, err := filepath.Match(c.Glob, ""); err != nil {
 			errs = append(errs, fmt.Errorf("glob %q: %w", c.Glob, err))
+		} else if strings.ContainsAny(filepath.Dir(c.Glob), `*?[\`) {
+			errs = append(errs, fmt.Errorf("glob %q: wildcards are allowed in the file name only", c.Glob))
 		}
 	}
 	return errors.Join(errs...)
@@ -185,28 +190,28 @@ type Collector struct {
 	// и отказывает остальным.
 	epoch string
 
-	nextSeq uint64  // номер следующей строки
-	acked   uint64  // всё до этого номера включительно принято хранилищем
-	pos     filePos // текущий файл и откуда читать его дальше
-	head    string  // первая строка текущего файла (до 64 байт); "" — не знаем
-	// cur — открытый дескриптор текущего файла: ротированный или удалённый
-	// файл дочитывается через него. curSize, curGrowth — когда файл рос
-	// последний раз (для rotateQuiet).
-	cur       *os.File
-	curSize   int64
-	curGrowth time.Time
-	// files — файлы под маской (режим glob), уже прочитанные или пропущенные
-	// первым запуском, по inode: докуда прочитан, первая строка, время
-	// изменения. Текущего здесь нет: его место — pos.
-	files map[uint64]fileState
+	nextSeq uint64 // номер следующей строки
+	acked   uint64 // всё до этого номера включительно принято хранилищем
+	// files — реестр: каждый файл, который сборщик читает или прочитал и
+	// ещё видит, по inode (ReadOnce).
+	files     map[uint64]*tracked
+	firstPass bool // первый проход после запуска: новые файлы — не «из прошлого»
 
 	spool    *evlog.Log
 	sentPos  uint64 // позиция в буфере: всё до неё включительно доставлено
 	pending  int    // строк в буфере после sentPos
-	lastMark uint64 // позиция последней записи 'P' или 'S' в буфере
 	promises promiseFile
 
-	missingWarned time.Time // когда последний раз сказали «читать нечего»
+	warned map[string]time.Time // когда последний раз сказали «читать нечего (нельзя)» — по пути
+
+	// now, quietFor — часы и rotateQuiet этого сборщика: симуляция ведёт
+	// виртуальное время. persistHook (только тесты) зовётся перед каждой
+	// записью на диск — буфер, files.json, state.json, start-files.json — и
+	// сразу после неё (имя с «+»); ошибка — падение процесса ровно в этой
+	// точке.
+	now         func() time.Time
+	quietFor    time.Duration
+	persistHook func(what string) error
 }
 
 // promiseFile — файл обещаний (*os.File; тест подставляет обрыв записи).
@@ -218,17 +223,43 @@ type promiseFile interface {
 	Close() error
 }
 
+// tracked — файл в реестре.
+type tracked struct {
+	ino   uint64
+	path  string // где видели последний раз
+	off   int64  // прочитано до: за последней целой строкой (или куском)
+	head  string // первая строка, до 64 байт; "" — не знаем
+	mtime int64  // время изменения при последнем взгляде, unix-нс (порядок чтения)
+	// birth — время рождения файла (statx btime), unix-нс; 0 — файловая
+	// система не знает. inode удалённого файла ядро отдаёт новому: по
+	// рождению видно, что это другой файл, даже с той же первой строкой.
+	birth int64
+	// idle — дочитан и закрыт за простоем (под маской есть новее): дорастёт —
+	// откроется снова; пропадёт — без пропуска номера.
+	idle bool
+
+	f      *os.File  // открыт: ушедший с пути файл дочитывается через него
+	size   int64     // размер при последнем взгляде через f; -1 — ещё не смотрели
+	growth time.Time // когда рос последний раз (для rotateQuiet)
+	left   time.Time // когда сборщик заметил, что файл ушёл с пути (из-под маски)
+	listed bool      // на пути журнала или под маской в этом проходе
+	lsize  int64     // размер по листингу этого прохода
+}
+
 type filePos struct {
 	Inode  uint64
 	Offset int64
 }
 
-// fileState — файл в files.json.
+// fileState — файл в files.json (снимок реестра).
 type fileState struct {
 	Inode  uint64 `json:"inode"`
 	Offset int64  `json:"offset"`          // прочитано до
-	MTime  int64  `json:"mtime,omitempty"` // unix-нс, время изменения при этом Offset
+	MTime  int64  `json:"mtime,omitempty"` // unix-нс
 	Head   string `json:"head,omitempty"`  // первая строка, до 64 байт
+	Path   string `json:"path,omitempty"`  // где видели последний раз
+	Birth  int64  `json:"birth,omitempty"` // время рождения, unix-нс
+	Idle   bool   `json:"idle,omitempty"`  // дочитан и закрыт за простоем
 }
 
 // state — state.json.
@@ -241,7 +272,7 @@ func New(cfg *Config, log *slog.Logger) (_ *Collector, err error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
-	c := &Collector{cfg: cfg, log: log, files: map[uint64]fileState{}}
+	c := &Collector{cfg: cfg, log: log, files: map[uint64]*tracked{}, now: time.Now, quietFor: rotateQuiet, firstPass: true}
 	if c.storeKey, err = parseStoreKey(cfg.StoreKey); err != nil {
 		return nil, fmt.Errorf("collector: %w", err)
 	}
@@ -312,15 +343,27 @@ func (c *Collector) load() error {
 	if err != nil {
 		return err
 	}
+	// Реестр — снимок files.json (до первого files.json — снимок первого
+	// запуска, start-files.json), поверх — записи буфера по порядку: снимок
+	// пишется раньше, чем освобождается доставленное, поэтому записи после
+	// него новее, а до него — не новее.
 	var files []fileState
 	filesFound, err := readJSON(c.filesPath(), &files)
 	if err != nil {
 		return err
 	}
+	startFound := false
+	if !filesFound {
+		if startFound, err = readJSON(c.startPath(), &files); err != nil {
+			return err
+		}
+	}
 	c.acked = st.Acked
+	for _, f := range files {
+		c.files[f.Inode] = &tracked{ino: f.Inode, off: f.Offset, mtime: f.MTime, head: f.Head, path: f.Path, birth: f.Birth, idle: f.Idle, size: -1}
+	}
 
 	var last spoolRecord
-	var headIno uint64 // чья первая строка в c.head
 	n, started := 0, false
 	visit := func(p uint64, data []byte) error {
 		r, err := parseRecord(data)
@@ -331,18 +374,32 @@ func (c *Collector) load() error {
 		case n == 0:
 			c.sentPos = p - 1
 		case r.seq < last.seq || r.kind == kindLine && r.seq == last.seq:
-			// Номера строк в буфере только растут (метки места повторяют
-			// последний); иначе буфер испорчен, и слать из него нельзя.
+			// Номера строк в буфере только растут (метки повторяют
+			// последний выданный); иначе буфер испорчен, и слать из него
+			// нельзя.
 			return fmt.Errorf("collector spool position %d: seq %d after %d", p, r.seq, last.seq)
 		}
 		switch r.kind {
 		case kindStart:
 			started = true
 			c.acked = max(c.acked, r.seq)
-			c.lastMark = p
 		case kindPos:
-			c.head, headIno = string(r.body), r.pos.Inode
-			c.lastMark = p
+			if r.pos.Inode != 0 {
+				t := c.track(r.pos.Inode)
+				parts := strings.SplitN(string(r.body), "\n", 3)
+				t.off, t.head, t.idle = r.pos.Offset, parts[0], false
+				if len(parts) > 1 && parts[1] != "" {
+					t.path = parts[1]
+				}
+				if len(parts) > 2 {
+					t.birth, _ = strconv.ParseInt(parts[2], 10, 64)
+				}
+			}
+		case kindLine:
+			t := c.track(r.pos.Inode)
+			t.off, t.idle = r.pos.Offset, false
+		case kindDone:
+			delete(c.files, r.pos.Inode)
 		}
 		if r.seq <= c.acked {
 			c.sentPos = p
@@ -357,35 +414,22 @@ func (c *Collector) load() error {
 	}
 	switch {
 	case n == 0 && (stateFound || filesFound):
-		return errors.New("collector: the spool is empty, but state.json or files.json is there: the spool was lost, and the read position with it. " +
+		return errors.New("collector: the spool is empty, but state.json or files.json is there: the spool was lost, and the read positions with it. " +
 			"Restore spool_dir from a backup if there is one. Emptying spool_dir starts over: numbering continues from the store, " +
 			"lines not yet delivered are skipped — or, with from_start, the whole log is delivered again under new numbers (duplicates). " +
 			"An emptied spool_dir is a new collector installation: the store refuses it until the operator binds it (the command is in the refusal)")
 	case n == 0:
 		c.sentPos = c.spool.Next() - 1 // первый запуск
+		clear(c.files)
 	case !filesFound && !started:
 		return errors.New("collector: files.json is missing and the spool no longer holds the start record: read positions are unknown")
+	case !filesFound && !startFound:
+		return errors.New("collector: files.json and start-files.json are both missing: read positions are unknown")
 	case c.acked > last.seq:
 		return fmt.Errorf("collector: state.json says seq %d is delivered, but the spool ends at %d", c.acked, last.seq)
 	default:
-		c.nextSeq, c.pos = last.seq+1, last.pos
-		if headIno != c.pos.Inode {
-			c.head = ""
-		}
+		c.nextSeq = last.seq + 1
 	}
-	// Упали после записи «старт», до files.json: реестр первого запуска лежит
-	// в start-files.json (пишется раньше «старт»).
-	if n > 0 && !filesFound {
-		if ok, err := readJSON(c.startPath(), &files); err != nil {
-			return err
-		} else if !ok {
-			return errors.New("collector: files.json and start-files.json are both missing: read positions are unknown")
-		}
-	}
-	for _, f := range files {
-		c.files[f.Inode] = f
-	}
-	delete(c.files, c.pos.Inode) // текущий: его место — pos
 	if err := c.loadEpoch(); err != nil {
 		return err
 	}
@@ -467,7 +511,12 @@ func (c *Collector) repairPromises() error {
 
 // Close закрывает буфер и файлы.
 func (c *Collector) Close() error {
-	c.closeCur()
+	for _, t := range c.files {
+		if t.f != nil {
+			t.f.Close()
+			t.f = nil
+		}
+	}
 	var errs []error
 	if c.spool != nil {
 		errs = append(errs, c.spool.Close())
@@ -576,52 +625,40 @@ func (c *Collector) Bootstrap(ctx context.Context) error {
 		c.log.Warn("from_start, but the store already holds records of this source: lines it has will come again under new numbers",
 			"store_last_seq", st.LastSeq)
 	}
-	if !c.cfg.FromStart {
-		if err := c.skipExisting(); err != nil {
-			return err
-		}
+	if err := c.registerExisting(); err != nil {
+		return err
 	}
 	// Реестр первого запуска — в отдельный файл до записи «старт»: он нужен,
 	// если упасть после «старт», до files.json, а в запись буфера тысячи
 	// файлов под маской не уместились бы.
-	if err := writeJSON(c.startPath(), c.fileList()); err != nil {
+	if err := c.persist("start", func() error { return writeJSON(c.startPath(), c.fileList()) }); err != nil {
 		return err
 	}
 	// Старт — первая запись буфера: с ним запуск уже не первый.
-	recs := []spoolRecord{{kind: kindStart, seq: st.LastSeq, pos: c.pos}}
-	if c.head != "" {
-		recs = append(recs, spoolRecord{kind: kindPos, seq: st.LastSeq, pos: c.pos, body: []byte(c.head)})
-	}
-	if err := c.appendSpool(recs); err != nil {
+	if err := c.appendSpool([]spoolRecord{{kind: kindStart, seq: st.LastSeq}}); err != nil {
 		return err
 	}
-	c.sentPos, c.lastMark = c.spool.Next()-1, c.spool.Next()-1
+	c.sentPos = c.spool.Next() - 1
 	c.log.Info("collector bootstrap", "next_seq", c.nextSeq)
 	return c.saveFiles()
 }
 
-// skipExisting — первый запуск без from_start: то, что уже записано, не
-// читается. Место — конец последней целой строки: недописанная строка
-// новая, и первая улика — не её обрывок.
-func (c *Collector) skipExisting() error {
-	if c.cfg.Glob == "" {
-		fi, err := os.Stat(c.cfg.File)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		c.pos = filePos{Inode: inode(fi), Offset: lastLineEnd(c.cfg.File, fi.Size())}
-		c.head = fileHead(c.cfg.File)
-		return nil
-	}
-	files, err := c.globFiles()
+// registerExisting — первый запуск: файлы на пути (под маской) — в реестр,
+// чтобы ротированный до первого прохода нашёлся по inode. С from_start —
+// с начала; без него то, что уже записано, не читается: место — конец
+// последней целой строки (недописанная строка новая, и первая улика — не
+// её обрывок).
+func (c *Collector) registerExisting() error {
+	seen, err := c.list()
 	if err != nil {
 		return err
 	}
-	for _, f := range files {
-		c.files[f.ino] = fileState{Inode: f.ino, Offset: lastLineEnd(f.path, f.size), MTime: f.mtime, Head: fileHead(f.path)}
+	for _, f := range seen {
+		t := &tracked{ino: f.ino, path: f.path, head: fileHead(f.path), mtime: f.mtime, birth: birthAt(f.path, f.ino), size: -1}
+		if !c.cfg.FromStart {
+			t.off = lastLineEnd(f.path, f.size)
+		}
+		c.files[f.ino] = t
 	}
 	return nil
 }
@@ -632,6 +669,7 @@ func (c *Collector) Run(ctx context.Context) error {
 		return err
 	}
 	backoff := time.Duration(0)
+	var sendAt time.Time // раньше не слать: хранилище отказало
 	for {
 		if _, err := c.ReadOnce(); err != nil {
 			// Буфер отказал (запись или fsync): что на диске, покажет только
@@ -641,205 +679,425 @@ func (c *Collector) Run(ctx context.Context) error {
 			}
 			c.log.Error("read", "err", err)
 		}
-		wait := c.cfg.FlushEvery.D()
-		if err := c.SendOnce(ctx); err != nil {
-			if errors.Is(err, ErrConflict) || errors.Is(err, ErrEpoch) {
-				return err
+		if !time.Now().Before(sendAt) {
+			if err := c.SendOnce(ctx); err != nil {
+				if errors.Is(err, ErrConflict) || errors.Is(err, ErrEpoch) {
+					return err
+				}
+				// Хранилище недоступно или отказало: записи ждут в буфере,
+				// повтор с растущей паузой. Чтение идёт прежним шагом: пауза
+				// доходит до минуты, и две ротации за неё теряли бы средний
+				// файл (W-03).
+				backoff = min(max(backoff*2, time.Second), time.Minute)
+				sendAt = time.Now().Add(backoff)
+				level := slog.LevelWarn
+				if errors.Is(err, ErrBadPromise) {
+					level = slog.LevelError
+				}
+				c.log.Log(ctx, level, "send", "err", err, "pending", c.pending, "retry_in", backoff)
+			} else {
+				backoff = 0
 			}
-			// Хранилище недоступно или отказало: записи ждут в буфере,
-			// повтор с растущей паузой.
-			backoff = min(max(backoff*2, time.Second), time.Minute)
-			wait = max(wait, backoff)
-			level := slog.LevelWarn
-			if errors.Is(err, ErrBadPromise) {
-				level = slog.LevelError
-			}
-			c.log.Log(ctx, level, "send", "err", err, "pending", c.pending, "retry_in", wait)
-		} else {
-			backoff = 0
 		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(wait):
+		case <-time.After(c.cfg.FlushEvery.D()):
 		}
 	}
 }
 
-// ReadOnce дочитывает файл: новые полные строки — в буфер с номерами.
+// ReadOnce — один проход: найти файлы, дочитать каждый, закрыть дочитанные.
 //
-// Текущий файл держится открытым дескриптором. Ротация: на пути журнала уже
-// другой файл (или ничего) — прежний дочитывается через свой дескриптор,
-// пока не замолчит на rotateQuiet: приложение пишет в ротированный файл,
-// пока не переоткроет журнал (logrotate create, затем HUP). Только тогда
-// берётся последняя строка без перевода строки и чтение переходит к новому
-// файлу. Удалённый файл через дескриптор тоже дочитывается до конца.
+// Реестр (c.files) знает каждый файл по inode: докуда прочитан, первую
+// строку, где видели последний раз, открыт ли он и когда рос. Файл на пути
+// журнала (под маской) читается, пока растёт. Ушедший оттуда —
+// ротированный, ушедший из-под маски, удалённый — дочитывается через свой
+// дескриптор, пока не замолчит на rotateQuiet: приложение пишет в него,
+// пока не переоткроет журнал (logrotate create, затем HUP); только тогда
+// берётся и последняя строка без перевода строки. Каждый файл — сам по
+// себе: вторая ротация, пока первый ротированный ждёт тишины, ничего не
+// теряет, и два писателя под одной маской друг другу не мешают. Раньше
+// сборщик читал один «текущий» файл, а следующие ждали в очереди в памяти:
+// каждое ожидание тишины открывало окно для потери (W-03, X-02, Y-02, Y-03,
+// Y-04).
 //
-// Дочитать нечем (сборщик перезапущен, а прежнего файла рядом нет) или файл
-// обрезан (подменён) на месте — непрочитанный хвост потерян. Тогда сборщик
-// пропускает один номер, и хранилище запишет в цепь пропуск: потеря видна, а
-// не тиха.
+// Новый файл попадает в реестр записью 'P' в буфере — до своей первой
+// строки: после падения сборщик знает о нём и найдёт по inode в каталоге,
+// даже переименованный (Y-03, Y-05). Дочитанный и ушедший — записью 'D'.
+//
+// Найти нечем (сборщик стоял, а файл сжали, удалили или унесли из
+// каталога) или файл обрезан (подменён) на месте — непрочитанное потеряно:
+// сборщик пропускает номер, и хранилище запишет в цепь пропуск — потеря
+// видна, а не тиха.
+//
+// Файл, который не открыть (права), — тоже в реестре: откроется, когда
+// права исправят, где бы в каталоге ни лежал (Z-01, Z-02). Каталог, который
+// не прочитать (права, нехватка дескрипторов, сбой ФС), — не «файлов нет»:
+// по такому листингу ничего не решается, открытые файлы читаются дальше, а
+// проход возвращает ошибку (Z-03).
 func (c *Collector) ReadOnce() (int, error) {
+	seen, listErr := c.list()
+	if listErr == nil {
+		if err := c.reconcile(seen); err != nil {
+			return 0, err
+		}
+		c.firstPass = false
+	}
+	total := 0
+	for _, t := range c.byAge() {
+		n, err := c.readFile(t)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	if err := c.retire(); err != nil {
+		return total, err
+	}
+	return total, listErr
+}
+
+// rotateQuiet — сколько ушедший с пути файл должен молчать, чтобы считать
+// его закрытым приложением. Переменная — чтобы тесты не ждали.
+var rotateQuiet = 10 * time.Second
+
+// idleQuiets — сколько rotateQuiet файл под маской молчит, прежде чем его
+// дескриптор закрывается (если под маской есть файл новее): тысячи
+// дописанных шардов не держат тысячи дескрипторов.
+const idleQuiets = 6
+
+// list — файлы на пути журнала или под маской.
+func (c *Collector) list() ([]globFile, error) {
 	if c.cfg.Glob != "" {
-		return c.readGlob()
+		files, err := c.globFiles()
+		if err == nil && len(files) == 0 {
+			c.warnMissing("no log files match the glob (yet)", c.cfg.Glob)
+		}
+		return files, err
 	}
 	fi, err := os.Stat(c.cfg.File)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		fi = nil
 		c.warnMissing("log file does not exist (yet)", c.cfg.File)
+		return nil, nil
 	case err != nil:
-		return 0, err
+		return nil, err
+	case !fi.Mode().IsRegular():
+		return nil, fmt.Errorf("collector: %s is not a regular file", c.cfg.File)
 	}
-	total := 0
-	if c.pos.Inode != 0 && (fi == nil || inode(fi) != c.pos.Inode) {
-		done, n, err := c.drainRotated()
-		total += n
-		if err != nil || !done {
-			return total, err
-		}
-	}
-	if fi == nil {
-		return total, nil
-	}
-	if c.pos.Inode == 0 {
-		if err := c.follow(inode(fi)); err != nil {
-			return total, err
-		}
-	}
-	n, err := c.readCurrent(c.cfg.File, false)
-	return total + n, err
+	return []globFile{{path: c.cfg.File, ino: inode(fi), size: fi.Size(), mtime: fi.ModTime().UnixNano()}}, nil
 }
 
-// rotateQuiet — сколько ротированный файл должен молчать, чтобы считать его
-// закрытым. Переменная — чтобы тесты не ждали.
-var rotateQuiet = 10 * time.Second
+// track — запись реестра для inode (новая — пустая).
+func (c *Collector) track(ino uint64) *tracked {
+	t := c.files[ino]
+	if t == nil {
+		t = &tracked{ino: ino, size: -1}
+		c.files[ino] = t
+	}
+	return t
+}
 
-// drainRotated дочитывает прежний текущий файл, когда на пути журнала уже
-// другой файл или ничего. done — файл дочитан до конца и закрыт.
-func (c *Collector) drainRotated() (done bool, n int, err error) {
-	if c.cur == nil {
-		if old := c.findByInode(c.pos.Inode); old != "" {
-			if c.cur, err = openInode(old, c.pos.Inode); err != nil {
-				return false, 0, err
+// reconcile сверяет реестр с листингом: новые файлы — в реестр, ушедшие без
+// дескриптора — искать по inode рядом, пропавшие — забыть.
+func (c *Collector) reconcile(seen []globFile) error {
+	for _, t := range c.files {
+		t.listed = false
+	}
+	newest := int64(0)
+	for _, t := range c.files {
+		newest = max(newest, t.mtime)
+	}
+	for _, f := range seen {
+		t := c.files[f.ino]
+		// Закрытый файл, у которого не изменились размер и время, не
+		// открывается: тысячи дописанных шардов — не тысячи вызовов за проход.
+		if t != nil && t.f == nil && (f.size != t.off || f.mtime != t.mtime) && !c.same(t, f.path) {
+			// inode удалённого файла ядро отдало новому: прежний дочитан, если
+			// закрыт за простоем; иначе не узнать.
+			if err := c.forget(t, !t.idle, "log file replaced under the same inode"); err != nil {
+				return err
+			}
+			t = nil
+		}
+		if t == nil {
+			var err error
+			if t, err = c.adopt(f, newest); err != nil {
+				return err
+			}
+			if t == nil {
+				continue // не открыть: в следующий раз
 			}
 		}
-		if c.cur == nil || c.replacedFD(c.cur) {
-			c.closeCur()
-			c.log.Error("rotated log file is gone, its unread tail is lost; leaving a gap in numbering", "file", c.cfg.File)
-			c.nextSeq++
-			c.pos, c.head = filePos{}, ""
-			return true, 0, nil
+		t.path, t.mtime, t.listed, t.lsize = f.path, f.mtime, true, f.size
+	}
+	for _, t := range c.files {
+		switch {
+		case t.listed:
+			t.left = time.Time{}
+		case t.left.IsZero():
+			t.left = c.now() // ушёл: приложение пишет в него до HUP
 		}
 	}
-	quiet, err := c.quiet()
-	if err != nil {
-		return false, 0, err
-	}
-	if n, err = c.readFrom(c.cur, quiet); err != nil || !quiet {
-		return false, n, err
-	}
-	c.log.Info("log file rotated", "file", c.cfg.File)
-	c.closeCur()
-	c.pos, c.head = filePos{}, ""
-	return true, n, nil
-}
-
-// quiet — текущий файл не рос дольше rotateQuiet (по монотонным часам).
-func (c *Collector) quiet() (bool, error) {
-	fi, err := c.cur.Stat()
-	if err != nil {
-		return false, err
-	}
-	if fi.Size() != c.curSize || c.curGrowth.IsZero() {
-		c.curSize, c.curGrowth = fi.Size(), time.Now()
-	}
-	return time.Since(c.curGrowth) >= rotateQuiet, nil
-}
-
-// readCurrent дочитывает текущий файл, лежащий по path: открывает его, если
-// он ещё не открыт, и сверяет, что это он (inode, первая строка — через тот
-// же дескриптор). Обрезан или подменён на месте — пропуск номера и чтение
-// нового содержимого с начала.
-func (c *Collector) readCurrent(path string, final bool) (int, error) {
-	if c.cur == nil {
-		f, err := openInode(path, c.pos.Inode)
-		if f == nil {
-			return 0, err // файл сменился между stat и open: в следующий раз
+	for _, t := range c.byAge() {
+		if t.listed || t.f != nil {
+			continue
 		}
-		c.cur = f
-	}
-	fi, err := c.cur.Stat()
-	if err != nil {
-		return 0, err
-	}
-	if fi.Size() < c.pos.Offset || c.replacedFD(c.cur) {
-		c.log.Error("log file truncated or replaced in place, unread lines are lost; leaving a gap in numbering", "file", path)
-		c.nextSeq++
-		if err := c.follow(c.pos.Inode); err != nil { // тот же inode: дескриптор годен
-			return 0, err
+		// Ушёл с пути (из-под маски), а дескриптора нет: сборщик стоял или
+		// закрыл его за простоем. Ротированный лежит рядом под другим именем.
+		path, err := c.findInode(t)
+		if err != nil {
+			// Каталог не прочитать: файл не пропал, его не видно (Z-03).
+			c.warnMissing("log directory cannot be read: "+err.Error(), filepath.Dir(t.path))
+			continue
+		}
+		if path != "" {
+			f, err := openInode(path, t.ino)
+			if err != nil {
+				// Не открыть (права) — ждёт в реестре, остальные файлы
+				// читаются (Z-01); на inode другой файл — пропал.
+				if b := birthAt(path, t.ino); t.birth == 0 || b == 0 || b == t.birth {
+					t.path = path
+					c.warnMissing("log file cannot be opened: "+err.Error(), path)
+					continue
+				}
+			}
+			if f != nil && sameFile(t, f) {
+				t.f, t.path, t.size = f, path, -1
+				continue
+			}
+			if f != nil {
+				f.Close()
+			}
+		}
+		// Нигде нет: закрытый за простоем был дочитан — без пропуска;
+		// иначе дочитан ли он, не узнать — пропуск номера.
+		if err := c.forget(t, !t.idle, "log file is gone"); err != nil {
+			return err
 		}
 	}
-	n, err := c.readFrom(c.cur, final)
-	if err == nil && n > 0 {
-		err = c.learnHead()
-	}
-	return n, err
-}
-
-// follow делает текущим файл с этим inode, с начала. Смена места ложится в
-// буфер записью 'P' — вместе с пропуском номера, если он был: после падения
-// чтение продолжается с нового места, а не со старого смещения в новом
-// содержимом.
-func (c *Collector) follow(ino uint64) error {
-	c.pos, c.head = filePos{Inode: ino}, ""
-	c.curSize, c.curGrowth = 0, time.Time{}
-	return c.markPos()
-}
-
-// markPos кладёт в буфер запись 'P': где читать дальше, последний выданный
-// номер и первую строку текущего файла.
-func (c *Collector) markPos() error {
-	if err := c.appendSpool([]spoolRecord{{kind: kindPos, seq: c.nextSeq - 1, pos: c.pos, body: []byte(c.head)}}); err != nil {
-		return err
-	}
-	c.lastMark = c.spool.Next() - 1
 	return nil
 }
 
-// replacedFD — на месте текущего файла (тот же inode) уже другое
-// содержимое: первая строка не та. inode удалённого файла ядро отдаёт
-// новому, а файл, обрезанный на месте (copytruncate), успевает дорасти до
-// прежнего места. Первую строку не прочитать — «не знаю», а не «подменён».
-func (c *Collector) replacedFD(f *os.File) bool {
-	if c.pos.Offset == 0 || c.head == "" {
+// adopt — новый файл: в реестр с начала и в буфер записью 'P' — до первой
+// строки. Открывается сразу: ротированный дочитывается через этот
+// дескриптор, даже если его тут же сожмут или удалят. Не открыть (права
+// после logrotate create) — всё равно в реестр: откроется, когда права
+// исправят, где бы ни лежал, а пропадёт раньше — пропуск номера, не тихая
+// потеря (Z-02); остальные файлы читаются (X-03).
+func (c *Collector) adopt(f globFile, newest int64) (*tracked, error) {
+	fd, err := openInode(f.path, f.ino)
+	if err == nil && fd == nil {
+		return nil, nil // сменился между листингом и открытием
+	}
+	t := &tracked{ino: f.ino, path: f.path, mtime: f.mtime, size: -1}
+	if err != nil {
+		c.warnMissing("log file cannot be opened: "+err.Error(), f.path)
+		t.birth = birthAt(f.path, f.ino)
+	} else {
+		t.f, t.birth = fd, birthOf(fd)
+	}
+	if err := c.mark(t); err != nil {
+		if t.f != nil {
+			t.f.Close()
+		}
+		return nil, err
+	}
+	c.files[f.ino] = t
+	if !c.firstPass && f.mtime < newest-int64(c.quietFor) {
+		c.log.Warn("a new log file is older than the ones already read by modification time; is the clock going back?", "file", f.path)
+	}
+	if t.f != nil {
+		c.log.Info("reading log file", "file", f.path, "inode", f.ino)
+	}
+	return t, nil
+}
+
+// mark кладёт в буфер запись 'P': файл в реестре с этого места; номер —
+// последний выданный (в том числе пропущенный), тело — первая строка, путь
+// и время рождения через перевод строки.
+func (c *Collector) mark(t *tracked) error {
+	body := t.head + "\n" + t.path + "\n" + strconv.FormatInt(t.birth, 10)
+	return c.appendSpool([]spoolRecord{{kind: kindPos, seq: c.nextSeq - 1, pos: filePos{t.ino, t.off}, body: []byte(body)}})
+}
+
+// same — файл по path с inode записи — тот же файл, что в реестре: то же
+// рождение (если файловая система его знает; statx по пути — и у файла,
+// который не открыть), иначе та же первая строка.
+func (c *Collector) same(t *tracked, path string) bool {
+	if b := birthAt(path, t.ino); t.birth != 0 && b != 0 {
+		return b == t.birth
+	}
+	f, err := openInode(path, t.ino)
+	if err != nil || f == nil {
+		return true // не знаем — не значит «другой»
+	}
+	defer f.Close()
+	return sameFile(t, f)
+}
+
+// sameFile — открытый файл с inode записи — тот же файл, что в реестре.
+func sameFile(t *tracked, f *os.File) bool {
+	if b := birthOf(f); t.birth != 0 && b != 0 {
+		return b == t.birth
+	}
+	return t.off == 0 || headMatches(f, t.head)
+}
+
+// birthOf — время рождения открытого файла (statx btime), unix-нс; 0 —
+// файловая система не знает.
+func birthOf(f *os.File) int64 {
+	var st unix.Statx_t
+	if err := unix.Statx(int(f.Fd()), "", unix.AT_EMPTY_PATH, unix.STATX_BTIME, &st); err != nil || st.Mask&unix.STATX_BTIME == 0 {
+		return 0
+	}
+	return st.Btime.Sec*1e9 + int64(st.Btime.Nsec)
+}
+
+// birthAt — время рождения файла по пути, если там файл с этим inode; 0 —
+// не знаем. Файл не открывается: прав на чтение не нужно.
+func birthAt(path string, ino uint64) int64 {
+	var st unix.Statx_t
+	if err := unix.Statx(unix.AT_FDCWD, path, 0, unix.STATX_BTIME|unix.STATX_INO, &st); err != nil ||
+		st.Ino != ino || st.Mask&unix.STATX_BTIME == 0 {
+		return 0
+	}
+	return st.Btime.Sec*1e9 + int64(st.Btime.Nsec)
+}
+
+// forget убирает файл из реестра записью 'D'; gap — непрочитанное могло
+// пропасть: номер пропускается (в той же записи), хранилище запишет пропуск.
+func (c *Collector) forget(t *tracked, gap bool, why string) error {
+	if gap {
+		c.log.Error(why+"; its unread tail may be lost: leaving a gap in numbering", "file", t.path, "inode", t.ino)
+		c.nextSeq++
+	}
+	if err := c.appendSpool([]spoolRecord{{kind: kindDone, seq: c.nextSeq - 1, pos: filePos{t.ino, t.off}}}); err != nil {
+		if gap {
+			c.nextSeq--
+		}
+		return err
+	}
+	if t.f != nil {
+		t.f.Close()
+	}
+	delete(c.files, t.ino)
+	return nil
+}
+
+// byAge — реестр в порядке записи: по времени изменения, при равенстве — по
+// имени с числами как числами.
+func (c *Collector) byAge() []*tracked {
+	out := make([]*tracked, 0, len(c.files))
+	for _, t := range c.files {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].mtime != out[j].mtime {
+			return out[i].mtime < out[j].mtime
+		}
+		if bi, bj := filepath.Base(out[i].path), filepath.Base(out[j].path); bi != bj {
+			return naturalLess(bi, bj)
+		}
+		return out[i].ino < out[j].ino
+	})
+	return out
+}
+
+// readFile дочитывает файл: новые полные строки — в буфер с номерами.
+func (c *Collector) readFile(t *tracked) (int, error) {
+	if t.f == nil {
+		// Закрыт (за простоем или до перезапуска) и на месте: открыть, если
+		// изменился; путь журнала в режиме file — всегда.
+		if !t.listed || (c.cfg.Glob != "" && t.lsize == t.off) {
+			return 0, nil
+		}
+		f, err := openInode(t.path, t.ino)
+		if err != nil {
+			c.warnMissing("log file cannot be opened: "+err.Error(), t.path)
+			return 0, nil
+		}
+		if f == nil {
+			return 0, nil // переименован после листинга: найдётся в следующий раз
+		}
+		t.f, t.size, t.idle = f, -1, false
+	}
+	fi, err := t.f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if fi.Size() < t.off || c.replaced(t) {
+		c.log.Error("log file truncated or replaced in place, unread lines are lost; leaving a gap in numbering", "file", t.path, "inode", t.ino)
+		c.nextSeq++
+		t.off, t.head = 0, ""
+		if err := c.mark(t); err != nil { // пропуск — в той же записи
+			return 0, err
+		}
+	}
+	if fi.Size() != t.size {
+		t.size, t.growth = fi.Size(), c.now()
+	}
+	// Последняя строка без перевода строки берётся, когда файл замолчал и
+	// ушёл с пути (под маской — когда есть файл новее): писатель его
+	// закрыл.
+	final := c.quiet(t) && (!t.listed || (c.cfg.Glob != "" && c.newerListed(t)))
+	return c.readLines(t, final)
+}
+
+// quiet — файл не рос дольше rotateQuiet, а ушедший с пути — ещё и
+// rotateQuiet с того, как сборщик заметил уход: приложение пишет в
+// ротированный файл, пока не переоткроет журнал, и файл, молчавший до
+// ротации, — не закрытый (Y-02).
+func (c *Collector) quiet(t *tracked) bool {
+	now := c.now()
+	return !t.growth.IsZero() && now.Sub(t.growth) >= c.quietFor && (t.listed || now.Sub(t.left) >= c.quietFor)
+}
+
+// newerListed — под маской есть файл новее: писатель перешёл к нему.
+func (c *Collector) newerListed(t *tracked) bool {
+	for _, o := range c.files {
+		if o != t && o.listed && o.mtime > t.mtime {
+			return true
+		}
+	}
+	return false
+}
+
+// replaced — на месте файла (тот же inode, тот же дескриптор) другое
+// содержимое: первая строка не та (copytruncate, файл успел дорасти до
+// прежнего места). Первую строку не прочитать — «не знаю», а не «подменён».
+func (c *Collector) replaced(t *tracked) bool {
+	if t.off == 0 || t.head == "" {
 		return false
 	}
-	head, err := headOf(f)
-	return err == nil && head != c.head
+	return !headMatches(t.f, t.head)
 }
 
-// learnHead запоминает первую строку текущего файла, когда она дописана, —
-// записью 'P' в буфере, рядом с местом чтения.
-func (c *Collector) learnHead() error {
-	if c.head != "" {
-		return nil
+// retire закрывает дочитанное: ушедший с пути и замолчавший файл — из
+// реестра (запись 'D'); файл под маской, долго молчащий, когда есть новее, —
+// дескриптор закрыт (idle), место помнится.
+func (c *Collector) retire() error {
+	changed := false
+	for _, t := range c.byAge() {
+		if t.f == nil || !c.quiet(t) || t.off < t.size {
+			continue
+		}
+		switch {
+		case !t.listed:
+			c.log.Info("log file done", "file", t.path, "inode", t.ino)
+			if err := c.forget(t, false, ""); err != nil {
+				return err
+			}
+		case c.cfg.Glob != "" && c.now().Sub(t.growth) >= idleQuiets*c.quietFor && c.newerListed(t):
+			t.f.Close()
+			t.f, t.idle, changed = nil, true, true
+		}
 	}
-	head, err := headOf(c.cur)
-	if err != nil || head == "" {
-		return nil
+	if changed {
+		return c.saveFiles()
 	}
-	c.head = head
-	return c.markPos()
-}
-
-// closeCur закрывает дескриптор текущего файла.
-func (c *Collector) closeCur() {
-	if c.cur != nil {
-		c.cur.Close()
-		c.cur = nil
-	}
-	c.curSize, c.curGrowth = 0, time.Time{}
+	return nil
 }
 
 // openInode открывает path, если это файл с этим inode; иначе nil.
@@ -859,16 +1117,19 @@ func openInode(path string, ino uint64) (*os.File, error) {
 	return f, nil
 }
 
-// warnMissing говорит в журнал, что читать нечего (опечатка в пути, пустая
-// маска): раз в минуту, а не молча.
+// warnMissing говорит в журнал, что читать нечего или нельзя (опечатка в
+// пути, пустая маска, права): раз в минуту на путь, а не молча.
 func (c *Collector) warnMissing(msg, what string) {
-	if time.Since(c.missingWarned) >= time.Minute {
+	if c.warned == nil {
+		c.warned = map[string]time.Time{}
+	}
+	if c.now().Sub(c.warned[what]) >= time.Minute {
 		c.log.Warn(msg, "path", what)
-		c.missingWarned = time.Now()
+		c.warned[what] = c.now()
 	}
 }
 
-// globFile — файл под маской.
+// globFile — файл под маской (или на пути журнала).
 type globFile struct {
 	path  string
 	ino   uint64
@@ -876,186 +1137,51 @@ type globFile struct {
 	mtime int64 // unix-нс
 }
 
-// globFiles — файлы под маской в порядке записи: по времени изменения, при
-// равенстве — по имени с числами как числами («-8» раньше «-16»).
+// globFiles — файлы под маской (порядок чтения задаёт byAge). Каталог
+// читается целиком, и ошибка чтения — ошибка: filepath.Glob её глотает, и
+// нечитаемый каталог выглядел пустым — все файлы разом «уходили» (Z-03).
 func (c *Collector) globFiles() ([]globFile, error) {
-	paths, err := filepath.Glob(c.cfg.Glob)
+	dir, pattern := filepath.Dir(c.cfg.Glob), filepath.Base(c.cfg.Glob)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 	var out []globFile
-	for _, p := range paths {
+	for _, e := range entries {
+		if ok, _ := filepath.Match(pattern, e.Name()); !ok {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
 		fi, err := os.Stat(p)
-		if err != nil || !fi.Mode().IsRegular() {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			continue // удалён между листингом и взглядом
+		case err != nil:
+			return nil, err
+		case !fi.Mode().IsRegular():
 			continue
 		}
 		out = append(out, globFile{path: p, ino: inode(fi), size: fi.Size(), mtime: fi.ModTime().UnixNano()})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].mtime != out[j].mtime {
-			return out[i].mtime < out[j].mtime
-		}
-		return naturalLess(filepath.Base(out[i].path), filepath.Base(out[j].path))
-	})
 	return out, nil
 }
 
-// readGlob — ReadOnce для маски: дочитать текущий файл и, если есть другой
-// файл с непрочитанным, перейти к нему.
-func (c *Collector) readGlob() (int, error) {
-	files, err := c.globFiles()
-	if err != nil {
-		return 0, err
-	}
-	if len(files) == 0 {
-		c.warnMissing("no log files match the glob (yet)", c.cfg.Glob)
-	}
-	c.forgetGone(files)
-	total := 0
-	// Переходов за проход — не больше, чем файлов (с запасом): если вопреки
-	// условию в каталоге пишут двое, проход всё равно кончается.
-	for range 2*len(files) + 1 {
-		cur := -1
-		if c.pos.Inode != 0 {
-			cur = slices.IndexFunc(files, func(f globFile) bool { return f.ino == c.pos.Inode })
-			if c.cur == nil && cur >= 0 {
-				// После перезапуска файл открывается по пути. Тот ли это
-				// файл (inode удалённого ядро отдаёт новому), readCurrent
-				// сверит по первой строке через этот же дескриптор.
-				f, err := openInode(files[cur].path, c.pos.Inode)
-				if err != nil {
-					return total, err
-				}
-				c.cur = f
-			}
-			// Под маской нашего файла больше нет (удалён): то, что в нём
-			// осталось, дочитывается через дескриптор. Дескриптора нет
-			// (перезапуск) — хвост потерян.
-			// Пока дескриптор открыт, inode файла ядро никому не отдаст, а
-			// подмену на месте ловит readCurrent — по первой строке через
-			// тот же дескриптор.
-			if cur < 0 || c.cur == nil {
-				if c.cur != nil {
-					n, err := c.readFrom(c.cur, true)
-					total += n
-					if err != nil {
-						return total, err
-					}
-				} else {
-					c.log.Error("current log file is gone, its unread tail is lost; leaving a gap in numbering", "glob", c.cfg.Glob)
-					c.nextSeq++
-				}
-				c.closeCur()
-				delete(c.files, c.pos.Inode)
-				c.pos, c.head, cur = filePos{}, "", -1
-			}
-		}
-		next := c.firstUnread(files)
-		if cur < 0 {
-			if next < 0 {
-				return total, nil
-			}
-			if err := c.switchTo(files[next], nil); err != nil {
-				return total, err
-			}
-			continue
-		}
-		if next >= 0 && next < cur {
-			if _, known := c.files[files[next].ino]; !known {
-				c.log.Warn("a new log file is older than the current one by modification time; is the clock going back?", "file", files[next].path)
-			}
-		}
-		final := next >= 0
-		n, err := c.readCurrent(files[cur].path, final)
-		total += n
-		if err != nil || !final {
-			return total, err
-		}
-		if err := c.switchTo(files[next], &files[cur]); err != nil {
-			return total, err
-		}
-	}
-	return total, nil
-}
-
-// sameHead — первая строка файла по path та же, что у текущего (или её
-// не знаем): inode удалённого файла мог достаться новому.
-func sameHead(path, head string) bool {
+// headMatches — первая строка файла та же, что head; head "" — не знаем, и
+// прочитать не вышло — тоже. Недописанная первая строка у файла, чья первая
+// строка была дописана, — другой файл (inode удалённого достался новому).
+func headMatches(f *os.File, head string) bool {
 	if head == "" {
 		return true
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return true // не знаем — не значит «другой»
-	}
-	defer f.Close()
 	h, err := headOf(f)
 	return err != nil || h == head
 }
 
-// switchTo делает файл f текущим — с того места, докуда он прочитан раньше
-// (0 — новый файл). from — прежний текущий, дочитанный до конца: он
-// числится в files.json прочитанным раньше, чем в буфере появится новое
-// место, а новый текущий остаётся там со своим местом до записи 'P' —
-// после падения в любой точке ни один файл не читается с начала заново.
-func (c *Collector) switchTo(f globFile, from *globFile) error {
-	if from != nil {
-		c.files[c.pos.Inode] = fileState{Inode: c.pos.Inode, Offset: c.pos.Offset, MTime: from.mtime, Head: c.head}
-	}
-	c.closeCur()
-	if err := c.saveFiles(); err != nil {
-		return err
-	}
-	e := c.files[f.ino]
-	c.pos, c.head = filePos{Inode: f.ino, Offset: e.Offset}, e.Head
-	c.log.Info("reading log file", "file", f.path, "offset", c.pos.Offset)
-	if err := c.markPos(); err != nil {
-		return err
-	}
-	delete(c.files, f.ino) // место текущего — pos; files.json узнает при следующей записи
-	return nil
-}
-
-// forgetGone забывает файлы, которых больше нет, и файлы, чей inode
-// достался другому файлу (первая строка не та). Файл, у которого не
-// изменились размер и время, не открывается; первую строку не прочитать —
-// файл не забывается.
-func (c *Collector) forgetGone(files []globFile) {
-	byIno := make(map[uint64]globFile, len(files))
-	for _, f := range files {
-		byIno[f.ino] = f
-	}
-	for ino, e := range c.files {
-		f, ok := byIno[ino]
-		switch {
-		case !ok:
-			delete(c.files, ino)
-		case f.size == e.Offset && f.mtime == e.MTime:
-		case !sameHead(f.path, e.Head):
-			delete(c.files, ino) // другой файл с тем же inode: читается с начала
-		default:
-			e.MTime = f.mtime
-			c.files[ino] = e
-		}
-	}
-}
-
-// firstUnread — первый по порядку файл, кроме текущего, где есть
-// непрочитанное: новый файл или известный, который дорос.
-func (c *Collector) firstUnread(files []globFile) int {
-	for i, f := range files {
-		if f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset {
-			return i
-		}
-	}
-	return -1
-}
-
-// fileList — files в порядке inode (для files.json).
+// fileList — реестр в порядке inode (для files.json).
 func (c *Collector) fileList() []fileState {
 	out := make([]fileState, 0, len(c.files))
-	for _, f := range c.files {
-		out = append(out, f)
+	for _, t := range c.files {
+		out = append(out, fileState{Inode: t.ino, Offset: t.off, MTime: t.mtime, Head: t.head, Path: t.path, Birth: t.birth, Idle: t.idle})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Inode < out[j].Inode })
 	return out
@@ -1141,55 +1267,87 @@ func chunk(s string) string {
 
 func isDigit(b byte) bool { return '0' <= b && b <= '9' }
 
-// findByInode ищет в каталоге журнала файл с этим inode: так находится
-// ротированный файл под новым именем после перезапуска сборщика.
-func (c *Collector) findByInode(ino uint64) string {
-	dir := filepath.Dir(c.cfg.File)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	for _, e := range entries {
-		if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() && inode(fi) == ino {
-			return filepath.Join(dir, e.Name())
+// findInode ищет файл реестра по inode в каталоге, где его видели
+// последний раз (или в каталоге журнала): так находится ротированный файл
+// под новым именем после перезапуска или закрытия за простоем. "" — файла
+// там нет; ошибка — каталог не прочитать, и про файл ничего не известно
+// (Z-03).
+func (c *Collector) findInode(t *tracked) (string, error) {
+	dir := filepath.Dir(t.path)
+	if t.path == "" {
+		dir = filepath.Dir(c.cfg.File)
+		if c.cfg.Glob != "" {
+			dir = filepath.Dir(c.cfg.Glob)
 		}
 	}
-	return ""
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() && inode(fi) == t.ino {
+			return filepath.Join(dir, e.Name()), nil
+		}
+	}
+	return "", nil
 }
 
 // readChunk — сколько байт тел копится в памяти до записи в буфер: файл
-// любого размера читается без роста памяти.
-const readChunk = 4 << 20
+// любого размера читается без роста памяти. pieceLen — длина куска, на
+// которые режется длинная строка. Переменные — чтобы симуляция писала в
+// буфер часто и резала строки дёшево.
+var (
+	readChunk = 4 << 20
+	pieceLen  = evidence.MaxBodyLen
+)
 
-// readFrom читает открытый текущий файл от текущей позиции до его размера
-// сейчас. final — файл больше не растёт: строка без перевода строки в конце
-// тоже берётся.
-func (c *Collector) readFrom(f *os.File, final bool) (int, error) {
-	fi, err := f.Stat()
+// readLines читает открытый файл от места в реестре до его размера сейчас.
+// final — файл больше не растёт: строка без перевода строки в конце тоже
+// берётся.
+func (c *Collector) readLines(t *tracked, final bool) (int, error) {
+	fi, err := t.f.Stat()
 	if err != nil {
 		return 0, err
 	}
-	if fi.Size() <= c.pos.Offset {
+	if fi.Size() <= t.off {
 		return 0, nil
 	}
-	r := bufio.NewReaderSize(io.NewSectionReader(f, c.pos.Offset, fi.Size()-c.pos.Offset), 1<<20)
+	// Первая строка нового файла ложится в буфер записью 'P' в одной пачке с
+	// его первыми строками и раньше них: есть в буфере строка файла — есть и
+	// его первая строка (оборванный хвост буфера отрезается только с конца).
+	// Отдельной записью после строк она оставляла окно: упал между ними —
+	// первая строка неизвестна, и copytruncate с дорастанием за прежнее
+	// место не виден (длинная симуляция: обрывки строк вместо потерянных).
+	head := ""
+	if t.off == 0 && t.head == "" {
+		head, _ = headOf(t.f)
+	}
+	r := bufio.NewReaderSize(io.NewSectionReader(t.f, t.off, fi.Size()-t.off), 1<<20)
 	var recs []spoolRecord
 	size, total := 0, 0
 	flush := func() error {
 		if len(recs) == 0 {
 			return nil
 		}
-		if err := c.appendSpool(recs); err != nil {
+		batch := recs
+		if head != "" {
+			hr := spoolRecord{kind: kindPos, seq: recs[0].seq - 1, pos: filePos{t.ino, 0}, body: []byte(head + "\n" + t.path + "\n" + strconv.FormatInt(t.birth, 10))}
+			batch = append([]spoolRecord{hr}, recs...)
+		}
+		if err := c.appendSpool(batch); err != nil {
 			c.nextSeq -= uint64(len(recs))
 			return err
 		}
-		c.pos = recs[len(recs)-1].pos
+		if head != "" {
+			t.head, head = head, ""
+		}
+		t.off = recs[len(recs)-1].pos.Offset
 		c.pending += len(recs)
 		total += len(recs)
 		recs, size = nil, 0
 		return nil
 	}
-	off := c.pos.Offset
+	off := t.off
 	for {
 		line, err := r.ReadBytes('\n')
 		if err != nil && err != io.EOF {
@@ -1206,12 +1364,12 @@ func (c *Collector) readFrom(f *os.File, final bool) (int, error) {
 		off += int64(len(line))
 		body := bytes.TrimSuffix(line, []byte("\n"))
 		for cut := 0; ; {
-			n := min(len(body)-cut, evidence.MaxBodyLen)
+			n := min(len(body)-cut, pieceLen)
 			end := off // после последнего куска — за переводом строки
 			if cut+n < len(body) {
 				end = start + int64(cut+n) // кусок длинной строки: сразу за ним
 			}
-			recs = append(recs, spoolRecord{kind: kindLine, seq: c.nextSeq, pos: filePos{c.pos.Inode, end}, body: body[cut : cut+n]})
+			recs = append(recs, spoolRecord{kind: kindLine, seq: c.nextSeq, pos: filePos{t.ino, end}, body: body[cut : cut+n]})
 			c.nextSeq++
 			size += n
 			if cut += n; cut == len(body) {
@@ -1250,15 +1408,13 @@ func (c *Collector) SendOnce(ctx context.Context) error {
 			return err
 		}
 		c.sentPos, c.pending = last, c.pending-len(batch)
-		if err := c.spool.Release(c.sentPos); err != nil {
+		// Снимок реестра — раньше, чем доставленное уйдёт из буфера: места
+		// файлов из освобождённых записей остаются в files.json.
+		if err := c.saveFiles(); err != nil {
 			return err
 		}
-		// Последняя метка места ушла вместе с доставленным сегментом:
-		// первая строка текущего файла и место должны пережить рестарт.
-		if c.lastMark < c.spool.First() {
-			if err := c.markPos(); err != nil {
-				return err
-			}
+		if err := c.spool.Release(c.sentPos); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1308,7 +1464,8 @@ type errorResponse struct {
 }
 
 // epochRefused — ErrEpoch, если хранилище отказало этой установке: в
-// тексте хранилища — закреплённая эпоха, эта эпоха и команда оператору.
+// тексте хранилища — эпоха этой установки и команда оператору.
+// Закреплённую эпоху хранилище не называет.
 func epochRefused(resp *http.Response, body []byte) error {
 	var e errorResponse
 	if resp.StatusCode == http.StatusConflict && json.Unmarshal(body, &e) == nil && e.Code == codeEpochMismatch {
@@ -1453,8 +1610,30 @@ func (c *Collector) Pending() int { return c.pending }
 // Acked — последний подтверждённый номер.
 func (c *Collector) Acked() uint64 { return c.acked }
 
-func (c *Collector) saveState() error { return writeJSON(c.statePath(), state{Acked: c.acked}) }
-func (c *Collector) saveFiles() error { return writeJSON(c.filesPath(), c.fileList()) }
+func (c *Collector) saveState() error {
+	return c.persist("state", func() error { return writeJSON(c.statePath(), state{Acked: c.acked}) })
+}
+
+func (c *Collector) saveFiles() error {
+	return c.persist("files", func() error { return writeJSON(c.filesPath(), c.fileList()) })
+}
+
+// persist — запись на диск: тест роняет здесь процесс — до записи или
+// сразу после неё.
+func (c *Collector) persist(what string, write func() error) error {
+	if c.persistHook != nil {
+		if err := c.persistHook(what); err != nil {
+			return err
+		}
+	}
+	if err := write(); err != nil {
+		return err
+	}
+	if c.persistHook != nil {
+		return c.persistHook(what + "+")
+	}
+	return nil
+}
 
 // readJSON читает файл состояния; false — файла нет.
 func readJSON(path string, v any) (bool, error) {
@@ -1511,14 +1690,19 @@ func syncDir(dir string) error {
 //	u8 вид | u64 номер | u64 inode | u64 смещение | тело
 //
 // Вид 'L' — строка (или кусок длинной строки); смещение — откуда читать
-// файл после неё. Вид 'S' — старт, первая запись первого запуска: всё до
-// этого номера включительно уже у хранилища, читать — с этого места. Вид 'P'
-// — смена места: читать этот файл с этого места; номер — последний выданный
-// (в том числе пропущенный); тело — первая строка файла, "" — не знаем.
+// этот файл после неё. Вид 'S' — старт, первая запись первого запуска: всё
+// до этого номера включительно уже у хранилища (места файлов —
+// start-files.json). Вид 'P' — файл в реестре с этого места: новый (с
+// нуля) или после пропуска (обрезан, подменён); номер — последний выданный
+// (в том числе пропущенный); тело — первая строка ("" — не знаем), перевод
+// строки и путь. Вид 'D' — файл ушёл из реестра (дочитан или пропал);
+// номер — последний выданный, с пропуском, если непрочитанное могло
+// пропасть.
 const (
 	kindLine  byte = 'L'
 	kindStart byte = 'S'
 	kindPos   byte = 'P'
+	kindDone  byte = 'D'
 	recHead        = 1 + 8 + 8 + 8
 )
 
@@ -1539,7 +1723,7 @@ func (r spoolRecord) marshal() []byte {
 }
 
 func parseRecord(b []byte) (spoolRecord, error) {
-	if len(b) < recHead || (b[0] != kindLine && b[0] != kindStart && b[0] != kindPos) {
+	if len(b) < recHead || (b[0] != kindLine && b[0] != kindStart && b[0] != kindPos && b[0] != kindDone) {
 		return spoolRecord{}, errors.New("not a spool record")
 	}
 	return spoolRecord{
@@ -1555,8 +1739,10 @@ func (c *Collector) appendSpool(recs []spoolRecord) error {
 	for i, r := range recs {
 		data[i] = r.marshal()
 	}
-	_, err := c.spool.Append(data)
-	return err
+	return c.persist("spool", func() error {
+		_, err := c.spool.Append(data)
+		return err
+	})
 }
 
 func inode(fi os.FileInfo) uint64 {

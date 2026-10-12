@@ -366,3 +366,36 @@ func TestAccuracyBound(t *testing.T) {
 		t.Fatalf("отрицательная точность: %v", err)
 	}
 }
+
+// Только для тестов: продукт зовёт встроенную службу напрямую (Sign), без
+// HTTP. HTTP нужен, чтобы проверить Request на настоящем обмене RFC 3161.
+
+// ServeHTTP отвечает на запросы RFC 3161, как настоящая служба.
+func (a *Authority) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req timeStampReq
+	if _, err := asn1.Unmarshal(body, &req); err != nil || !req.MessageImprint.HashAlgorithm.Algorithm.Equal(oidSHA256) {
+		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}}) // rejection
+		return
+	}
+	token, err := a.Sign(req.MessageImprint.HashedMessage, req.Nonce)
+	if err != nil {
+		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}})
+		return
+	}
+	writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 0}, Token: asn1.RawValue{FullBytes: token}})
+}
+
+func writeResp(w http.ResponseWriter, resp timeStampResp) {
+	der, err := asn1.Marshal(resp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/timestamp-reply")
+	w.Write(der)
+}

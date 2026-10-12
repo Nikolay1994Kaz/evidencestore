@@ -15,29 +15,22 @@ const (
 	OpCancelDestroy   Op = "cancel-destroy"
 )
 
-// Approval — подтверждение одного человека. Sig — его подпись над
-// (op, scope, kekID); проверяет её Policy, кейринг записывает только Who.
+// Approval — подтверждение одного человека: имя, которое ложится в
+// keyring.dat и в цепь. Подписи у подтверждения нет.
 type Approval struct {
 	Who string
-	Sig []byte
 }
 
-// Policy решает, хватает ли подтверждений.
+// TwoPeople — правило подтверждений: заявка на уничтожение — два разных
+// человека, отмена — один (отмена — безопасное направление).
 //
-// Настоящий двойной контроль — только если проверка исполняется там, куда
-// администратор хоста не дотягивается (кворум HSM, хранитель у другой
-// команды). Проверка внутри этого процесса — учёт «кто подтвердил», а не
-// запрет: администратор хоста её обойдёт.
-type Policy interface {
-	Check(op Op, scope string, kekID [kekIDSize]byte, approvals []Approval) error
-}
-
-// TwoPeople — политика по умолчанию, только учёт: заявка на уничтожение —
-// два разных человека, отмена — один (отмена — безопасное направление).
-// Подписи не проверяет.
+// Это учёт «кто подтвердил», а не запрет: имена приходят через админку, и
+// администратор хоста впишет любые. Настоящий двойной контроль — только если
+// проверка исполняется там, куда администратор хоста не дотягивается (кворум
+// HSM, хранитель у другой команды).
 type TwoPeople struct{}
 
-func (TwoPeople) Check(op Op, _ string, _ [kekIDSize]byte, approvals []Approval) error {
+func (TwoPeople) Check(op Op, approvals []Approval) error {
 	need := 2
 	if op == OpCancelDestroy {
 		need = 1
@@ -104,11 +97,6 @@ func (k *Keyring) Deactivate(scopes ...string) error {
 // ключ уничтожался бы сразу.
 const MaxWait = 10 * 365 * 24 * time.Hour
 
-// ScheduleDestroy — ScheduleDestroyFrom от часов кейринга.
-func (k *Keyring) ScheduleDestroy(scope string, wait time.Duration, approvals []Approval) (KeyInfo, error) {
-	return k.ScheduleDestroyFrom(scope, k.now(), wait, approvals)
-}
-
 // ScheduleDestroyFrom — первый шаг уничтожения: Deactivated → Pending. Ключ
 // сразу перестаёт работать, но до срока from + wait уничтожение можно
 // отменить. from — время, которому верят (движок берёт его от метки TSA).
@@ -134,7 +122,7 @@ func (k *Keyring) ScheduleDestroyFrom(scope string, from time.Time, wait time.Du
 	if wait > MaxWait {
 		return e.info(k.safe), fmt.Errorf("%w: wait %v is longer than maximum %v", ErrBadState, wait, MaxWait)
 	}
-	who, err := k.approve(OpScheduleDestroy, e, approvals)
+	who, err := approve(OpScheduleDestroy, approvals)
 	if err != nil {
 		return e.info(k.safe), err
 	}
@@ -163,7 +151,7 @@ func (k *Keyring) CancelDestroy(scope string, approvals []Approval) (KeyInfo, er
 	if e.state != Pending {
 		return e.info(k.safe), fmt.Errorf("%w: %q is %v, cancel needs %v", ErrBadState, scope, e.state, Pending)
 	}
-	if _, err := k.approve(OpCancelDestroy, e, approvals); err != nil {
+	if _, err := approve(OpCancelDestroy, approvals); err != nil {
 		return e.info(k.safe), err
 	}
 	prev := *e
@@ -175,10 +163,10 @@ func (k *Keyring) CancelDestroy(scope string, approvals []Approval) (KeyInfo, er
 	return e.info(k.safe), err
 }
 
-// approve проверяет пределы и зовёт Policy; отдаёт имена подтвердивших.
-// Пределы — до Policy: имя или их число сверх предела записалось бы в файл,
+// approve проверяет пределы и правило TwoPeople; отдаёт имена подтвердивших.
+// Пределы — до правила: имя или их число сверх предела записалось бы в файл,
 // который потом не откроется.
-func (k *Keyring) approve(op Op, e *entry, approvals []Approval) ([]string, error) {
+func approve(op Op, approvals []Approval) ([]string, error) {
 	if len(approvals) > MaxApprovals {
 		return nil, fmt.Errorf("%w: %d approvals, at most %d", ErrApproval, len(approvals), MaxApprovals)
 	}
@@ -187,11 +175,7 @@ func (k *Keyring) approve(op Op, e *entry, approvals []Approval) ([]string, erro
 			return nil, fmt.Errorf("%w: approver name longer than %d", ErrApproval, MaxApproverLen)
 		}
 	}
-	p := k.opt.Policy
-	if p == nil {
-		p = TwoPeople{}
-	}
-	if err := p.Check(op, e.scope, e.id, approvals); err != nil {
+	if err := (TwoPeople{}).Check(op, approvals); err != nil {
 		return nil, err
 	}
 	who := make([]string, 0, len(approvals))
@@ -200,9 +184,6 @@ func (k *Keyring) approve(op Op, e *entry, approvals []Approval) ([]string, erro
 	}
 	return who, nil
 }
-
-// CompleteDue — CompleteDueAt по часам кейринга.
-func (k *Keyring) CompleteDue() ([]KeyInfo, error) { return k.CompleteDueAt(k.now()) }
 
 // CompleteDueAt — второй шаг: уничтожает ключи, чей срок ожидания истёк к
 // моменту at, и добивает старые корни. at — время, которому верят: движок

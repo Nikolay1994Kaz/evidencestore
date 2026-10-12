@@ -160,8 +160,6 @@ type Bundle struct {
 	Gateway *GatewayProof `json:"gateway,omitempty"`
 }
 
-func (b Bundle) JSON() ([]byte, error) { return json.MarshalIndent(b, "", " ") }
-
 func Parse(data []byte) (Bundle, error) {
 	var b Bundle
 	if err := json.Unmarshal(data, &b); err != nil {
@@ -217,9 +215,6 @@ type Report struct {
 	// проверял никто: ключ гейтвея не закреплён ни в хранилище, ни у
 	// проверяющего. Такая точка запись не накрывает.
 	GatewayUnsigned bool
-	// LegacyEnvelope — конверт старого формата (EV1): ключ записи не связан с
-	// отпечатком улики.
-	LegacyEnvelope bool
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -241,9 +236,6 @@ func (r Report) Notes() []string {
 	}
 	if r.Lower.IsZero() {
 		n = append(n, "нет метки TSA раньше улики: нижняя граница времени не доказана")
-	}
-	if r.LegacyEnvelope {
-		n = append(n, "конверт старого формата (EV1): выданный ключ записи не связан с отпечатком улики")
 	}
 	switch {
 	case r.BodyOpened:
@@ -361,7 +353,6 @@ func Verify(b Bundle, trust Trust) Report {
 	// том же отпечатке) не пройдёт.
 	if len(b.DEK) > 0 {
 		r.BodyKey = true
-		r.LegacyEnvelope = keyring.LegacyEnvelope(sealed.Envelope)
 		body, err := keyring.OpenWithDEK(sealed.Envelope, b.DEK)
 		if add("тело вскрывается выданным ключом записи, ключ связан с отпечатком, тег GCM сходится", err, fmt.Sprintf("%d байт", len(body))) {
 			r.Body, r.BodyOpened = body, true

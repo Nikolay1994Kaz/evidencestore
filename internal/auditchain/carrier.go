@@ -417,25 +417,6 @@ func (c *Carrier) writeTick() (Head, error) {
 	return next, nil
 }
 
-// AppendSync — событие, которое обязано быть доказуемым немедленно.
-//
-// ⭐ЗАЧЕМ ОТДЕЛЬНЫЙ ПУТЬ. Батч у WAL стоит ДАННЫХ (осознанный RPO), у цепи он
-// стоит ГАРАНТИИ: голова, отставшая на k записей, после аварии неотличима от
-// обрезанного хвоста — то есть владелец получает правдоподобное отрицание в
-// пределах окна. Для SHRED и QUARANTINE это неприемлемо: их квитанция и есть
-// продукт. Флаш до себя закрывает окно ПОЛНОСТЬЮ — квитанция всегда покрывает
-// всё, что было раньше, — и стоит ноль, потому что эти команды и так платят
-// синхронную запись кейринга того же порядка (2.78 мс против 0.42+0.65).
-//
-// ⚠FORGET сюда НЕ относится, и это тоже измерено: в mix-прогоне их ~118/с, при
-// 2.78 мс это треть всего времени, потраченная на одну команду.
-func (c *Carrier) AppendSync(l Leaf) (Head, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.appendLocked(l)
-	return c.flushLocked()
-}
-
 // rotateIfNeeded режет файл листьев ПЕРЕД записью батча.
 //
 // ⚠Условие onDisk == 0 — не оптимизация, а то самое требование «непокрытые
@@ -455,6 +436,14 @@ func (c *Carrier) rotateIfNeeded() error {
 		return err
 	}
 	return c.createLeafSegment(c.nextLeaf - uint64(len(c.pending)))
+}
+
+// SetSegmentBytes опускает порог ротации файла листьев: тест движка гоняет
+// ротацию под падениями. В проде не зовётся.
+func (c *Carrier) SetSegmentBytes(n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.segmentBytes = n
 }
 
 // SetBeforeWrite ставит крючок отказа (см. beforeWrite): им тест движка
@@ -549,6 +538,90 @@ func (c *Carrier) closeFiles() error {
 	}
 	c.leaves, c.chain, c.head = nil, nil, nil
 	return firstErr
+}
+
+// TrimToHead обрезает цепь в каталоге по звену head: звенья после него и
+// листья, которых звенья до него не накрывают, уходят. Это для
+// восстановления из копии: проход копии, прерванный раньше головы (она
+// уезжает последней), оставляет хвост, которого голова не заверяет, —
+// звенья без листьев или листья без звеньев, среди них метки TSA над
+// звеньями, которых в копии нет. Подъём построил бы такие звенья заново и
+// иначе, и метка заверяла бы чужой хэш.
+func TrimToHead(dir string, head uint64) error {
+	path := filepath.Join(dir, chainFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	off, covered := 0, uint64(0)
+	for n := uint64(1); n <= head; n++ {
+		body, next, ok := nextFrame(data, off)
+		if !ok {
+			return fmt.Errorf("auditchain: %s: звеньев меньше %d", path, head)
+		}
+		if n == head {
+			r, err := decodeRecord(body)
+			if err != nil {
+				return err
+			}
+			p, err := DecodeBatchPayload(r.Payload)
+			if err != nil {
+				return err
+			}
+			covered = p.FirstLeaf + uint64(p.Count)
+		}
+		off = next
+	}
+	if err := truncateTo(path, int64(off)); err != nil {
+		return err
+	}
+	segs, err := leafSegments(dir)
+	if err != nil {
+		return err
+	}
+	for i, first := range segs {
+		lp := leafPath(dir, first)
+		switch {
+		case first >= covered:
+			if err := os.Remove(lp); err != nil {
+				return err
+			}
+		case i == len(segs)-1 || segs[i+1] >= covered:
+			// Последний нужный файл листьев: ровно covered-first листьев.
+			leaves, err := os.ReadFile(lp)
+			if err != nil {
+				return err
+			}
+			loff := 0
+			for k := first; k < covered; k++ {
+				_, next, ok := nextFrame(leaves, loff)
+				if !ok {
+					return fmt.Errorf("%w: звено %d покрывает лист %d, а в %s их %d", ErrLeavesMissing, head, covered-1, lp, k-first)
+				}
+				loff = next
+			}
+			if err := truncateTo(lp, int64(loff)); err != nil {
+				return err
+			}
+		}
+	}
+	return syncDir(dir)
+}
+
+// truncateTo обрезает файл до size, если он длиннее, и сбрасывает его.
+func truncateTo(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if st, err := f.Stat(); err != nil || st.Size() <= size {
+		return err
+	}
+	if err := f.Truncate(size); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // ReadChain читает звенья с диска — для VERIFY и для экспорта.
@@ -680,19 +753,12 @@ func scanFrames(f *os.File, truncate bool) ([][]byte, int64, string, error) {
 	var bodies [][]byte
 	off := 0
 	for off < len(data) {
-		if off+8 > len(data) {
-			break // хвост короче заголовка и CRC
-		}
-		n := int(binary.BigEndian.Uint32(data[off : off+4]))
-		if n == 0 || off+8+n > len(data) {
-			break // пустых кадров не бывает (нули после сбоя питания), или длина за концом файла
-		}
-		body := data[off+4 : off+4+n]
-		if crc32.ChecksumIEEE(body) != binary.BigEndian.Uint32(data[off+4+n:off+8+n]) {
+		body, next, ok := nextFrame(data, off)
+		if !ok {
 			break
 		}
 		bodies = append(bodies, body)
-		off += 8 + n
+		off = next
 	}
 	if off == len(data) {
 		return bodies, 0, "", nil
@@ -723,6 +789,22 @@ func scanFrames(f *os.File, truncate bool) ([][]byte, int64, string, error) {
 		}
 	}
 	return bodies, torn, aside, nil
+}
+
+// nextFrame — целый кадр со смещения off: тело и смещение следующего.
+func nextFrame(data []byte, off int) (body []byte, next int, ok bool) {
+	if off+8 > len(data) {
+		return nil, 0, false // хвост короче заголовка и CRC
+	}
+	n := int(binary.BigEndian.Uint32(data[off : off+4]))
+	if n == 0 || off+8+n > len(data) {
+		return nil, 0, false // пустых кадров не бывает (нули после сбоя питания), или длина за концом файла
+	}
+	body = data[off+4 : off+4+n]
+	if crc32.ChecksumIEEE(body) != binary.BigEndian.Uint32(data[off+4+n:off+8+n]) {
+		return nil, 0, false
+	}
+	return body, off + 8 + n, true
 }
 
 // frameAfter ищет целый кадр (длина в пределах maxFrame, CRC сходится),

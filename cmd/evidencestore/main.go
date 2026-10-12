@@ -274,7 +274,12 @@ func cmdRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("restored %d files, %d bytes; chain verified up to signed head %d\n", rep.Files, rep.Bytes, rep.HeadSeq)
+	// Сверены только звенья цепи: журнал улик и листья с цепью здесь не
+	// сверяются (W-07). «verified» без оговорки толкал выбросить другую
+	// копию data_dir, хотя испорченный кусок копии виден только позже.
+	fmt.Printf("restored %d files, %d bytes; chain links verified up to signed head %d\n", rep.Files, rep.Bytes, rep.HeadSeq)
+	fmt.Printf("restored from copy generation %d; the store writes the copy on as generation %d, from scratch (gen/%020d/ in the copy; earlier generations stay as they are)\n", rep.Generation, rep.NextGeneration, rep.NextGeneration)
+	fmt.Println("the evidence log and the leaves are not checked against the chain here: a damaged chunk shows when the store starts (frame checksum) or when a proof of its records is built; do not discard another copy of data_dir on the strength of this check")
 	fmt.Printf("now put keyring.dat into %s and sign.key into %s (from keys.backup_dir),\n", cfg.DataDir, filepath.Join(cfg.DataDir, "chain"))
 	if cfg.Keys.RootsMirrorDir != "" {
 		fmt.Printf("make sure roots_dir %s exists (the store reads missing roots from the mirror %s),\n", cfg.RootsDir, cfg.Keys.RootsMirrorDir)

@@ -316,8 +316,8 @@
   {
    "name": "S35 журнал улик открывается с правом Release",
    "file": "internal/store/store.go",
-   "old": "evlog.Options{OnCommit: s.onCommit}",
-   "new": "evlog.Options{OnCommit: s.onCommit, AllowRelease: true}"
+   "old": "evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment}",
+   "new": "evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment, AllowRelease: true}"
   },
   {
    "name": "S36 отказ цепи не останавливает приём",
@@ -338,16 +338,16 @@
    "new": ""
   },
   {
-   "name": "S39 прыжок часов вперёд не ограничен якорем TSA",
+   "name": "S39 время приёма не держится под нижней оценкой времени TSA (W-01)",
    "file": "internal/store/store.go",
-   "old": "\t\t\ts.clockCapped.Add(1)\n\t\t\tt = est\n",
-   "new": "\t\t\ts.clockCapped.Add(1)\n"
+   "old": "\t\tt = min(max(t, floor), lo)",
+   "new": "\t\t_ = lo\n\t\tt = max(t, floor)"
   },
   {
    "name": "S40 метка TSA не ставит якорь часов",
    "file": "internal/store/jobs.go",
-   "old": "\ts.anchorClock(info.GenTime)",
-   "new": "\t_ = info.GenTime"
+   "old": "\ts.anchorClock(info.GenTime, s.mono()-asked)",
+   "new": "\t_, _ = info.GenTime, asked"
   },
   {
    "name": "S41 метка ставится и без новых листьев",
@@ -564,6 +564,132 @@
    "file": "internal/store/epoch.go",
    "old": " && len(st.refusedEpochs) < maxRefusedEpochs",
    "new": ""
+  },
+  {
+   "name": "S65 отказ чужой эпохе называет закреплённую",
+   "file": "internal/store/epoch.go",
+   "old": "ErrEpochMismatch, source, epoch, source, epoch)",
+   "new": "ErrEpochMismatch, source+\" bound to \"+bound, epoch, source, epoch)"
+  },
+  {
+   "name": "S66 отказ сборщику без эпохи называет закреплённую",
+   "file": "internal/store/epoch.go",
+   "old": "ErrEpochMismatch, source)",
+   "new": "ErrEpochMismatch, source+\" bound to \"+bound)"
+  },
+  {
+   "name": "S67 время приёма не поднимается до окна при отставших часах хоста (Y-01)",
+   "file": "internal/store/store.go",
+   "old": "\t\tt = min(max(t, floor), lo)",
+   "new": "\t\tt = min(t, lo)"
+  },
+  {
+   "name": "S68 уход монотонных часов не вычитается из нижней оценки (W-01)",
+   "file": "internal/store/store.go",
+   "old": "\tlo = s.anchorTSA.Add(el - el/driftPPM).UnixNano()",
+   "new": "\tlo = s.anchorTSA.Add(el).UnixNano()"
+  },
+  {
+   "name": "S69 задержка ответа TSA не входит в верхнюю оценку (W-05)",
+   "file": "internal/store/store.go",
+   "old": "\trun := el + s.anchorLag",
+   "new": "\trun := el"
+  },
+  {
+   "name": "S70 приём не ждёт первой метки (W-13)",
+   "file": "internal/store/ingest.go",
+   "old": "\tif err := s.anchored(); err != nil {\n\t\treturn nil, err\n\t}\n",
+   "new": ""
+  },
+  {
+   "name": "S71 serve с TSA не включает ожидание первой метки (W-13)",
+   "file": "internal/store/store.go",
+   "old": "\t\ts.needAnchor = s.tsaURL != \"\" || s.tsaLocal != nil\n",
+   "new": ""
+  },
+  {
+   "name": "S72 метка для якоря не ставится, пока он несвеж (W-13)",
+   "file": "internal/store/jobs.go",
+   "old": "\t\tif _, err := s.stampNow(ctx); err != nil {\n\t\t\ts.log.Error(\"tsa stamp\", \"err\", err)\n\t\t}\n\t\tcancel()",
+   "new": "\t\t_ = ctx\n\t\tcancel()"
+  },
+  {
+   "name": "S73 разошедшееся окно не закрывает приём (X-01, Y-01)",
+   "file": "internal/store/store.go",
+   "old": "\treturn lo, hi, hi-lo <= int64(recvWindow)",
+   "new": "\treturn lo, hi, true"
+  },
+  {
+   "name": "S74 якорь не стареет: в простой метка не освежает его (Y-01)",
+   "file": "internal/store/store.go",
+   "old": "\treturn !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2)",
+   "new": "\t_, _ = lo, hi\n\treturn !ok"
+  },
+  {
+   "name": "S75 часы хоста позади окна — без тревоги",
+   "file": "internal/store/store.go",
+   "old": "\t\tcase t < floor-int64(clockSlack):\n\t\t\ts.clockAlarm(",
+   "new": "\t\tcase false && t < floor-int64(clockSlack):\n\t\t\ts.clockAlarm("
+  },
+  {
+   "name": "S76 недоступный резерв ключей при подъёме валит старт (Z-06)",
+   "file": "internal/store/store.go",
+   "old": "\t\tif !errors.Is(err, keyring.ErrBackupPending) {\n\t\t\treturn err\n\t\t}\n\t\ts.log.Warn(\"keyring backup pending at start",
+   "new": "\t\tif true {\n\t\t\treturn err\n\t\t}\n\t\ts.log.Warn(\"keyring backup pending at start"
+  },
+  {
+   "name": "S77 подъём не обрезает цепь по подписанной голове (Z-07)",
+   "file": "internal/store/replica.go",
+   "old": "\tif err := auditchain.TrimToHead(filepath.Join(dataDir, \"chain\"), st.HeadSeq); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "S78 поднятое хранилище пишет копию прежним поколением (Z-08)",
+   "file": "internal/store/replica.go",
+   "old": "[]byte(strconv.FormatUint(free, 10)+\"\\n\")",
+   "new": "[]byte(strconv.FormatUint(gen, 10)+\"\\n\")"
+  },
+  {
+   "name": "S79 куски копии мимо поколения",
+   "file": "internal/store/replica.go",
+   "old": "r.Put(ctx, s.replica.Prefix+chunkKey(name, from, end), data)",
+   "new": "r.Put(ctx, chunkKey(name, from, end), data)"
+  },
+  {
+   "name": "S80 голова копии мимо поколения",
+   "file": "internal/store/replica.go",
+   "old": "r.Put(ctx, s.replica.Prefix+fmt.Sprintf(\"heads/%020d.json\", st.HeadSeq), data)",
+   "new": "r.Put(ctx, fmt.Sprintf(\"heads/%020d.json\", st.HeadSeq), data)"
+  },
+  {
+   "name": "S81 копию, которую data_dir не продолжает, дописывают (Z-09)",
+   "file": "internal/store/replica.go",
+   "old": "\tif err := s.checkReplicaTail(ctx, r, files); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "S82 сверка хвоста копии — по первому куску файла",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\tif c.end > last.end {",
+   "new": "\t\t\tif false && c.end > last.end {"
+  },
+  {
+   "name": "S83 новый номер поколения — мимо недописанных",
+   "file": "internal/store/replica.go",
+   "old": "\t\tfree = max(free, gen+1)",
+   "new": "\t\tfree = max(free, newest+1)"
+  },
+  {
+   "name": "S84 подъём берёт поколение без головы",
+   "file": "internal/store/replica.go",
+   "old": "\t\tif strings.HasPrefix(rel, \"heads/\") && (!ok || gen > newest) {",
+   "new": "\t\tif (rel != \"\" || strings.HasPrefix(rel, \"heads/\")) && (!ok || gen > newest) {"
+  },
+  {
+   "name": "S85 первый проход после запуска не узнаёт своё поколение",
+   "file": "internal/store/replica.go",
+   "old": "\tprefix := genPrefix(gen)\n\tfiles, heads, err := listReplica(ctx, r, prefix)",
+   "new": "\tprefix := genPrefix(gen * 0)\n\tfiles, heads, err := listReplica(ctx, r, prefix)"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

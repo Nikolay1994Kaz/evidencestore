@@ -31,6 +31,13 @@ def run(pkg, only):
     if left:
         sys.exit("в дереве остался мутант — сначала верни код:\n  " + "\n  ".join(left))
     spec = json.loads((SETS / f"{pkg}.json").read_text(encoding="utf-8"))
+    # Без мутантов тесты обязаны быть зелёными: красный тест «ловит» любого
+    # мутанта, и прогон врёт (так было 11.10 со снимком дерева посреди правки).
+    base = subprocess.run(["go", "test", "-race", "-count=1"] + spec["packages"],
+                          cwd=ROOT, capture_output=True, text=True, timeout=600)
+    if base.returncode != 0:
+        fails = [l.strip() for l in (base.stdout + base.stderr).splitlines() if l.startswith("--- FAIL")]
+        sys.exit("тесты красные и без мутантов — прогон не начат: " + ", ".join(dict.fromkeys(fails))[:300])
     caught = survived = broken = 0
     for m in spec["mutations"]:
         name = m["name"]
@@ -55,8 +62,14 @@ def run(pkg, only):
                 broken += 1
                 print(f"НЕ СОБРАЛСЯ {name}")
                 continue
-            r = subprocess.run(["go", "test", "-race", "-count=1"] + spec["packages"],
-                               cwd=ROOT, capture_output=True, text=True, timeout=600)
+            try:
+                r = subprocess.run(["go", "test", "-race", "-count=1"] + spec["packages"],
+                                   cwd=ROOT, capture_output=True, text=True, timeout=600)
+            except subprocess.TimeoutExpired:
+                # Тесты не уложились в 10 минут: мутант их подвесил или
+                # замедлил в разы (R3 — каждый проход копии заново целиком).
+                # Такую регрессию тоже видно — засчитывается как пойманный.
+                r = subprocess.CompletedProcess([], 1, "--- FAIL: таймаут 10 минут", "")
         finally:
             path.write_text(src, encoding="utf-8")
         if r.returncode != 0:

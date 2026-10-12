@@ -17,7 +17,7 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		metrics.One("evidencestore_up", "1 while the store runs", metrics.Gauge, 1),
 		metrics.One("evidencestore_log_failed", "1 when the evidence log or the chain stopped after a write or fsync error; intake is refused until a human intervenes", metrics.Gauge, metrics.Bool(st.LogFailure != "")),
 		metrics.One("evidencestore_chain_failed", "1 when the chain stopped after a write or fsync error; intake is refused until a human intervenes", metrics.Gauge, metrics.Bool(st.ChainFailure != "")),
-		metrics.One("evidencestore_receive_clock_capped_total", "receive times capped because the host clock ran ahead of the last TSA time", metrics.Counter, float64(s.clockCapped.Load())),
+		metrics.One("evidencestore_receive_clock_capped_total", "receive times kept within the TSA window because the host clock ran ahead of TSA time or behind it", metrics.Counter, float64(s.clockCapped.Load())),
 		metrics.One("evidencestore_receive_time_ahead_seconds", "how far the last receive time is ahead of the host clock (an earlier clock jump), 0 if not", metrics.Gauge, s.receiveAhead(now)),
 		metrics.One("evidencestore_log_commits_total", "batches written to the evidence log with fsync", metrics.Counter, float64(ev.Commits)),
 		metrics.One("evidencestore_log_commit_seconds_total", "time spent writing and fsyncing evidence log batches", metrics.Counter, float64(ev.CommitNanos)/1e9),

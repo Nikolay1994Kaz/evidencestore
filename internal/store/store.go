@@ -24,8 +24,7 @@ package store
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/base64"
+	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -63,6 +62,10 @@ var (
 	// номеру. Пачка не принята целиком, событие — в цепи.
 	ErrSeqConflict = errors.New("store: resend under a taken seq refused")
 	ErrClosed      = errors.New("store: closed")
+	// ErrNoAnchor — с TSA приём ждёт свежей метки: без неё время приёма не
+	// удержать между метками (W-13, Y-01). Сборщик держит строки в буфере и
+	// повторит.
+	ErrNoAnchor = errors.New("store: waiting for a fresh TSA time-stamp before accepting records: without it receive times cannot be kept between the time-stamps; is the TSA reachable?")
 	// ErrEvidenceLost — цепь знает улики, которых нет в журнале: журнал
 	// потерял подтверждённые записи. Запускаться в таком состоянии нельзя.
 	ErrEvidenceLost = errors.New("store: chain covers evidence missing from the log")
@@ -86,6 +89,19 @@ type Options struct {
 	// Mono — сколько прошло с открытия по монотонным часам: скачки настенных
 	// часов на них не видны. nil — настоящие; при заданном Now — по нему.
 	Mono func() time.Duration
+	// writeHook (только тесты) зовётся перед копией keyring.dat в резерв:
+	// симуляция снимает здесь диск — так выглядит падение между записью
+	// кейринга и его копией.
+	writeHook func(point string)
+	// evlogSegment, chainSegment (только тесты) — пороги ротации сегментов
+	// журнала улик и файлов листьев цепи: симуляция гоняет ротацию под
+	// падениями. 0 — как в проде.
+	evlogSegment, chainSegment int64
+	// replicaChunk (только тесты) — предел куска копии наружу.
+	replicaChunk int64
+	// wrapRoots (только тесты) оборачивает хранилище корней: симуляция
+	// роняет процесс посреди поворота корня.
+	wrapRoots func(keyring.RootStore) keyring.RootStore
 }
 
 // Store — работающий экземпляр хранилища.
@@ -95,6 +111,12 @@ type Store struct {
 	now    func() time.Time
 	mono   func() time.Duration
 	opened time.Time
+
+	writeHook    func(point string) // Options.writeHook
+	evlogSegment int64              // Options.evlogSegment
+	chainSegment int64              // Options.chainSegment
+	replicaChunk int64              // Options.replicaChunk, без него — replicaChunk
+	wrapRoots    func(keyring.RootStore) keyring.RootStore
 
 	keys     *keyring.Keyring
 	evlog    *evlog.Log
@@ -107,12 +129,19 @@ type Store struct {
 	tsaLocal *tsa.Authority
 	tsaHTTP  *http.Client
 
-	// Якорь часов (под mu): время последней метки TSA этого процесса и
-	// монотонные часы в тот момент. Время приёма не обгоняет «время TSA +
-	// сколько прошло по монотонным часам» больше чем на clockSlack.
+	// Якорь часов (под mu): время последней метки TSA этого процесса,
+	// монотонные часы в момент ответа и сколько шёл ответ. По нему — окно
+	// времени TSA сейчас (anchorWindowLocked).
 	anchorTSA  time.Time
 	anchorMono time.Duration
-	clockAhead bool // часы хоста сейчас впереди якоря (о начале — в журнал один раз)
+	anchorLag  time.Duration // от запроса к TSA до якоря: подпись — где-то в этом окне
+	clockOff   bool          // часы хоста сейчас вне окна (о начале — в журнал один раз)
+	// needAnchor — приём ждёт свежего якоря: TSA настроена, фоновые циклы
+	// работают (serve). Без якоря время приёма не с чем сверить: часы хоста,
+	// убежавшие вперёд до первой метки, давали одной записи время «из
+	// будущего», а монотонность — и всем следующим на всю длину скачка
+	// (W-13).
+	needAnchor bool
 
 	// mu — источники, индекс принятых, часы приёма.
 	mu       sync.Mutex
@@ -218,10 +247,15 @@ func rootStore(cfg *config.Config) keyring.FileRoots {
 	return keyring.FileRoots{Dir: cfg.RootsDir, Mirror: cfg.Keys.RootsMirrorDir}
 }
 
-func keyringOptions(cfg *config.Config, now func() time.Time) keyring.Options {
+func keyringOptions(cfg *config.Config, now func() time.Time, hook func(point string)) keyring.Options {
 	opt := keyring.Options{MinWait: cfg.Keys.MinWait.D(), Now: now}
 	if dir := cfg.Keys.BackupDir; dir != "" {
-		opt.Backup = func(path string, gen uint64) error { return backupFile(path, dir, gen) }
+		opt.Backup = func(path string, gen uint64) error {
+			if hook != nil {
+				hook("keyring backup")
+			}
+			return backupFile(path, dir, gen)
+		}
 	}
 	return opt
 }
@@ -333,7 +367,7 @@ func Init(cfg *config.Config) (publicKey string, err error) {
 			}
 		}
 	}
-	k, err := keyring.Create(cfg.DataDir, rootStore(cfg), keyringOptions(cfg, nil))
+	k, err := keyring.Create(cfg.DataDir, rootStore(cfg), keyringOptions(cfg, nil, nil))
 	if err != nil {
 		return "", err
 	}
@@ -377,6 +411,12 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 		keyLabels: make(map[string]string),
 		stop:      make(chan struct{}),
 		tsaHTTP:   opt.HTTP,
+		writeHook: opt.writeHook,
+
+		evlogSegment: opt.evlogSegment,
+		chainSegment: opt.chainSegment,
+		replicaChunk: cmp.Or(opt.replicaChunk, replicaChunk),
+		wrapRoots:    opt.wrapRoots,
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -407,6 +447,7 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 		return nil, err
 	}
 	if !opt.NoBackground {
+		s.needAnchor = s.tsaURL != "" || s.tsaLocal != nil
 		s.startBackground()
 	}
 	return s, nil
@@ -418,7 +459,11 @@ func (s *Store) open() error {
 	s.chainDir = chainDir
 
 	var err error
-	if s.keys, err = keyring.Open(cfg.DataDir, rootStore(cfg), keyringOptions(cfg, s.now)); err != nil {
+	var roots keyring.RootStore = rootStore(cfg)
+	if s.wrapRoots != nil {
+		roots = s.wrapRoots(roots)
+	}
+	if s.keys, err = keyring.Open(cfg.DataDir, roots, keyringOptions(cfg, s.now, s.writeHook)); err != nil {
 		if errors.Is(err, keyring.ErrNotFound) {
 			return fmt.Errorf("%w (first run: `evidencestore init`; after losing data_dir: put keyring.dat and sign.key back from keys.backup_dir)", err)
 		}
@@ -448,6 +493,9 @@ func (s *Store) open() error {
 	}
 	if s.chain, err = auditchain.Open(chainDir); err != nil {
 		return fmt.Errorf("chain: %w", err)
+	}
+	if s.chainSegment > 0 {
+		s.chain.SetSegmentBytes(s.chainSegment)
 	}
 	s.logChainRecovery(s.chain.Recovery())
 	// Ключ подписи заводит init. Цепь есть, а ключа нет — ключ потерян: новый
@@ -495,7 +543,7 @@ func (s *Store) open() error {
 		}
 		return nil
 	}
-	if s.evlog, err = evlog.Open(evDir, evlog.Options{OnCommit: s.onCommit}, visit); err != nil {
+	if s.evlog, err = evlog.Open(evDir, evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment}, visit); err != nil {
 		return fmt.Errorf("evidence log: %w", err)
 	}
 	if r := s.evlog.Recovery(); r.TornTailBytes > 0 {
@@ -547,7 +595,13 @@ func (s *Store) open() error {
 	}
 	s.appendEvent(auditchain.EventStart, "", "", []byte(s.signer.PublicKeyString()))
 	if err := s.ensureMonthScopes(s.nowTime()); err != nil {
-		return err
+		// Копия в резерв не прошла: ключ заведён, но не выдаётся, пока
+		// обслуживание не повторит копию. Старту это не мешает — как и
+		// недоступное зеркало корней (Z-06).
+		if !errors.Is(err, keyring.ErrBackupPending) {
+			return err
+		}
+		s.log.Warn("keyring backup pending at start: new month keys are not used until the copy succeeds", "err", err)
 	}
 	return s.flush()
 }
@@ -613,10 +667,6 @@ func joinPaths(ps []string) string {
 	}
 	return out
 }
-
-// TSATrust — доверие к службе меток, которым пользуется хранилище. Для
-// встроенной демо-службы — её корень.
-func (s *Store) TSATrust() tsa.Trust { return s.tsaTrust }
 
 // TSARoot — корень встроенной демо-службы (nil для внешней).
 func (s *Store) TSARoot() []byte {
@@ -729,35 +779,69 @@ func backupSigner(cfg *config.Config, chainDir string) error {
 	return nil
 }
 
-// clockSlack — насколько время приёма может обогнать «время последней метки
-// TSA + сколько прошло по монотонным часам»: секундная точность меток, сеть,
-// уход хода.
-const clockSlack = 10 * time.Second
+// Время приёма и якорь TSA.
+//
+// esverify принимает время приёма между T1 − 1 мин и T2 + 1 с, где T1 —
+// метка в цепи перед уликой, T2 — первая после неё, а метки округлены до
+// секунды. Время TSA сейчас хранилище знает с точностью до окна по якорю —
+// последней метке этого процесса и монотонным часам после неё:
+//
+//	lo = метка + ход − 100 ppm                        (не позже времени TSA)
+//	hi = метка + 1 с + задержка ответа + ход + 100 ppm (не раньше его)
+//
+// Время приёма — часы хоста, зажатые в [hi − recvWindow, lo]: не позже
+// времени TSA, значит, не позже T2 + 1 с; не раньше времени TSA минус
+// recvWindow, значит, не раньше T1 − 1 мин (запас — время от взятия
+// времени приёма до листа в цепи, fsync журнала). Окно шире recvWindow
+// (якорь старше ≈суток, ответ TSA шёл слишком долго) удержать нельзя — приём
+// закрыт, пока свежая метка его не сузит; при простое метка ставится раз в
+// anchorRefresh, и якорь не стареет.
+//
+// Раньше якорь старел без предела (метка — только при новых листьях), и
+// каждая постоянная вычета ухода хода рвала одну из границ (W-01, X-01,
+// Y-01); часы хоста, отставшие больше чем на минуту, рвали нижнюю.
+const (
+	recvWindow    = 55 * time.Second
+	anchorRefresh = time.Hour
+	// clockSlack — на сколько часы хоста могут выйти за окно по якорю,
+	// прежде чем это тревога, а не обычное отставание оценки.
+	clockSlack = 10 * time.Second
+	driftPPM   = 10000 // 1/driftPPM — уход монотонных часов, 100 ppm
+)
 
-// clockLocked — время приёма: наши часы, но строго больше прошлого. Часы,
-// прыгнувшие назад, не уводят запись в прошлый (возможно, уже стёртый) месяц.
-// Прыжок вперёд ограничен якорем — последней меткой TSA этого процесса: иначе
-// один прыжок часов на сутки делал все следующие улики «из будущего» (так
-// требует монотонность), и это переживало рестарт.
+// anchorWindowLocked — lo и hi по якорю сейчас (unix-нс); ok — якорь есть и
+// окно не шире recvWindow.
+func (s *Store) anchorWindowLocked() (lo, hi int64, ok bool) {
+	if s.anchorTSA.IsZero() {
+		return 0, 0, false
+	}
+	el := s.mono() - s.anchorMono
+	lo = s.anchorTSA.Add(el - el/driftPPM).UnixNano()
+	run := el + s.anchorLag
+	hi = s.anchorTSA.Add(time.Second + run + run/driftPPM).UnixNano()
+	return lo, hi, hi-lo <= int64(recvWindow)
+}
+
+// clockLocked — время приёма: часы хоста в окне по якорю и строго больше
+// прошлого. Часы, прыгнувшие назад, не уводят запись в прошлый (возможно,
+// уже стёртый) месяц; прыгнувшие вперёд не делают улики «из будущего».
+// Без якоря (TSA не настроена; в serve с TSA приём до якоря закрыт) —
+// часы хоста как есть.
 func (s *Store) clockLocked() int64 {
 	t := s.nowTime().UnixNano()
-	if !s.anchorTSA.IsZero() {
-		// Оценка по якорю — время TSA плюс ход монотонных часов. Часы хоста
-		// впереди неё больше допуска (точность метки, сеть, уход хода 0,1 %)
-		// — им не верим и берём оценку.
-		elapsed := s.mono() - s.anchorMono
-		est := s.anchorTSA.Add(elapsed).UnixNano()
-		if t > est+int64(clockSlack+elapsed/1000) {
-			if !s.clockAhead {
-				s.log.Error("host clock is ahead of TSA time: receive times follow the last time-stamp and the monotonic clock",
-					"ahead", time.Duration(t-est))
-			}
-			s.clockAhead = true
-			s.clockCapped.Add(1)
-			t = est
-		} else {
-			s.clockAhead = false
+	if lo, hi, _ := s.anchorWindowLocked(); hi != 0 {
+		floor := hi - int64(recvWindow)
+		switch {
+		case t > hi+int64(clockSlack):
+			s.clockAlarm("host clock is ahead of TSA time: receive times follow the last time-stamp and the monotonic clock", time.Duration(t-hi))
+		case t < floor-int64(clockSlack):
+			s.clockAlarm("host clock is behind TSA time: receive times follow the last time-stamp and the monotonic clock", time.Duration(floor-t))
+		default:
+			s.clockOff = false
 		}
+		// Окно уже recvWindow — floor ≤ lo; шире (только без фоновых
+		// циклов: в serve приём тогда закрыт) — верхняя граница важнее.
+		t = min(max(t, floor), lo)
 	}
 	if t <= s.lastRecv {
 		t = s.lastRecv + 1
@@ -766,13 +850,43 @@ func (s *Store) clockLocked() int64 {
 	return t
 }
 
-// anchorClock ставит якорь часов по свежей метке TSA.
-func (s *Store) anchorClock(gen time.Time) {
-	s.mu.Lock()
-	s.anchorTSA, s.anchorMono = gen, s.mono()
-	s.mu.Unlock()
+// clockAlarm — часы хоста вне окна по якорю: в журнал один раз на эпизод,
+// счётчик — на каждую запись.
+func (s *Store) clockAlarm(msg string, by time.Duration) {
+	if !s.clockOff {
+		s.log.Error(msg, "by", by)
+	}
+	s.clockOff = true
+	s.clockCapped.Add(1)
 }
 
-func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+// anchored — ErrNoAnchor, пока приём ждёт якоря: в serve с TSA время
+// приёма без свежего якоря не удержать в границах проверки.
+func (s *Store) anchored() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.needAnchor {
+		return nil
+	}
+	if _, _, ok := s.anchorWindowLocked(); !ok {
+		return ErrNoAnchor
+	}
+	return nil
+}
 
-func sum(b []byte) [32]byte { return sha256.Sum256(b) }
+// anchorStale — якорь пора освежить: его нет, он старше anchorRefresh или
+// окно по нему разошлось больше чем на половину recvWindow.
+func (s *Store) anchorStale() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lo, hi, ok := s.anchorWindowLocked()
+	return !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2)
+}
+
+// anchorClock ставит якорь часов по свежей метке TSA: её время и монотонные
+// часы в момент ответа. lag — сколько шёл ответ, от запроса до якоря.
+func (s *Store) anchorClock(gen time.Time, lag time.Duration) {
+	s.mu.Lock()
+	s.anchorTSA, s.anchorMono, s.anchorLag = gen, s.mono(), lag
+	s.mu.Unlock()
+}

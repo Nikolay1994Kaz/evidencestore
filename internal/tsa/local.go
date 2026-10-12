@@ -14,9 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -206,36 +204,6 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 	sd = append(sd, tlv(0x31, si)...)
 	sdType, _ := asn1.Marshal(oidSignedData)
 	return tlv(0x30, append(sdType, tlv(0xA0, tlv(0x30, sd))...)), nil
-}
-
-// ServeHTTP отвечает на запросы RFC 3161, как настоящая служба.
-func (a *Authority) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	var req timeStampReq
-	if _, err := asn1.Unmarshal(body, &req); err != nil || !req.MessageImprint.HashAlgorithm.Algorithm.Equal(oidSHA256) {
-		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}}) // rejection
-		return
-	}
-	token, err := a.Sign(req.MessageImprint.HashedMessage, req.Nonce)
-	if err != nil {
-		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}})
-		return
-	}
-	writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 0}, Token: asn1.RawValue{FullBytes: token}})
-}
-
-func writeResp(w http.ResponseWriter, resp timeStampResp) {
-	der, err := asn1.Marshal(resp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/timestamp-reply")
-	w.Write(der)
 }
 
 // Save кладёт ключ, сертификат и корень службы в каталог (PEM), Load

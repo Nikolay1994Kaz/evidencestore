@@ -57,7 +57,7 @@ func newWorld(t *testing.T) world {
 		}
 		return p
 	}
-	data, _ := b.JSON()
+	data, _ := json.Marshal(b)
 	w.bundle = write("proof.json", data)
 	w.key = write("store.key", []byte(s.PublicKey()))
 	w.trust = write("tsa-root.crt", s.TSARoot())
@@ -115,7 +115,7 @@ func TestBundleWithoutTSAIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.Upper = nil
-	stripped, _ := b.JSON()
+	stripped, _ := json.Marshal(b)
 	os.WriteFile(w.bundle, stripped, 0o600)
 	if code, out := w.run(t); code != exitInvalid {
 		t.Fatalf("без метки TSA: %d\n%s", code, out)

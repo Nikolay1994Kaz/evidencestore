@@ -77,20 +77,6 @@ func dekCommit(id [kekIDSize]byte, dek []byte) [commitSize]byte {
 	return out
 }
 
-// LegacyEnvelope — конверт прежнего формата (EV1): ключ записи в нём не
-// связан с отпечатком улики.
-func LegacyEnvelope(envelope []byte) bool {
-	return len(envelope) >= len(legacyTag) && string(envelope[:len(legacyTag)]) == legacyTag
-}
-
-// wrappedAt — где в конверте начинается обёрнутый DEK.
-func wrappedAt(envelope []byte) int {
-	if LegacyEnvelope(envelope) {
-		return len(legacyTag) + kekIDSize
-	}
-	return len(envelopeTag) + kekIDSize + commitSize
-}
-
 // Unseal вскрывает конверт. Исходы:
 //
 //	ErrKeyDestroyed — ключ уничтожен штатно: запись пропустить;
@@ -129,7 +115,7 @@ func (k *Keyring) UnwrapDEK(envelope []byte) ([]byte, error) {
 	case e.state == Pending:
 		return nil, ErrKeyPending
 	}
-	at := wrappedAt(envelope)
+	at := dekAt
 	if len(envelope) < at {
 		return nil, ErrMalformed
 	}
@@ -142,25 +128,23 @@ func (k *Keyring) UnwrapDEK(envelope []byte) ([]byte, error) {
 
 // OpenWithDEK вскрывает тело конверта ключом записи, без кейринга: так
 // проверяющий читает выданную ему улику офлайн. Ключ записи сверяется с
-// обязательством в конверте (EV2), тег GCM проверяет, что тело не менялось.
+// обязательством в конверте, тег GCM проверяет, что тело не менялось.
 func OpenWithDEK(envelope, dek []byte) ([]byte, error) {
 	id, ok := KEKIDOf(envelope)
 	if !ok || len(dek) != dekSize {
 		return nil, ErrMalformed
 	}
-	if !LegacyEnvelope(envelope) {
-		want := envelope[len(envelopeTag)+kekIDSize:]
-		got := dekCommit(id, dek)
-		if len(want) < commitSize || subtle.ConstantTimeCompare(want[:commitSize], got[:]) != 1 {
-			return nil, fmt.Errorf("%w: record key does not match the commitment in the envelope", ErrMalformed)
-		}
+	want := envelope[len(envelopeTag)+kekIDSize:]
+	got := dekCommit(id, dek)
+	if len(want) < commitSize || subtle.ConstantTimeCompare(want[:commitSize], got[:]) != 1 {
+		return nil, fmt.Errorf("%w: record key does not match the commitment in the envelope", ErrMalformed)
 	}
 	dataAEAD, err := newAEAD(dek)
 	if err != nil {
 		return nil, ErrMalformed
 	}
 	// Обёрнутый DEK пропускаем: nonce(12) | wrappedDEK(48).
-	p := envelope[wrappedAt(envelope):]
+	p := envelope[dekAt:]
 	wrapped := dataAEAD.NonceSize() + dekSize + dataAEAD.Overhead()
 	if len(p) < wrapped {
 		return nil, ErrMalformed
@@ -180,7 +164,7 @@ func KEKIDOf(envelope []byte) ([kekIDSize]byte, bool) {
 	if len(envelope) < len(envelopeTag)+kekIDSize {
 		return id, false
 	}
-	if tag := string(envelope[:len(envelopeTag)]); tag != envelopeTag && tag != legacyTag {
+	if string(envelope[:len(envelopeTag)]) != envelopeTag {
 		return id, false
 	}
 	copy(id[:], envelope[len(envelopeTag):])

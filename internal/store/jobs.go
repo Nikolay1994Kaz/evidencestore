@@ -22,14 +22,11 @@ func (s *Store) startBackground() {
 		}
 	})
 	if s.tsaURL != "" || s.tsaLocal != nil {
-		// Первая метка — сразу после старта: она же якорь часов приёма.
-		s.loopNow(s.cfg.TSA.Every.D(), func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-			if _, err := s.Stamp(ctx); err != nil {
-				s.log.Error("tsa stamp", "err", err)
-			}
-		})
+		// Первая метка — сразу после старта: она же якорь часов приёма, и
+		// до неё приём закрыт (W-13). Якорь держится свежим (keepAnchor).
+		s.loopNow(s.cfg.TSA.Every.D(), s.stampLogged)
+		s.wg.Add(1)
+		go s.keepAnchor()
 	} else {
 		s.log.Warn("no TSA configured (tsa.url): proofs carry no external time-stamp, and esverify rejects them unless told -allow-no-tsa")
 	}
@@ -44,6 +41,48 @@ func (s *Store) startBackground() {
 	}
 	s.loop(time.Minute, func() { s.Maintain(s.nowTime()) })
 	s.loop(10*time.Second, func() { s.CheckSilence(s.nowTime()) })
+}
+
+// anchorRetry — как часто проверять, свеж ли якорь, и повторять метку,
+// пока он не свеж. Переменная — чтобы тесты не ждали.
+var anchorRetry = 10 * time.Second
+
+// stampLogged — метка по расписанию; ошибка — в журнал.
+func (s *Store) stampLogged() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := s.Stamp(ctx); err != nil {
+		s.log.Error("tsa stamp", "err", err)
+	}
+}
+
+// keepAnchor держит якорь часов приёма свежим: якоря нет, он старше
+// anchorRefresh или окно по нему разошлось — метка ставится сейчас, даже
+// если в цепь ничего не легло (простой). Не вышла — повтор через
+// anchorRetry, а не через tsa.every: без свежего якоря приём закрыт.
+// Зовётся с s.wg.Add(1).
+func (s *Store) keepAnchor() {
+	defer s.wg.Done()
+	t := time.NewTicker(anchorRetry)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-t.C:
+		}
+		if !s.anchorStale() {
+			continue
+		}
+		if s.anchored() != nil {
+			s.log.Warn("intake waits for a fresh TSA time-stamp")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		if _, err := s.stampNow(ctx); err != nil {
+			s.log.Error("tsa stamp", "err", err)
+		}
+		cancel()
+	}
 }
 
 func (s *Store) loop(every time.Duration, fn func()) { s.runLoop(every, false, fn) }
@@ -168,6 +207,7 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 		return 0, gen, nil
 	}
 	imprint := proof.HeadImprint(head.Seq, head.Hash)
+	asked := s.mono()
 	var token []byte
 	if s.tsaLocal != nil {
 		token, err = s.tsaLocal.Sign(imprint[:], nil)
@@ -195,7 +235,7 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	s.stampedLeaves = num + 1
 	err = s.flushLocked()
 	s.chainMu.Unlock()
-	s.anchorClock(info.GenTime)
+	s.anchorClock(info.GenTime, s.mono()-asked)
 	s.log.Info("tsa stamp", "head", head.Seq, "gen_time", info.GenTime)
 	return head.Seq, info.GenTime, err
 }

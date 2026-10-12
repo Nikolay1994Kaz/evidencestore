@@ -54,6 +54,11 @@ func TestEpochBindsSource(t *testing.T) {
 		if e != "" && !strings.Contains(err.Error(), "evidencestore sources bind -source abs-core -epoch "+e) {
 			t.Fatalf("в отказе нет команды оператору: %v", err)
 		}
+		// Закреплённая эпоха в отказе работала бы паролем: самозванец
+		// повторил бы запрос с ней.
+		if strings.Contains(err.Error(), epochA) {
+			t.Fatalf("отказ называет закреплённую эпоху: %v", err)
+		}
 	}
 	if err := s.Admit("abs-core", "ABC"); !errors.Is(err, ErrBadRecord) {
 		t.Fatalf("кривая эпоха: %v", err)

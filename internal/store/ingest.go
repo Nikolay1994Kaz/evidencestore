@@ -64,6 +64,9 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	if err := s.Healthy(); err != nil {
 		return nil, err
 	}
+	if err := s.anchored(); err != nil {
+		return nil, err
+	}
 	// Журнал гейтвея — по одной пачке: вердикт записи зависит от предыдущей,
 	// и считать их надо в порядке журнала улик.
 	s.mu.Lock()

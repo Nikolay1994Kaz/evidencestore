@@ -59,9 +59,14 @@ const (
 	kekSize       = 32  // AES-256
 	kekIDSize     = 16
 	dekSize       = 32
-	envelopeTag   = "EV2"
-	legacyTag     = "EV1" // прежний конверт: без обязательства на ключ записи
-	commitSize    = 32
+	// envelopeTag — формат конверта. EV1 (без обязательства на ключ записи)
+	// не читается: записей в нём в обороте не было, а читать его значило
+	// пускать обход V-07 (W-12). Метка не переиспользуется: старый конверт
+	// иначе разбирался бы по новой раскладке.
+	envelopeTag = "EV2"
+	commitSize  = 32
+	// dekAt — где в конверте начинается обёрнутый DEK.
+	dekAt = len(envelopeTag) + kekIDSize + commitSize
 )
 
 // State — состояние ключа скоупа. Значения записываются в файл.
@@ -144,8 +149,6 @@ type Options struct {
 	// уничтожением. Задаётся настройкой, а не тем, кто подаёт заявку: иначе
 	// окно отмены было бы доброй волей заявителя.
 	MinWait time.Duration
-	// Policy решает, хватает ли подтверждений. nil — TwoPeople.
-	Policy Policy
 	// Now — часы для сроков ожидания; nil — time.Now. Нужны тестам.
 	Now func() time.Time
 }
@@ -399,20 +402,6 @@ func (k *Keyring) newRoot() (string, error) {
 	return id, nil
 }
 
-// Scopes возвращает скоупы, ключи которых ещё не уничтожены, в порядке имён.
-func (k *Keyring) Scopes() []string {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-	var out []string
-	for name, e := range k.byName {
-		if e.live() {
-			out = append(out, name)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
 // List возвращает состояние всех ключей, включая надгробия, в порядке имён.
 // По нему движок после рестарта сверяет кейринг с квитанциями в цепи.
 func (k *Keyring) List() []KeyInfo {
@@ -510,6 +499,12 @@ func (k *Keyring) RepairRoots() error {
 	if !ok {
 		return nil
 	}
+	// wmu на весь доклад: иначе поворот корня проходил целиком между
+	// чтением копии в Dir и в Mirror, и корень, уничтоженный после чтения
+	// Dir, записывался обратно в зеркало после квитанции об окончательности
+	// (W-08). Seal wmu не берёт: приём не ждёт.
+	k.wmu.Lock()
+	defer k.wmu.Unlock()
 	k.mu.RLock()
 	if k.closed {
 		k.mu.RUnlock()

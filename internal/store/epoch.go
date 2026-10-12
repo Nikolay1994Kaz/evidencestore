@@ -152,6 +152,11 @@ const maxRefusedEpochs = 16
 // refuseEpoch — отказ установке с чужой эпохой. В журнал и в цепь — один
 // раз на эпоху за время работы процесса: отказанный сборщик
 // останавливается, но повтор не должен засорять цепь.
+//
+// Закреплённая эпоха — только в журнал сервера и в цепь, в ответ её не
+// пишем: в ответе она работала бы паролем. Самозванец с тем же
+// сертификатом повторил бы запрос с ней, и два сборщика пошли бы под одной
+// эпохой (B-03 вернулся бы). Свою эпоху сборщик знает и так.
 func (s *Store) refuseEpoch(st *sourceState, source, epoch, bound string) error {
 	st.epochRefused.Add(1)
 	s.mu.Lock()
@@ -169,11 +174,11 @@ func (s *Store) refuseEpoch(st *sourceState, source, epoch, bound string) error 
 		s.appendJSONEvent(auditchain.EventEpoch, source, "", epochEvent{Epoch: epoch, Bound: bound, Reason: epochRefused})
 	}
 	if epoch == "" {
-		return fmt.Errorf("%w: %s is bound to collector epoch %s, and this collector sends no epoch (older version): upgrade it",
-			ErrEpochMismatch, source, bound)
+		return fmt.Errorf("%w (source %s); this collector sends no epoch (older version): upgrade it",
+			ErrEpochMismatch, source)
 	}
-	return fmt.Errorf("%w: %s is bound to collector epoch %s, this collector is epoch %s; "+
+	return fmt.Errorf("%w (source %s); this collector is epoch %s; "+
 		"if it replaces the bound one (reinstalled, spool_dir lost), accept it on the store host: "+
 		"evidencestore sources bind -source %s -epoch %s",
-		ErrEpochMismatch, source, bound, epoch, source, epoch)
+		ErrEpochMismatch, source, epoch, source, epoch)
 }

@@ -189,13 +189,6 @@ func (s *Store) linkOfLocked(leaf uint64) (linkRef, bool) {
 	return s.links[i], true
 }
 
-// Head — голова цепи.
-func (s *Store) Head() auditchain.Head {
-	s.chainMu.Lock()
-	defer s.chainMu.Unlock()
-	return s.chain.Head()
-}
-
 // Statement — голова, подписанная ключом хранилища.
 func (s *Store) Statement() auditchain.Statement {
 	s.chainMu.Lock()

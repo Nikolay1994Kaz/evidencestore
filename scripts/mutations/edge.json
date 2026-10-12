@@ -17,10 +17,10 @@
    "new": "\t\tClientAuth:   tls.VerifyClientCertIfGiven,"
   },
   {
-   "name": "C1 позиция в файле не восстанавливается из буфера",
+   "name": "C1 место в файле не восстанавливается из буфера",
    "file": "internal/collector/collector.go",
-   "old": "\t\tc.nextSeq, c.pos = last.seq+1, last.pos\n",
-   "new": "\t\tc.nextSeq = last.seq + 1\n"
+   "old": "\t\t\tt.off, t.idle = r.pos.Offset, false\n\t\tcase kindDone:",
+   "new": "\t\t\tt.idle = false\n\t\tcase kindDone:"
   },
   {
    "name": "C2 недописанная строка уходит",
@@ -41,22 +41,22 @@
    "new": "\tif false {"
   },
   {
-   "name": "C5 ротация не замечается",
+   "name": "C5 уход с пути не замечается: тишина не ждёт после ротации (C-01, Y-02)",
    "file": "internal/collector/collector.go",
-   "old": "\tif c.pos.Inode != 0 && (fi == nil || inode(fi) != c.pos.Inode) {",
-   "new": "\tif c.pos.Inode != 0 && fi == nil {"
+   "old": "\t\tcase t.left.IsZero():\n\t\t\tt.left = c.now() // ушёл: приложение пишет в него до HUP\n",
+   "new": "\t\tcase t.left.IsZero():\n"
   },
   {
-   "name": "C6 ротированный файл не дочитывается",
+   "name": "C6 ротированный после перезапуска не ищется по inode",
    "file": "internal/collector/collector.go",
-   "old": "\t\tif old := c.findByInode(c.pos.Inode); old != \"\" {",
-   "new": "\t\tif old := c.findByInode(c.pos.Inode); false && old != \"\" {"
+   "old": "\t\tif path != \"\" {\n\t\t\tf, err := openInode(path, t.ino)",
+   "new": "\t\tif false && path != \"\" {\n\t\t\tf, err := openInode(path, t.ino)"
   },
   {
    "name": "C7 потеря хвоста без пропуска номера",
    "file": "internal/collector/collector.go",
-   "old": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)\n\t\t\tc.nextSeq++\n",
-   "new": "\t\t\tc.log.Error(\"rotated log file is gone, its unread tail is lost; leaving a gap in numbering\", \"file\", c.cfg.File)\n"
+   "old": "\tif gap {\n\t\tc.log.Error(why+",
+   "new": "\tif false && gap {\n\t\tc.log.Error(why+"
   },
   {
    "name": "C8 пачка без предела байтов",
@@ -73,32 +73,32 @@
   {
    "name": "C10 шарды по строке, а не по числу",
    "file": "internal/collector/collector.go",
-   "old": "\t\treturn naturalLess(filepath.Base(out[i].path), filepath.Base(out[j].path))",
-   "new": "\t\treturn filepath.Base(out[i].path) < filepath.Base(out[j].path)"
+   "old": "\t\t\treturn naturalLess(bi, bj)",
+   "new": "\t\t\treturn bi < bj"
   },
   {
-   "name": "C11 подменённый файл с тем же inode не замечается",
+   "name": "C11 подменённый на месте файл (первая строка) не замечается",
    "file": "internal/collector/collector.go",
-   "old": "\treturn err == nil && head != c.head",
-   "new": "\treturn false && err == nil && head != c.head"
+   "old": "\treturn !headMatches(t.f, t.head)\n}",
+   "new": "\treturn false && !headMatches(t.f, t.head)\n}"
   },
   {
-   "name": "C12 следующим берётся последний непрочитанный, а не первый",
+   "name": "C12 файлы читаются от новых к старым",
    "file": "internal/collector/collector.go",
-   "old": "\tfor i, f := range files {\n\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset {",
-   "new": "\tfor i, f := range slices.Backward(files) {\n\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset {"
+   "old": "\t\tif out[i].mtime != out[j].mtime {\n\t\t\treturn out[i].mtime < out[j].mtime\n\t\t}\n\t\tif bi, bj",
+   "new": "\t\tif out[i].mtime != out[j].mtime {\n\t\t\treturn out[i].mtime > out[j].mtime\n\t\t}\n\t\tif bi, bj"
   },
   {
-   "name": "C13 удалённый файл без пропуска номера",
+   "name": "C13 пропавший файл без пропуска номера",
    "file": "internal/collector/collector.go",
-   "old": "\t\t\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n\t\t\t\t\tc.nextSeq++\n",
-   "new": "\t\t\t\t\tc.log.Error(\"current log file is gone, its unread tail is lost; leaving a gap in numbering\", \"glob\", c.cfg.Glob)\n"
+   "old": "c.forget(t, !t.idle, \"log file is gone\")",
+   "new": "c.forget(t, false, \"log file is gone\")"
   },
   {
    "name": "C14 старт не ложится в буфер (A, B)",
    "file": "internal/collector/collector.go",
-   "old": "\tif err := c.appendSpool(recs); err != nil {\n\t\treturn err\n\t}\n\tc.sentPos, c.lastMark = c.spool.Next()-1, c.spool.Next()-1",
-   "new": "\tif err := error(nil); err != nil || recs == nil {\n\t\treturn err\n\t}\n\tc.sentPos, c.lastMark = c.spool.Next()-1, c.spool.Next()-1"
+   "old": "\tif err := c.appendSpool([]spoolRecord{{kind: kindStart, seq: st.LastSeq}}); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
   },
   {
    "name": "C15 позиция куска — начало строки (C)",
@@ -163,26 +163,26 @@
   {
    "name": "C25 файл из прошлого не читается (AD)",
    "file": "internal/collector/collector.go",
-   "old": "\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset {\n\t\t\treturn i",
-   "new": "\t\tif f.ino != c.pos.Inode && f.size > c.files[f.ino].Offset && (c.pos.Inode == 0 || i > slices.IndexFunc(files, func(g globFile) bool { return g.ino == c.pos.Inode })) {\n\t\t\treturn i"
+   "old": "\tif !c.firstPass && f.mtime < newest-int64(c.quietFor) {\n\t\tc.log.Warn(",
+   "new": "\tif !c.firstPass && f.mtime < newest-int64(c.quietFor) {\n\t\tfd.Close()\n\t\tdelete(c.files, f.ino)\n\t\treturn nil, nil\n\t\tc.log.Warn("
   },
   {
-   "name": "C26 дочитанный файл не помнит, докуда прочитан (P)",
+   "name": "C26 снимок реестра не помнит, докуда файл прочитан (P)",
    "file": "internal/collector/collector.go",
-   "old": "\t\tc.files[c.pos.Inode] = fileState{Inode: c.pos.Inode, Offset: c.pos.Offset, MTime: from.mtime, Head: c.head}",
-   "new": "\t\tc.files[c.pos.Inode] = fileState{Inode: c.pos.Inode, Offset: 0, MTime: from.mtime, Head: c.head}"
+   "old": "fileState{Inode: t.ino, Offset: t.off, MTime: t.mtime",
+   "new": "fileState{Inode: t.ino, Offset: 0, MTime: t.mtime"
   },
   {
-   "name": "C27 первый запуск по маске читает старое (A, B)",
+   "name": "C27 первый запуск без from_start читает старое (A, B)",
    "file": "internal/collector/collector.go",
-   "old": "\t\tc.files[f.ino] = fileState{Inode: f.ino, Offset: lastLineEnd(f.path, f.size), MTime: f.mtime, Head: fileHead(f.path)}",
-   "new": "\t\tc.files[f.ino] = fileState{Inode: f.ino, Offset: 0, MTime: f.mtime, Head: fileHead(f.path)}"
+   "old": "\t\t\tt.off = lastLineEnd(f.path, f.size)",
+   "new": "\t\t\tt.off = 0"
   },
   {
    "name": "C28 реестр первого запуска не поднимается из start-files.json",
    "file": "internal/collector/collector.go",
-   "old": "\tif n > 0 && !filesFound {",
-   "new": "\tif false && n > 0 && !filesFound {"
+   "old": "\t\tif startFound, err = readJSON(c.startPath(), &files); err != nil {",
+   "new": "\t\tif startFound, err = true, error(nil); err != nil {"
   },
   {
    "name": "C29 доставленное не удаляется из буфера (P1)",
@@ -233,16 +233,16 @@
    "new": "\"store_key\": \"set\", "
   },
   {
-   "name": "C37 подмена файла на месте не замечается (H, C-02; file и маска)",
+   "name": "C37 обрезанный файл (copytruncate) не замечается по размеру",
    "file": "internal/collector/collector.go",
-   "old": "\tif fi.Size() < c.pos.Offset || c.replacedFD(c.cur) {",
-   "new": "\tif fi.Size() < c.pos.Offset {"
+   "old": "\tif fi.Size() < t.off || c.replaced(t) {",
+   "new": "\tif c.replaced(t) {"
   },
   {
-   "name": "C38 первая строка не запоминается (H)",
+   "name": "C38 первая строка не запоминается (H): нет записи P с первой строкой в пачке со строками",
    "file": "internal/collector/collector.go",
-   "old": "\tc.head = head\n\treturn c.markPos()\n}",
-   "new": "\treturn nil\n}"
+   "old": "\tif t.off == 0 && t.head == \"\" {\n\t\thead, _ = headOf(t.f)",
+   "new": "\tif false && t.off == 0 && t.head == \"\" {\n\t\thead, _ = headOf(t.f)"
   },
   {
    "name": "V3 конфликт номера без кода для сборщика",
@@ -251,64 +251,64 @@
    "new": "\t\tresp.Code = \"\""
   },
   {
-   "name": "C39 ротированный файл бросается, не дождавшись тишины",
+   "name": "C39 ушедший файл закрывается, не дождавшись тишины",
    "file": "internal/collector/collector.go",
-   "old": "\treturn time.Since(c.curGrowth) >= rotateQuiet, nil",
-   "new": "\treturn true, nil"
+   "old": "\treturn !t.growth.IsZero() && now.Sub(t.growth) >= c.quietFor && (t.listed || now.Sub(t.left) >= c.quietFor)",
+   "new": "\treturn now.Before(now.Add(1))"
   },
   {
-   "name": "C40 ротированный файл не дочитывается через дескриптор",
+   "name": "C40 ушедший с пути файл не дочитывается через дескриптор",
    "file": "internal/collector/collector.go",
-   "old": "\tif n, err = c.readFrom(c.cur, quiet); err != nil || !quiet {",
-   "new": "\tif n, err = 0, error(nil); err != nil || !quiet {"
+   "old": "func (c *Collector) readFile(t *tracked) (int, error) {\n\tif t.f == nil {",
+   "new": "func (c *Collector) readFile(t *tracked) (int, error) {\n\tif !t.listed {\n\t\treturn 0, nil\n\t}\n\tif t.f == nil {"
   },
   {
-   "name": "C41 строка без перевода строки в ротированном берётся до тишины",
+   "name": "C41 строка без перевода строки берётся до тишины",
    "file": "internal/collector/collector.go",
-   "old": "\tif n, err = c.readFrom(c.cur, quiet); err != nil || !quiet {",
-   "new": "\tif n, err = c.readFrom(c.cur, true); err != nil || !quiet {"
+   "old": "\tfinal := c.quiet(t) && (!t.listed || (c.cfg.Glob != \"\" && c.newerListed(t)))",
+   "new": "\tfinal := !t.listed || (c.cfg.Glob != \"\" && c.newerListed(t))"
   },
   {
-   "name": "C42 новое место чтения не ложится в буфер (P)",
+   "name": "C42 новый файл не ложится в буфер записью 'P' (Y-03)",
    "file": "internal/collector/collector.go",
-   "old": "\tc.curSize, c.curGrowth = 0, time.Time{}\n\treturn c.markPos()\n}",
-   "new": "\tc.curSize, c.curGrowth = 0, time.Time{}\n\treturn nil\n}"
+   "old": "\tif err := c.mark(t); err != nil {\n\t\tif t.f != nil {",
+   "new": "\tif err := error(nil); err != nil {\n\t\tif t.f != nil {"
   },
   {
-   "name": "C44 удалённый текущий файл (маска) не дочитывается через дескриптор",
+   "name": "C44 удалённый файл не дочитывается через дескриптор",
    "file": "internal/collector/collector.go",
-   "old": "\t\t\t\tif c.cur != nil {\n\t\t\t\t\tn, err := c.readFrom(c.cur, true)",
-   "new": "\t\t\t\tif false {\n\t\t\t\t\tn, err := c.readFrom(c.cur, true)"
+   "old": "\t\tif t.listed || t.f != nil {\n\t\t\tcontinue\n\t\t}",
+   "new": "\t\tif t.listed {\n\t\t\tcontinue\n\t\t}"
   },
   {
-   "name": "C45 файл с чужим inode (маска) не забывается",
+   "name": "C45 файл с чужим inode не узнаётся",
    "file": "internal/collector/collector.go",
-   "old": "\t\tcase !sameHead(f.path, e.Head):",
-   "new": "\t\tcase false:"
+   "old": "&& (f.size != t.off || f.mtime != t.mtime) && !c.same(t, f.path) {",
+   "new": "&& (f.size != t.off || f.mtime != t.mtime) && false && !c.same(t, f.path) {"
   },
   {
-   "name": "C46 первый запуск по файлу не запоминает первую строку",
+   "name": "C46 первый запуск не запоминает первую строку",
    "file": "internal/collector/collector.go",
-   "old": "\t\tc.head = fileHead(c.cfg.File)\n",
-   "new": ""
+   "old": "\t\tt := &tracked{ino: f.ino, path: f.path, head: fileHead(f.path), mtime: f.mtime, birth: birthAt(f.path, f.ino), size: -1}",
+   "new": "\t\tt := &tracked{ino: f.ino, path: f.path, mtime: f.mtime, birth: birthAt(f.path, f.ino), size: -1}"
   },
   {
    "name": "C47 start-files.json не пишется до старта",
    "file": "internal/collector/collector.go",
-   "old": "\tif err := writeJSON(c.startPath(), c.fileList()); err != nil {",
-   "new": "\tif err := error(nil); err != nil {"
+   "old": "\tif err := c.persist(\"start\", func() error { return writeJSON(c.startPath(), c.fileList()) }); err != nil {",
+   "new": "\tif err := c.persist(\"start\", func() error { return nil }); err != nil {"
   },
   {
    "name": "C48 первая строка не поднимается из буфера",
    "file": "internal/collector/collector.go",
-   "old": "\t\t\tc.head, headIno = string(r.body), r.pos.Inode\n",
-   "new": "\t\t\t_ = headIno\n"
+   "old": "\t\t\t\tt.off, t.head, t.idle = r.pos.Offset, parts[0], false",
+   "new": "\t\t\t\tt.off, t.idle = r.pos.Offset, false"
   },
   {
-   "name": "C49 подмена на месте под маской принимается за пропавший файл (дубль, без пропуска)",
+   "name": "C49 подменённый на месте читается со старого места (дубль, без пропуска)",
    "file": "internal/collector/collector.go",
-   "old": "\t\t\tif cur < 0 || c.cur == nil {",
-   "new": "\t\t\tif cur < 0 || c.cur == nil || !sameHead(files[cur].path, c.head) {"
+   "old": "\t\tt.off, t.head = 0, \"\"\n\t\tif err := c.mark(t); err != nil { // пропуск — в той же записи",
+   "new": "\t\tt.head = \"\"\n\t\tif err := c.mark(t); err != nil { // пропуск — в той же записи"
   },
   {
    "name": "C50 причина конфликта от хранилища не доходит (G-05)",
@@ -351,6 +351,90 @@
    "file": "internal/collector/collector.go",
    "old": "&& e.Code == codeEpochMismatch {",
    "new": "&& false {"
+  },
+  {
+   "name": "C58 чтение ждёт паузы отправки (W-03)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tcase <-time.After(c.cfg.FlushEvery.D()):",
+   "new": "\t\tcase <-time.After(max(c.cfg.FlushEvery.D(), time.Until(sendAt))):"
+  },
+  {
+   "name": "C60 устаревший листинг — «файл пропал» (W-06)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif f == nil {\n\t\t\treturn 0, nil // переименован после листинга: найдётся в следующий раз\n\t\t}",
+   "new": "\t\tif f == nil {\n\t\t\treturn 0, c.forget(t, true, \"log file is gone\")\n\t\t}"
+  },
+  {
+   "name": "C64 ошибка открытия нового файла обрывает проход (X-03)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tc.warnMissing(\"log file cannot be opened: \"+err.Error(), f.path)\n\t\tt.birth = birthAt(f.path, f.ino)",
+   "new": "\t\treturn nil, err"
+  },
+  {
+   "name": "C65 рождение файла не сверяется: чужой файл с тем же inode — свой",
+   "file": "internal/collector/collector.go",
+   "old": "\tif b := birthOf(f); t.birth != 0 && b != 0 {\n\t\treturn b == t.birth\n",
+   "new": "\tif b := birthOf(f); t.birth != 0 && b != 0 {\n\t\treturn b == t.birth || b != 0\n"
+  },
+  {
+   "name": "C66 снимок реестра не пишется перед освобождением буфера",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif err := c.saveFiles(); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif err := c.spool.Release(c.sentPos); err != nil {",
+   "new": "\t\tif err := c.spool.Release(c.sentPos); err != nil {"
+  },
+  {
+   "name": "C67 запись 'D' не ложится в буфер: пропуск номера и дочитанность не переживают падения",
+   "file": "internal/collector/collector.go",
+   "old": "\tif err := c.appendSpool([]spoolRecord{{kind: kindDone, seq: c.nextSeq - 1, pos: filePos{t.ino, t.off}}}); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "C68 закрытый файл под маской не открывается снова, когда дорос",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tif !t.listed || (c.cfg.Glob != \"\" && t.lsize == t.off) {",
+   "new": "\t\tif !t.listed || c.cfg.Glob != \"\" {"
+  },
+  {
+   "name": "C69 неоткрываемый ушедший файл обрывает проход (Z-01)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t\t\t\tt.path = path\n\t\t\t\t\tc.warnMissing(\"log file cannot be opened: \"+err.Error(), path)\n\t\t\t\t\tcontinue",
+   "new": "\t\t\t\t\treturn err"
+  },
+  {
+   "name": "C70 неоткрытый новый файл не вносится в реестр (Z-02)",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tc.warnMissing(\"log file cannot be opened: \"+err.Error(), f.path)\n\t\tt.birth = birthAt(f.path, f.ino)",
+   "new": "\t\tc.warnMissing(\"log file cannot be opened: \"+err.Error(), f.path)\n\t\treturn nil, nil"
+  },
+  {
+   "name": "C71 листинг маски глотает ошибку чтения каталога (Z-03)",
+   "file": "internal/collector/collector.go",
+   "old": "\tentries, err := os.ReadDir(dir)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tvar out []globFile",
+   "new": "\tentries, _ := os.ReadDir(dir)\n\tvar out []globFile"
+  },
+  {
+   "name": "C72 неудачный листинг читается как «файлов нет» (Z-03)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif listErr == nil {\n\t\tif err := c.reconcile(seen); err != nil {",
+   "new": "\tif true {\n\t\tif err := c.reconcile(seen); err != nil {"
+  },
+  {
+   "name": "C73 нечитаемый каталог — ротированный файл «пропал» (Z-03)",
+   "file": "internal/collector/collector.go",
+   "old": "\tentries, err := os.ReadDir(dir)\n\tif err != nil {\n\t\treturn \"\", err\n\t}",
+   "new": "\tentries, err := os.ReadDir(dir)\n\tif err != nil {\n\t\treturn \"\", nil\n\t}"
+  },
+  {
+   "name": "C74 рождение по пути не сверяется: неоткрываемый чужой файл на inode — свой (Z-04)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif b := birthAt(path, t.ino); t.birth != 0 && b != 0 {\n\t\treturn b == t.birth\n",
+   "new": "\tif b := birthAt(path, t.ino); t.birth != 0 && b != 0 {\n\t\treturn true\n"
+  },
+  {
+   "name": "C75 маска с подстановкой в каталоге принимается",
+   "file": "internal/collector/collector.go",
+   "old": "\t\t} else if strings.ContainsAny(filepath.Dir(c.Glob), `*?[\\`) {",
+   "new": "\t\t} else if false {"
   }
  ],
  "note": "V3 (имя из сертификата не сверяется с реестром на входе) снят как равносильный: store.Ingest и store.LastSeq сами отказывают неизвестному источнику (ErrUnknownSource → 403)."

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1177,4 +1178,30 @@ func TestCompleteDueAtUsesGivenTime(t *testing.T) {
 	if err != nil || len(out) != 1 || out[0].State != Destroyed || !out[0].DestroyedAt.Equal(c.t.Add(-30*time.Minute)) {
 		t.Fatalf("после срока: %+v, %v", out, err)
 	}
+}
+
+// Обёртки только для тестов: продукт зовёт ScheduleDestroyFrom и
+// CompleteDueAt со временем, которому верит (метка TSA), а состояние ключей
+// берёт из List.
+
+// ScheduleDestroy — ScheduleDestroyFrom от часов кейринга.
+func (k *Keyring) ScheduleDestroy(scope string, wait time.Duration, approvals []Approval) (KeyInfo, error) {
+	return k.ScheduleDestroyFrom(scope, k.now(), wait, approvals)
+}
+
+// CompleteDue — CompleteDueAt по часам кейринга.
+func (k *Keyring) CompleteDue() ([]KeyInfo, error) { return k.CompleteDueAt(k.now()) }
+
+// Scopes возвращает скоупы, ключи которых ещё не уничтожены, в порядке имён.
+func (k *Keyring) Scopes() []string {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	var out []string
+	for name, e := range k.byName {
+		if e.live() {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

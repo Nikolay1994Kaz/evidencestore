@@ -149,8 +149,8 @@ func TestSealBodyLimits(t *testing.T) {
 	if _, err := big.Seal(k); err == nil {
 		t.Error("sealed an oversized body")
 	}
-	if scopes := k.Scopes(); len(scopes) != 0 {
-		t.Fatalf("invalid records created keys: %v", scopes)
+	if keys := k.List(); len(keys) != 0 {
+		t.Fatalf("invalid records created keys: %v", keys)
 	}
 
 	// Тело ровно на пределе проходит: запаса хватает на служебные поля конверта.
@@ -173,10 +173,11 @@ func destroy(t *testing.T, k *keyring.Keyring, scope string) {
 		t.Fatal(err)
 	}
 	approvals := []keyring.Approval{{Who: "operator"}, {Who: "security"}}
-	if _, err := k.ScheduleDestroy(scope, 0, approvals); err != nil {
+	now := time.Now()
+	if _, err := k.ScheduleDestroyFrom(scope, now, 0, approvals); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := k.CompleteDue(); err != nil {
+	if _, err := k.CompleteDueAt(now); err != nil {
 		t.Fatal(err)
 	}
 }

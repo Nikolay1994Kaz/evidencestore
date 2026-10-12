@@ -164,8 +164,8 @@ func TestWaitLimitAndTimeRange(t *testing.T) {
 func TestDEKCommitment(t *testing.T) {
 	k, _, _ := newRing(t, Options{})
 	env := seal(t, k, "a", "the real body")
-	if LegacyEnvelope(env) {
-		t.Fatal("Seal пишет старый формат")
+	if string(env[:len(envelopeTag)]) != envelopeTag {
+		t.Fatal("Seal пишет не EV2")
 	}
 	dek, err := k.UnwrapDEK(env)
 	if err != nil {
@@ -178,9 +178,83 @@ func TestDEKCommitment(t *testing.T) {
 	other := bytes.Repeat([]byte{7}, dekSize)
 	aead, _ := newAEAD(other)
 	id, _ := KEKIDOf(env)
-	forged := append([]byte(nil), env[:wrappedAt(env)+12+dekSize+16]...)
+	forged := append([]byte(nil), env[:dekAt+12+dekSize+16]...)
 	forged = appendSealed(forged, aead, []byte("another body"), id[:])
 	if _, err := OpenWithDEK(forged, other); err == nil {
 		t.Fatal("ключ записи, не сходящийся с обязательством, открыл тело")
+	}
+}
+
+// W-12: конверт прежнего формата EV1 (без обязательства на ключ записи) не
+// читается. Иначе нечестное хранилище запечатывало бы записи по-старому и
+// обходило V-07: двум проверяющим — два ключа записи, два тела, оба
+// «проверено». Конверт EV1 здесь — настоящий EV2 с вырезанным
+// обязательством: ключ записи тот же, тело то же.
+func TestLegacyEnvelopeRejected(t *testing.T) {
+	k, _, _ := newRing(t, Options{})
+	env := seal(t, k, "a", "the real body")
+	dek, err := k.UnwrapDEK(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := len(envelopeTag) + kekIDSize
+	legacy := append([]byte("EV1"), env[len(envelopeTag):head]...)
+	legacy = append(legacy, env[head+commitSize:]...)
+	if _, ok := KEKIDOf(legacy); ok {
+		t.Error("конверт EV1 распознан")
+	}
+	if body, err := OpenWithDEK(legacy, dek); err == nil {
+		t.Errorf("конверт EV1 вскрыт ключом записи: %q", body)
+	}
+	if body, err := k.Unseal(legacy); err == nil {
+		t.Errorf("конверт EV1 вскрыт кейрингом: %q", body)
+	}
+}
+
+// pausingRoots — FileRoots, у которого RepairRoots стоит, пока тест не
+// отпустит: окно между чтением копий корня в Dir и в Mirror.
+type pausingRoots struct {
+	FileRoots
+	entered, release chan struct{}
+}
+
+func (p pausingRoots) RepairRoots(ids []string) error {
+	p.entered <- struct{}{}
+	<-p.release
+	return p.FileRoots.RepairRoots(ids)
+}
+
+// W-08: доклад копий корня и изменения кейринга не перемежаются. Иначе
+// поворот корня (keys complete) проходил целиком между чтением копии в Dir
+// и в Mirror, и уничтоженный корень записывался обратно в зеркало после
+// квитанции destroyed-effective. Изменение (здесь — заведение скоупа: тот
+// же замок wmu, что у поворота) ждёт, пока доклад не кончится.
+func TestRepairRootsExcludesKeyringChanges(t *testing.T) {
+	roots := pausingRoots{
+		FileRoots: FileRoots{Dir: t.TempDir(), Mirror: t.TempDir()},
+		entered:   make(chan struct{}), release: make(chan struct{}),
+	}
+	k, err := Create(t.TempDir(), roots, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	repaired := make(chan error, 1)
+	go func() { repaired <- k.RepairRoots() }()
+	<-roots.entered
+	changed := make(chan error, 1)
+	go func() { changed <- k.EnsureScopes("b") }()
+	select {
+	case err := <-changed:
+		close(roots.release)
+		t.Fatalf("кейринг изменился посреди доклада копий корня (err=%v)", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(roots.release)
+	if err := <-repaired; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-changed; err != nil {
+		t.Fatal(err)
 	}
 }

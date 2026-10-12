@@ -187,8 +187,8 @@
   {
    "name": "M31 отмена без подтверждения",
    "file": "internal/keyring/lifecycle.go",
-   "old": "\tif _, err := k.approve(OpCancelDestroy, e, approvals); err != nil {",
-   "new": "\tif _, err := k.approve(OpCancelDestroy, e, approvals); err != nil && false {"
+   "old": "\tif _, err := approve(OpCancelDestroy, approvals); err != nil {",
+   "new": "\tif _, err := approve(OpCancelDestroy, approvals); err != nil && false {"
   },
   {
    "name": "M32 уничтожение не ждёт срока",
@@ -355,14 +355,26 @@
   {
    "name": "K8 ключ записи не сверяется с обязательством",
    "file": "internal/keyring/envelope.go",
-   "old": "\tif !LegacyEnvelope(envelope) {\n\t\twant := envelope[len(envelopeTag)+kekIDSize:]",
-   "new": "\tif false {\n\t\twant := envelope[len(envelopeTag)+kekIDSize:]"
+   "old": "\tif len(want) < commitSize || subtle.ConstantTimeCompare(want[:commitSize], got[:]) != 1 {",
+   "new": "\tif len(want) < commitSize && subtle.ConstantTimeCompare(want[:commitSize], got[:]) != 1 {"
   },
   {
    "name": "K9 пропавший каталог корней создаётся заново",
    "file": "internal/keyring/rootfile.go",
    "old": "\t\tif err != nil {\n\t\t\treturn fmt.Errorf(\"keyring root copies: %s: %w (is the disk mounted?)\", dir, err)\n\t\t}",
    "new": "\t\tif err != nil {\n\t\t\tos.MkdirAll(dir, 0o700)\n\t\t}"
+  },
+  {
+   "name": "K10 доклад копий корня без замка wmu (W-08)",
+   "file": "internal/keyring/keyring.go",
+   "old": "\t// (W-08). Seal wmu не берёт: приём не ждёт.\n\tk.wmu.Lock()\n\tdefer k.wmu.Unlock()\n",
+   "new": "\t// (W-08). Seal wmu не берёт: приём не ждёт.\n"
+  },
+  {
+   "name": "K11 конверт EV1 снова распознаётся (W-12)",
+   "file": "internal/keyring/envelope.go",
+   "old": "\tif string(envelope[:len(envelopeTag)]) != envelopeTag {",
+   "new": "\tif t := string(envelope[:len(envelopeTag)]); t != envelopeTag && t != \"EV1\" {"
   }
  ]
 }

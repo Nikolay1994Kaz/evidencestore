@@ -34,8 +34,23 @@ import (
 // Докуда доехала копия, знает сама копия: первый проход после запуска берёт
 // смещения из её листинга, дальше они живут в памяти. Своего файла
 // состояния нет: файл, откатившийся после сбоя, слал бы куски внахлёст.
+// Тот же первый проход сверяет с data_dir последний кусок новейших файлов
+// копии: копию, которая не начало файлов data_dir, хранилище не дописывает
+// (Z-09) — data_dir потерял уже скопированное (диск соврал про fsync) или
+// копию писал не он, и байты с её смещений с её кусками не стыковались бы.
+//
+// ПОКОЛЕНИЯ. Хранилище, поднятое из копии, пишет её дальше не в прежние
+// ключи, а новым поколением в gen/<номер>/, целиком с нуля (Z-08). Подъём
+// отрезает хвост прерванного прохода копии, который не заверен подписанной
+// головой (Z-07), а старт — оборванную запись журнала улик; с отрезанного
+// места поднятое хранилище пишет уже другие байты, а в копии там лежит
+// мёртвый хвост. Номер поколения подъём кладёт в data_dir
+// (replica-generation); прежние поколения остаются как были. Подъём берёт
+// новейшее поколение с подписанной головой: поколение, чей первый проход не
+// дошёл до головы, пропускается.
 
 type replicaState struct {
+	Prefix  string // поколение, в которое пишет хранилище: "" (первое) или gen/<номер>/
 	Offsets map[string]int64
 	Head    uint64
 }
@@ -89,11 +104,19 @@ func (s *Store) loadReplicaState(ctx context.Context, r ship.Remote) error {
 	if s.replica != nil {
 		return nil
 	}
-	files, heads, err := listReplica(ctx, r)
+	gen, err := readGeneration(s.cfg.DataDir)
 	if err != nil {
 		return err
 	}
-	st := &replicaState{Offsets: map[string]int64{}}
+	prefix := genPrefix(gen)
+	files, heads, err := listReplica(ctx, r, prefix)
+	if err != nil {
+		return err
+	}
+	if err := s.checkReplicaTail(ctx, r, files); err != nil {
+		return err
+	}
+	st := &replicaState{Prefix: prefix, Offsets: map[string]int64{}}
 	for name, chunks := range files {
 		for _, c := range chunks {
 			st.Offsets[name] = max(st.Offsets[name], c.end)
@@ -106,9 +129,96 @@ func (s *Store) loadReplicaState(ctx context.Context, r ship.Remote) error {
 	return nil
 }
 
-// headSeqOf — номер головы из имени heads/<номер>.json.
+// ErrReplicaDiverged — копия не начало файлов data_dir: дописывать её нельзя.
+var ErrReplicaDiverged = errors.New("replica: the copy is not where data_dir left it")
+
+const divergedHint = "data_dir lost data after it was copied (a disk that lied about fsync?) or did not write this copy: restore from the copy into an empty data_dir, or point replica.url at a new location (the old copy stays as evidence)"
+
+// checkReplicaTail сверяет с data_dir последний кусок новейшего файла
+// каждого вида в копии. Разойтись файлы могли только в хвосте: закрытые
+// сегменты не меняются.
+func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[string][]chunk) error {
+	newest := map[string]string{}
+	for name := range files {
+		kind := name
+		if strings.HasPrefix(name, "evidence/") {
+			kind = "evidence/"
+		} else if strings.HasPrefix(name, "chain/leaves_") {
+			kind = "chain/leaves_"
+		}
+		newest[kind] = max(newest[kind], name)
+	}
+	for _, name := range newest {
+		last := files[name][0]
+		for _, c := range files[name] {
+			if c.end > last.end {
+				last = c
+			}
+		}
+		copied, err := r.Get(ctx, last.key)
+		if err != nil {
+			return err
+		}
+		local, err := readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(name)), last.start, last.end)
+		if err != nil || !bytes.Equal(local, copied) {
+			return fmt.Errorf("%w: its %s holds bytes %d-%d that data_dir lacks or has otherwise; %s", ErrReplicaDiverged, name, last.start, last.end, divergedHint)
+		}
+	}
+	return nil
+}
+
+// headSeqOf — номер головы из имени …heads/<номер>.json.
 func headSeqOf(key string) (uint64, error) {
-	return strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(key, "heads/"), ".json"), 10, 64)
+	return strconv.ParseUint(strings.TrimSuffix(path.Base(key), ".json"), 10, 64)
+}
+
+// genPrefix — где в копии лежит поколение gen: первое — в корне, следующие
+// — в gen/<номер>/.
+func genPrefix(gen uint64) string {
+	if gen == 0 {
+		return ""
+	}
+	return fmt.Sprintf("gen/%020d/", gen)
+}
+
+// generationFile — номер поколения копии, в которое пишет хранилище,
+// поднятое из копии (кладёт RestoreReplica). Нет файла — первое поколение.
+const generationFile = "replica-generation"
+
+func readGeneration(dataDir string) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(dataDir, generationFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	gen, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("replica: bad %s: %w", generationFile, err)
+	}
+	return gen, nil
+}
+
+// generations — поколения копии: новейшее, в котором есть подписанная
+// голова, и первый свободный номер.
+func generations(keys []string) (newest, free uint64, ok bool) {
+	for _, k := range keys {
+		gen, rel := uint64(0), k
+		if rest, found := strings.CutPrefix(k, "gen/"); found {
+			n, after, _ := strings.Cut(rest, "/")
+			g, err := strconv.ParseUint(n, 10, 64)
+			if err != nil || g == 0 {
+				continue // чужие объекты в бакете не наши
+			}
+			gen, rel = g, after
+		}
+		free = max(free, gen+1)
+		if strings.HasPrefix(rel, "heads/") && (!ok || gen > newest) {
+			newest, ok = gen, true
+		}
+	}
+	return newest, free, ok
 }
 
 // ShipOnce дотягивает копию: новые байты каждого файла и подписанную
@@ -150,16 +260,16 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 		if size < from {
 			// Файл стал короче отправленного: так бывает, только если его
 			// обрезали. Молча догонять нельзя — кусок в копии уже другой.
-			return total, fmt.Errorf("replica: %s is %d bytes, %d already copied — file was truncated", name, size, from)
+			return total, fmt.Errorf("%w: %s is %d bytes, %d already copied — file was truncated; %s", ErrReplicaDiverged, name, size, from, divergedHint)
 		}
 		local := filepath.Join(s.cfg.DataDir, filepath.FromSlash(name))
 		for from < size {
-			end := min(size, from+replicaChunk)
+			end := min(size, from+s.replicaChunk)
 			data, err := readRange(local, from, end)
 			if err != nil {
 				return total, err
 			}
-			if err := r.Put(ctx, chunkKey(name, from, end), data); err != nil {
+			if err := r.Put(ctx, s.replica.Prefix+chunkKey(name, from, end), data); err != nil {
 				return total, err
 			}
 			total += end - from
@@ -169,7 +279,7 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 	}
 	if st := snap.head; st.HeadSeq > s.replica.Head {
 		data, _ := st.JSON()
-		if err := r.Put(ctx, fmt.Sprintf("heads/%020d.json", st.HeadSeq), data); err != nil {
+		if err := r.Put(ctx, s.replica.Prefix+fmt.Sprintf("heads/%020d.json", st.HeadSeq), data); err != nil {
 			return total, err
 		}
 		s.replica.Head = st.HeadSeq
@@ -177,6 +287,7 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 	return total, nil
 }
 
+// replicaChunk — предел куска копии (Options.replicaChunk в тестах).
 const replicaChunk = 16 << 20
 
 func chunkKey(name string, from, end int64) string {
@@ -201,20 +312,32 @@ type chunk struct {
 	start, end int64
 }
 
-// listReplica разбирает копию: куски по файлам (по порядку) и головы.
-func listReplica(ctx context.Context, r ship.Remote) (map[string][]chunk, []string, error) {
-	keys, err := r.List(ctx, "")
+// listReplica разбирает поколение копии под prefix: куски по файлам (по
+// порядку) и головы.
+func listReplica(ctx context.Context, r ship.Remote, prefix string) (map[string][]chunk, []string, error) {
+	keys, err := r.List(ctx, prefix)
 	if err != nil {
 		return nil, nil, err
 	}
+	return parseReplica(keys, prefix)
+}
+
+// parseReplica разбирает ключи поколения prefix: имена файлов — без prefix,
+// ключи кусков и голов — полные. Ключи других поколений пропускаются (у
+// первого поколения — как чужие: не под evidence/, chain/ или heads/).
+func parseReplica(keys []string, prefix string) (map[string][]chunk, []string, error) {
 	files := map[string][]chunk{}
 	var heads []string
 	for _, k := range keys {
-		if strings.HasPrefix(k, "heads/") {
+		rel, ok := strings.CutPrefix(k, prefix)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(rel, "heads/") {
 			heads = append(heads, k)
 			continue
 		}
-		dir, base := path.Split(k)
+		dir, base := path.Split(rel)
 		se := strings.SplitN(base, "-", 2)
 		if len(se) != 2 || (!strings.HasPrefix(dir, "evidence/") && !strings.HasPrefix(dir, "chain/")) {
 			continue // чужие объекты в бакете не наши
@@ -239,6 +362,9 @@ type RestoreReport struct {
 	Files   int
 	Bytes   int64
 	HeadSeq uint64
+	// Generation — поколение копии, из которого собрано; NextGeneration —
+	// поколение, которым поднятое хранилище пишет копию дальше.
+	Generation, NextGeneration uint64
 }
 
 // RestoreReplica собирает журнал улик и цепь из копии в пустой каталог
@@ -257,12 +383,17 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 			return rep, fmt.Errorf("replica restore: %s is not empty — refusing to overwrite", filepath.Join(dataDir, sub))
 		}
 	}
-	files, heads, err := listReplica(ctx, r)
+	keys, err := r.List(ctx, "")
 	if err != nil {
 		return rep, err
 	}
-	if len(heads) == 0 {
+	gen, free, ok := generations(keys)
+	if !ok {
 		return rep, errors.New("replica restore: no signed head in the copy")
+	}
+	files, heads, err := parseReplica(keys, genPrefix(gen))
+	if err != nil {
+		return rep, err
 	}
 	for name, chunks := range files {
 		var data []byte
@@ -330,7 +461,17 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 	if auditchain.EncodeHash(head.Hash) != st.HeadHash {
 		return rep, errors.New("replica restore: chain in the copy does not match its signed head — copy was altered")
 	}
-	rep.HeadSeq = st.HeadSeq
+	// Цепь — ровно по подписанной голове: хвост прерванного прохода копии
+	// голова не заверяет (Z-07). Улики после неё подъём досчитает в цепь по
+	// журналу улик.
+	if err := auditchain.TrimToHead(filepath.Join(dataDir, "chain"), st.HeadSeq); err != nil {
+		return rep, fmt.Errorf("replica restore: %w", err)
+	}
+	// Дальше копию пишет новое поколение (Z-08).
+	if err := writeAtomic(filepath.Join(dataDir, generationFile), []byte(strconv.FormatUint(free, 10)+"\n")); err != nil {
+		return rep, err
+	}
+	rep.HeadSeq, rep.Generation, rep.NextGeneration = st.HeadSeq, gen, free
 	return rep, nil
 }
 

@@ -56,6 +56,24 @@
    "file": "internal/auditchain/carrier.go",
    "old": "\tif err = c.recover(); err != nil {\n\t\tc.closeFiles()",
    "new": "\tif err = c.recover(); err != nil {\n\t\tc.Close()"
+  },
+  {
+   "name": "A10 обрезка не трогает звенья после головы (Z-07)",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\tif err := truncateTo(path, int64(off)); err != nil {\n\t\treturn err\n\t}\n\tsegs, err := leafSegments(dir)",
+   "new": "\tif err := error(nil); err != nil {\n\t\treturn err\n\t}\n\tsegs, err := leafSegments(dir)"
+  },
+  {
+   "name": "A11 последний нужный файл листьев не обрезается",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\t\t\tif err := truncateTo(lp, int64(loff)); err != nil {",
+   "new": "\t\t\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "A12 обрезка оставляет на лист больше",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\t\t\tfor k := first; k < covered; k++ {",
+   "new": "\t\t\tfor k := first; k <= covered; k++ {"
   }
  ]
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -225,6 +226,242 @@ func TestReplicaInterruptedPassRestores(t *testing.T) {
 	}
 }
 
+// Z-07: проход копии прервался между звеньями и листьями цепи. В копии не
+// бывает звеньев над листьями, которых в ней нет: листья уезжают раньше
+// chain.log — в том же порядке, в каком цепь пишет сама. Раньше chain.log
+// уезжал первым (по алфавиту), и копия, прерванная на листьях, не
+// поднималась: «звено покрывает лист N, а в файлах листьев их M» (нашла
+// симуляция с падениями).
+func TestReplicaInterruptedBetweenLinksAndLeaves(t *testing.T) {
+	c := newClock()
+	cfg, remote := replicaConfig(t)
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(context.Background(), remote); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 4, 6)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(context.Background(), failingRemote{remote, "chain/leaves_"}); err == nil {
+		t.Fatal("отказ копии не сработал")
+	}
+	s.Close()
+	s2, err := restoreCopy(t, cfg, s, remote, c)
+	if err != nil {
+		t.Fatalf("восстановление после прохода, прерванного на листьях: %v", err)
+	}
+	defer s2.Close()
+	if _, err := s2.Proof("abs-core", 3, false); err != nil {
+		t.Fatalf("доехавшая улика: %v", err)
+	}
+}
+
+// Z-08: подъём из копии с прерванным проходом отрезает хвост (Z-07), а
+// поднятое хранилище пишет ту же копию дальше — следующий подъём из неё
+// обязан пройти. Раньше оно дописывало копию с отрезанного места: отправка
+// отказывала («file was truncated»), пока файл не дорастал до мёртвого
+// хвоста копии, а потом молча слала байты, которые с ним не стыкуются.
+func TestRestoredStoreContinuesCopy(t *testing.T) {
+	c := newClock()
+	cfg, remote := replicaConfig(t)
+	s := openStore(t, cfg, c)
+	ctx := context.Background()
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 4, 6)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, failingRemote{remote, "chain/leaves_"}); err == nil {
+		t.Fatal("отказ копии не сработал")
+	}
+	s.Close()
+	s2, err := restoreCopy(t, cfg, s, remote, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Цепь поднятого дорастает за мёртвый хвост копии.
+	for q := uint64(7); q <= 30; q++ {
+		ingest(t, s2, "abs-core", q, q)
+		mustStamp(t, s2)
+	}
+	if _, err := s2.ShipOnce(ctx, remote); err != nil {
+		t.Fatalf("копия после подъёма: %v", err)
+	}
+	s2.Close()
+	s3, err := restoreCopy(t, cfg, s2, remote, c)
+	if err != nil {
+		t.Fatalf("второй подъём из копии: %v", err)
+	}
+	defer s3.Close()
+	for _, q := range []uint64{3, 6, 30} {
+		if _, err := s3.Proof("abs-core", q, false); err != nil {
+			t.Fatalf("улика %d после второго подъёма: %v", q, err)
+		}
+	}
+}
+
+// Z-09: data_dir потерял уже скопированное (диск соврал про fsync) и пишет
+// журнал дальше. Копию с её смещений дописывать нельзя: байты не стыкуются
+// с её кусками. Раньше отправка отказывала, только пока файл был короче
+// скопированного, а дорастя — молча слала чужие байты, и копия переставала
+// собираться.
+func TestShipRefusesDataDirBehindCopy(t *testing.T) {
+	c := newClock()
+	cfg, remote := replicaConfig(t)
+	s := openStore(t, cfg, c)
+	ctx := context.Background()
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 4, 5) // в журнале, в цепь ещё не легли
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	lied := copyDirs(t, cfg) // диск в момент отказа питания
+	s.Close()
+	// Диск соврал: последней записи журнала, уже скопированной, на нём нет.
+	evDir, _, _ := dirs(lied)
+	segs, _ := filepath.Glob(filepath.Join(evDir, "seg_*.log"))
+	offs := frameStarts(t, segs[len(segs)-1], 16, true)
+	if err := os.Truncate(segs[len(segs)-1], offs[len(offs)-1]); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := reopen(lied, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	ingest(t, s2, "abs-core", 6, 40) // журнал дорастает за скопированное
+	mustStamp(t, s2)
+	if _, err := s2.ShipOnce(ctx, remote); !errors.Is(err, ErrReplicaDiverged) {
+		t.Fatalf("отправка в копию, которую data_dir не продолжает: %v", err)
+	}
+	// Копия по-прежнему собирается, и в ней — то, что потерял диск.
+	s3, err := restoreCopy(t, cfg, s, remote, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	if _, err := s3.Proof("abs-core", 5, false); err != nil {
+		t.Fatalf("улика, потерянная диском, из копии: %v", err)
+	}
+}
+
+// Поколение, чей первый проход не дошёл до подписанной головы, подъём
+// пропускает и собирает предыдущее; следующее поколение получает новый
+// номер, а не пишет поверх недописанного.
+func TestRestoreSkipsGenerationWithoutHead(t *testing.T) {
+	c := newClock()
+	cfg, remote := replicaConfig(t)
+	s := openStore(t, cfg, c)
+	ctx := context.Background()
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s2, err := restoreCopy(t, cfg, s, remote, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s2, "abs-core", 4, 6)
+	mustStamp(t, s2)
+	if _, err := s2.ShipOnce(ctx, failingRemote{remote, genPrefix(1) + "heads/"}); err == nil {
+		t.Fatal("отказ копии не сработал")
+	}
+	s2.Close()
+	s3, err := restoreCopy(t, cfg, s2, remote, c)
+	if err != nil {
+		t.Fatalf("подъём при поколении без головы: %v", err)
+	}
+	if _, err := s3.Proof("abs-core", 3, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s3.Proof("abs-core", 4, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("улика из поколения без головы: %v", err)
+	}
+	ingest(t, s3, "abs-core", 7, 9)
+	mustStamp(t, s3)
+	if _, err := s3.ShipOnce(ctx, remote); err != nil {
+		t.Fatalf("копия после подъёма: %v", err)
+	}
+	s3.Close()
+	s4, err := restoreCopy(t, cfg, s3, remote, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s4.Close()
+	if _, err := s4.Proof("abs-core", 9, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// stopAfter — копия, связь с которой рвётся после n кусков.
+type stopAfter struct {
+	ship.Remote
+	n *int
+}
+
+func (r stopAfter) Put(ctx context.Context, key string, data []byte) error {
+	if *r.n == 0 {
+		return errors.New("сеть упала (тест)")
+	}
+	*r.n--
+	return r.Remote.Put(ctx, key, data)
+}
+
+// Проход копии прерван между кусками одного сегмента журнала: копия кончается
+// посреди записи. Поднятое хранилище отрезает оборванную запись при старте и
+// пишет копию дальше новым поколением; следующий подъём из неё проходит.
+func TestRestoreFromChunkCutMidRecord(t *testing.T) {
+	c := newClock()
+	cfg, remote := replicaConfig(t)
+	s, err := Open(cfg, Options{Logger: quiet, Now: c.now, NoBackground: true, replicaChunk: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 4, 10)
+	mustStamp(t, s)
+	n := 1
+	if _, err := s.ShipOnce(ctx, stopAfter{remote, &n}); err == nil {
+		t.Fatal("отказ копии не сработал")
+	}
+	s.Close()
+	s2, err := restoreCopy(t, cfg, s, remote, c)
+	if err != nil {
+		t.Fatalf("подъём из копии, оборванной посреди записи: %v", err)
+	}
+	s2.replicaChunk = 100
+	ingest(t, s2, "abs-core", 11, 12)
+	mustStamp(t, s2)
+	if _, err := s2.ShipOnce(ctx, remote); err != nil {
+		t.Fatalf("копия после подъёма: %v", err)
+	}
+	s2.Close()
+	s3, err := restoreCopy(t, cfg, s2, remote, c)
+	if err != nil {
+		t.Fatalf("второй подъём: %v", err)
+	}
+	defer s3.Close()
+	for _, q := range []uint64{3, 12} {
+		if _, err := s3.Proof("abs-core", q, false); err != nil {
+			t.Fatalf("улика %d: %v", q, err)
+		}
+	}
+}
+
 // S-02: подписанная голова в копии не новее звеньев копии: она снимается под
 // тем же замком цепи, что и размеры файлов. Раньше тик успевал добавить
 // звено между снимками, и голова указывала на звено, которого в копии нет.
@@ -249,7 +486,7 @@ func TestReplicaHeadNotAheadOfShippedChain(t *testing.T) {
 		if _, err := s.ShipOnce(ctx, remote); err != nil {
 			t.Fatal(err)
 		}
-		files, heads, err := listReplica(ctx, remote)
+		files, heads, err := listReplica(ctx, remote, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -284,7 +521,7 @@ func TestRestoreSkipsHeadAheadOfLinks(t *testing.T) {
 	if _, err := s.ShipOnce(ctx, remote); err != nil {
 		t.Fatal(err)
 	}
-	_, heads, err := listReplica(ctx, remote)
+	_, heads, err := listReplica(ctx, remote, "")
 	if err != nil || len(heads) == 0 {
 		t.Fatalf("головы в копии: %v, %v", heads, err)
 	}
@@ -403,6 +640,310 @@ func TestReceiveTimeHeldByTSAAnchor(t *testing.T) {
 	}
 	if s.clockCapped.Load() == 0 {
 		t.Fatal("срез времени приёма не посчитан")
+	}
+}
+
+// ⭐ W-01: часы хоста впереди TSA меньше чем на clockSlack. Время приёма
+// не обгоняет оценку по якорю: иначе оно ложилось позже следующей метки
+// T2 больше чем на секунду, и esverify навсегда отвергал законную улику
+// («часы хранилища врут»). Тревога и счётчик — только за clockSlack.
+// genTime метки округлён вниз до секунды: доля секунды у TSA в момент
+// подписи — часть сценария.
+func TestReceiveTimeNeverPassesNextStamp(t *testing.T) {
+	cases := []struct {
+		ahead, toStamp, frac time.Duration
+		capped               bool
+		gap, monoFast        time.Duration // от якоря до улики; насколько монотонные часы ушли вперёд TSA
+	}{
+		{300 * time.Millisecond, 150 * time.Millisecond, 800 * time.Millisecond, false, time.Minute, 0},
+		{50 * time.Millisecond, 20 * time.Millisecond, 960 * time.Millisecond, false, time.Minute, 0},
+		{5 * time.Second, 2 * time.Second, 100 * time.Millisecond, false, time.Minute, 0},
+		{30 * time.Second, 2 * time.Second, 500 * time.Millisecond, true, time.Minute, 0},
+		// Часы хоста позади на 3 минуты: время приёма поднято до окна.
+		{-3 * time.Minute, 2 * time.Second, 500 * time.Millisecond, true, time.Minute, 0},
+		// TSA недоступна 10 часов, монотонные часы спешат на 50 ppm, часы
+		// хоста впереди на 5 с: время приёма срезается по оценке, и без
+		// вычета ухода хода оценка обгоняла бы T2 на 1,8 с.
+		{5 * time.Second, 150 * time.Millisecond, 0, false, 10 * time.Hour, 1800 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		tsaClock := newClock()
+		tsaClock.add(tc.frac)
+		host := newClock()
+		host.set(tsaClock.now().Add(tc.ahead))
+		var mono time.Duration
+		s, err := Open(testConfig(t), Options{Logger: quiet, Now: host.now, NoBackground: true, Mono: func() time.Duration { return mono }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.tsaLocal.Now = tsaClock.now
+		ingest(t, s, "abs-core", 1, 1)
+		mustStamp(t, s) // якорь
+		step := func(d time.Duration) { mono += d; host.add(d); tsaClock.add(d) }
+		step(tc.gap)
+		mono += tc.monoFast
+		ingest(t, s, "abs-core", 2, 2)
+		step(tc.toStamp)
+		mustStamp(t, s) // T2 улики 2
+		b, err := s.Proof("abs-core", 2, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := proof.Verify(b, trustOf(t, s)); !r.Valid() {
+			t.Errorf("часы впереди на %v, метка через %v: законная улика не прошла проверку:\n%s", tc.ahead, tc.toStamp, r.Text())
+		}
+		if got := s.clockCapped.Load() > 0; got != tc.capped {
+			t.Errorf("часы впереди на %v: тревога %v, ожидали %v", tc.ahead, got, tc.capped)
+		}
+		s.Close()
+	}
+}
+
+// W-05: ответ TSA шёл 15 с. Якорь ставится по времени ответа (так оценка
+// не обгоняет время TSA), и оценка отстаёт от верных часов на задержку
+// ответа. Тревога «часы хоста впереди TSA» это учитывает: верные часы
+// хоста не тревога. Раньше — тревога и счётчик: README велит идти
+// разбираться с часами, а они в порядке.
+func TestSlowTSAAnswerIsNotClockAlarm(t *testing.T) {
+	host, tsaClock := newClock(), newClock()
+	var mono time.Duration
+	s, err := Open(testConfig(t), Options{Logger: quiet, Now: host.now, NoBackground: true, Mono: func() time.Duration { return mono }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.tsaLocal.Now = func() time.Time {
+		gen := tsaClock.now()
+		const lag = 15 * time.Second // ответ идёт после подписи
+		mono += lag
+		host.add(lag)
+		tsaClock.add(lag)
+		return gen
+	}
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // якорь
+	ingest(t, s, "abs-core", 2, 2)
+	if n := s.clockCapped.Load(); n != 0 {
+		t.Fatalf("верные часы хоста сочтены убежавшими вперёд: тревог %d", n)
+	}
+	// Часы хоста и правда убежали — тревога остаётся.
+	host.add(time.Minute)
+	ingest(t, s, "abs-core", 3, 3)
+	if s.clockCapped.Load() == 0 {
+		t.Fatal("часы хоста впереди TSA на минуту, а тревоги нет")
+	}
+}
+
+// ⭐ W-13: до первой метки процесса якоря нет, и время приёма не с чем
+// сверить. Часы хоста убежали на сутки, TSA ещё не ответила: одна принятая
+// запись получила бы время «из будущего», а монотонность — и все следующие
+// на всю длину скачка; все они навсегда не проходили бы esverify. С TSA
+// хранилище не принимает до первой метки (сборщик держит строки в буфере и
+// повторит), после неё время приёма — по якорю, и улика проверяется.
+func TestIntakeWaitsForFirstStamp(t *testing.T) {
+	tsaClock := newClock()
+	host := newClock()
+	host.set(tsaClock.now().Add(24 * time.Hour)) // часы хоста убежали
+	s, err := Open(testConfig(t), Options{Logger: quiet, Now: host.now, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.tsaLocal.Now = tsaClock.now
+	s.needAnchor = true // так в serve с настроенной TSA (фоновые циклы здесь выключены)
+	if _, err := s.Ingest("abs-core", []Incoming{{Seq: 1, Body: []byte("x")}}); !errors.Is(err, ErrNoAnchor) {
+		t.Fatalf("приём до первой метки: %v", err)
+	}
+	mustStamp(t, s)
+	ingest(t, s, "abs-core", 1, 1)
+	tsaClock.add(time.Second)
+	host.add(time.Second)
+	mustStamp(t, s) // T2
+	b, err := s.Proof("abs-core", 1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b, trustOf(t, s)); !r.Valid() {
+		t.Fatalf("улика после скачка часов не проходит:\n%s", r.Text())
+	}
+}
+
+// W-13: в боевом режиме (фоновые циклы) с TSA приём ждёт первой метки и
+// открывается сам: первая метка ставится сразу после старта.
+func TestServeOpensIntakeAfterFirstStamp(t *testing.T) {
+	s, err := Open(testConfig(t), Options{Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if !s.needAnchor {
+		t.Fatal("с TSA приём не ждёт первой метки")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, err := s.Ingest("abs-core", []Incoming{{Seq: 1, Body: []byte("x")}})
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrNoAnchor) || time.Now().After(deadline) {
+			t.Fatalf("приём после старта: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// W-13: TSA при старте не ответила — первая метка повторяется каждые
+// anchorRetry, и приём открывается сам, как только TSA ответит, а не через
+// tsa.every (10 минут). Отказ TSA здесь — метка с временем после конца
+// срока её сертификата: такой токен хранилище не принимает.
+func TestFirstStampRetriedUntilAnchored(t *testing.T) {
+	saved := anchorRetry
+	anchorRetry = 20 * time.Millisecond
+	defer func() { anchorRetry = saved }()
+	s, err := Open(testConfig(t), Options{Logger: quiet, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var up atomic.Bool
+	s.tsaLocal.Now = func() time.Time {
+		if !up.Load() {
+			return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		return time.Now()
+	}
+	s.needAnchor = true
+	if _, err := s.Stamp(context.Background()); err == nil {
+		t.Fatal("ПАРНЫЙ КОНТРОЛЬ: метка недоступной TSA принята")
+	}
+	s.wg.Add(1)
+	go s.keepAnchor()
+	time.Sleep(100 * time.Millisecond)
+	if err := s.anchored(); !errors.Is(err, ErrNoAnchor) {
+		t.Fatalf("приём открыт без метки: %v", err)
+	}
+	up.Store(true)
+	deadline := time.Now().Add(5 * time.Second)
+	for s.anchored() != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("TSA ответила, а приём так и ждёт первой метки")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// ⭐ X-01, Y-01: запись пришла в окно между токеном новой метки в цепи и
+// новым якорем после долгого перерыва без метки: время приёма — по
+// прежнему якорю, а T1 — новая метка. Раньше время приёма ложилось раньше
+// T1 больше чем на минуту (вычет ухода хода рос с возрастом якоря), и
+// законная улика навсегда не проходила esverify. Теперь якорь, по которому
+// окно шире recvWindow, приём закрывает: запись в окне либо принята и
+// проходит проверку (перерыв сутки), либо отвергнута до свежей метки
+// (неделя, месяц) и принята после неё. Все часы верные.
+func TestRecordAcceptedWhileAnchorMoves(t *testing.T) {
+	for _, gap := range []time.Duration{24 * time.Hour, 8 * 24 * time.Hour, 30 * 24 * time.Hour} {
+		clk := newClock()
+		var mono time.Duration
+		var armed, fired bool
+		var inWindow error
+		var s *Store
+		s, err := Open(testConfig(t), Options{Logger: quiet, Now: clk.now, NoBackground: true, Mono: func() time.Duration {
+			if armed && !fired {
+				// Токен уже в цепи, якорь ещё прежний: запись 2.
+				fired = true
+				_, inWindow = s.Ingest("abs-core", []Incoming{{Seq: 2, Body: []byte("abs-core event 2")}})
+			}
+			return mono
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.needAnchor = true // так в serve с TSA
+		s.tsaLocal.Now = func() time.Time {
+			if !fired && !armed && mono > 0 {
+				armed = true // идёт метка после перерыва
+			}
+			return clk.now()
+		}
+		if _, err := s.stampNow(context.Background()); err != nil { // якорь
+			t.Fatal(err)
+		}
+		ingest(t, s, "abs-core", 1, 1)
+		mono += gap
+		clk.add(gap)
+		if _, err := s.stampNow(context.Background()); err != nil { // новая метка; в окне — запись 2
+			t.Fatal(err)
+		}
+		armed = false
+		switch {
+		case !fired:
+			t.Fatal("запись в окне не пришла: сценарий не воспроизведён")
+		case gap > 2*24*time.Hour && !errors.Is(inWindow, ErrNoAnchor):
+			t.Fatalf("перерыв %v: якорь несвеж, а запись в окне не отвергнута: %v", gap, inWindow)
+		case errors.Is(inWindow, ErrNoAnchor):
+			ingest(t, s, "abs-core", 2, 2) // сборщик повторил после свежей метки
+		case inWindow != nil:
+			t.Fatal(inWindow)
+		}
+		ingest(t, s, "abs-core", 3, 3)
+		clk.add(time.Second)
+		mono += time.Second
+		mustStamp(t, s) // T2
+		for q := uint64(1); q <= 3; q++ {
+			b, err := s.Proof("abs-core", q, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r := proof.Verify(b, trustOf(t, s)); !r.Valid() {
+				t.Errorf("перерыв %v: законная улика %d не прошла:\n%s", gap, q, r.Text())
+			}
+		}
+		s.Close()
+	}
+}
+
+// Y-01: в простой (в цепь ничего не ложится) якорь не стареет: старше
+// anchorRefresh — несвеж, и keepAnchor ставит метку, хотя заверять нечего.
+// Раньше метка ставилась только при новых листьях, и якорь старел без
+// предела.
+func TestAnchorRefreshedWhenIdle(t *testing.T) {
+	saved := anchorRetry
+	anchorRetry = 10 * time.Millisecond
+	defer func() { anchorRetry = saved }()
+	var mono atomic.Int64
+	s, err := Open(testConfig(t), Options{Logger: quiet, NoBackground: true, Mono: func() time.Duration { return time.Duration(mono.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.needAnchor = true
+	if _, err := s.stampNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.anchorStale() {
+		t.Fatal("ПАРНЫЙ КОНТРОЛЬ: свежий якорь сочтён несвежим")
+	}
+	mono.Add(int64(anchorRefresh + time.Minute)) // простой дольше anchorRefresh
+	if !s.anchorStale() {
+		t.Fatal("якорю больше anchorRefresh, а он свеж")
+	}
+	s.mu.Lock()
+	before := s.anchorMono
+	s.mu.Unlock()
+	s.wg.Add(1)
+	go s.keepAnchor()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.Lock()
+		moved := s.anchorMono != before
+		s.mu.Unlock()
+		if moved {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("в простой якорь не освежён")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -622,6 +1163,38 @@ func TestMirrorDownDoesNotStopStart(t *testing.T) {
 	}
 	if r := proof.Verify(b, trustOf(t, s2)); !r.Valid() || !r.BodyOpened {
 		t.Fatalf("без зеркала:\n%s", r.Text())
+	}
+}
+
+// Z-06: резерв ключей недоступен как раз тогда, когда при подъёме надо
+// завести ключ месяца (за неделю до конца — следующего). Хранилище
+// поднимается: ключ заведён, но не выдаётся, пока копия не пройдёт, а её
+// повторит обслуживание. Раньше подъём падал с ErrBackupPending, и
+// хранилище не стартовало вовсе, пока резерв не вернётся (нашла симуляция
+// с падениями).
+func TestStartsWhileKeyBackupUnreachable(t *testing.T) {
+	c := newClock()
+	c.set(time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC))
+	backup := filepath.Join(t.TempDir(), "backup")
+	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = backup })
+	s := openStore(t, cfg, c)
+	s.Close()
+	c.set(time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)) // пора завести ключи октября
+	os.Chmod(backup, 0o500)
+	t.Cleanup(func() { os.Chmod(backup, 0o700) })
+	s2, err := Open(cfg, Options{Logger: quiet, Now: c.now, NoBackground: true})
+	if err != nil {
+		t.Fatalf("не поднялось при недоступном резерве: %v", err)
+	}
+	t.Cleanup(func() { s2.Close() })
+	os.Chmod(backup, 0o700)
+	s2.Maintain(c.now()) // копия прошла
+	mustStamp(t, s2)
+	ingest(t, s2, "abs-core", 1, 1)
+	for _, ki := range s2.Keys() {
+		if !ki.Confirmed {
+			t.Fatalf("после возврата резерва ключ %s не в резерве", ki.Scope)
+		}
 	}
 }
 
