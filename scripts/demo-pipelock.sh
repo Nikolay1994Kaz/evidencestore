@@ -11,10 +11,11 @@
 #   4. запись, изменённая после записи на диск гейтвея, ловится при приёме.
 #
 #   PIPELOCK_BIN=/path/to/pipelock scripts/demo-pipelock.sh
-#   (go install github.com/luckyPipewrench/pipelock/cmd/pipelock@v3.6.0)
+#   (go install github.com/luckyPipewrench/pipelock/cmd/pipelock@v1.5.1-0.20261002230022-3e868ac5d5b6
+#    — коммит тега v3.6.0: путь модуля Pipelock без /v3, и @v3.6.0 Go не берёт)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-: "${PIPELOCK_BIN:?PIPELOCK_BIN must point to a pipelock binary (go install github.com/luckyPipewrench/pipelock/cmd/pipelock@v3.6.0)}"
+: "${PIPELOCK_BIN:?PIPELOCK_BIN must point to a pipelock binary (v3.6.0: go install github.com/luckyPipewrench/pipelock/cmd/pipelock@v1.5.1-0.20261002230022-3e868ac5d5b6)}"
 WORK=${WORK:-$(mktemp -d)}
 BIN=$WORK/bin
 PORT=${PORT:-18444}

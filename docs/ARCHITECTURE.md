@@ -19,7 +19,8 @@ server ─ internal/server
    │
    ▼
 store.Ingest ─ internal/store/ingest.go           ┐
-   повтор (Source, Seq)? → время приёма (монотонно)│ синхронно,
+   повтор (Source, Seq)? → время приёма            │ синхронно,
+     (часы хоста в окне по якорю TSA, монотонно)   │
    → evidence.Record.Seal (keyring: DEK под KEK)   │ до ответа
    → evlog.Append: запись, fsync пачки              │ «принято»
    → лист цепи (из потока журнала, по порядку)     │
@@ -45,7 +46,7 @@ esverify ─ cmd/esverify, internal/proof
 | Пакет | Что делает | Главные файлы | Тесты |
 |---|---|---|---|
 | `internal/evidence` | формат улики: заголовок открыто, тело конвертом; отпечаток `SHA-256("evidencestore/sealed/v1" ‖ байты)` | `record.go`, `seal.go` | золотые байты, обрезки, фазз, стирание |
-| `internal/keyring` | ключи: корень → ключ файла → KEK месяца → DEK записи; формат KRNG3 (корень заворачивает только ключ файла); конверт EV2 (обязательство на DEK); уничтожение поворотом корня; состояния и двухэтапное уничтожение; зеркало корней, починка копий и корни-сироты | `keyring.go`, `format.go`, `envelope.go`, `lifecycle.go`, `destroy.go`, `rootfile.go` | 32 теста, 60 мутаций |
+| `internal/keyring` | ключи: корень → ключ файла → KEK месяца → DEK записи; формат KRNG3 (корень заворачивает только ключ файла); конверт EV2 (обязательство на DEK); уничтожение поворотом корня; состояния и двухэтапное уничтожение; зеркало корней, починка копий и корни-сироты | `keyring.go`, `format.go`, `envelope.go`, `lifecycle.go`, `destroy.go`, `rootfile.go` | 34 теста, 62 мутации |
 | `internal/gateway` | проверка бортового журнала Pipelock при приёме: хэш записи (проекции v1–v3), сцепка `prev_hash` по писателям, подписи контрольных точек | `pipelock.go`, `testdata/pipelock-v3.6.0` (настоящий вывод Pipelock) | 9 тестов, 15 мутаций |
 | `internal/metrics` | показатели в текстовом формате Prometheus, без зависимостей | `metrics.go` | формат вывода |
 | `internal/evlog` | журнал улик: групповой коммит, ответ после fsync, сегменты только дописываются, fail-stop; хвост режется, только если за ним нет целой записи, и откладывается рядом; `Release` и `floor` — только у буфера сборщика (`AllowRelease`) | `evlog.go` | 17 тестов, 20 мутаций |
@@ -74,7 +75,8 @@ data_dir/
   chain/leaves_*.log   листья (не удаляются никогда)
   chain/sign.key       ключ подписи хранилища (Ed25519)
   tsa-local/           демо-TSA, если tsa.url = "local"
-  admin.sock           админка, права 0600
+  admin.sock           админка, права 0600 (или admin_socket)
+  replica-generation   поколение копии, в которое пишет хранилище, поднятое из копии (кладёт restore)
   *.torn-<смещение>    рядом с сегментом или файлом цепи: отрезанный оборванный хвост (не удаляется)
 roots_dir/             корни кейринга (FileRoots), отдельно от data_dir
 keys.roots_mirror_dir/ вторая копия корней (другой диск или машина): пишется и уничтожается вместе с roots_dir
@@ -86,10 +88,12 @@ replica.url            копия: evidence/…, chain/… кусками по �
 У сборщика (`spool_dir`):
 
 ```
-spool/seg_*.log          буфер — экземпляр evlog: записи L (строка), S («старт»), P (место чтения);
+spool/seg_*.log          буфер — экземпляр evlog: записи L (строка), S («старт»), P (файл в реестре с этого
+                         места: новый или после пропуска), D (файл ушёл из реестра: дочитан или пропал);
                          доставленные сегменты удаляются, граница — spool/floor
 state.json               докуда доставлено (acked)
-files.json               что известно о файлах: докуда прочитан, первая строка
+files.json               снимок реестра файлов (перед освобождением буфера): inode, рождение, путь,
+                         докуда прочитан, первая строка
 start-files.json         реестр файлов на момент первого запуска (пишется раньше записи «старт»)
 epoch.json               эпоха этой установки сборщика: с каждым запросом; потерян — новая установка
 promises.jsonl           обещания хранилища, сошедшиеся с закреплённым ключом
@@ -149,7 +153,7 @@ promises-rejected.jsonl  обещания, которые не сошлись: �
 | хэши и подписи Pipelock повторяются байт в байт; ключ, повторённый со свёрткой регистра, и невалидный UTF-8 — ошибка | `gateway.Entry.ComputeHash`, `gateway.Tracker`, `gateway.ParseEntry` | `TestPipelockRecorderVectors`, `TestPipelockTamperedEntry`, `TestDetailBytesAreHashedAsWritten`, `TestTimestampNormalizedLikePipelock`, `TestCaseFoldedDuplicateKeyAndBadUTF8` |
 | запись журнала гейтвея: вердикт в цепи, после падения досчитывается | `store.recordGateway`, `store.open` (вердикты по телам) | `TestGatewayJournalProof`, `TestGatewayVerdictCatchUp` |
 | пакет: тело — та самая запись гейтвея, её накрывает подписанная точка | `proof.verifyGateway` | `TestGatewayJournalProof`, `TestGatewayBodyMustMatchVerdict`, `TestGatewayVerdictOfAnotherRecord`, `TestGatewayTamperedEntry` |
-| шарды по маске — по порядку, без повторов; удалённый или ушедший из-под маски текущий файл дочитывается через дескриптор, пока не замолчит, а непрочитанные под маской тем временем ждут в очереди открытыми; пропуск — только после перезапуска; подменённый на месте — пропуск и чтение с начала, без дубля; файл с чужим inode забывается; устаревший листинг (файл переименован под маской) — перечитать каталог, а не пропуск; шард «из прошлого» по часам читается | `collector.globFiles`, `collector.reconcile` (`files.json`), `collector.retire` | `TestGlobFollowsPipelockShards`, `TestGlobEqualMTimesUseNaturalOrder`, `TestGlobCurrentFileGoneLeavesGap`, `TestGlobFileFromThePastIsRead`, `TestGlobDeletedCurrentDoesNotRereadOlder`, `TestGlobRotatedOutOfMaskWaitsForQuiet`, `TestGlobSecondRotationWhileDrainingKeepsMiddleFile`, `TestGlobQueuedFileKeepsItsOffset`, `TestGlobRenameBetweenListingAndOpen`, `TestGlobReplacedInPlaceIsGapNotDuplicate`, `TestGlobForgetsFileWithReusedInode` |
+| шарды по маске — по порядку, без повторов; удалённый или ушедший из-под маски файл дочитывается через дескриптор, пока не замолчит, а остальные файлы под маской тем временем читаются независимо (реестр); пропуск — только после перезапуска; подменённый на месте — пропуск и чтение с начала, без дубля; файл с чужим inode забывается; устаревший листинг (файл переименован под маской) — перечитать каталог, а не пропуск; шард «из прошлого» по часам читается | `collector.globFiles`, `collector.reconcile` (`files.json`), `collector.retire` | `TestGlobFollowsPipelockShards`, `TestGlobEqualMTimesUseNaturalOrder`, `TestGlobCurrentFileGoneLeavesGap`, `TestGlobFileFromThePastIsRead`, `TestGlobDeletedCurrentDoesNotRereadOlder`, `TestGlobRotatedOutOfMaskWaitsForQuiet`, `TestGlobSecondRotationWhileDrainingKeepsMiddleFile`, `TestGlobQueuedFileKeepsItsOffset`, `TestGlobRenameBetweenListingAndOpen`, `TestGlobReplacedInPlaceIsGapNotDuplicate`, `TestGlobForgetsFileWithReusedInode` |
 | показатели для тревог | `store.Metrics`, `server.MetricsHandler` | `TestMetrics`, `TestMetricsEndpoint` |
 | из копии наружу ничего не удаляется | `ship.Remote`: метода удаления нет | — (держит тип) |
 | отчёт проверяющего называет верную причину, почему тело закрыто | `proof.Report.Notes` | `TestNotesTellWhyBodyIsClosed` |

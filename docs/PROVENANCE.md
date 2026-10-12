@@ -24,6 +24,7 @@
   - пропавшие листья — ошибка `ErrLeavesMissing`, а не «истёкшие по сроку хранения»;
   - добавлены `ScanLeaves`, `ScanVerifiedLeaves`, `SignMessage`, `EncodeHash`;
   - 09.10: защёлка отказа записи, неудачный `Open` не флашит, порча середины файла — отказ вместо среза хвоста, отрезанный хвост откладывается рядом; удалены `InclusionProof`, `BuildProof`, `ForEachLeaf`, `FindLeaf`, `VerifyRange` (в продукте не вызывались, `InclusionProof.Verify` принимал выдуманный лист).
+  - 12.10: `TrimToHead` — подъём из копии обрезает цепь по её подписанной голове (Z-07); чтение кадра вынесено в `nextFrame`; `SetSegmentBytes` — порог файлов листьев для тестов.
 - `internal/wal` удалён: журнал улик — новый пакет `internal/evlog`.
 - `internal/ship`: оставлен только транспорт `Remote`; `Shipper` (снапшоты, манифесты, удаление старых объектов) удалён вместе с `wal`, из `Remote` убран `Delete`.
 - `internal/monitoring` удалён: все три его метрики относились к `wal` и `Shipper`. С ним из `go.mod` ушла `VictoriaMetrics/metrics`, осталась одна зависимость — `golang.org/x/sys`.
