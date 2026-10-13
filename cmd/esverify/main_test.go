@@ -124,3 +124,12 @@ func TestBundleWithoutTSAIsRefused(t *testing.T) {
 		t.Fatalf("без метки TSA с -allow-no-tsa: %d\n%s", code, out)
 	}
 }
+
+// -version отвечает без пакета и ключей: проверяющий узнаёт, что у него за
+// сборка, до всякой проверки.
+func TestVersionFlag(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"-version"}, &out, &errb); code != exitValid || !strings.HasPrefix(out.String(), "esverify ") {
+		t.Fatalf("-version: код %d, вывод %q, ошибки %q", code, out.String(), errb.String())
+	}
+}

@@ -25,6 +25,7 @@ import (
 	"evidencestore/internal/gateway"
 	"evidencestore/internal/proof"
 	"evidencestore/internal/tsa"
+	"evidencestore/internal/version"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -45,13 +46,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
 	allowNoTSA := fs.Bool("allow-no-tsa", false, "accept a bundle without a TSA time-stamp after the record (then only the store's own signature vouches for it)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
+	showVersion := fs.Bool("version", false, "print the version and the commit it was built from")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-allow-no-tsa] [-json]")
+		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
 		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage or an unreadable key, certificate or promise file")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	if *showVersion {
+		fmt.Fprintln(stdout, version.String("esverify"))
+		return exitValid
 	}
 	usageErr := func(err error) int {
 		fmt.Fprintln(stderr, "error:", err)

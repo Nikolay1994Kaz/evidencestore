@@ -41,6 +41,7 @@ import (
 	"evidencestore/internal/server"
 	"evidencestore/internal/ship"
 	"evidencestore/internal/store"
+	"evidencestore/internal/version"
 )
 
 func main() {
@@ -73,6 +74,8 @@ func main() {
 		err = cmdSources(args)
 	case "restore":
 		err = cmdRestore(args)
+	case "version", "-version", "--version":
+		fmt.Println(version.String("evidencestore"))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -93,6 +96,7 @@ Server:
   init      -config FILE                       create keyring, signing key (once)
   serve     -config FILE                       accept evidence over mTLS
   dev-pki   -out DIR -source NAME [-source …]  demo CA, server and collector certificates
+  version                                      print the version and the commit it was built from
 
 Operator (talks to the running server via its admin socket):
   status    -config FILE

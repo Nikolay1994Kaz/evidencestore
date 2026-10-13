@@ -17,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${PIPELOCK_BIN:?PIPELOCK_BIN must point to a pipelock binary (v3.6.0: go install github.com/luckyPipewrench/pipelock/cmd/pipelock@v1.5.1-0.20261002230022-3e868ac5d5b6)}"
 WORK=${WORK:-$(mktemp -d)}
-BIN=$WORK/bin
+BIN=${ES_BIN:-$WORK/bin} # ES_BIN — готовые бинарники (например, из релиза) вместо сборки
 PORT=${PORT:-18444}
 mkdir -p "$BIN"
 
@@ -25,7 +25,7 @@ step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
 
 step "сборка"
-go build -o "$BIN/" ./cmd/...
+if [ -n "${ES_BIN:-}" ]; then "$BIN/evidencestore" version; else go build -o "$BIN/" ./cmd/...; fi
 "$PIPELOCK_BIN" version | head -1
 
 step "Pipelock: ключ подписи журнала"

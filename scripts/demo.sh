@@ -15,17 +15,18 @@
 #   WORK=/tmp/es-demo scripts/demo.sh     # каталог стенда (по умолчанию mktemp)
 #   DEMO_TSA=nca scripts/demo.sh          # метки у настоящей TSA НУЦ РК (нужен интернет)
 #   DEMO_TSA=digicert scripts/demo.sh     # метки у публичной TSA DigiCert (нужен интернет)
+#   ES_BIN=/path/to/bin scripts/demo.sh   # готовые бинарники (evidencestore, escollect, esverify) вместо сборки
 set -euo pipefail
 cd "$(dirname "$0")/.."
 WORK=${WORK:-$(mktemp -d)}
-BIN=$WORK/bin
+BIN=${ES_BIN:-$WORK/bin} # ES_BIN — готовые бинарники (например, из релиза) вместо сборки
 PORT=${PORT:-18443}
 mkdir -p "$BIN"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 step "сборка"
-go build -o "$BIN/" ./cmd/...
+if [ -n "${ES_BIN:-}" ]; then "$BIN/evidencestore" version; else go build -o "$BIN/" ./cmd/...; fi
 
 step "учебный УЦ: сертификат сервера и сборщика abs-core"
 "$BIN/evidencestore" dev-pki -out "$WORK/pki" -source abs-core
