@@ -4,7 +4,7 @@
   "cert": "/etc/escollect/pipelock.crt",
   "key": "/etc/escollect/pipelock.key",
   "store_key": "PIN-THE-STORE-PUBLIC-KEY-PRINTED-BY-evidencestore-init",
-  "spool_dir": "/var/lib/escollect-pipelock",
+  "spool_dir": "/var/lib/escollect/pipelock",
   "glob": "/var/lib/pipelock/recorder/evidence-*.jsonl",
   "from_start": true,
   "batch": 256,

@@ -1,0 +1,39 @@
+# Сборщик одного источника: /etc/systemd/system/escollect@.service.
+#
+#   systemctl enable --now escollect@abs-core   # конфиг /etc/escollect/abs-core.json
+#
+# spool_dir в конфиге источника — /var/lib/escollect/<источник>: служба
+# создаёт его сама. Журналы в /var/log на Debian и Ubuntu читает группа adm.
+[Unit]
+Description=escollect: collector for source %i
+Documentation=https://github.com/Nikolay1994Kaz/evidencestore
+After=network-online.target
+Wants=network-online.target
+# Отказ эпохи или конфликт номера останавливают сборщик нарочно: после пяти
+# попыток служба ждёт человека.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+User=escollect
+Group=escollect
+SupplementaryGroups=adm
+ExecStart=/usr/local/bin/escollect -config /etc/escollect/%i.json
+Restart=on-failure
+RestartSec=5s
+StateDirectory=escollect/%i
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

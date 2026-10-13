@@ -1,0 +1,41 @@
+# Хранилище улик как служба systemd: /etc/systemd/system/evidencestore.service.
+# Пути — как в configs/evidencestore.example.json; поменяли пути в конфиге —
+# поменяйте и здесь. Каталоги резерва ключей и зеркала корней не создаются
+# службой: это другие диски, их монтирует администратор (README, Keys).
+[Unit]
+Description=evidencestore: tamper-evident storage for audit records
+Documentation=https://github.com/Nikolay1994Kaz/evidencestore
+After=network-online.target
+Wants=network-online.target
+# Отказ при старте (потеря улик, чужой keyring.dat) повторять бесконечно
+# незачем: после пяти попыток служба ждёт человека.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+User=evidencestore
+Group=evidencestore
+ExecStart=/usr/local/bin/evidencestore serve -config /etc/evidencestore/evidencestore.json
+Restart=on-failure
+RestartSec=5s
+# SIGTERM: хранилище дописывает начатые пачки и сбрасывает звено.
+TimeoutStopSec=60s
+# data_dir и roots_dir: создаются с владельцем и правами 0700.
+StateDirectory=evidencestore evidencestore-roots
+StateDirectoryMode=0700
+ReadWritePaths=-/mnt/backup/evidencestore-keyring -/mnt/roots-mirror/evidencestore
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

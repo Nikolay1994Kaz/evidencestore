@@ -31,6 +31,35 @@ The demo runs these steps:
 | `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
 | `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; exit code 0 — verified, 1 — not verified (including an unparsable bundle or a broken promise), 2 — bad usage or an unreadable key, certificate or promise file |
 
+`evidencestore version`, `escollect -version` and `esverify -version` print the version and the commit a binary was built from.
+
+## Install
+
+The store and the collector run on Linux (amd64, arm64). `esverify` also runs on macOS and Windows: an auditor needs nothing else.
+
+**From a release.** Download the binaries and `SHA256SUMS` from [Releases](https://github.com/Nikolay1994Kaz/evidencestore/releases), then check the checksum and where the binary was built: the attestation shows that this repository's release workflow built the file from the tagged commit.
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify evidencestore-linux-amd64 --repo Nikolay1994Kaz/evidencestore
+sudo install -m 0755 evidencestore-linux-amd64 /usr/local/bin/evidencestore   # likewise escollect, esverify
+evidencestore version
+```
+
+**From source.** With Go 1.25 or newer: `git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore && go build -o /usr/local/bin/ ./cmd/...`.
+
+**A store host**, with the unit file from [`configs/systemd/`](configs/systemd):
+
+1. Create the service user and its directories: `useradd --system --home-dir /var/lib/evidencestore --shell /usr/sbin/nologin evidencestore`, then `install -d -o evidencestore -g evidencestore -m 0700 /var/lib/evidencestore /var/lib/evidencestore-roots`.
+2. Mount `keys.backup_dir` and `keys.roots_mirror_dir` on other disks, better on another machine, and create those directories for the same user. Nothing creates them for you: a missing one looks like an unmounted disk.
+3. Put the config into `/etc/evidencestore/evidencestore.json`, starting from [`configs/evidencestore.example.json`](configs/evidencestore.example.json). Relative paths in it resolve against the config's directory, so copy `configs/tsa/` next to it. Add the server certificate and key (readable by the service user) and the CA that issues collector certificates: your own PKI (`dev-pki` is for demos).
+4. `sudo -u evidencestore evidencestore init -config /etc/evidencestore/evidencestore.json`. It prints the store's public key: collectors pin it as `store_key`, auditors pass it to `esverify -store-key`.
+5. `cp configs/systemd/evidencestore.service /etc/systemd/system/ && systemctl enable --now evidencestore`. Operator commands talk to the admin socket, which belongs to the service user: `sudo -u evidencestore evidencestore status -config /etc/evidencestore/evidencestore.json`.
+
+**A collector host**: one service per source. Create the user (`useradd --system --no-create-home --shell /usr/sbin/nologin escollect`); the unit adds it to group `adm`, which reads `/var/log` on Debian and Ubuntu. For each source put its certificate and `/etc/escollect/<source>.json` (from [`configs/collector.example.json`](configs/collector.example.json), with `spool_dir` set to `/var/lib/escollect/<source>`), then `cp configs/systemd/escollect@.service /etc/systemd/system/ && systemctl enable --now escollect@<source>`.
+
+There is no container image yet.
+
 ## Configuration
 
 See [`configs/evidencestore.example.json`](configs/evidencestore.example.json) and [`configs/collector.example.json`](configs/collector.example.json). The example time-stamps with the public DigiCert TSA (`configs/tsa/digicert`); any RFC 3161 service works if its certificates are listed in `tsa.trust`, e.g. `http://tsp.pki.gov.kz` with `configs/tsa/nca-kz/*.cer` in Kazakhstan. Tokens are verified before they enter the chain. With a TSA configured, receive times are kept between the time-stamps that `esverify` checks them against: the store knows TSA time within a window from its last time-stamp and the monotonic clock, and a receive time is the host clock held inside that window, so neither a host clock running ahead nor one lagging behind makes a record unverifiable. The intake accepts records only while that window is narrow enough: before the first time-stamp of the process, and when the last one is about three days old (about 75 hours; less if the TSA answered slowly), it answers `503` and collectors keep the lines in their spool. The store requests a time-stamp at start, retries every 10 seconds while the intake waits, and stamps at least once an hour even when nothing new entered the chain; a TSA that stays unreachable for about three days closes the intake. Every source is registered by name. The name must equal the CommonName of the collector's client certificate, and the certificate can be pinned by its SHA-256 fingerprint. The source is always taken from the certificate, never from the request.
@@ -161,8 +190,12 @@ Numbers below are for commit `957345c` (12 October 2026).
 
 ## Development
 
+GitHub Actions runs the same gate on every push and pull request (`.github/workflows/ci.yml`). A `v*` tag also builds the release binaries with `scripts/release.sh`, attests where they were built and publishes the release with notes from `docs/releases/`.
+
 ```sh
 go build ./... && go vet ./... && go test -race ./...
+scripts/release.sh dist               # release binaries and SHA256SUMS
+ES_BIN=/usr/local/bin scripts/demo.sh # the demo on installed binaries instead of a fresh build
 python3 scripts/mutate.py keyring     # mutation testing: every injected bug must fail a test
                                       # sets: keyring, evlog, tsa, store, edge, auditchain, gateway, config
 SIM_SEEDS=1000 go test -run TestCollectorSim ./internal/collector/   # collector simulation: rotations (dateext too),
