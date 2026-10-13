@@ -25,4 +25,14 @@ done
 build darwin amd64 esverify
 build darwin arm64 esverify
 build windows amd64 esverify
+
+# Бинарник из изменённого дерева помечен +dirty (vcs.modified): релиз
+# обязан быть ровно коммитом тега. На GitHub Actions это отказ, локально —
+# предупреждение.
+for f in "$out"/*; do
+	if go version -m "$f" | grep -q 'vcs.modified=true'; then
+		echo "release.sh: $f собран из изменённого дерева (+dirty)" >&2
+		[ -z "${GITHUB_ACTIONS:-}" ] || exit 1
+	fi
+done
 (cd "$out" && sha256sum -- * >SHA256SUMS)
