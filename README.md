@@ -131,6 +131,19 @@ Not proven:
 
 Root on the store host can delete files. After the next time-stamp, deletion or alteration cannot be hidden, but it cannot be prevented either. The pilot cryptography (AES-256-GCM from the Go standard library, root keys in files) is not certified. The design keeps a plug-in point for an HSM.
 
+## How it was tested
+
+Numbers below are for commit `957345c` (12 October 2026).
+
+- **Test gate.** `go build ./... && go vet ./... && go test -race ./...` passes.
+- **Mutation testing.** 316 bugs injected one at a time (`scripts/mutations/`), and every one of them makes a test fail: store and proofs 114, collector and intake 72, keyring 62, evidence log 20, gateway journals 15, TSA 14, chain 12, configuration 7.
+- **Simulations:** randomized scenarios checked against an oracle (commands under Development).
+  - Store with crashes: 2,000 scenarios of 300 steps, no failures. They went through 36,038 crashes (3,848 in the middle of a write), 6,649 restores from the copy (1,154 after the disk was lost in the middle of a copy pass), 1,368 disks that lied about fsync, 2,185 destroyed keys (231 crashes in the middle of a root rotation) and 75,858 rounds of parallel intake (1.25 million batches, 312,900 pairs of identical concurrent requests). 300 more scenarios under the race detector found no data race.
+  - Receive-time clock: 3,000 scenarios, no failures.
+  - Collector: 2,000 scenarios in each of four worlds (one file or a glob, with and without destruction) against an in-memory store, 150 per world against the real store over mTLS, and 400 per world against the real store with all faults at once; no failures.
+- **Live gateway.** `scripts/demo-pipelock.sh` passes against Pipelock v3.6.0 built from the tag's commit.
+- **A night on real data** (11–12 October, 21:19–06:23). The store ran with four collectors: the host's own `/var/log/syslog`, `auth.log` and `kern.log` (read from the start), and the flight recorder of a live Pipelock v3.6.0 that blocked an "agent" all night (no request left the host). During the night logrotate rotated all three logs at midnight (`create`, `delaycompress`, rsyslog HUP), the store was restarted 5 times, a collector was killed with `kill -9`, Pipelock was restarted twice (3 sessions, 359 shards), and the copy went to a directory every minute. Every one of the 104,738 records matched its source line, in order, with no duplicates and no losses: syslog 71,120 (67,596 from the rotated file, 3,524 from the new one), auth.log 1,246, kern.log 10,752, Pipelock 21,620. A sample of 7,560 proof bundles across the whole range verified the way `esverify` does, the Pipelock ones with the gateway's checkpoint signature. A store restored from the copy (76 MB, chain checked up to signed head 8005) gave the same result. The store log had no errors. The scripts of this run were a one-off and are not in the repository.
+
 ## Known limitations
 
 - **A file the collector never saw.** A file that appears at the log path (or under the mask) and leaves it while the collector is not looking — it was stopped, or both happened within one `flush_every` — is never read, and no gap is recorded. Likewise, lines that are written and destroyed (deleted, truncated) between two reads leave no trace — and so do lines of a file the collector cannot open yet, if the file is truncated in place before it can be read. Every file the collector has seen is followed until it is read or its loss is recorded as a gap.
