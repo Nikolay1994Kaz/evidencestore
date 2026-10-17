@@ -17,8 +17,8 @@ import (
 	"strings"
 	"syscall"
 
-	"evidencestore/internal/collector"
-	"evidencestore/internal/version"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/collector"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/version"
 )
 
 func main() {

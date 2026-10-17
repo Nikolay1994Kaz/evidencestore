@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // Симуляция часов приёма: истинное время задаёт TSA (метка округлена до

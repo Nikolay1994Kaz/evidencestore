@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
 )
 
 // Каждая смена состояния ключа ложится в цепь событием EventKeyState:

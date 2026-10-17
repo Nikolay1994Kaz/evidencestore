@@ -1,4 +1,4 @@
-module evidencestore
+module github.com/Nikolay1994Kaz/evidencestore
 
 go 1.25.4
 

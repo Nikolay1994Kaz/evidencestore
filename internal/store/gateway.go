@@ -4,10 +4,10 @@ import (
 	"crypto/ed25519"
 	"fmt"
 
-	"evidencestore/internal/config"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/gateway"
-	"evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // Журнал гейтвея (content_type pipelock/recorder). Каждая принятая строка

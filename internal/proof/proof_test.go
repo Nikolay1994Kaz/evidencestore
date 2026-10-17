@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/tsa"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // Синтетическая цепь: каждую проверку Verify стережёт свой тест, в котором

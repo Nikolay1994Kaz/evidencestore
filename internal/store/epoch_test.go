@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 )
 
 var (

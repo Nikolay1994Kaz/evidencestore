@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"evidencestore/internal/metrics"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
 )
 
 // Показатели отражают то, на что ставят тревоги: записи и повторы по

@@ -11,10 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/config"
-	"evidencestore/internal/gateway"
-	"evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // Настоящий бортовой журнал Pipelock v3.6.0 из тестовых данных пакета

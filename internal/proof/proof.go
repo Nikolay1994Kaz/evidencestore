@@ -31,11 +31,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/gateway"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/tsa"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // Version — версия формата пакета.

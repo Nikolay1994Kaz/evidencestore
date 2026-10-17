@@ -27,12 +27,12 @@ import (
 	"strconv"
 	"time"
 
-	"evidencestore/internal/config"
-	"evidencestore/internal/evlog"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/metrics"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/store"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
 )
 
 // MaxRequest — предел тела запроса приёма: пачка до store.MaxBatch записей.

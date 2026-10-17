@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 )
 
 // Эпоха сборщика — случайный идентификатор установки сборщика (его

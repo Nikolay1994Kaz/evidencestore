@@ -18,13 +18,13 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/config"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/ship"
-	"evidencestore/internal/tsa"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // clock — подвижные часы теста.

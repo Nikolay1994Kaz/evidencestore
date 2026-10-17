@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/gateway"
-	"evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
 )
 
 // gatewayWorld — синтетическая цепь с уликой из журнала гейтвея: тело —

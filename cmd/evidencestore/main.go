@@ -36,12 +36,12 @@ import (
 	"syscall"
 	"time"
 
-	"evidencestore/internal/config"
-	"evidencestore/internal/pki"
-	"evidencestore/internal/server"
-	"evidencestore/internal/ship"
-	"evidencestore/internal/store"
-	"evidencestore/internal/version"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pki"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/server"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/version"
 )
 
 func main() {

@@ -28,15 +28,15 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/config"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/pki"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/server"
-	"evidencestore/internal/store"
-	"evidencestore/internal/tsa"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pki"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/server"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // Симуляция сборщика: случайные записи, ротации, переименования, перезапуски

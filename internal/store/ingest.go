@@ -9,11 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/config"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // MaxBatch — наибольшее число записей в одном приёме.

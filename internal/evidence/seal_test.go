@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
 )
 
 // Проверка при компиляции: keyring подходит под оба интерфейса.

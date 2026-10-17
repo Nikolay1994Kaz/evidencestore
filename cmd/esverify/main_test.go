@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"evidencestore/internal/config"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/store"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
 )
 
 // world — настоящее хранилище с демо-TSA и файлы для esverify.

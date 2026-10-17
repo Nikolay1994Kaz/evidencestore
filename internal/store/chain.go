@@ -6,10 +6,10 @@ import (
 	"sort"
 	"strconv"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/tsa"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // chainScan — что подъём узнал из цепи.

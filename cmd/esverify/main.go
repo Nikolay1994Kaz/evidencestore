@@ -22,10 +22,10 @@ import (
 	"os"
 	"strings"
 
-	"evidencestore/internal/gateway"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/tsa"
-	"evidencestore/internal/version"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/version"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }

@@ -62,10 +62,10 @@ import (
 	"syscall"
 	"time"
 
-	"evidencestore/internal/config"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/evlog"
-	"evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 
 	"golang.org/x/sys/unix"
 )

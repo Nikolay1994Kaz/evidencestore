@@ -4,7 +4,7 @@ import (
 	"sort"
 	"time"
 
-	"evidencestore/internal/metrics"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
 )
 
 // Metrics — показатели для /metrics. Счётчики — с запуска процесса

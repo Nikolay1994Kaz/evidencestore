@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strconv"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 )
 
 // Улика из журнала гейтвея несёт второй лист — вердикт хранилища при приёме

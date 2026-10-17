@@ -16,13 +16,13 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/config"
-	"evidencestore/internal/evlog"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/metrics"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/ship"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
 )
 
 // Находки проверки агентами 09.10 (docs/FINDINGS.md, «Проверка агентами»):

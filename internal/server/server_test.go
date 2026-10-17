@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/config"
-	"evidencestore/internal/pki"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/store"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pki"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))

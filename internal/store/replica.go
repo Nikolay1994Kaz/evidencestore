@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/ship"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
 )
 
 // Копия наружу (S3 или каталог). Уезжают только дописываемые файлы, кусками

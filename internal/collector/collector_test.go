@@ -21,14 +21,14 @@ import (
 	"testing"
 	"time"
 
-	"evidencestore/internal/config"
-	"evidencestore/internal/evidence"
-	"evidencestore/internal/evlog"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/pki"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/server"
-	"evidencestore/internal/store"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pki"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/server"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))

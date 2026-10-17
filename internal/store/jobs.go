@@ -7,10 +7,10 @@ import (
 	"strconv"
 	"time"
 
-	"evidencestore/internal/auditchain"
-	"evidencestore/internal/keyring"
-	"evidencestore/internal/proof"
-	"evidencestore/internal/tsa"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // startBackground запускает фоновые циклы: звено раз в тик, метку TSA раз
