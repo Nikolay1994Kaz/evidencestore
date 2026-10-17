@@ -1,14 +1,19 @@
 // Command esverify — офлайн-проверка пакета доказательств по улике.
 //
-//	esverify -proof proof.json -store-key KEY -tsa-trust root.cer[,intermediate.cer] [-promise p.json]
+//	esverify -proof proof.json -store-key KEY -tsa-trust root.cer[,intermediate.cer] [-promise p.json] [-body body.bin]
 //
 // Проверяющему не нужен ни сервер хранилища, ни доверие к нему: только
 // пакет, заранее закреплённый открытый ключ хранилища и сертификаты TSA (у
 // НУЦ РК — root_rsa_2020.cer и nca_rsa_2022.cer).
 //
+// -body кладёт тело улики в файл байт в байт — только когда пакет прошёл
+// все проверки: так из хранилища поднимают сам журнал, а отчёт показывает
+// тело человеку с экранированными управляющими символами.
+//
 // Код выхода: 0 — пакет проходит; 1 — не проходит (в том числе пакет не
-// разбирается или обещание нарушено); 2 — неверный вызов или не читается
-// файл ключа, сертификатов или обещания.
+// разбирается или обещание нарушено); 2 — неверный вызов, не читается
+// файл ключа, сертификатов или обещания, или -body у пакета без ключа
+// записи.
 package main
 
 import (
@@ -46,12 +51,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
 	allowNoTSA := fs.Bool("allow-no-tsa", false, "accept a bundle without a TSA time-stamp after the record (then only the store's own signature vouches for it)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
+	bodyPath := fs.String("body", "", "once the bundle verifies, write the record body to FILE exactly as the source sent it (the bundle must carry the record key: evidencestore proof -dek)")
 	showVersion := fs.Bool("version", false, "print the version and the commit it was built from")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-allow-no-tsa] [-json]")
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-allow-no-tsa] [-json] [-body FILE]")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
-		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage or an unreadable key, certificate or promise file")
+		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage, an unreadable key, certificate or promise file, or -body for a bundle without the record key")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -138,7 +144,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, report.Text())
 	}
 	if !valid {
+		if *bodyPath != "" {
+			fmt.Fprintln(stderr, "body not written: the bundle does not verify")
+		}
 		return exitInvalid
+	}
+	if *bodyPath != "" {
+		// Тело выдаётся только из пакета, прошедшего все проверки, и байт в
+		// байт: Text экранирует управляющие символы, а журнал поднимают
+		// ровно из тех байтов, что прислал источник.
+		if !report.BodyOpened {
+			fmt.Fprintln(stderr, "error: -body: the bundle carries no record key (request it with evidencestore proof -dek) or the month key was destroyed: there is no body to write")
+			return exitUsage
+		}
+		// Тело — содержимое улики: файл только владельцу.
+		if err := os.WriteFile(*bodyPath, report.Body, 0o600); err != nil {
+			return usageErr(fmt.Errorf("-body: %w", err))
+		}
+		fmt.Fprintf(stderr, "body written to %s (%d bytes)\n", *bodyPath, len(report.Body))
 	}
 	return exitValid
 }

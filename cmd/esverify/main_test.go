@@ -20,7 +20,10 @@ type world struct {
 	dir, bundle, key, trust, promise string
 }
 
-func newWorld(t *testing.T) world {
+func newWorld(t *testing.T) world { return newWorldWith(t, []byte("login admin")) }
+
+// newWorldWith — то же с заданным телом единственной улики.
+func newWorldWith(t *testing.T, body []byte) world {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{
@@ -38,7 +41,7 @@ func newWorld(t *testing.T) world {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	res, err := s.Ingest("abs-core", []store.Incoming{{Seq: 1, Body: []byte("login admin")}})
+	res, err := s.Ingest("abs-core", []store.Incoming{{Seq: 1, Body: body}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +125,84 @@ func TestBundleWithoutTSAIsRefused(t *testing.T) {
 	}
 	if code, out := w.run(t, "-allow-no-tsa"); code != exitValid {
 		t.Fatalf("без метки TSA с -allow-no-tsa: %d\n%s", code, out)
+	}
+}
+
+// P-01: -body отдаёт тело байт в байт (отчёт экранирует управляющие символы,
+// файл — нет) и только из пакета, прошедшего проверку; без ключа записи
+// тела нет, и вызов говорит об этом кодом 2, а не пустым файлом.
+func TestBodyFlag(t *testing.T) {
+	body := []byte("login root from 203.0.113.7\x1b[2K\r\xff\x00 tail")
+	w := newWorldWith(t, body)
+	out := filepath.Join(w.dir, "body.bin")
+	if code, rep := w.run(t, "-body", out); code != exitValid {
+		t.Fatalf("целый пакет: %d\n%s", code, rep)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("тело в файле %q (%v), а пришло %q", got, err, body)
+	}
+	if fi, _ := os.Stat(out); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("права файла с телом: %v", fi.Mode().Perm())
+	}
+
+	// JSON-отчёт остаётся чистым JSON: сообщение о файле — в stderr.
+	var stdout, stderr bytes.Buffer
+	args := []string{"-proof", w.bundle, "-store-key", w.key, "-tsa-trust", w.trust, "-json", "-body", filepath.Join(w.dir, "json-body.bin")}
+	if code := run(args, &stdout, &stderr); code != exitValid {
+		t.Fatalf("-json -body: %d\n%s%s", code, stdout.String(), stderr.String())
+	}
+	var rep map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil || rep["valid"] != true {
+		t.Fatalf("stdout с -json -body — не отчёт: %v\n%s", err, stdout.String())
+	}
+
+	data, _ := os.ReadFile(w.bundle)
+	b, err := proof.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func() {
+		bad, _ := json.Marshal(b)
+		os.WriteFile(w.bundle, bad, 0o600)
+	}
+	rewrite := func(dek []byte) {
+		b.DEK = dek
+		save()
+	}
+
+	// Тело вскрывается, но пакет не проходит (нет метки TSA после улики):
+	// файла нет.
+	upper := b.Upper
+	b.Upper = nil
+	save()
+	noTSA := filepath.Join(w.dir, "no-tsa.bin")
+	if code, rep := w.run(t, "-body", noTSA); code != exitInvalid || !strings.Contains(rep, "body not written") {
+		t.Fatalf("пакет без метки TSA: %d\n%s", code, rep)
+	}
+	if _, err := os.Stat(noTSA); !os.IsNotExist(err) {
+		t.Fatalf("тело записано из пакета, который не прошёл: %v", err)
+	}
+	b.Upper = upper
+
+	// Ключ записи не тот: проверка не проходит, файла нет.
+	rewrite(bytes.Repeat([]byte{7}, 32))
+	wrong := filepath.Join(w.dir, "wrong-dek.bin")
+	if code, rep := w.run(t, "-body", wrong); code != exitInvalid || !strings.Contains(rep, "body not written") {
+		t.Fatalf("чужой ключ записи: %d\n%s", code, rep)
+	}
+	if _, err := os.Stat(wrong); !os.IsNotExist(err) {
+		t.Fatalf("тело записано из пакета, который не прошёл: %v", err)
+	}
+
+	// Ключа записи нет: пакет проходит, а тела нет — код 2, файла нет.
+	rewrite(nil)
+	none := filepath.Join(w.dir, "no-dek.bin")
+	if code, rep := w.run(t, "-body", none); code != exitUsage || !strings.Contains(rep, "no record key") {
+		t.Fatalf("пакет без ключа записи: %d\n%s", code, rep)
+	}
+	if _, err := os.Stat(none); !os.IsNotExist(err) {
+		t.Fatalf("файл тела без ключа записи: %v", err)
 	}
 }
 

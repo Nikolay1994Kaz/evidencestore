@@ -690,6 +690,36 @@
    "file": "internal/store/replica.go",
    "old": "\tprefix := genPrefix(gen)\n\tfiles, heads, err := listReplica(ctx, r, prefix)",
    "new": "\tprefix := genPrefix(gen * 0)\n\tfiles, heads, err := listReplica(ctx, r, prefix)"
+  },
+  {
+   "name": "P23 -body у пакета без ключа записи пишет пустой файл с кодом 0",
+   "file": "cmd/esverify/main.go",
+   "old": "\t\tif !report.BodyOpened {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "P24 -body пишет тело из пакета, который не прошёл",
+   "file": "cmd/esverify/main.go",
+   "old": "\tif !valid {\n\t\tif *bodyPath != \"\" {\n\t\t\tfmt.Fprintln(stderr, \"body not written: the bundle does not verify\")\n\t\t}\n\t\treturn exitInvalid\n\t}",
+   "new": "\tif !valid && *bodyPath == \"\" {\n\t\treturn exitInvalid\n\t}"
+  },
+  {
+   "name": "P25 -body пишет тело экранированным, как в отчёте",
+   "file": "cmd/esverify/main.go",
+   "old": "os.WriteFile(*bodyPath, report.Body, 0o600)",
+   "new": "os.WriteFile(*bodyPath, []byte(proof.Printable(string(report.Body))), 0o600)"
+  },
+  {
+   "name": "P26 файл с телом читают все",
+   "file": "cmd/esverify/main.go",
+   "old": "report.Body, 0o600)",
+   "new": "report.Body, 0o644)"
+  },
+  {
+   "name": "P27 сообщение о файле тела — в stdout, JSON-отчёт ломается",
+   "file": "cmd/esverify/main.go",
+   "old": "fmt.Fprintf(stderr, \"body written to",
+   "new": "fmt.Fprintf(stdout, \"body written to"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

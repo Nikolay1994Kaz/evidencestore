@@ -29,7 +29,7 @@ The demo runs these steps:
 |---|---|
 | `evidencestore` | the store: `init`, `serve`, plus operator commands over a local admin socket (`status`, `stamp`, `proof`, `keys …`, `sources bind`, `dev-pki`) |
 | `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
-| `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; exit code 0 — verified, 1 — not verified (including an unparsable bundle or a broken promise), 2 — bad usage or an unreadable key, certificate or promise file |
+| `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; `-body FILE` writes the record body to a file byte for byte, only once the bundle verifies; exit code 0 — verified, 1 — not verified (including an unparsable bundle or a broken promise), 2 — bad usage, an unreadable key, certificate or promise file, or `-body` for a bundle without the record key |
 
 `evidencestore version`, `escollect -version` and `esverify -version` print the version and the commit a binary was built from.
 
@@ -147,7 +147,7 @@ Proven offline:
 - they have not been altered since;
 - they entered the chain between the two time-stamps T1 and T2;
 - the store committed to including them by the signed deadline it gave the collector;
-- with the record key: the body as received; the key is bound to the record's digest, so the store cannot show two auditors two different bodies;
+- with the record key: the body as received (`esverify -body FILE` writes it out byte for byte, so the original log can be rebuilt from the store); the key is bound to the record's digest, so the store cannot show two auditors two different bodies;
 - for gateway journals: the body is the gateway's own entry, and a checkpoint signed by the gateway covers it — when that signature was checked by the store with the pinned `gateway_key` or by you with `-gateway-key`. A gateway record whose bundle lacks the gateway part does not verify.
 
 T2 is required: a bundle without a time-stamp after the record only carries the store's own signature, and whoever holds `sign.key` can make up a record with any date. `esverify` rejects such a bundle unless told `-allow-no-tsa`. The verdict is printed first and last, and control characters in the body are escaped, so a body cannot paint a false verdict on the auditor's screen.
