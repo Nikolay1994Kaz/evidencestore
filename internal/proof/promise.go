@@ -64,15 +64,15 @@ func VerifyPromise(p Promise, pinned ed25519.PublicKey) error {
 func CheckPromise(p Promise, r Report, linkTime int64) error {
 	switch {
 	case p.Source != r.Header.Source || p.Seq != r.Header.Seq:
-		return fmt.Errorf("обещание про %s/%d, пакет про %s/%d", p.Source, p.Seq, r.Header.Source, r.Header.Seq)
+		return fmt.Errorf("the promise is about %s/%d, the bundle about %s/%d", p.Source, p.Seq, r.Header.Source, r.Header.Seq)
 	case string(p.Digest) != string(r.Digest[:]):
-		return errors.New("отпечаток в обещании не совпадает с уликой в цепи — хранилище подменило улику после приёма")
+		return errors.New("the digest in the promise does not match the record in the chain: the store replaced the record after intake")
 	case p.Position != r.Position:
-		return fmt.Errorf("обещана позиция %d, в цепи %d", p.Position, r.Position)
+		return fmt.Errorf("position %d was promised, the chain has %d", p.Position, r.Position)
 	case p.ReceivedAt != r.Header.ReceivedAt:
-		return errors.New("время приёма в обещании не совпадает с уликой")
+		return errors.New("the receive time in the promise does not match the record")
 	case linkTime > p.Deadline:
-		return errors.New("улика вошла в цепь позже обещанного срока")
+		return errors.New("the record entered the chain after the promised deadline")
 	}
 	return nil
 }

@@ -229,7 +229,7 @@ func encodeBatchPayload(p BatchPayload) []byte {
 // DecodeBatchPayload разбирает предмет звена-агрегата.
 func DecodeBatchPayload(b []byte) (BatchPayload, error) {
 	if len(b) != batchPayloadSize {
-		return BatchPayload{}, fmt.Errorf("auditchain: предмет звена %d Б, ожидалось %d", len(b), batchPayloadSize)
+		return BatchPayload{}, fmt.Errorf("auditchain: link payload is %d bytes, expected %d", len(b), batchPayloadSize)
 	}
 	var p BatchPayload
 	copy(p.Root[:], b[0:32])
@@ -246,7 +246,7 @@ func DecodeBatchPayload(b []byte) (BatchPayload, error) {
 // миллионов раз в год — это 3.5 ГБ пустоты на простаивающем инстансе.
 func LinkBatch(head Head, unixNano int64, firstLeaf uint64, leaves []Leaf) (Record, error) {
 	if len(leaves) == 0 {
-		return Record{}, fmt.Errorf("auditchain: звено над пустым батчем не строится")
+		return Record{}, fmt.Errorf("auditchain: no link is built over an empty batch")
 	}
 	payload := encodeBatchPayload(BatchPayload{
 		Root:      MerkleRoot(leaves),
@@ -266,11 +266,11 @@ func Verify(records []Record, want *Head) (Head, error) {
 	var head Head
 	for i, r := range records {
 		if r.Seq != head.Seq+1 {
-			return Head{}, fmt.Errorf("auditchain: запись %d имеет seq %d, ожидался %d — цепь с пропуском",
+			return Head{}, fmt.Errorf("auditchain: record %d has seq %d, expected %d: the chain has a gap",
 				i, r.Seq, head.Seq+1)
 		}
 		if r.PrevHash != head.Hash {
-			return Head{}, fmt.Errorf("auditchain: запись %d (seq %d) не связана с предыдущей — прошлое переписано",
+			return Head{}, fmt.Errorf("auditchain: record %d (seq %d) does not link to the previous one: the past was rewritten",
 				i, r.Seq)
 		}
 		head = Head{Seq: r.Seq, Hash: Hash(r)}
@@ -282,11 +282,11 @@ func Verify(records []Record, want *Head) (Head, error) {
 		// ослабляет. Оставлена ради внятного сообщения: «хвост обрезан»
 		// говорит оператору, что делать, а «голова не совпадает» — нет.
 		if want.Seq != head.Seq {
-			return Head{}, fmt.Errorf("auditchain: в журнале %d записей, голова помнит %d — хвост обрезан",
+			return Head{}, fmt.Errorf("auditchain: the log holds %d records, the head remembers %d: the tail was cut",
 				head.Seq, want.Seq)
 		}
 		if want.Hash != head.Hash {
-			return Head{}, fmt.Errorf("auditchain: голова журнала не совпадает с сохранённой — цепь подменена")
+			return Head{}, fmt.Errorf("auditchain: the log's head does not match the saved one: the chain was replaced")
 		}
 	}
 	return head, nil

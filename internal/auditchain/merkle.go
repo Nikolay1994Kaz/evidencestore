@@ -100,7 +100,7 @@ type ProofStep struct {
 // MerkleProof строит путь включения листа с индексом idx.
 func MerkleProof(leaves []Leaf, idx int) ([]ProofStep, error) {
 	if idx < 0 || idx >= len(leaves) {
-		return nil, fmt.Errorf("auditchain: лист %d вне батча из %d", idx, len(leaves))
+		return nil, fmt.Errorf("auditchain: leaf %d is outside a batch of %d", idx, len(leaves))
 	}
 	level := make([][32]byte, len(leaves))
 	for i, l := range leaves {

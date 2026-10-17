@@ -1993,7 +1993,7 @@ func (m *storeSim) checkRecord(c *simClient, q uint64, trust proof.Trust) {
 		// с чистым прогоном в checkVerdicts).
 		hole := c.lines != nil && slices.ContainsFunc(slices.Collect(maps.Keys(c.drLost)), func(x uint64) bool { return x < q })
 		for _, ch := range rep.Checks {
-			if !ch.OK && !(hole && strings.Contains(ch.Name, "гейтвея")) {
+			if !ch.OK && !(hole && strings.Contains(ch.Name, "gateway")) {
 				m.fail("пакет %s/%d не проходит проверку: %s: %s", c.source, q, ch.Name, ch.Detail)
 				return
 			}
@@ -2032,7 +2032,7 @@ func (m *storeSim) checkRecord(c *simClient, q uint64, trust proof.Trust) {
 		if err := proof.CheckPromise(p, rep, linkTime); err != nil {
 			// Улика доехала до копии, а её звено — нет: подъём из копии вплетает
 			// её в цепь позже срока; обещание нарушено видимо (README).
-			late := strings.Contains(err.Error(), "позже обещанного срока") &&
+			late := strings.Contains(err.Error(), "after the promised deadline") &&
 				slices.ContainsFunc(m.restoredAt, func(t time.Time) bool { return t.UnixNano() >= p.ReceivedAt })
 			if !late {
 				m.fail("обещание %s/%d не выполнено: %v", c.source, q, err)

@@ -1238,7 +1238,7 @@ func TestTamperedLeafStopsStart(t *testing.T) {
 	if err == nil {
 		t.Fatal("подменённый лист цепи принят при подъёме")
 	}
-	if !strings.Contains(err.Error(), "лист подменён") {
+	if !strings.Contains(err.Error(), "a leaf was replaced") {
 		t.Fatalf("подъём упал не на сверке корня: %v", err)
 	}
 }

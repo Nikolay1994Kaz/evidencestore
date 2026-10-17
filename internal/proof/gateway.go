@@ -68,22 +68,22 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	if err == nil {
 		switch {
 		case leaf.Scope != sealed.Source || leaf.Subject != strconv.FormatUint(sealed.Seq, 10):
-			err = fmt.Errorf("вердикт про %s/%s, а улика %s/%d", leaf.Scope, leaf.Subject, sealed.Source, sealed.Seq)
+			err = fmt.Errorf("the verdict is about %s/%s, the record is %s/%d", leaf.Scope, leaf.Subject, sealed.Source, sealed.Seq)
 		case pos != r.Position:
-			err = fmt.Errorf("вердикт про позицию %d, а улика на позиции %d", pos, r.Position)
+			err = fmt.Errorf("the verdict is about position %d, the record is at position %d", pos, r.Position)
 		}
 	}
-	if !add("вердикт гейтвея описывает эту улику", err, "") {
+	if !add("the gateway verdict describes this record", err, "") {
 		return
 	}
 	r.Gateway = &v
-	add("вердикт гейтвея входит в цепь (путь Меркла)", checkInclusion(g.Entry, linkAt), fmt.Sprintf("звено %d", g.Entry.LinkSeq))
+	add("the gateway verdict is in the chain (Merkle path)", checkInclusion(g.Entry, linkAt), fmt.Sprintf("link %d", g.Entry.LinkSeq))
 
 	err = nil
 	if !v.Clean() {
-		err = fmt.Errorf("сцепка %s, хэш сошёлся: %v, подпись: %s; %s", v.Link, v.HashOK, orDash(v.Signature), v.Problem)
+		err = fmt.Errorf("chaining %s, hash matches: %v, signature: %s; %s", v.Link, v.HashOK, orDash(v.Signature), v.Problem)
 	}
-	add("запись цела в цепочке гейтвея (проверено хранилищем при приёме)", err, fmt.Sprintf("seq %d, сцепка %s", v.Seq, v.Link))
+	add("the entry is intact in the gateway chain (checked by the store at intake)", err, fmt.Sprintf("seq %d, chaining %s", v.Seq, v.Link))
 
 	if r.BodyOpened {
 		e, err := gateway.ParseEntry(r.Body)
@@ -92,9 +92,9 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 			h, err = e.ComputeHash()
 		}
 		if err == nil && (h != v.Hash || e.Hash != v.Hash) {
-			err = fmt.Errorf("хэш тела %s, в вердикте %s", short(h), short(v.Hash))
+			err = fmt.Errorf("body hash %s, verdict hash %s", short(h), short(v.Hash))
 		}
-		add("тело — та самая запись журнала гейтвея (хэш пересчитан)", err, short(v.Hash))
+		add("the body is that very gateway journal entry (hash recomputed)", err, short(v.Hash))
 	}
 
 	if g.Checkpoint == nil {
@@ -105,19 +105,19 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	if err == nil {
 		switch {
 		case cl.Scope != sealed.Source:
-			err = fmt.Errorf("контрольная точка другого источника %s", cl.Scope)
+			err = fmt.Errorf("the checkpoint belongs to another source, %s", cl.Scope)
 		case cv.Type != "checkpoint" || cv.Sig == "":
-			err = errors.New("лист не контрольная точка с подписью")
+			err = errors.New("the leaf is not a signed checkpoint")
 		case cv.Namespace() != v.Namespace():
-			err = errors.New("контрольная точка другой цепочки гейтвея")
+			err = errors.New("the checkpoint belongs to another gateway chain")
 		case cpos <= pos || cv.Seq <= v.Seq:
-			err = errors.New("контрольная точка не после записи")
+			err = errors.New("the checkpoint does not come after the entry")
 		}
 	}
 	if err == nil {
 		err = checkInclusion(*g.Checkpoint, linkAt)
 	}
-	if !add("контрольная точка гейтвея после записи входит в цепь", err, fmt.Sprintf("seq %d", cv.Seq)) {
+	if !add("a gateway checkpoint after the entry is in the chain", err, fmt.Sprintf("seq %d", cv.Seq)) {
 		return
 	}
 	// Накрывает запись только точка, чью подпись кто-то проверил: сам
@@ -126,7 +126,7 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	switch {
 	case trust.GatewayKey != nil:
 		r.GatewayKeyChecked = true
-		if add("контрольная точка подписана закреплённым ключом гейтвея", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf("seq %d", cv.Seq)) {
+		if add("the checkpoint is signed with the pinned gateway key", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf("seq %d", cv.Seq)) {
 			r.GatewayCheckpoint = &cv
 		}
 	case cv.Signature == gateway.SigValid:
@@ -143,18 +143,18 @@ func (r Report) gatewayNotes() []string {
 	}
 	var n []string
 	if r.Gateway.Link == gateway.LinkFirstSeen {
-		n = append(n, "цепочка гейтвея началась раньше первой полученной записи: предыдущих записей хранилище не видело")
+		n = append(n, "the gateway chain began before the first entry received: the store never saw the entries before it")
 	}
 	switch {
 	case r.GatewayUnsigned:
-		n = append(n, "контрольная точка после записи есть, но её подпись не проверял никто: ключ гейтвея не закреплён ни в реестре хранилища, ни у вас (esverify -gateway-key) — подпись гейтвея эту запись не накрывает")
+		n = append(n, "there is a checkpoint after the entry, but nobody checked its signature: the gateway key is pinned neither in the store's registry nor by you (esverify -gateway-key), so no gateway signature covers this entry")
 	case r.GatewayCheckpoint == nil:
-		n = append(n, "контрольной точки гейтвея после записи в пакете нет: подпись гейтвея эту запись не накрывает (точка ещё не пришла или в цепочке до неё есть поломка)")
+		n = append(n, "the bundle has no gateway checkpoint after the entry: no gateway signature covers it (the checkpoint has not arrived yet, or the chain breaks before it)")
 	case !r.GatewayKeyChecked:
-		n = append(n, "подпись контрольной точки проверило хранилище при приёме; закрепите ключ гейтвея (esverify -gateway-key), чтобы проверить её самим")
+		n = append(n, "the store checked the checkpoint signature at intake; pin the gateway key (esverify -gateway-key) to check it yourself")
 	}
 	if r.GatewayCheckpoint != nil {
-		n = append(n, "сцепку записи с контрольной точкой (хэши промежуточных записей) проверило хранилище при приёме: промежуточных записей в пакете нет")
+		n = append(n, "the store checked at intake that the entry chains to the checkpoint (the hashes of the entries in between); those entries are not in the bundle")
 	}
 	return n
 }

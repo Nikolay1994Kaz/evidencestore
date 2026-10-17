@@ -115,12 +115,12 @@ type Recovery struct {
 // ⚠Это не поломка носителя, а ровно тот сигнал, ради которого цепь построена:
 // кто-то отрезал хвост. Отдельная ошибка нужна, чтобы вызывающий мог отличить
 // её от «файл побился» и не чинил её автоматически.
-var ErrTruncatedChain = errors.New("auditchain: журнал короче сохранённой головы — хвост обрезан")
+var ErrTruncatedChain = errors.New("auditchain: the log is shorter than the saved head: the tail was cut")
 
 // Open поднимает носитель, восстанавливая состояние после любого отказа.
 func Open(dir string) (*Carrier, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("auditchain: каталог %s: %w", dir, err)
+		return nil, fmt.Errorf("auditchain: directory %s: %w", dir, err)
 	}
 	c := &Carrier{dir: dir, segmentBytes: defaultSegmentBytes}
 
@@ -173,7 +173,7 @@ func (c *Carrier) recover() error {
 	for i, body := range bodies {
 		r, err := decodeRecord(body)
 		if err != nil {
-			return fmt.Errorf("auditchain: звено %d: %w", i, err)
+			return fmt.Errorf("auditchain: link %d: %w", i, err)
 		}
 		links = append(links, r)
 	}
@@ -184,7 +184,7 @@ func (c *Carrier) recover() error {
 	}
 	switch {
 	case saved.Seq > head.Seq:
-		return fmt.Errorf("%w: в журнале %d звеньев, голова помнит %d", ErrTruncatedChain, head.Seq, saved.Seq)
+		return fmt.Errorf("%w: the log holds %d links, the head remembers %d", ErrTruncatedChain, head.Seq, saved.Seq)
 	case saved.Seq < head.Seq:
 		// Отказ между fsync звена и записью головы. Журнал длиннее — данные
 		// целы, голова просто не успела; догоняем и говорим об этом вслух.
@@ -194,12 +194,12 @@ func (c *Carrier) recover() error {
 		// бы молча — «голова отстала» стало бы универсальным оправданием
 		// любого расхождения, то есть дырой ровно там, где строится защита.
 		if saved.Seq > 0 && Hash(links[saved.Seq-1]) != saved.Hash {
-			return fmt.Errorf("auditchain: сохранённая голова (seq %d) не совпадает со звеном журнала на той же позиции — цепь подменена",
+			return fmt.Errorf("auditchain: the saved head (seq %d) does not match the log's link at the same position: the chain was replaced",
 				saved.Seq)
 		}
 		c.recovery.HeadAdvanced = head.Seq - saved.Seq
 	case saved.Hash != head.Hash:
-		return fmt.Errorf("auditchain: голова журнала не совпадает с сохранённой при равной длине — цепь подменена")
+		return fmt.Errorf("auditchain: the log's head does not match the saved one at equal length: the chain was replaced")
 	}
 	c.headState = head
 	c.recovery.Links = len(links)
@@ -217,7 +217,7 @@ func (c *Carrier) recover() error {
 	if n := len(links); n > 0 {
 		p, err := DecodeBatchPayload(links[n-1].Payload)
 		if err != nil {
-			return fmt.Errorf("auditchain: последнее звено: %w", err)
+			return fmt.Errorf("auditchain: last link: %w", err)
 		}
 		covered = p.FirstLeaf + uint64(p.Count)
 	}
@@ -233,7 +233,7 @@ func (c *Carrier) openLeafSegment(covered uint64) error {
 	}
 	if len(segs) == 0 {
 		if covered > 0 {
-			return fmt.Errorf("%w: звенья покрывают %d листьев, а файлов листьев нет", ErrLeavesMissing, covered)
+			return fmt.Errorf("%w: the links cover %d leaves, but there are no leaf files", ErrLeavesMissing, covered)
 		}
 		c.segFirst = covered
 		c.nextLeaf = covered
@@ -257,15 +257,15 @@ func (c *Carrier) openLeafSegment(covered uint64) error {
 	c.nextLeaf = c.segFirst + uint64(len(bodies))
 
 	if c.nextLeaf < covered {
-		return fmt.Errorf("%w: звено покрывает лист %d, а в файлах листьев их %d — листья потеряны",
-			ErrLeavesMissing, covered-1, c.nextLeaf)
+		return fmt.Errorf("%w: the links cover %d leaves, but the leaf files hold %d: leaves were lost",
+			ErrLeavesMissing, covered, c.nextLeaf)
 	}
 	// ⭐Листья без корня: отказ случился между их fsync и записью звена.
 	// Они не потеряны — поднимаем в буфер, следующее звено их накроет.
 	for i := covered - c.segFirst; i < uint64(len(bodies)); i++ {
 		l, err := decodeLeaf(bodies[i])
 		if err != nil {
-			return fmt.Errorf("auditchain: лист %d: %w", c.segFirst+i, err)
+			return fmt.Errorf("auditchain: leaf %d: %w", c.segFirst+i, err)
 		}
 		c.pending = append(c.pending, l)
 	}
@@ -344,7 +344,7 @@ func (c *Carrier) flushLocked() (Head, error) {
 	}
 	head, err := c.writeTick()
 	if err != nil {
-		c.failed = fmt.Errorf("auditchain: запись тика: %w", err)
+		c.failed = fmt.Errorf("auditchain: tick write: %w", err)
 		return c.headState, c.failed
 	}
 	return head, nil
@@ -555,7 +555,7 @@ func TrimToHead(dir string, head uint64) error {
 	for n := uint64(1); n <= head; n++ {
 		body, next, ok := nextFrame(data, off)
 		if !ok {
-			return fmt.Errorf("auditchain: %s: звеньев меньше %d", path, head)
+			return fmt.Errorf("auditchain: %s: fewer than %d links", path, head)
 		}
 		if n == head {
 			r, err := decodeRecord(body)
@@ -594,7 +594,7 @@ func TrimToHead(dir string, head uint64) error {
 			for k := first; k < covered; k++ {
 				_, next, ok := nextFrame(leaves, loff)
 				if !ok {
-					return fmt.Errorf("%w: звено %d покрывает лист %d, а в %s их %d", ErrLeavesMissing, head, covered-1, lp, k-first)
+					return fmt.Errorf("%w: %s holds %d leaves, but link %d needs %d of them", ErrLeavesMissing, lp, k-first, head, covered-first)
 				}
 				loff = next
 			}
@@ -641,7 +641,7 @@ func ReadChain(dir string) ([]Record, error) {
 	for i, body := range bodies {
 		r, err := decodeRecord(body)
 		if err != nil {
-			return nil, fmt.Errorf("auditchain: звено %d: %w", i, err)
+			return nil, fmt.Errorf("auditchain: link %d: %w", i, err)
 		}
 		links = append(links, r)
 	}
@@ -663,7 +663,7 @@ func ReadLeaves(dir string, first uint64, count int) ([]Leaf, error) {
 	}
 	idx := sort.Search(len(segs), func(i int) bool { return segs[i] > first }) - 1
 	if idx < 0 {
-		return nil, fmt.Errorf("%w: листья с номера %d не найдены", ErrLeavesMissing, first)
+		return nil, fmt.Errorf("%w: leaves from number %d not found", ErrLeavesMissing, first)
 	}
 	f, err := os.Open(leafPath(dir, segs[idx]))
 	if errors.Is(err, os.ErrNotExist) {
@@ -680,7 +680,7 @@ func ReadLeaves(dir string, first uint64, count int) ([]Leaf, error) {
 	}
 	from := int(first - segs[idx])
 	if from+count > len(bodies) {
-		return nil, fmt.Errorf("%w: в файле листьев %d записей, запрошены %d..%d",
+		return nil, fmt.Errorf("%w: the leaf file holds %d records, %d..%d requested",
 			ErrLeavesMissing, len(bodies), from, from+count)
 	}
 	out := make([]Leaf, 0, count)
@@ -764,7 +764,7 @@ func scanFrames(f *os.File, truncate bool) ([][]byte, int64, string, error) {
 	// Плохой кадр. Обрыв записи бывает только в конце: целый кадр дальше
 	// значит порчу середины.
 	if at, ok := frameAfter(data, off+1); ok {
-		return nil, 0, "", fmt.Errorf("auditchain: %s: кадр по смещению %d испорчен, а по смещению %d — целый кадр: файл повреждён, это не оборванный хвост",
+		return nil, 0, "", fmt.Errorf("auditchain: %s: the frame at offset %d is damaged, yet a whole frame follows at offset %d: the file is corrupt, not a torn tail",
 			f.Name(), off, at)
 	}
 	torn := int64(len(data) - off)
@@ -774,7 +774,7 @@ func scanFrames(f *os.File, truncate bool) ([][]byte, int64, string, error) {
 		// мусором и разъедется навсегда. Но сначала откладываем его рядом.
 		aside = fmt.Sprintf("%s.torn-%d", f.Name(), off)
 		if err := writeSynced(aside, data[off:]); err != nil {
-			return nil, 0, "", fmt.Errorf("auditchain: отложить хвост: %w", err)
+			return nil, 0, "", fmt.Errorf("auditchain: set the tail aside: %w", err)
 		}
 		if err := syncDir(filepath.Dir(f.Name())); err != nil {
 			return nil, 0, "", err
@@ -862,7 +862,7 @@ func decodeHead(buf []byte) (Head, bool) {
 func decodeRecord(b []byte) (Record, error) {
 	var r Record
 	if len(b) < 8+hashSize+8+1 {
-		return r, fmt.Errorf("звено короче заголовка: %d Б", len(b))
+		return r, fmt.Errorf("link shorter than its header: %d bytes", len(b))
 	}
 	r.Seq = binary.BigEndian.Uint64(b[0:8])
 	copy(r.PrevHash[:], b[8:8+hashSize])
@@ -884,10 +884,10 @@ func decodeRecord(b []byte) (Record, error) {
 func decodeLeaf(b []byte) (Leaf, error) {
 	var l Leaf
 	if len(b) < 1+8+1 {
-		return l, fmt.Errorf("лист короче заголовка: %d Б", len(b))
+		return l, fmt.Errorf("leaf shorter than its header: %d bytes", len(b))
 	}
 	if b[0] != domainLeaf {
-		return l, fmt.Errorf("лист начинается с байта 0x%02x, ожидался домен листа 0x%02x", b[0], domainLeaf)
+		return l, fmt.Errorf("leaf starts with byte 0x%02x, expected the leaf domain 0x%02x", b[0], domainLeaf)
 	}
 	l.UnixNano = int64(binary.BigEndian.Uint64(b[1:9]))
 	l.Type = EventType(b[9])
@@ -905,18 +905,18 @@ func readFields(b []byte, n int) ([][]byte, error) {
 	off := 0
 	for i := 0; i < n; i++ {
 		if off+4 > len(b) {
-			return nil, fmt.Errorf("поле %d: нет длины", i)
+			return nil, fmt.Errorf("field %d: no length", i)
 		}
 		size := int(binary.BigEndian.Uint32(b[off : off+4]))
 		off += 4
 		if size < 0 || off+size > len(b) {
-			return nil, fmt.Errorf("поле %d: длина %d выходит за пределы записи", i, size)
+			return nil, fmt.Errorf("field %d: length %d runs past the record", i, size)
 		}
 		out = append(out, b[off:off+size])
 		off += size
 	}
 	if off != len(b) {
-		return nil, fmt.Errorf("после разбора осталось %d лишних байт", len(b)-off)
+		return nil, fmt.Errorf("%d extra bytes left after parsing", len(b)-off)
 	}
 	return out, nil
 }
@@ -975,7 +975,7 @@ func ScanLeaves(dir string, fn func(num uint64, l Leaf) error) error {
 	var next uint64
 	for _, first := range segs {
 		if first != next {
-			return fmt.Errorf("%w: нет листьев %d…%d — файл листьев утрачен", ErrLeavesMissing, next, first-1)
+			return fmt.Errorf("%w: leaves %d…%d are missing: a leaf file was lost", ErrLeavesMissing, next, first-1)
 		}
 		f, err := os.Open(leafPath(dir, first))
 		if err != nil {
@@ -989,7 +989,7 @@ func ScanLeaves(dir string, fn func(num uint64, l Leaf) error) error {
 		for _, b := range bodies {
 			l, err := decodeLeaf(b)
 			if err != nil {
-				return fmt.Errorf("auditchain: лист %d: %w", next, err)
+				return fmt.Errorf("auditchain: leaf %d: %w", next, err)
 			}
 			if err := fn(next, l); err != nil {
 				return err

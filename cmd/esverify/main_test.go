@@ -86,7 +86,7 @@ func TestExitCodesAndPromiseVerdict(t *testing.T) {
 		t.Fatalf("целый пакет: %d\n%s", code, out)
 	}
 
-	if code, out := w.run(t, "-promise", filepath.Join(w.dir, "nope.json")); code != exitUsage || strings.Contains(out, "обещание при приёме") {
+	if code, out := w.run(t, "-promise", filepath.Join(w.dir, "nope.json")); code != exitUsage || strings.Contains(out, "the promise given at intake") {
 		t.Fatalf("опечатка в пути обещания: %d\n%s", code, out)
 	}
 
@@ -97,7 +97,7 @@ func TestExitCodesAndPromiseVerdict(t *testing.T) {
 	bad, _ := json.Marshal(p)
 	os.WriteFile(w.promise, bad, 0o600)
 	code, out := w.run(t, "-promise", w.promise)
-	if code != exitInvalid || !strings.HasPrefix(out, "ПРОВЕРКА НЕ ПРОЙДЕНА") {
+	if code != exitInvalid || !strings.HasPrefix(out, "NOT VERIFIED") {
 		t.Fatalf("нарушенное обещание: %d\n%s", code, out)
 	}
 

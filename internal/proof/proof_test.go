@@ -311,14 +311,14 @@ func TestPromise(t *testing.T) {
 func TestNotesTellWhyBodyIsClosed(t *testing.T) {
 	closed := func(r Report) string {
 		for _, n := range r.Notes() {
-			if strings.HasPrefix(n, "тело не вскрыто") {
+			if strings.HasPrefix(n, "body not opened") {
 				return n
 			}
 		}
 		return ""
 	}
 	w, b := standard(t, nil)
-	if n := closed(Verify(b, w.trust())); !strings.Contains(n, "не выдан") {
+	if n := closed(Verify(b, w.trust())); !strings.Contains(n, "carries no record key") {
 		t.Errorf("без ключа записи: %q", n)
 	}
 	b.DEK = make([]byte, 32)
@@ -326,7 +326,7 @@ func TestNotesTellWhyBodyIsClosed(t *testing.T) {
 	if r.Valid() {
 		t.Fatal("чужой ключ записи вскрыл тело")
 	}
-	if n := closed(r); !strings.Contains(n, "не подошёл") {
+	if n := closed(r); !strings.Contains(n, "does not fit") {
 		t.Errorf("ключ выдан и не подошёл: %q", n)
 	}
 	if n := closed(Report{BodyOpened: true, BodyKey: true}); n != "" {
@@ -365,7 +365,7 @@ func TestReportTextEscapesControls(t *testing.T) {
 		}
 	}
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	if lines[len(lines)-1] != "ПРОВЕРКА НЕ ПРОЙДЕНА" {
+	if lines[len(lines)-1] != "NOT VERIFIED" {
 		t.Fatalf("последняя строка: %q", lines[len(lines)-1])
 	}
 }

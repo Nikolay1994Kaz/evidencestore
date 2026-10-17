@@ -69,7 +69,7 @@ func LoadOrCreateSigner(dir string) (*Signer, error) {
 	switch {
 	case err == nil:
 		if len(data) != ed25519.PrivateKeySize {
-			return nil, fmt.Errorf("auditchain: ключ подписи %s повреждён: %d Б вместо %d",
+			return nil, fmt.Errorf("auditchain: signing key %s is damaged: %d bytes instead of %d",
 				path, len(data), ed25519.PrivateKeySize)
 		}
 		return &Signer{priv: ed25519.PrivateKey(data)}, nil
@@ -184,21 +184,21 @@ func (s *Signer) Sign(head Head, links int, unixSec int64) Statement {
 // явного nil, а не быть значением по умолчанию.
 func VerifyStatement(st Statement, pinned ed25519.PublicKey) error {
 	if st.Version != StatementVersion {
-		return fmt.Errorf("auditchain: заявление версии %d, поддерживается %d", st.Version, StatementVersion)
+		return fmt.Errorf("auditchain: statement version %d, supported %d", st.Version, StatementVersion)
 	}
 	pub, err := base64.RawStdEncoding.DecodeString(st.PublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
-		return fmt.Errorf("auditchain: публичный ключ в заявлении неразбираем")
+		return fmt.Errorf("auditchain: the public key in the statement does not parse")
 	}
 	if pinned != nil && !pinned.Equal(ed25519.PublicKey(pub)) {
-		return errors.New("auditchain: заявление подписано ДРУГИМ ключом, чем закреплённый — подменён инстанс или журнал")
+		return errors.New("auditchain: the statement is signed with a DIFFERENT key than the pinned one: the instance or the log was replaced")
 	}
 	sig, err := base64.RawStdEncoding.DecodeString(st.Signature)
 	if err != nil {
-		return fmt.Errorf("auditchain: подпись неразбираема")
+		return fmt.Errorf("auditchain: the signature does not parse")
 	}
 	if !ed25519.Verify(ed25519.PublicKey(pub), statementBytes(st), sig) {
-		return errors.New("auditchain: подпись не сходится — заявление изменено после выпуска")
+		return errors.New("auditchain: the signature does not match: the statement was changed after it was issued")
 	}
 	return nil
 }

@@ -232,7 +232,7 @@
   {
    "name": "S24 вердикт не сверяется с уликой",
    "file": "internal/proof/gateway.go",
-   "old": "\t\tcase leaf.Scope != sealed.Source || leaf.Subject != strconv.FormatUint(sealed.Seq, 10):\n\t\t\terr = fmt.Errorf(\"вердикт про %s/%s, а улика %s/%d\", leaf.Scope, leaf.Subject, sealed.Source, sealed.Seq)\n\t\tcase pos != r.Position:\n\t\t\terr = fmt.Errorf(\"вердикт про позицию %d, а улика на позиции %d\", pos, r.Position)\n",
+   "old": "\t\tcase leaf.Scope != sealed.Source || leaf.Subject != strconv.FormatUint(sealed.Seq, 10):\n\t\t\terr = fmt.Errorf(\"the verdict is about %s/%s, the record is %s/%d\", leaf.Scope, leaf.Subject, sealed.Source, sealed.Seq)\n\t\tcase pos != r.Position:\n\t\t\terr = fmt.Errorf(\"the verdict is about position %d, the record is at position %d\", pos, r.Position)\n",
    "new": ""
   },
   {
@@ -244,14 +244,14 @@
   {
    "name": "P13 подпись точки не проверяется ключом проверяющего",
    "file": "internal/proof/gateway.go",
-   "old": "\t\tif add(\"контрольная точка подписана закреплённым ключом гейтвея\", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf(\"seq %d\", cv.Seq)) {",
-   "new": "\t\tif add(\"контрольная точка подписана закреплённым ключом гейтвея\", nil, fmt.Sprintf(\"seq %d\", cv.Seq)) {"
+   "old": "\t\tif add(\"the checkpoint is signed with the pinned gateway key\", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf(\"seq %d\", cv.Seq)) {",
+   "new": "\t\tif add(\"the checkpoint is signed with the pinned gateway key\", nil, fmt.Sprintf(\"seq %d\", cv.Seq)) {"
   },
   {
    "name": "P14 поломка записи гейтвея не валит пакет",
    "file": "internal/proof/gateway.go",
-   "old": "\tif !v.Clean() {\n\t\terr = fmt.Errorf(\"сцепка %s",
-   "new": "\tif false {\n\t\terr = fmt.Errorf(\"сцепка %s"
+   "old": "\tif !v.Clean() {\n\t\terr = fmt.Errorf(\"chaining %s",
+   "new": "\tif false {\n\t\terr = fmt.Errorf(\"chaining %s"
   },
   {
    "name": "S25 повторы не считаются",
@@ -466,7 +466,7 @@
   {
    "name": "P21 пакет, который не разбирается, — код 2",
    "file": "cmd/esverify/main.go",
-   "old": "\t\treport.Checks = []proof.Check{{Name: \"пакет разбирается\", Detail: err.Error()}}",
+   "old": "\t\treport.Checks = []proof.Check{{Name: \"the bundle parses\", Detail: err.Error()}}",
    "new": "\t\treturn exitUsage"
   },
   {

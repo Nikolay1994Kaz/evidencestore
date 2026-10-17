@@ -113,14 +113,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	report := proof.Report{}
 	bundle, err := proof.Parse(data)
 	if err != nil {
-		report.Checks = []proof.Check{{Name: "пакет разбирается", Detail: err.Error()}}
+		report.Checks = []proof.Check{{Name: "the bundle parses", Detail: err.Error()}}
 	} else {
 		report = proof.Verify(bundle, pt)
 		if promise != nil {
 			// Обещание — часть вердикта: шапка отчёта не может говорить
 			// «пройдена», когда обещание нарушено.
 			perr := checkPromise(*promise, key, report, bundle)
-			c := proof.Check{Name: "обещание при приёме выполнено: улика в цепи та же и вовремя", OK: perr == nil}
+			c := proof.Check{Name: "the promise given at intake is kept: the same record, in the chain in time", OK: perr == nil}
 			if perr != nil {
 				c.Detail = perr.Error()
 			}

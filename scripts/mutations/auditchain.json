@@ -6,13 +6,13 @@
   {
    "name": "A1 ReadLeaves: пропажа старых листьев без ErrLeavesMissing",
    "file": "internal/auditchain/carrier.go",
-   "old": "fmt.Errorf(\"%w: листья с номера %d не найдены\", ErrLeavesMissing, first)",
+   "old": "fmt.Errorf(\"%w: leaves from number %d not found\", ErrLeavesMissing, first)",
    "new": "fmt.Errorf(\"листья с номера %d не найдены\", first)"
   },
   {
    "name": "A2 ReadLeaves: нехватка записей в файле без ErrLeavesMissing",
    "file": "internal/auditchain/carrier.go",
-   "old": "fmt.Errorf(\"%w: в файле листьев %d записей, запрошены %d..%d\",\n\t\t\tErrLeavesMissing, len(bodies), from, from+count)",
+   "old": "fmt.Errorf(\"%w: the leaf file holds %d records, %d..%d requested\",\n\t\t\tErrLeavesMissing, len(bodies), from, from+count)",
    "new": "fmt.Errorf(\"в файле листьев %d записей, запрошены %d..%d\",\n\t\t\tlen(bodies), from, from+count)"
   },
   {
@@ -24,14 +24,14 @@
   {
    "name": "A4 недостача листьев в конце молчит",
    "file": "internal/auditchain/query.go",
-   "old": "\tif cur < len(batches) {\n\t\treturn fmt.Errorf(\"%w: звено %d обещает",
-   "new": "\tif false {\n\t\treturn fmt.Errorf(\"%w: звено %d обещает"
+   "old": "\tif cur < len(batches) {\n\t\treturn fmt.Errorf(\"%w: link %d promises",
+   "new": "\tif false {\n\t\treturn fmt.Errorf(\"%w: link %d promises"
   },
   {
    "name": "A5 ошибка записи тика не защёлкивается",
    "file": "internal/auditchain/carrier.go",
-   "old": "\t\tc.failed = fmt.Errorf(\"auditchain: запись тика: %w\", err)\n\t\treturn c.headState, c.failed",
-   "new": "\t\treturn c.headState, fmt.Errorf(\"auditchain: запись тика: %w\", err)"
+   "old": "\t\tc.failed = fmt.Errorf(\"auditchain: tick write: %w\", err)\n\t\treturn c.headState, c.failed",
+   "new": "\t\treturn c.headState, fmt.Errorf(\"auditchain: tick write: %w\", err)"
   },
   {
    "name": "A6 порча середины файла срезается как хвост",

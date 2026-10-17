@@ -25,10 +25,10 @@ mkdir -p "$BIN"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
-step "сборка"
+step "build"
 if [ -n "${ES_BIN:-}" ]; then "$BIN/evidencestore" version; else go build -o "$BIN/" ./cmd/...; fi
 
-step "учебный УЦ: сертификат сервера и сборщика abs-core"
+step "demo CA: certificates for the server and the abs-core collector"
 "$BIN/evidencestore" dev-pki -out "$WORK/pki" -source abs-core
 
 TSA_JSON='"url": "local", "every": "1h"'
@@ -60,7 +60,7 @@ cat >"$WORK/evidencestore.json" <<EOF
 EOF
 CFG=$WORK/evidencestore.json
 
-step "init: кейринг под корнем, ключ подписи хранилища"
+step "init: keyring under a root key, the store's signing key"
 "$BIN/evidencestore" init -config "$CFG" | tee "$WORK/init.txt"
 STORE_KEY=$(tail -1 "$WORK/init.txt")
 
@@ -70,10 +70,10 @@ SERVER=$!
 trap 'kill $SERVER 2>/dev/null || true' EXIT
 for _ in $(seq 50); do [ -S "$WORK/data/admin.sock" ] && break; sleep 0.1; done
 
-step "метка времени до приёма: она станет нижней границей T1 для улик"
+step "time-stamp before intake: it becomes the lower bound T1 for the records"
 "$BIN/evidencestore" stamp -config "$CFG"
 
-step "сборщик дочитывает журнал АБС и доставляет строки"
+step "the collector reads the core banking log and delivers the lines"
 cat >"$WORK/abs-audit.log" <<'EOF'
 2026-10-03T09:00:01Z user=teller7 action=login ip=10.0.4.17
 2026-10-03T09:02:44Z user=teller7 action=transfer from=KZ01 to=KZ02 amount=1500000 KZT
@@ -88,9 +88,9 @@ cat >"$WORK/collector.json" <<EOF
 }
 EOF
 "$BIN/escollect" -config "$WORK/collector.json" -once
-echo "обещания хранилища у сборщика для номеров: $("$BIN/escollect" -config "$WORK/collector.json" -promises)"
+echo "the collector holds the store's promises for numbers: $("$BIN/escollect" -config "$WORK/collector.json" -promises)"
 
-step "метка времени над головой цепи, пакет доказательств по улике №2 с ключом записи"
+step "time-stamp over the chain head; proof bundle for record #2 with its record key"
 "$BIN/evidencestore" stamp -config "$CFG"
 "$BIN/evidencestore" proof -config "$CFG" -source abs-core -seq 2 -dek -out "$WORK/proof-2.json"
 case "${DEMO_TSA:-}" in
@@ -103,10 +103,10 @@ digicert) TSA_TRUST="$DC/DigiCertTrustedRootG4.crt,$DC/DigiCertTrustedG4TimeStam
 esac
 grep '"seq":2,' "$WORK/spool/promises.jsonl" >"$WORK/promise-2.json"
 
-step "проверяющий: esverify офлайн, с обещанием, полученным сборщиком при приёме"
+step "auditor: esverify offline, with the promise the collector got at intake"
 "$BIN/esverify" -proof "$WORK/proof-2.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST" -promise "$WORK/promise-2.json"
 
-step "подделка: в предъявленной улике изменён один байт"
+step "forgery: one byte of the presented record is changed"
 python3 - "$WORK/proof-2.json" "$WORK/forged-2.json" <<'PY'
 import base64, json, sys
 b = json.load(open(sys.argv[1]))
@@ -116,33 +116,33 @@ b["evidence"] = base64.b64encode(bytes(ev)).decode()
 json.dump(b, open(sys.argv[2], "w"))
 PY
 if "$BIN/esverify" -proof "$WORK/forged-2.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST"; then
-  echo "ОШИБКА: подделка прошла проверку"; exit 1
+  echo "ERROR: the forgery passed verification"; exit 1
 else
-  echo ">>> подделка поймана (код выхода $?)"
+  echo ">>> forgery caught (exit code $?)"
 fi
 
 MONTH=$(date -u +%Y-%m)
-step "стирание по сроку: месяц abs-core/$MONTH — закрыть, заявка двух людей, ожидание, уничтожение"
+step "retention: month abs-core/$MONTH: close it, two people request destruction, wait, destroy"
 # Текущий месяц закрывается только с -force: приём от источника встанет до
 # конца месяца. В жизни по сроку уничтожают прошлые месяцы (keys due).
 "$BIN/evidencestore" keys deactivate -config "$CFG" -scope "abs-core/$MONTH" -force >/dev/null
 if "$BIN/evidencestore" keys schedule -config "$CFG" -scope "abs-core/$MONTH" -approve operator -wait 1s 2>&1; then
-  echo "ОШИБКА: хватило одного подтверждения"; exit 1
+  echo "ERROR: a single approval was enough"; exit 1
 fi
 "$BIN/evidencestore" keys schedule -config "$CFG" -scope "abs-core/$MONTH" -approve operator -approve security -wait 1s
 sleep 2.1 # срок отмеряется и по метке TSA, а время в метке — с точностью до секунды
 "$BIN/evidencestore" keys complete -config "$CFG"
 "$BIN/evidencestore" stamp -config "$CFG"
 
-step "после уничтожения: ключ записи не выдаётся, тело не прочитать, доказательство проходит"
+step "after destruction: no record key is issued, the body cannot be read, the proof still verifies"
 "$BIN/evidencestore" proof -config "$CFG" -source abs-core -seq 2 -dek -out "$WORK/proof-2-erased.json"
 "$BIN/esverify" -proof "$WORK/proof-2-erased.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST"
 
-step "старый пакет с ключом записи: тело вскрывается ключом, выданным ДО стирания"
-echo "(ключ записи, однажды выданный проверяющему, у него и остаётся — это предел, а не дыра)"
+step "an old bundle with its record key: the body opens with the key issued BEFORE erasure"
+echo "(a record key once given to an auditor stays with the auditor: a limit, not a hole)"
 "$BIN/esverify" -proof "$WORK/proof-2.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST" | head -3
 
-step "сводка хранилища"
+step "store summary"
 "$BIN/evidencestore" status -config "$CFG"
 echo
-echo "стенд: $WORK"
+echo "work directory: $WORK"

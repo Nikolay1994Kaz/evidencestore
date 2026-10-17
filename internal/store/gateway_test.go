@@ -130,8 +130,8 @@ func TestGatewayJournalProof(t *testing.T) {
 		t.Fatalf("вердикт %+v, точка %+v, ключ проверен %v", r.Gateway, r.GatewayCheckpoint, r.GatewayKeyChecked)
 	}
 	for _, name := range []string{
-		"тело — та самая запись журнала гейтвея (хэш пересчитан)",
-		"контрольная точка подписана закреплённым ключом гейтвея",
+		"the body is that very gateway journal entry (hash recomputed)",
+		"the checkpoint is signed with the pinned gateway key",
 	} {
 		if !hasCheck(r, name) {
 			t.Fatalf("нет пройденной проверки %q:\n%s", name, r.Text())
@@ -308,7 +308,7 @@ func TestNoKeyCheckpointDoesNotCover(t *testing.T) {
 		t.Fatalf("точка без проверенной подписи накрывает запись: %+v", r.GatewayCheckpoint)
 	}
 	text := r.Text()
-	if strings.Contains(text, "Накрыта контрольной точкой") || !strings.Contains(text, "подпись не проверял никто") {
+	if strings.Contains(text, "Covered by gateway checkpoint") || !strings.Contains(text, "nobody checked its signature") {
 		t.Fatalf("отчёт:\n%s", text)
 	}
 	// С ключом у проверяющего та же точка накрывает: подпись проверена им.

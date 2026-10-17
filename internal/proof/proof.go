@@ -232,21 +232,21 @@ func (r Report) Valid() bool {
 func (r Report) Notes() []string {
 	var n []string
 	if r.Upper.IsZero() {
-		n = append(n, "нет метки TSA над головой после улики: время подтверждено только подписью хранилища")
+		n = append(n, "no TSA time-stamp over a head after the record: its time rests on the store's signature alone")
 	}
 	if r.Lower.IsZero() {
-		n = append(n, "нет метки TSA раньше улики: нижняя граница времени не доказана")
+		n = append(n, "no TSA time-stamp before the record: the lower bound of its time is not proven")
 	}
 	switch {
 	case r.BodyOpened:
 	case r.BodyKey:
-		n = append(n, "тело не вскрыто: выданный ключ записи к телу не подошёл (см. проверки)")
+		n = append(n, "body not opened: the record key in the bundle does not fit the body (see the checks)")
 	default:
-		n = append(n, "тело не вскрыто: ключ записи не выдан или ключ месяца уничтожен (стирание по сроку)")
+		n = append(n, "body not opened: the bundle carries no record key, or the month key was destroyed (retention)")
 	}
 	n = append(n, r.gatewayNotes()...)
-	n = append(n, "подпись хранилища доказывает, что ЭТОТ экземпляр подписал голову; против переписывания всей цепи её владельцем работает только метка TSA")
-	n = append(n, "доказано, что такие байты пришли от источника и не менялись; правдивость их содержимого не доказывается")
+	n = append(n, "the store's signature proves that THIS store signed the head; only a TSA time-stamp stands against its owner rewriting the whole chain")
+	n = append(n, "what is proven is that these bytes came from the source and have not changed, not that their content is true")
 	return n
 }
 
@@ -265,7 +265,7 @@ func Verify(b Bundle, trust Trust) Report {
 
 	// 1. Улика и её отпечаток.
 	sealed, err := evidence.Unmarshal(b.Evidence)
-	if !add("улика разбирается", err, "") {
+	if !add("the record parses", err, "") {
 		return r
 	}
 	r.Header = sealed.Header
@@ -278,18 +278,18 @@ func Verify(b Bundle, trust Trust) Report {
 		r.Position = pos
 		switch {
 		case digest != r.Digest:
-			err = errors.New("отпечаток в листе не совпадает с байтами улики")
+			err = errors.New("the digest in the leaf does not match the record bytes")
 		case leaf.Scope != sealed.Source || leaf.Subject != strconv.FormatUint(sealed.Seq, 10):
-			err = fmt.Errorf("лист про %s/%s, а улика %s/%d", leaf.Scope, leaf.Subject, sealed.Source, sealed.Seq)
+			err = fmt.Errorf("the leaf is about %s/%s, the record is %s/%d", leaf.Scope, leaf.Subject, sealed.Source, sealed.Seq)
 		case leaf.UnixNano != sealed.ReceivedAt:
-			err = errors.New("время приёма в листе не совпадает с уликой")
+			err = errors.New("the receive time in the leaf does not match the record")
 		}
 	}
-	add("лист цепи описывает именно эту улику", err, fmt.Sprintf("позиция %d", pos))
+	add("the chain leaf describes this very record", err, fmt.Sprintf("position %d", pos))
 
 	// 3. Звенья подряд и связаны хэшами.
 	links, hashes, err := chainLinks(b.Links)
-	if !add("звенья связаны хэшами без пропусков", err, fmt.Sprintf("%d звеньев", len(links))) {
+	if !add("the links are chained by hash with no gaps", err, fmt.Sprintf("%d links", len(links))) {
 		return r
 	}
 	linkAt := func(seq uint64) (auditchain.Record, [32]byte, bool) {
@@ -305,30 +305,30 @@ func Verify(b Bundle, trust Trust) Report {
 	if err == nil {
 		last := len(links) - 1
 		if b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {
-			err = errors.New("подписанная голова не совпадает с последним звеном пакета")
+			err = errors.New("the signed head does not match the last link in the bundle")
 		}
 	}
 	r.HeadSeq = b.Statement.HeadSeq
-	add("голова подписана ключом хранилища", err, fmt.Sprintf("голова %d", b.Statement.HeadSeq))
+	add("the head is signed with the store key", err, fmt.Sprintf("head %d", b.Statement.HeadSeq))
 
 	// 5. Путь Меркла от листа улики до корня звена n.
 	r.LinkSeq = b.Inclusion.LinkSeq
-	add("улика входит в звено цепи (путь Меркла)", checkInclusion(b.Inclusion, linkAt), fmt.Sprintf("звено %d", b.Inclusion.LinkSeq))
+	add("the record is in a chain link (Merkle path)", checkInclusion(b.Inclusion, linkAt), fmt.Sprintf("link %d", b.Inclusion.LinkSeq))
 
 	// 6. Верхняя граница: TSA заверила голову m ≥ n. Без неё пакет — только
 	// слово хранилища: держатель ключа подписи сочинит улику с любой датой.
 	if b.Upper != nil {
 		r.Upper, err = checkUpper(*b.Upper, b.Inclusion.LinkSeq, linkAt, trust.TSA)
-		add("метка TSA над цепью после улики (не позже T2)", err, fmt.Sprintf("T2 = %s, голова %d", fmtTime(r.Upper), b.Upper.HeadSeq))
+		add("a TSA time-stamp over the chain after the record (not later than T2)", err, fmt.Sprintf("T2 = %s, head %d", fmtTime(r.Upper), b.Upper.HeadSeq))
 	} else if !trust.AllowNoTSA {
-		add("метка TSA над цепью после улики (не позже T2)",
-			errors.New("в пакете её нет: время и неизменность подтверждает только подпись хранилища (запросите пакет после следующей метки — evidencestore stamp; принять без неё — esverify -allow-no-tsa)"), "")
+		add("a TSA time-stamp over the chain after the record (not later than T2)",
+			errors.New("the bundle has none: only the store's signature vouches for the time and integrity (request the bundle after the next time-stamp, evidencestore stamp; to accept it anyway, esverify -allow-no-tsa)"), "")
 	}
 
 	// 7. Нижняя граница: токен TSA лежит в цепи раньше звена улики.
 	if b.Lower != nil {
 		r.Lower, err = checkLower(*b.Lower, b.Inclusion.LinkSeq, linkAt, trust.TSA)
-		add("метка TSA в цепи раньше улики (не раньше T1)", err, fmt.Sprintf("T1 = %s", fmtTime(r.Lower)))
+		add("a TSA time-stamp in the chain before the record (not earlier than T1)", err, fmt.Sprintf("T1 = %s", fmtTime(r.Lower)))
 	}
 
 	// 8. Время приёма по нашим часам попадает между метками.
@@ -340,12 +340,12 @@ func Verify(b Bundle, trust Trust) Report {
 		// допускаем минуту перекоса.
 		const skew = time.Minute
 		if !r.Upper.IsZero() && recv.After(r.Upper.Add(time.Second)) {
-			err = fmt.Errorf("время приёма %s позже метки T2 %s — часы хранилища врут", fmtTime(recv), fmtTime(r.Upper))
+			err = fmt.Errorf("receive time %s is later than time-stamp T2 %s: the store's clock lies", fmtTime(recv), fmtTime(r.Upper))
 		}
 		if !r.Lower.IsZero() && recv.Before(r.Lower.Add(-skew)) {
-			err = fmt.Errorf("время приёма %s раньше метки T1 %s — часы хранилища врут", fmtTime(recv), fmtTime(r.Lower))
+			err = fmt.Errorf("receive time %s is earlier than time-stamp T1 %s: the store's clock lies", fmtTime(recv), fmtTime(r.Lower))
 		}
-		add("время приёма между метками TSA", err, fmtTime(recv))
+		add("the receive time lies between the TSA time-stamps", err, fmtTime(recv))
 	}
 
 	// 9. Тело, если выдан ключ записи. Конверт EV2 несёт обязательство на
@@ -354,7 +354,7 @@ func Verify(b Bundle, trust Trust) Report {
 	if len(b.DEK) > 0 {
 		r.BodyKey = true
 		body, err := keyring.OpenWithDEK(sealed.Envelope, b.DEK)
-		if add("тело вскрывается выданным ключом записи, ключ связан с отпечатком, тег GCM сходится", err, fmt.Sprintf("%d байт", len(body))) {
+		if add("the body opens with the record key in the bundle, the key is bound to the digest, the GCM tag matches", err, fmt.Sprintf("%d bytes", len(body))) {
 			r.Body, r.BodyOpened = body, true
 		}
 	}
@@ -366,14 +366,14 @@ func Verify(b Bundle, trust Trust) Report {
 	case b.Gateway != nil:
 		verifyGateway(b.Gateway, sealed, &r, trust, linkAt, add)
 	case sealed.ContentType == gateway.ContentType:
-		add("вердикт гейтвея описывает эту улику", errors.New("улика из журнала гейтвея, а части gateway в пакете нет"), "")
+		add("the gateway verdict describes this record", errors.New("the record comes from a gateway journal, but the bundle has no gateway part"), "")
 	}
 	return r
 }
 
 func chainLinks(in []Link) ([]auditchain.Record, [][32]byte, error) {
 	if len(in) == 0 {
-		return nil, nil, errors.New("в пакете нет звеньев")
+		return nil, nil, errors.New("the bundle has no links")
 	}
 	links := make([]auditchain.Record, len(in))
 	hashes := make([][32]byte, len(in))
@@ -384,10 +384,10 @@ func chainLinks(in []Link) ([]auditchain.Record, [][32]byte, error) {
 		}
 		if i > 0 {
 			if r.Seq != links[i-1].Seq+1 {
-				return nil, nil, fmt.Errorf("после звена %d идёт %d", links[i-1].Seq, r.Seq)
+				return nil, nil, fmt.Errorf("link %d is followed by link %d", links[i-1].Seq, r.Seq)
 			}
 			if r.PrevHash != hashes[i-1] {
-				return nil, nil, fmt.Errorf("звено %d не ссылается на хэш звена %d — цепь подменена", r.Seq, links[i-1].Seq)
+				return nil, nil, fmt.Errorf("link %d does not refer to the hash of link %d: the chain was replaced", r.Seq, links[i-1].Seq)
 			}
 		}
 		links[i], hashes[i] = r, auditchain.Hash(r)
@@ -398,10 +398,10 @@ func chainLinks(in []Link) ([]auditchain.Record, [][32]byte, error) {
 func checkInclusion(inc Inclusion, linkAt func(uint64) (auditchain.Record, [32]byte, bool)) error {
 	link, _, ok := linkAt(inc.LinkSeq)
 	if !ok {
-		return fmt.Errorf("звена %d нет в пакете", inc.LinkSeq)
+		return fmt.Errorf("link %d is not in the bundle", inc.LinkSeq)
 	}
 	if link.Type != auditchain.EventBatch {
-		return fmt.Errorf("звено %d не агрегат листьев", inc.LinkSeq)
+		return fmt.Errorf("link %d does not aggregate leaves", inc.LinkSeq)
 	}
 	p, err := auditchain.DecodeBatchPayload(link.Payload)
 	if err != nil {
@@ -410,24 +410,24 @@ func checkInclusion(inc Inclusion, linkAt func(uint64) (auditchain.Record, [32]b
 	path := make([]auditchain.ProofStep, len(inc.Path))
 	for i, s := range inc.Path {
 		if len(s.Hash) != 32 {
-			return errors.New("шаг пути неразбираем")
+			return errors.New("a path step does not parse")
 		}
 		copy(path[i].Hash[:], s.Hash)
 		path[i].SiblingLeft = s.Left
 	}
 	if !auditchain.VerifyProof(inc.Leaf.chain(), path, p.Root) {
-		return fmt.Errorf("путь не сходится с корнем звена %d", inc.LinkSeq)
+		return fmt.Errorf("the path does not lead to the root of link %d", inc.LinkSeq)
 	}
 	return nil
 }
 
 func checkUpper(u Upper, evidenceLink uint64, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) (time.Time, error) {
 	if u.HeadSeq < evidenceLink {
-		return time.Time{}, fmt.Errorf("метка над головой %d, а улика в звене %d — метка её не покрывает", u.HeadSeq, evidenceLink)
+		return time.Time{}, fmt.Errorf("the time-stamp is over head %d, the record is in link %d: the time-stamp does not cover it", u.HeadSeq, evidenceLink)
 	}
 	_, hash, ok := linkAt(u.HeadSeq)
 	if !ok {
-		return time.Time{}, fmt.Errorf("звена %d нет в пакете", u.HeadSeq)
+		return time.Time{}, fmt.Errorf("link %d is not in the bundle", u.HeadSeq)
 	}
 	info, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, hash), trust)
 	if err != nil {
@@ -439,21 +439,21 @@ func checkUpper(u Upper, evidenceLink uint64, linkAt func(uint64) (auditchain.Re
 func checkLower(lw Lower, evidenceLink uint64, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) (time.Time, error) {
 	inc := lw.Inclusion
 	if inc.Leaf.Type != uint8(auditchain.EventTimestamp) {
-		return time.Time{}, errors.New("нижняя граница — не лист метки TSA")
+		return time.Time{}, errors.New("the lower bound is not a TSA time-stamp leaf")
 	}
 	if inc.LinkSeq >= evidenceLink {
-		return time.Time{}, fmt.Errorf("метка в звене %d, улика в звене %d — метка не раньше улики", inc.LinkSeq, evidenceLink)
+		return time.Time{}, fmt.Errorf("the time-stamp is in link %d, the record in link %d: the time-stamp is not earlier than the record", inc.LinkSeq, evidenceLink)
 	}
 	if err := checkInclusion(inc, linkAt); err != nil {
 		return time.Time{}, err
 	}
 	stamped, err := strconv.ParseUint(inc.Leaf.Subject, 10, 64)
 	if err != nil {
-		return time.Time{}, errors.New("лист метки без номера головы")
+		return time.Time{}, errors.New("the time-stamp leaf has no head number")
 	}
 	_, hash, ok := linkAt(stamped)
 	if !ok {
-		return time.Time{}, fmt.Errorf("звена %d, заверенного меткой, нет в пакете", stamped)
+		return time.Time{}, fmt.Errorf("link %d, certified by the time-stamp, is not in the bundle", stamped)
 	}
 	info, err := tsa.Verify(inc.Leaf.Payload, HeadImprint(stamped, hash), trust)
 	if err != nil {
@@ -477,9 +477,9 @@ func fmtTime(t time.Time) string {
 // Verdict — итог одной строкой.
 func (r Report) Verdict() string {
 	if r.Valid() {
-		return "ПРОВЕРКА ПРОЙДЕНА"
+		return "VERIFIED"
 	}
-	return "ПРОВЕРКА НЕ ПРОЙДЕНА"
+	return "NOT VERIFIED"
 }
 
 // Text — отчёт человеческим языком: что доказано, что нет и где пределы.
@@ -492,20 +492,20 @@ func (r Report) Text() string {
 	verdict := r.Verdict()
 	s += verdict + "\n\n"
 	if r.Header.Source != "" {
-		s += fmt.Sprintf("Улика: источник %s, номер %d, тип %q\n", r.Header.Source, r.Header.Seq, r.Header.ContentType)
-		s += fmt.Sprintf("Принята хранилищем: %s (по его часам)\n", fmtTime(time.Unix(0, r.Header.ReceivedAt)))
-		s += fmt.Sprintf("Отпечаток: %x\n", r.Digest)
+		s += fmt.Sprintf("Record: source %s, number %d, type %q\n", r.Header.Source, r.Header.Seq, r.Header.ContentType)
+		s += fmt.Sprintf("Received by the store: %s (by its clock)\n", fmtTime(time.Unix(0, r.Header.ReceivedAt)))
+		s += fmt.Sprintf("Digest: %x\n", r.Digest)
 	}
 	if !r.Lower.IsZero() || !r.Upper.IsZero() {
-		s += fmt.Sprintf("Вошла в цепь между T1 = %s и T2 = %s (по меткам TSA)\n", fmtTime(r.Lower), fmtTime(r.Upper))
+		s += fmt.Sprintf("Entered the chain between T1 = %s and T2 = %s (TSA time-stamps)\n", fmtTime(r.Lower), fmtTime(r.Upper))
 	}
 	if g := r.Gateway; g != nil {
-		s += fmt.Sprintf("Запись журнала гейтвея: seq %d, сессия %s, хэш %s\n", g.Seq, g.Session, short(g.Hash))
+		s += fmt.Sprintf("Gateway journal entry: seq %d, session %s, hash %s\n", g.Seq, g.Session, short(g.Hash))
 		if c := r.GatewayCheckpoint; c != nil {
-			s += fmt.Sprintf("Накрыта контрольной точкой гейтвея seq %d\n", c.Seq)
+			s += fmt.Sprintf("Covered by gateway checkpoint seq %d\n", c.Seq)
 		}
 	}
-	s += "\nПроверки:\n"
+	s += "\nChecks:\n"
 	for _, c := range r.Checks {
 		mark := "✔"
 		if !c.OK {
@@ -519,12 +519,12 @@ func (r Report) Text() string {
 	}
 	if r.BodyOpened {
 		if utf8.Valid(r.Body) {
-			s += "\nТело:\n" + string(r.Body) + "\n"
+			s += "\nBody:\n" + string(r.Body) + "\n"
 		} else {
-			s += fmt.Sprintf("\nТело: %d байт (двоичное)\n", len(r.Body))
+			s += fmt.Sprintf("\nBody: %d bytes (binary)\n", len(r.Body))
 		}
 	}
-	s += "\nЧего этот пакет не доказывает:\n"
+	s += "\nWhat this bundle does not prove:\n"
 	for _, n := range r.Notes() {
 		s += "  — " + n + "\n"
 	}
