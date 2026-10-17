@@ -1308,6 +1308,9 @@ func (m *storeSim) rush() {
 		c.rng = mrand.New(mrand.NewPCG(m.rng.Uint64(), m.rng.Uint64()))
 		n := 2 + m.rng.IntN(8)
 		m.stats.rushBatches += n
+		// c.bound — до горутины клиента: её приём пишет c.bound, и чтение
+		// после её запуска — гонка (CI 17.10, Z-12).
+		rogue := c.bound && m.rng.IntN(4) == 0
 		wg.Go(func() {
 			for range n {
 				if c.rng.IntN(4) == 0 {
@@ -1319,7 +1322,7 @@ func (m *storeSim) rush() {
 				runtime.Gosched()
 			}
 		})
-		if c.bound && m.rng.IntN(4) == 0 {
+		if rogue {
 			rogues.Add(1)
 			wg.Go(func() {
 				for range 3 {
