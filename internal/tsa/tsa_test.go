@@ -212,9 +212,10 @@ func TestSaveLoad(t *testing.T) {
 	}
 }
 
-// Живая проверка против настоящей службы (НУЦ РК). Запускается вручную:
+// Живая проверка против настоящей службы (НУЦ РК). Запускается вручную, из
+// корня репозитория; пути — абсолютные: тест идёт в каталоге пакета.
 //
-//	ES_TSA_URL=http://tsp.pki.gov.kz ES_TSA_ROOTS=root_rsa_2020.cer,nca_rsa_2022.cer go test -run Live ./internal/tsa/
+//	ES_TSA_URL=http://tsp.pki.gov.kz ES_TSA_ROOTS=$PWD/configs/tsa/nca-kz/root_rsa_2020.cer,$PWD/configs/tsa/nca-kz/nca_rsa_2022.cer go test -run Live ./internal/tsa/
 func TestLiveTSA(t *testing.T) {
 	url := os.Getenv("ES_TSA_URL")
 	if url == "" {

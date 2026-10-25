@@ -153,6 +153,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		if report.WitnessChecked {
 			out["witness_head"] = report.WitnessHead
+			out["witness_fork"] = report.WitnessFork
 		}
 		enc.Encode(out)
 	} else {

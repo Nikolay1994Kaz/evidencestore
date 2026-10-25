@@ -25,15 +25,17 @@
   - добавлены `ScanLeaves`, `ScanVerifiedLeaves`, `SignMessage`, `EncodeHash`;
   - 09.10: защёлка отказа записи, неудачный `Open` не флашит, порча середины файла — отказ вместо среза хвоста, отрезанный хвост откладывается рядом; удалены `InclusionProof`, `BuildProof`, `ForEachLeaf`, `FindLeaf`, `VerifyRange` (в продукте не вызывались, `InclusionProof.Verify` принимал выдуманный лист).
   - 12.10: `TrimToHead` — подъём из копии обрезает цепь по её подписанной голове (Z-07); чтение кадра вынесено в `nextFrame`; `SetSegmentBytes` — порог файлов листьев для тестов.
+  - 13.10: `fdatasync` вынесен в `sync_linux.go` / `sync_other.go` (вне Linux — полный `fsync`): пакет нужен и `esverify` на macOS и Windows;
+  - 17.10: сообщения об ошибках — на английском (P-03);
+  - 25.10: `ReadLinks` — звенья from…to потоком, без всей цепи в памяти (P-06).
 - `internal/wal` удалён: журнал улик — новый пакет `internal/evlog`.
-- `internal/ship`: оставлен только транспорт `Remote`; `Shipper` (снапшоты, манифесты, удаление старых объектов) удалён вместе с `wal`, из `Remote` убран `Delete`.
+- `internal/ship`: оставлен только транспорт `Remote`; `Shipper` (снапшоты, манифесты, удаление старых объектов) удалён вместе с `wal`, из `Remote` убран `Delete`. 25.10 (P-07): `OpenRemoteEnv` — ключи S3 из своих переменных (свидетель голов, `ES_WITNESS_*`); запись в S3 несёт `Content-MD5` (бакеты с Object Lock).
 - `internal/monitoring` удалён: все три его метрики относились к `wal` и `Shipper`. С ним из `go.mod` ушла `VictoriaMetrics/metrics`, осталась одна зависимость — `golang.org/x/sys`.
-- Новые пакеты: `evlog`, `tsa`, `proof`, `store`, `server`, `collector`, `config`, `pki`, `gateway`, `metrics`; команды `evidencestore`, `escollect`, `esverify`. Карта — `docs/ARCHITECTURE.md`, решения — `docs/DECISIONS.md`.
+- Новые пакеты: `evidence`, `evlog`, `tsa`, `proof`, `store`, `server`, `collector`, `config`, `pki`, `gateway`, `metrics`, `version` (13.10); команды `evidencestore`, `escollect`, `esverify`. Карта — `docs/ARCHITECTURE.md`, решения — `docs/DECISIONS.md`.
 
 ## Что осталось от старого проекта и ещё не вычищено
 
-- `ship`: переменные окружения `KVSTORE_S3_*`.
-- Удаления листьев по сроку в перенесённом коде не было, но от него оставались сообщение «истёк по retention» в `carrier.go` и обход «истёкших» листьев в `query.go`. Убраны 03.10: пропавшие листья теперь `ErrLeavesMissing`.
+- `ship`: переменные окружения `KVSTORE_S3_*` и ссылка на `KVSTORE_REQUIREPASS` старого проекта в комментарии `s3_remote.go`.
 
 ## Чего нет и надо писать
 

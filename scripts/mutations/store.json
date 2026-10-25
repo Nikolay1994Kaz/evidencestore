@@ -742,14 +742,14 @@
   {
    "name": "W1 головы свидетеля не сверяются со звеньями пакета",
    "file": "internal/proof/heads.go",
-   "old": "if h := heads[seq]; h.Statement.HeadHash != encodeHash(hashes[seq-first]) {",
-   "new": "if h := heads[seq]; false && h.Statement.HeadHash != encodeHash(hashes[seq-first]) {"
+   "old": "\t\t\tif h.Statement.HeadHash == encodeHash(hashes[seq-first]) {\n\t\t\t\tcontinue\n\t\t\t}",
+   "new": "\t\t\tif true {\n\t\t\t\tcontinue\n\t\t\t}"
   },
   {
-   "name": "W2 развилка у свидетеля не видна",
+   "name": "W2 под одним номером у свидетеля остаётся одна голова: развилка не видна",
    "file": "internal/proof/heads.go",
-   "old": "\t\tcase prev.Statement.HeadHash != h.Statement.HeadHash && fork == nil:",
-   "new": "\t\tcase false:"
+   "old": "known = known || v.Statement.HeadHash == h.Statement.HeadHash",
+   "new": "known = known || v.Statement.HeadSeq == h.Statement.HeadSeq"
   },
   {
    "name": "W3 головы под чужим ключом идут в счёт",
@@ -760,8 +760,8 @@
   {
    "name": "W4 пакет может кончаться раньше головы свидетеля",
    "file": "internal/proof/heads.go",
-   "old": "if a := seqs[i]; a > last {",
-   "new": "if a := seqs[i]; false && a > last {"
+   "old": "\tcase seqs[i] > last:",
+   "new": "\tcase false && seqs[i] > last:"
   },
   {
    "name": "W5 улику закрепляет голова свидетеля раньше её звена",
@@ -798,6 +798,36 @@
    "file": "internal/server/server.go",
    "old": "r.URL.Query().Get(\"dek\") == \"1\", toHead)",
    "new": "r.URL.Query().Get(\"dek\") == \"1\", 0*toHead)"
+  },
+  {
+   "name": "W11 голова под меткой, ждущая в очереди текущей, не помечается",
+   "file": "internal/store/witness.go",
+   "old": "if n := len(s.witnessQueue); stamped && n > 0 && s.witnessQueue[n-1].head == h {",
+   "new": "if n := len(s.witnessQueue); false && stamped && n > 0 {"
+  },
+  {
+   "name": "W12 отчёт пишет «головы ещё нет», когда сверка со свидетелем провалилась",
+   "file": "internal/proof/proof.go",
+   "old": "\tcase r.WitnessNone:",
+   "new": "\tcase r.WitnessChecked:"
+  },
+  {
+   "name": "W13 свидетель обгоняет копию",
+   "file": "internal/store/witness.go",
+   "old": "\t\tlimit = s.replicaShipped.Load()",
+   "new": "\t\t_ = s.replicaShipped.Load()"
+  },
+  {
+   "name": "W14 отметка копии ставится без удачного прохода",
+   "file": "internal/store/replica.go",
+   "old": "\ts.replicaShipped.Store(s.replica.Head)",
+   "new": "\ts.replicaShipped.Store(^uint64(0))"
+  },
+  {
+   "name": "W15 развилка вне участка записи не называется в отчёте",
+   "file": "internal/proof/heads.go",
+   "old": "if len(vs) > 1 && r.WitnessFork == 0 {",
+   "new": "if false && len(vs) > 1 {"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

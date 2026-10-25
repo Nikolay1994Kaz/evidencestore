@@ -284,6 +284,9 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 		}
 		s.replica.Head = st.HeadSeq
 	}
+	// Проход удался: копия продолжает data_dir и держит цепь до этой головы.
+	// Дальше неё свидетелю голов не отдаём (witness.go).
+	s.replicaShipped.Store(s.replica.Head)
 	return total, nil
 }
 

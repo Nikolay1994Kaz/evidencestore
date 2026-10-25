@@ -221,9 +221,15 @@ type Report struct {
 
 	// WitnessChecked — пакет сверялся с головами свидетеля (Trust.Witness);
 	// WitnessHead — голова свидетеля, которая закрепляет улику: первая не
-	// раньше её звена. Ноль — у свидетеля такой головы ещё нет.
+	// раньше её звена; WitnessNone — такой головы у свидетеля ещё нет.
+	// Сверка не прошла — ни того, ни другого.
 	WitnessChecked bool
 	WitnessHead    uint64
+	WitnessNone    bool
+	// WitnessFork — первый номер, под которым у свидетеля две версии головы
+	// вне участка цепи этой записи: хранилище подписало вторую историю, но
+	// запись она не задевает. Ноль — таких нет.
+	WitnessFork uint64
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -254,10 +260,13 @@ func (r Report) Notes() []string {
 		n = append(n, "body not opened: the bundle carries no record key, or the month key was destroyed (retention)")
 	}
 	n = append(n, r.gatewayNotes()...)
+	if r.WitnessFork != 0 {
+		n = append(n, fmt.Sprintf("the witness holds two versions of the chain, both signed with the store key (the first head it holds in two versions is %d): this record's part of the chain is not among them, but the store signed a second history — a rewrite, or a store that lost data without a copy; ask its operator", r.WitnessFork))
+	}
 	switch {
 	case r.WitnessHead != 0:
 		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this record would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
-	case r.WitnessChecked:
+	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after this record yet: until it gets one, only a TSA time-stamp stands against the store's owner rewriting the chain")
 	default:
 		n = append(n, "the store's signature proves that THIS store signed the head; only a TSA time-stamp stands against its owner rewriting the whole chain")

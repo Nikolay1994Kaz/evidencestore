@@ -31,7 +31,7 @@ But a collector running next to the log had already sent every line to a store o
    8  VERIFIED      yes (again)    Oct 24 05:53:49 web-1 sudo:   deploy : TTY=pts/0 ; PWD=/srv/app ; ...
 ```
 
-The deleted lines are all there, byte for byte. Each one comes with a proof that the store received it between two time-stamps signed by an outside authority, and that it was in the store before the file was rewritten. To check a proof you need the proof bundle, the store's public key and the authority's root certificate. You don't need access to the store, and you don't have to trust whoever runs it.
+The deleted lines are all there, byte for byte. Each one comes with a proof that the store received it between two time-stamps signed by an outside authority, and that it was in the store before the file was rewritten. To check a proof you need the proof bundle, the store's public key and the certificates of the time-stamping authority. You don't need access to the store, and you don't have to trust whoever runs it.
 
 This is evidencestore, a store for logs that may one day have to hold up as evidence. The code is written in Go together with an AI assistant, Claude Code, and licensed under Apache 2.0. The demo above is one script, `scripts/demo-intruder.sh`. What follows is the idea and the design: the path of one line, and what ends up proven and what doesn't.
 
@@ -105,8 +105,8 @@ Entered the chain between T1 = 2026-10-24 05:53:50 UTC and T2 = 2026-10-24 05:53
 Checks:
   ✔ the record parses
   ✔ the chain leaf describes this very record — position 5
-  ✔ the links are chained by hash with no gaps — 9 links
-  ✔ the head is signed with the store key — head 12
+  ✔ the links are chained by hash with no gaps — 6 links
+  ✔ the head is signed with the store key — head 9
   ✔ the record is in a chain link (Merkle path) — link 8
   ✔ a TSA time-stamp over the chain after the record (not later than T2) — T2 = 2026-10-24 05:53:54 UTC, head 9
   ✔ a TSA time-stamp in the chain before the record (not earlier than T1) — T1 = 2026-10-24 05:53:50 UTC
@@ -249,9 +249,9 @@ For an auditor, the operator exports a bundle for one record:
 evidencestore proof -config /etc/evidencestore/evidencestore.json -source web-1 -seq 5 -dek -out 5.json
 ```
 
-The bundle holds the sealed record exactly as it lies on disk, its leaf and Merkle path, the links from its own link up to a signed head, the T1 and T2 tokens and, with `-dek`, the key of this one record, so the auditor can read the body without getting the month key.
+The bundle holds the sealed record exactly as it lies on disk, its leaf and Merkle path, the links from the one T1 time-stamps (it comes before the record's own link) up to the head under T2, signed by the store, the T1 and T2 tokens and, with `-dek`, the key of this one record, so the auditor can read the body without getting the month key.
 
-Besides the bundle, `esverify` needs the store's public key (printed by `evidencestore init`; the collectors pin the same key), the root certificates of the TSA and, optionally, the collector's promise for that record. The checks in the report above go in order. The record parses. The leaf in the chain names exactly these bytes. The links are chained by hash and end in a head signed by the pinned key. The Merkle path leads from the leaf to its link. The T2 token is valid and sits over a head at or after the record's link, and the T1 token is valid and lies in the chain before it. The receive time lies between them. The record key opens the body and matches the commitment, and the GCM tag is correct. With `-promise`, the promise is checked too: signed by the same key, naming the same record, with the record in the chain before its deadline.
+Besides the bundle, `esverify` needs the store's public key (printed by `evidencestore init`; the collectors pin the same key), the TSA certificates (the root, and the intermediate when the token does not carry it: for the NCA, `root_rsa_2020.cer` and `nca_rsa_2022.cer`) and, optionally, the collector's promise for that record. The checks in the report above go in order. The record parses. The leaf in the chain names exactly these bytes. The links are chained by hash and end in a head signed by the pinned key. The Merkle path leads from the leaf to its link. The T2 token is valid and sits over a head at or after the record's link, and the T1 token is valid and lies in the chain before it. The receive time lies between them. The record key opens the body and matches the commitment, and the GCM tag is correct. With `-promise`, the promise is checked too: signed by the same key, naming the same record, with the record in the chain before its deadline.
 
 A bundle without T2 is refused unless you pass `-allow-no-tsa`. Without a time-stamp after the record, the bundle carries only the store's own word, and whoever holds the signing key can make up a record with any date. The verdict is printed first and last, and control characters in the body are escaped; otherwise a log line with an ESC sequence ("clear the screen, print VERIFIED") would paint a false verdict on the auditor's screen. The exit code is 0 for verified, 1 for not verified and 2 for bad usage. `-body FILE` writes the body out byte for byte, but only when the bundle verified, so the original log can be rebuilt from the store.
 
@@ -280,7 +280,7 @@ active ──deactivate──▶ deactivated ──schedule──▶ pending ─
                             └─────────cancel────────┘
 ```
 
-The current month is active and seals new records; past months only decrypt. A destruction request needs two different approvers and a waiting period (seven days by default, at least an hour outside a demo), and it can be cancelled while it waits. The waiting period starts at a TSA time-stamp taken with the request and ends by the earlier of the store clock and a fresh TSA time-stamp, so moving the host clock doesn't shorten it. The store never destroys keys on its own: `keys due` only shows which months are past retention.
+The current month is active and seals new records; past months only decrypt. A destruction request needs two different approvers and a waiting period (seven days by default, at least an hour outside a demo), and it can be cancelled while it waits. The waiting period starts at a TSA time-stamp taken with the request and ends by the earlier of the store clock and a fresh TSA time-stamp, so moving the host clock doesn't shorten it. The store never starts a destruction on its own: `keys due` only shows which months are past retention. A request that has waited out its period the store completes by itself within a minute, or at once on `keys complete`.
 
 From `scripts/demo.sh`, with one approver:
 
@@ -311,14 +311,14 @@ evidencestore has a source type for such journals. At intake the store recompute
 
 We tried a scenario that Pipelock's documentation lists as an open limit: deleting a whole run. The gateway ran twice, the second run linked to the first by a chain-link file, and the collector picked up the shards. Then the first run's shards and its chain-link were deleted. Pipelock's verifier said `RESTART CONTINUITY OK` on what was left, exit code 0: from the inside the deletion was invisible. From the store both runs came back byte for byte, and the same verifier said `CHAIN VALID` for each. The store narrows this gap rather than closing it: only what was written within the last `flush_every` before the deletion can still disappear unnoticed. The chain-link files aren't collected yet, so restored runs show up as unlinked.
 
-The Pipelock-specific code is 665 lines out of about 14 thousand. Everything else is the same for any log, which is why the first demo is an `auth.log`.
+The Pipelock-specific code is 665 lines out of about 14.5 thousand. Everything else is the same for any log, which is why the first demo is an `auth.log`.
 
 ## What it can't do
 
 - Lines destroyed before the collector reads them are not in the store. By default the collector reads every second. A file created and deleted between two reads isn't seen either.
 - A stopped collector looks like a quiet log: when there's nothing new, the collector sends nothing. The "source silent" alarm fires only after `expect_every`, so an intruder who starts by stopping the collector shows up only as silence. A collector heartbeat would fix this; it doesn't exist yet.
 - The store keeps what the source wrote. It doesn't make a line true: if the application lies, the lie is stored faithfully.
-- Root on the store host can delete or rewrite the store's files. Time-stamps, the collectors' promises and the remote copy make that detectable, but only for someone who checks them, and nothing can prevent it. Keep the store on its own machine with its own administrators, and its remote copy (S3 or a directory, chunks that are never deleted) on yet another one. With one administrator for everything, only the time-stamps and a copy that administrator can't delete stand against them.
+- Root on the store host can delete or rewrite the store's files. Time-stamps, the collectors' promises and the remote copy make that detectable, but only for someone who checks them, and nothing can prevent it. Keep the store on its own machine with its own administrators, and its remote copy (S3 or a directory, chunks that are never deleted) on yet another one. With one administrator for everything, only the time-stamps and a witness that administrator does not control stand against them: signed chain heads kept out of their reach (`witness.url`, checked with `esverify -heads`; see the README).
 - The cryptography isn't certified: AES-256-GCM and Ed25519 from the Go standard library, root keys in files. The root sits behind an interface so that an HSM can be plugged in.
 - The collector reads files only. There's no syslog receiver.
 
@@ -347,7 +347,7 @@ DEMO_TSA=digicert scripts/demo-intruder.sh   # real time-stamps from DigiCert (n
 go build ./... && go vet ./... && go test -race ./...
 ```
 
-Release binaries are on the [Releases](https://github.com/Nikolay1994Kaz/evidencestore/releases) page: the store and the collector for Linux, and `esverify` also for macOS and Windows, with `SHA256SUMS` and build attestations. The latest release is v0.1.1; the intruder demo and `esverify -body` will be in the next one.
+Release binaries are on the [Releases](https://github.com/Nikolay1994Kaz/evidencestore/releases) page: the store and the collector for Linux, and `esverify` also for macOS and Windows, with `SHA256SUMS` and build attestations. The latest release is v0.2.0: it has the intruder demo, `esverify -body` and the witness of chain heads.
 
 Further reading: the [README](../README.md) (configuration, installation, limits), and in Russian [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (a code map with the order to read it in) and [`docs/DECISIONS.md`](DECISIONS.md) (design decisions).
 

@@ -171,6 +171,9 @@ type Store struct {
 	replicaMu     sync.Mutex
 	replica       *replicaState
 	replicaRemote ship.Remote
+	// replicaShipped — голова, до которой копия держит цепь после удачного
+	// прохода этого процесса; до первого удачного прохода — ноль.
+	replicaShipped atomic.Uint64
 
 	// Канал свидетеля голов (witness.go). Очередь — под chainMu.
 	witnessRemote ship.Remote

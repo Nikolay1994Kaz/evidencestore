@@ -25,10 +25,7 @@ func failed(r Report, name string) bool {
 	return false
 }
 
-const (
-	checkOneVersion = "the witness holds one version of the chain (no two different heads with one number)"
-	checkAgrees     = "the chain in the bundle agrees with the heads the witness saw"
-)
+const checkAgrees = "the chain in the bundle agrees with the heads the witness saw"
 
 // ⭐ Свидетель видел голову 4 той же цепи: она закрепляет улику из звена 3.
 // Голова 2 раньше улики сверяется со звеном пакета, но улику не закрепляет.
@@ -56,9 +53,10 @@ func TestWitnessHeadOfAnotherChain(t *testing.T) {
 	}
 }
 
-// Две разные головы с одним номером у свидетеля — развилка, даже когда
-// голова, закрепляющая улику, с пакетом сходится.
-func TestWitnessSeesFork(t *testing.T) {
+// Две разные головы с одним номером вне участка цепи этой записи: хранилище
+// подписало вторую историю, но запись она не задевает — пакет проходит, а
+// отчёт называет развилку (P-11).
+func TestWitnessForkOutsideRecordIsNote(t *testing.T) {
 	w, b := standard(t, nil)
 	tr := w.trust()
 	tr.Witness = &Witness{Heads: []PublishedHead{
@@ -66,8 +64,23 @@ func TestWitnessSeesFork(t *testing.T) {
 		w.published("heads/7.json", 7, w.linkHash(1)),
 		w.published("heads/7.json.v2", 7, w.linkHash(2)),
 	}}
-	if r := Verify(b, tr); r.Valid() || !failed(r, checkOneVersion) {
-		t.Fatalf("развилка у свидетеля:\n%s", r.Text())
+	r := Verify(b, tr)
+	if !r.Valid() || r.WitnessHead != 4 || r.WitnessFork != 7 || !strings.Contains(strings.Join(r.Notes(), "\n"), "two versions of the chain") {
+		t.Fatalf("развилка вне участка записи:\n%s", r.Text())
+	}
+}
+
+// Две разные головы с одним номером на участке цепи этой записи — провал,
+// даже когда одна из них с пакетом сходится.
+func TestWitnessForkInRecordPartFails(t *testing.T) {
+	w, b := standard(t, nil)
+	tr := w.trust()
+	tr.Witness = &Witness{Heads: []PublishedHead{
+		w.published("heads/4.json", 4, w.linkHash(4)),
+		w.published("heads/4.json.v2", 4, w.linkHash(3)),
+	}}
+	if r := Verify(b, tr); r.Valid() || !failed(r, checkAgrees) || !strings.Contains(r.Text(), "two different heads number 4") {
+		t.Fatalf("развилка на участке записи:\n%s", r.Text())
 	}
 }
 
@@ -77,8 +90,14 @@ func TestWitnessHeadBeyondBundle(t *testing.T) {
 	w, b := standard(t, nil)
 	tr := w.trust()
 	tr.Witness = &Witness{Heads: []PublishedHead{w.published("heads/9.json", 9, w.linkHash(1))}}
-	if r := Verify(b, tr); r.Valid() || !failed(r, checkAgrees) || !strings.Contains(r.Text(), "proof -to-head 9") {
+	r := Verify(b, tr)
+	if r.Valid() || !failed(r, checkAgrees) || !strings.Contains(r.Text(), "proof -to-head 9") {
 		t.Fatalf("голова свидетеля дальше пакета:\n%s", r.Text())
+	}
+	// Голова у свидетеля есть, просто пакет до неё не доходит: отчёт не
+	// говорит, что её нет.
+	if strings.Contains(strings.Join(r.Notes(), "\n"), "has no head") {
+		t.Fatalf("замечание «головы ещё нет» при голове дальше пакета:\n%s", r.Text())
 	}
 }
 

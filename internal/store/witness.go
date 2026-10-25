@@ -9,8 +9,8 @@ import (
 )
 
 // Канал свидетеля голов (witness.url; решение 25.10, DECISIONS «Свидетель
-// голов»). Туда уходят только подписанные головы цепи — номер, хэш,
-// подпись, — без журнала улик и тел. Держит его не тот, кто администрирует
+// голов»). Туда уходят только подписанные головы цепи — заявления о голове,
+// без журнала улик и тел. Держит его не тот, кто администрирует
 // хранилище: проверяющий или другая организация. Голова у свидетеля
 // закрепляет цепь до неё, и пакет из цепи, переписанной после этого, с ней не
 // сойдётся (esverify -heads).
@@ -20,6 +20,12 @@ import (
 // heads/<номер>.json, как в копии наружу. Очередь живёт в памяти: головы под
 // метками, не ушедшие до остановки, после запуска не досылаются, и пакет по
 // их уликам просят до следующей головы свидетеля (proof -to-head).
+//
+// Свидетель не обгоняет копию наружу: когда она есть, уходят только головы,
+// до которых копия держит цепь после удачного прохода. Иначе подъём из копии
+// оборвал бы цепь раньше головы, которую свидетель уже видел, и под теми же
+// номерами поднятое хранилище написало бы другое — для свидетеля развилка
+// (P-11). Головы дальше копии ждут в очереди её следующего прохода.
 
 // witnessHead — голова в очереди к свидетелю; stamped — над ней метка TSA.
 type witnessHead struct {
@@ -32,7 +38,16 @@ type witnessHead struct {
 // метками остаются все — ими кончаются пакеты, — так что, пока свидетель
 // недоступен, очередь растёт только ими. Зовётся под chainMu.
 func (s *Store) queueWitnessLocked(h auditchain.Head, stamped bool) {
-	if s.witnessRemote == nil || h.Seq == 0 || h.Seq <= s.witnessQueued {
+	if s.witnessRemote == nil || h.Seq == 0 {
+		return
+	}
+	if h.Seq <= s.witnessQueued {
+		// Голова ещё ждёт в очереди текущей, а теперь над ней метка: она
+		// остаётся головой под меткой и не уступит место следующей текущей.
+		// Ушедшая голова у свидетеля уже лежит.
+		if n := len(s.witnessQueue); stamped && n > 0 && s.witnessQueue[n-1].head == h {
+			s.witnessQueue[n-1].stamped = true
+		}
 		return
 	}
 	if n := len(s.witnessQueue); n > 0 && !s.witnessQueue[n-1].stamped {
@@ -52,7 +67,14 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 	s.queueWitnessLocked(s.chain.Head(), false)
 	queue := append([]witnessHead(nil), s.witnessQueue...)
 	s.chainMu.Unlock()
+	limit := ^uint64(0)
+	if s.replicaRemote != nil {
+		limit = s.replicaShipped.Load()
+	}
 	for _, h := range queue {
+		if h.head.Seq > limit {
+			break // очередь по возрастанию: дальше — тоже за копией
+		}
 		data, err := s.signer.Sign(h.head, int(h.head.Seq), s.nowTime().Unix()).JSON()
 		if err != nil {
 			return err
