@@ -52,6 +52,36 @@ func verifyOnDisk(t *testing.T, dir string, want Head) {
 	}
 }
 
+// ReadLinks отдаёт ровно звенья from…to, какие лежат в файле, и отказывает,
+// когда звеньев в файле меньше или диапазон пуст.
+func TestReadLinks(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir)
+	defer c.Close()
+	for i := 0; i < 6; i++ {
+		c.Append(leafN(i))
+		if _, err := c.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := ReadChain(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadLinks(dir, 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || Hash(got[0]) != Hash(all[1]) || Hash(got[2]) != Hash(all[3]) {
+		t.Fatalf("звенья 2…4: прочитано %d, не те", len(got))
+	}
+	for _, r := range [][2]uint64{{1, 7}, {0, 3}, {4, 3}} {
+		if _, err := ReadLinks(dir, r[0], r[1]); err == nil {
+			t.Fatalf("звенья %d…%d прочитаны без ошибки", r[0], r[1])
+		}
+	}
+}
+
 func TestCarrier_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	c := mustOpen(t, dir)

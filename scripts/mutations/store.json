@@ -720,6 +720,24 @@
    "file": "cmd/esverify/main.go",
    "old": "fmt.Fprintf(stderr, \"body written to",
    "new": "fmt.Fprintf(stdout, \"body written to"
+  },
+  {
+   "name": "P28 пакет снова тянет звенья до текущей головы",
+   "file": "internal/store/proofs.go",
+   "old": "\t\tto = b.Upper.HeadSeq\n",
+   "new": "\t\tto = max(to, b.Upper.HeadSeq)\n"
+  },
+  {
+   "name": "P29 пакет гейтвея не доходит до поздней контрольной точки",
+   "file": "internal/store/proofs.go",
+   "old": "\t\t\t\tto = max(to, g.Checkpoint.LinkSeq)",
+   "new": "\t\t\t\t_ = g.Checkpoint.LinkSeq"
+  },
+  {
+   "name": "P30 звенья пакета читаются с начала файла",
+   "file": "internal/auditchain/carrier.go",
+   "old": "\t\tif seq < from {",
+   "new": "\t\tif false {"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

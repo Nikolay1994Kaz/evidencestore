@@ -1,6 +1,7 @@
 package auditchain
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -642,6 +643,58 @@ func ReadChain(dir string) ([]Record, error) {
 		r, err := decodeRecord(body)
 		if err != nil {
 			return nil, fmt.Errorf("auditchain: link %d: %w", i, err)
+		}
+		links = append(links, r)
+	}
+	return links, nil
+}
+
+// ReadLinks читает звенья from…to (номера с единицы, включительно) — для
+// пакета доказательств. Файл идёт потоком до звена to, а разбираются и
+// остаются в памяти только нужные звенья: пакету по старой улике вся цепь не
+// нужна (P-06). Звенья до from пропускаются по длине кадра без разбора: файл
+// сверен носителем при открытии, а выданные звенья проверяющий сверит сам —
+// хэшами подряд до подписанной головы. Звеньев в файле меньше to — ошибка.
+func ReadLinks(dir string, from, to uint64) ([]Record, error) {
+	if from == 0 || from > to {
+		return nil, fmt.Errorf("auditchain: links %d…%d requested", from, to)
+	}
+	f, err := os.Open(filepath.Join(dir, chainFileName))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	rd := bufio.NewReaderSize(f, 1<<20)
+	links := make([]Record, 0, to-from+1)
+	for seq := uint64(1); seq <= to; seq++ {
+		var n [4]byte
+		if _, err := io.ReadFull(rd, n[:]); err != nil {
+			return nil, fmt.Errorf("auditchain: %s: link %d: %w", f.Name(), seq, err)
+		}
+		size := int(binary.BigEndian.Uint32(n[:]))
+		if size == 0 || size > maxFrame {
+			return nil, fmt.Errorf("auditchain: %s: link %d: frame length %d", f.Name(), seq, size)
+		}
+		if seq < from {
+			if _, err := rd.Discard(size + 4); err != nil {
+				return nil, fmt.Errorf("auditchain: %s: link %d: %w", f.Name(), seq, err)
+			}
+			continue
+		}
+		buf := make([]byte, size+4)
+		if _, err := io.ReadFull(rd, buf); err != nil {
+			return nil, fmt.Errorf("auditchain: %s: link %d: %w", f.Name(), seq, err)
+		}
+		body := buf[:size]
+		if crc32.ChecksumIEEE(body) != binary.BigEndian.Uint32(buf[size:]) {
+			return nil, fmt.Errorf("auditchain: %s: link %d: the frame checksum does not match", f.Name(), seq)
+		}
+		r, err := decodeRecord(body)
+		if err != nil {
+			return nil, fmt.Errorf("auditchain: link %d: %w", seq, err)
+		}
+		if r.Seq != seq {
+			return nil, fmt.Errorf("auditchain: %s: link %d carries number %d", f.Name(), seq, r.Seq)
 		}
 		links = append(links, r)
 	}

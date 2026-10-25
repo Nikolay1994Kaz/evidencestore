@@ -83,18 +83,30 @@ func (s *Store) Proof(source string, seq uint64, withDEK bool) (proof.Bundle, er
 		break
 	}
 
-	head := s.chain.Head()
-	links, err := auditchain.ReadChain(s.chainDir)
+	// Пакет кончается головой T2: дальше проверке ничего не нужно, а звенья
+	// после неё растили бы пакет с каждым тиком без предела (P-06). Вердикт и
+	// контрольная точка гейтвея могут лечь в звенья позже T2 — тогда пакет
+	// доходит до последнего из них. Без T2 — до текущей головы.
+	to := s.chain.Head().Seq
+	if b.Upper != nil {
+		to = b.Upper.HeadSeq
+		if g := b.Gateway; g != nil {
+			to = max(to, g.Entry.LinkSeq)
+			if g.Checkpoint != nil {
+				to = max(to, g.Checkpoint.LinkSeq)
+			}
+		}
+	}
+	links, err := auditchain.ReadLinks(s.chainDir, from, to)
 	if err != nil {
 		return proof.Bundle{}, err
 	}
-	if uint64(len(links)) < head.Seq || from == 0 {
-		return proof.Bundle{}, fmt.Errorf("store: chain file has %d links, head is %d", len(links), head.Seq)
-	}
-	for _, l := range links[from-1 : head.Seq] {
+	for _, l := range links {
 		b.Links = append(b.Links, proof.FromLink(l))
 	}
-	b.Statement = s.signer.Sign(head, len(s.links), s.nowTime().Unix())
+	// Заявление — о голове, которой кончается пакет; подписано при выдаче.
+	last := links[len(links)-1]
+	b.Statement = s.signer.Sign(auditchain.Head{Seq: last.Seq, Hash: auditchain.Hash(last)}, int(last.Seq), s.nowTime().Unix())
 
 	if withDEK {
 		sealed, err := evidence.Unmarshal(data)

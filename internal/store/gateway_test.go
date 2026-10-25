@@ -152,6 +152,41 @@ func TestGatewayJournalProof(t *testing.T) {
 	}
 }
 
+// P-06: контрольная точка гейтвея легла в цепь позже T2 — пакет доходит до
+// её звена, но не до текущей головы.
+func TestGatewayProofReachesLateCheckpoint(t *testing.T) {
+	key := pipelockKey(t)
+	c := newClock()
+	cfg := testConfig(t, withGateway(key))
+	s := openStore(t, cfg, c)
+	lines := pipelockSession(t)
+	ingestLines(t, s, 1, lines[:4]) // улика 4 — запись гейтвея seq 3
+	mustStamp(t, s)                 // T2: контрольной точки после записи ещё нет
+	ingestLines(t, s, 5, lines[4:])
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 1, 1) // звено после точки
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := s.Proof("agent-gw", 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b, gatewayTrust(t, s, key)); !r.Valid() || r.GatewayCheckpoint == nil {
+		t.Fatalf("пакет:\n%s", r.Text())
+	}
+	if b.Upper == nil || b.Gateway == nil || b.Gateway.Checkpoint == nil {
+		t.Fatalf("в пакете нет T2 или контрольной точки: upper=%v gateway=%v", b.Upper != nil, b.Gateway != nil)
+	}
+	last, point, head := b.Links[len(b.Links)-1].Seq, b.Gateway.Checkpoint.LinkSeq, s.chain.Head().Seq
+	if point <= b.Upper.HeadSeq || last != point || last >= head {
+		t.Fatalf("звенья до %d, T2 над головой %d, точка в звене %d, голова %d", last, b.Upper.HeadSeq, point, head)
+	}
+}
+
 // Запись с изменённым байтом принимается, но вердикт и пакет говорят, что с
 // ней не так, и контрольной точкой она не накрыта.
 func TestGatewayTamperedEntry(t *testing.T) {

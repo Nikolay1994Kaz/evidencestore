@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -195,6 +196,73 @@ func TestIngestProofVerify(t *testing.T) {
 	}
 	if r2 := proof.Verify(b2, trustOf(t, s)); !r2.Valid() {
 		t.Fatalf("после JSON:\n%s", r2.Text())
+	}
+}
+
+// ⭐ P-06: пакет — от головы, которую заверяет T1, до головы под T2. Звенья,
+// легшие после T2, проверке не нужны, и пакет по старой улике от них не
+// растёт. Без T2 пакет доходит до текущей головы.
+func TestProofEndsAtUpperStamp(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	link := func(seq uint64) {
+		t.Helper()
+		ingest(t, s, "abs-core", seq, seq)
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for q := uint64(1); q <= 3; q++ {
+		link(q) // звенья до T1: пакет начинается не с первого
+	}
+	mustStamp(t, s) // T1
+	c.add(time.Minute)
+	ingest(t, s, "abs-core", 4, 6)
+	c.add(time.Minute)
+	mustStamp(t, s) // T2
+
+	before, err := s.Proof("abs-core", 5, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for q := uint64(7); q <= 56; q++ {
+		link(q) // 50 звеньев после T2
+	}
+	b, err := s.Proof("abs-core", 5, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b, trustOf(t, s)); !r.Valid() {
+		t.Fatalf("пакет не прошёл:\n%s", r.Text())
+	}
+	if b.Lower == nil || b.Upper == nil {
+		t.Fatalf("в пакете нет меток: lower=%v upper=%v", b.Lower != nil, b.Upper != nil)
+	}
+	stamped, err := strconv.ParseUint(b.Lower.Inclusion.Leaf.Subject, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, last := b.Links[0].Seq, b.Links[len(b.Links)-1].Seq
+	if first != stamped || last != b.Upper.HeadSeq || b.Statement.HeadSeq != last {
+		t.Fatalf("звенья %d…%d, T1 заверяет голову %d, T2 — %d, заявление о голове %d",
+			first, last, stamped, b.Upper.HeadSeq, b.Statement.HeadSeq)
+	}
+	if head := s.chain.Head().Seq; len(b.Links) != len(before.Links) || head < last+50 {
+		t.Fatalf("звеньев в пакете %d, до новых звеньев было %d; голова %d", len(b.Links), len(before.Links), head)
+	}
+
+	// Без T2 — до текущей головы.
+	nb, err := s.Proof("abs-core", 56, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trustOf(t, s)
+	tr.AllowNoTSA = true
+	if r := proof.Verify(nb, tr); !r.Valid() {
+		t.Fatalf("пакет без T2:\n%s", r.Text())
+	}
+	if end, head := nb.Links[len(nb.Links)-1].Seq, s.chain.Head().Seq; nb.Upper != nil || end != head {
+		t.Fatalf("пакет без T2 кончается звеном %d, голова %d", end, head)
 	}
 }
 
