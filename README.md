@@ -12,9 +12,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Nikolay1994Kaz/evidencestore" alt="License"></a>
 </p>
 
-Tamper-evident storage for audit records: actions of AI agents, logs of core banking systems, a copy of the SIEM stream.
+A log is written by the system it describes and usually lies on the same machine, so whoever controls the machine controls the log. An intruder cleans `auth.log`; an administrator, or an AI agent that did something it shouldn't have, often has the same access. evidencestore is a witness that lives elsewhere: a collector next to the log sends every line to a store on another machine, and the store can later prove any of those lines to an auditor.
 
-Every record is accepted over mutual TLS, encrypted with its own key, written to disk (the store answers "accepted" only after `fsync`) and chained by hash. The chain head is time-stamped by an external RFC 3161 authority, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). For any record the store produces a proof bundle. An auditor checks it **offline**, without access to the store and without trusting it: the record bytes, a Merkle path into the chain, the chain up to a signed head, and time-stamps from before and after the record.
+It takes any line-based log: system logs, application and core banking audit logs, a copy of the SIEM stream, the flight recorder of an AI agent gateway such as [Pipelock](https://github.com/luckyPipewrench/pipelock), whose own hash chain and signatures the store also checks at intake.
+
+Every record is accepted over mutual TLS, encrypted with its own key, written to disk (the store answers "accepted" only after `fsync`) and chained by hash. The chain head is time-stamped by an external RFC 3161 authority, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). For any record the store produces a proof bundle. An auditor checks it **offline**, without access to the store and without trusting it: the record bytes, a Merkle path into the chain, the chain up to a signed head, and time-stamps from before and after the record. The chain heads can also go to a witness of their own, out of reach of the store's administrator, so that a rewrite by that administrator shows as well ([Witness of the chain heads](#witness-of-the-chain-heads)).
 
 Retention is enforced by destroying keys (crypto-erasure). Every record of a source for a month is encrypted under that month's key. Destroying the key needs two approvers and a waiting period, and it makes those bodies unreadable in every copy (log segments, backups). The chain and the proofs stay intact: you can still prove that record #42 from `abs-core` existed, was received at a given time and was never altered. You can no longer read it.
 
@@ -62,6 +64,8 @@ gh attestation verify evidencestore-linux-amd64 --repo Nikolay1994Kaz/evidencest
 sudo install -m 0755 evidencestore-linux-amd64 /usr/local/bin/evidencestore   # likewise escollect, esverify
 evidencestore version
 ```
+
+**With Go** 1.25 or newer: `go install github.com/Nikolay1994Kaz/evidencestore/cmd/esverify@latest`, likewise `cmd/evidencestore` and `cmd/escollect`.
 
 **From source.** With Go 1.25 or newer: `git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore && go build -o /usr/local/bin/ ./cmd/...`.
 
@@ -201,6 +205,7 @@ Numbers below are for commit `957345c` (12 October 2026).
   - Collector: 2,000 scenarios in each of four worlds (one file or a glob, with and without destruction) against an in-memory store, 150 per world against the real store over mTLS, and 400 per world against the real store with all faults at once; no failures.
 - **Live gateway.** `scripts/demo-pipelock.sh` passes against Pipelock v3.6.0 built from the tag's commit.
 - **A night on real data** (11–12 October, 21:19–06:23). The store ran with four collectors: the host's own `/var/log/syslog`, `auth.log` and `kern.log` (read from the start), and the flight recorder of a live Pipelock v3.6.0 that blocked an "agent" all night (no request left the host). During the night logrotate rotated all three logs at midnight (`create`, `delaycompress`, rsyslog HUP), the store was restarted 5 times, a collector was killed with `kill -9`, Pipelock was restarted twice (3 sessions, 359 shards), and the copy went to a directory every minute. Every one of the 104,738 records matched its source line, in order, with no duplicates and no losses: syslog 71,120 (67,596 from the rotated file, 3,524 from the new one), auth.log 1,246, kern.log 10,752, Pipelock 21,620. A sample of 7,560 proof bundles across the whole range verified the way `esverify` does, the Pipelock ones with the gateway's checkpoint signature. A store restored from the copy (76 MB, chain checked up to signed head 8005) gave the same result. The store log had no errors. The scripts of this run were a one-off and are not in the repository.
+- **Witness and copy on real S3** (25 October, MinIO RELEASE.2025-10-15 with Object Lock in compliance mode). The store sent its signed heads to a locked bucket and its copy to another; `esverify -heads` verified a bundle against all versions of the witnessed heads, a junk version and a delete marker put over a head afterwards changed nothing, and `restore` from the copy passed. A one-off run; AWS itself was not tried.
 
 ## Known limitations
 
