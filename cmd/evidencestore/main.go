@@ -5,7 +5,7 @@
 //	evidencestore dev-pki  -out DIR -source N…  учебный УЦ и сертификаты для стенда
 //	evidencestore status   -config C           сводка
 //	evidencestore stamp    -config C           заверить голову цепи у TSA сейчас
-//	evidencestore proof    -config C -source S -seq N [-dek] [-out F]
+//	evidencestore proof    -config C -source S -seq N [-dek] [-to-head H] [-out F]
 //	evidencestore statement -config C          подписанная голова цепи
 //	evidencestore tsa-root -config C -out F    корень встроенной демо-TSA
 //	evidencestore keys list|due|deactivate|schedule|cancel|complete|destroy-orphan-roots -config C …
@@ -102,7 +102,8 @@ Operator (talks to the running server via its admin socket):
   status    -config FILE
   statement -config FILE                       signed chain head
   stamp     -config FILE                       time-stamp the chain head now
-  proof     -config FILE -source S -seq N [-dek] [-out FILE]
+  proof     -config FILE -source S -seq N [-dek] [-to-head H] [-out FILE]
+                                               -to-head: the bundle reaches at least head H (one a witness saw)
   tsa-root  -config FILE -out FILE             root certificate of the built-in demo TSA
   keys list|due      -config FILE
   keys deactivate    -config FILE -scope S [-force]
@@ -225,6 +226,7 @@ func cmdProof(args []string) error {
 	source := fs.String("source", "", "source name")
 	seq := fs.Uint64("seq", 0, "record number at the source")
 	dek := fs.Bool("dek", false, "attach the key of this one record so the auditor can open the body")
+	toHead := fs.Uint64("to-head", 0, "extend the bundle at least up to this chain head: one a witness saw (esverify -heads names it)")
 	out := fs.String("out", "", "write the bundle here instead of stdout")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
@@ -233,6 +235,9 @@ func cmdProof(args []string) error {
 	q := url.Values{"source": {*source}, "seq": {fmt.Sprint(*seq)}}
 	if *dek {
 		q.Set("dek", "1")
+	}
+	if *toHead > 0 {
+		q.Set("to_head", fmt.Sprint(*toHead))
 	}
 	body, err := adminDo(cfg, http.MethodGet, "/admin/proof?"+q.Encode(), nil)
 	if err != nil {

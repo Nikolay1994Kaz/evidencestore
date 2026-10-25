@@ -18,6 +18,8 @@ import (
 // world — настоящее хранилище с демо-TSA и файлы для esverify.
 type world struct {
 	dir, bundle, key, trust, promise string
+	// later — подписанная голова после той, которой кончается пакет.
+	later string
 }
 
 func newWorld(t *testing.T) world { return newWorldWith(t, []byte("login admin")) }
@@ -66,7 +68,54 @@ func newWorldWith(t *testing.T, body []byte) world {
 	w.trust = write("tsa-root.crt", s.TSARoot())
 	pdata, _ := json.Marshal(res[0].Promise)
 	w.promise = write("promise.json", pdata)
+	later, _ := s.Statement().JSON() // токен T2 лёг звеном после головы пакета
+	w.later = write("later-head.json", later)
 	return w
+}
+
+// Свидетель голов: голова, которой кончается пакет, есть у свидетеля —
+// пакет проходит, и отчёт её называет; посторонний файл в каталоге не
+// мешает. Свидетель видел только голову после пакета — не проходит, и
+// отчёт говорит, какой пакет просить. Каталога нет — неверный вызов.
+func TestHeadsFlag(t *testing.T) {
+	w := newWorld(t)
+	data, err := os.ReadFile(w.bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := proof.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(w.dir, "witness")
+	if err := os.MkdirAll(filepath.Join(dir, "versions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	head, _ := b.Statement.JSON()
+	for name, content := range map[string][]byte{"versions/head.json": head, "README": []byte("not a head")} {
+		if err := os.WriteFile(filepath.Join(dir, name), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out := w.run(t, "-heads", dir, "-json")
+	var rep map[string]any
+	if err := json.Unmarshal([]byte(out), &rep); err != nil || code != 0 || rep["witness_head"] != float64(b.Statement.HeadSeq) {
+		t.Fatalf("голова пакета у свидетеля: код %d, %v\n%s", code, err, out)
+	}
+
+	later := filepath.Join(w.dir, "witness-later")
+	if err := os.MkdirAll(later, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(w.later, filepath.Join(later, "head.json")); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := w.run(t, "-heads", later); code != 1 || !strings.Contains(out, "proof -to-head") {
+		t.Fatalf("голова свидетеля после пакета: код %d\n%s", code, out)
+	}
+	if code, out := w.run(t, "-heads", filepath.Join(w.dir, "nope")); code != 2 {
+		t.Fatalf("нет каталога голов: код %d\n%s", code, out)
+	}
 }
 
 func (w world) run(t *testing.T, extra ...string) (int, string) {

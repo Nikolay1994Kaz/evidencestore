@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"strings"
 )
 
@@ -36,7 +37,26 @@ var ErrNotExist = fmt.Errorf("ship: object does not exist")
 //	                            — S3-совместимый бакет; креды из env
 //	                              (KVSTORE_S3_ACCESS_KEY/SECRET_KEY или
 //	                              AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
-func OpenRemote(rawURL string) (Remote, error) {
+func OpenRemote(rawURL string) (Remote, error) { return openRemote(rawURL, defaultCreds) }
+
+// OpenRemoteEnv — то же, но ключи S3 берутся только из своих переменных
+// окружения: <env>_ACCESS_KEY_ID, <env>_SECRET_ACCESS_KEY, <env>_SESSION_TOKEN.
+// Свидетель голов (witness.url) — чужое хранилище со своими ключами: ключи
+// копии наружу (AWS_*) ему не подставляются.
+func OpenRemoteEnv(rawURL, env string) (Remote, error) {
+	return openRemote(rawURL, func() (string, string, string, error) {
+		id, key := os.Getenv(env+"_ACCESS_KEY_ID"), os.Getenv(env+"_SECRET_ACCESS_KEY")
+		if id == "" || key == "" {
+			return "", "", "", fmt.Errorf("ship: s3 credentials not set (%s_ACCESS_KEY_ID/%s_SECRET_ACCESS_KEY)", env, env)
+		}
+		return id, key, os.Getenv(env + "_SESSION_TOKEN"), nil
+	})
+}
+
+// credsFunc — откуда клиент S3 берёт ключи: access, secret, session token.
+type credsFunc func() (access, secret, token string, err error)
+
+func openRemote(rawURL string, creds credsFunc) (Remote, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("ship: bad url %q: %w", rawURL, err)
@@ -49,7 +69,7 @@ func OpenRemote(rawURL string) (Remote, error) {
 		}
 		return newFileRemote(u.Path)
 	case "s3":
-		return newS3Remote(u)
+		return newS3RemoteWith(u, creds)
 	default:
 		return nil, fmt.Errorf("ship: unsupported scheme %q (want file:// or s3://)", u.Scheme)
 	}

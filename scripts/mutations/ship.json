@@ -1,0 +1,19 @@
+{
+ "packages": [
+  "./internal/ship/"
+ ],
+ "mutations": [
+  {
+   "name": "H1 запись в S3 без Content-MD5",
+   "file": "internal/ship/s3_remote.go",
+   "old": "\t\treq.Header.Set(\"Content-MD5\", base64.StdEncoding.EncodeToString(sum[:]))",
+   "new": "\t\t_, _ = sum, base64.StdEncoding"
+  },
+  {
+   "name": "H2 свидетель открывается без своих ключей",
+   "file": "internal/ship/remote.go",
+   "old": "\t\tif id == \"\" || key == \"\" {",
+   "new": "\t\tif false {"
+  }
+ ]
+}

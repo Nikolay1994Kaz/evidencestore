@@ -41,6 +41,7 @@ type Config struct {
 	TSA     TSA      `json:"tsa"`
 	Keys    Keys     `json:"keys"`
 	Replica Replica  `json:"replica"`
+	Witness Witness  `json:"witness"`
 	Sources []Source `json:"sources"`
 
 	// Demo — стенд для показа: разрешает короткие сроки (keys.min_wait меньше
@@ -57,6 +58,21 @@ type Replica struct {
 	URL string `json:"url"`
 	// Every — как часто дотягивать копию. По умолчанию 1m: это и есть
 	// наибольшее отставание копии (RPO).
+	Every Duration `json:"every"`
+}
+
+// Witness — канал свидетеля голов: туда уходят только подписанные головы
+// цепи (номер, хэш, подпись), без журнала и тел. Держит его не тот, кто
+// администрирует хранилище: проверяющий или другая организация. S3 под тем
+// же администратором — не свидетель: блокировку объектов root на машине
+// хранилища обходит мимо S3 (DECISIONS, «Свидетель голов»).
+type Witness struct {
+	// URL: s3://bucket/prefix?endpoint=…&region=… (ключи — только из
+	// ES_WITNESS_ACCESS_KEY_ID / ES_WITNESS_SECRET_ACCESS_KEY) или
+	// file:///abs/path. Пусто — без свидетеля.
+	URL string `json:"url"`
+	// Every — как часто отправлять текущую голову. По умолчанию 1m. Голова
+	// под каждой меткой TSA уходит и без этого: ею кончается пакет.
 	Every Duration `json:"every"`
 }
 
@@ -218,6 +234,9 @@ func (c *Config) Defaults() {
 	if c.Replica.Every == 0 {
 		c.Replica.Every = Duration(time.Minute)
 	}
+	if c.Witness.Every == 0 {
+		c.Witness.Every = Duration(time.Minute)
+	}
 	if c.Keys.MinWait == 0 {
 		c.Keys.MinWait = Duration(7 * 24 * time.Hour)
 	}
@@ -275,10 +294,15 @@ func (c *Config) Validate() error {
 	}
 	// Сроки: отрицательный тикер — паника посреди работы, отрицательное
 	// окно отмены — уничтожение ключа без окна.
-	for name, d := range map[string]Duration{"tsa.every": c.TSA.Every, "replica.every": c.Replica.Every, "keys.min_wait": c.Keys.MinWait} {
+	for name, d := range map[string]Duration{"tsa.every": c.TSA.Every, "replica.every": c.Replica.Every, "witness.every": c.Witness.Every, "keys.min_wait": c.Keys.MinWait} {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive", name))
 		}
+	}
+	// Свидетель — чужое хранилище, копия — своё: в одном месте головы
+	// свидетеля ничего бы не доказывали.
+	if c.Witness.URL != "" && c.Witness.URL == c.Replica.URL {
+		errs = append(errs, errors.New("witness.url must not be replica.url: the witness keeps heads out of the store administrator's reach, the copy is the store's own"))
 	}
 	if !c.Demo && c.Keys.MinWait > 0 && c.Keys.MinWait.D() < MinWaitFloor {
 		errs = append(errs, fmt.Errorf("keys.min_wait %v is shorter than %v: the window to cancel a key destruction would be too short (set \"demo\": true for a demo stand)", c.Keys.MinWait.D(), MinWaitFloor))

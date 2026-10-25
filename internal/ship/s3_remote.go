@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -41,7 +43,25 @@ type s3Remote struct {
 	sessionToken string
 }
 
-func newS3Remote(u *url.URL) (*s3Remote, error) {
+func newS3Remote(u *url.URL) (*s3Remote, error) { return newS3RemoteWith(u, defaultCreds) }
+
+// defaultCreds — ключи копии наружу: KVSTORE_S3_ACCESS_KEY/KVSTORE_S3_SECRET_KEY,
+// иначе AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN).
+func defaultCreds() (access, secret, token string, err error) {
+	access = os.Getenv("KVSTORE_S3_ACCESS_KEY")
+	secret = os.Getenv("KVSTORE_S3_SECRET_KEY")
+	if access == "" {
+		access = os.Getenv("AWS_ACCESS_KEY_ID")
+		secret = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
+	if access == "" || secret == "" {
+		return "", "", "", fmt.Errorf("ship: s3 credentials not set " +
+			"(KVSTORE_S3_ACCESS_KEY/KVSTORE_S3_SECRET_KEY or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)")
+	}
+	return access, secret, os.Getenv("AWS_SESSION_TOKEN"), nil
+}
+
+func newS3RemoteWith(u *url.URL, creds credsFunc) (*s3Remote, error) {
 	bucket := u.Host
 	if bucket == "" {
 		return nil, fmt.Errorf("ship: s3 URL must be s3://bucket[/prefix], got %q", u.String())
@@ -59,15 +79,9 @@ func newS3Remote(u *url.URL) (*s3Remote, error) {
 		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", region)
 	}
 
-	access := os.Getenv("KVSTORE_S3_ACCESS_KEY")
-	secret := os.Getenv("KVSTORE_S3_SECRET_KEY")
-	if access == "" {
-		access = os.Getenv("AWS_ACCESS_KEY_ID")
-		secret = os.Getenv("AWS_SECRET_ACCESS_KEY")
-	}
-	if access == "" || secret == "" {
-		return nil, fmt.Errorf("ship: s3 credentials not set " +
-			"(KVSTORE_S3_ACCESS_KEY/KVSTORE_S3_SECRET_KEY or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)")
+	access, secret, token, err := creds()
+	if err != nil {
+		return nil, err
 	}
 
 	return &s3Remote{
@@ -78,7 +92,7 @@ func newS3Remote(u *url.URL) (*s3Remote, error) {
 		region:       region,
 		accessKey:    access,
 		secretKey:    secret,
-		sessionToken: os.Getenv("AWS_SESSION_TOKEN"),
+		sessionToken: token,
 	}, nil
 }
 
@@ -191,6 +205,13 @@ func (s *s3Remote) do(ctx context.Context, method, objKey string, query url.Valu
 
 	req.Header.Set("x-amz-date", amzDate)
 	req.Header.Set("x-amz-content-sha256", payloadHash)
+	if method == http.MethodPut {
+		// Бакет с блокировкой объектов (Object Lock) принимает запись только
+		// с контрольной суммой тела, и Content-MD5 — та, что требует AWS.
+		// Подпись её не накрывает: тело и так накрыто x-amz-content-sha256.
+		sum := md5.Sum(body)
+		req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(sum[:]))
+	}
 	if s.sessionToken != "" {
 		req.Header.Set("x-amz-security-token", s.sessionToken)
 	}

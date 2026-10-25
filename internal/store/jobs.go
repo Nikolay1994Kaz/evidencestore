@@ -39,6 +39,15 @@ func (s *Store) startBackground() {
 			}
 		})
 	}
+	if s.witnessRemote != nil {
+		s.loop(s.cfg.Witness.Every.D(), func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if err := s.WitnessOnce(ctx); err != nil {
+				s.log.Error("witness", "err", err)
+			}
+		})
+	}
 	s.loop(time.Minute, func() { s.Maintain(s.nowTime()) })
 	s.loop(10*time.Second, func() { s.CheckSilence(s.nowTime()) })
 }
@@ -231,6 +240,7 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 		Payload:  token,
 	})
 	s.tokens = append(s.tokens, tokenRef{head: head.Seq, leaf: num, gen: info.GenTime})
+	s.queueWitnessLocked(head, true) // ею кончаются пакеты: свидетель видит её саму
 	s.lastStamped = max(s.lastStamped, head.Seq)
 	s.stampedLeaves = num + 1
 	err = s.flushLocked()

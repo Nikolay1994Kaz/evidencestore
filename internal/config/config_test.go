@@ -109,6 +109,10 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 		"min_wait 1s":           func(c *Config) { c.Keys.MinWait = Duration(time.Second) },
 		"tsa.every -1m":         func(c *Config) { c.TSA.Every = Duration(-time.Minute) },
 		"replica.every -1m":     func(c *Config) { c.Replica.Every = Duration(-time.Minute) },
+		"witness.every -1m":     func(c *Config) { c.Witness.Every = Duration(-time.Minute) },
+		"свидетель — сама копия": func(c *Config) {
+			c.Replica.URL, c.Witness.URL = "file:///srv/copy", "file:///srv/copy"
+		},
 		"expect_every -1s":      func(c *Config) { c.Sources[0].ExpectEvery = Duration(-time.Second) },
 		"content_type 256 байт": func(c *Config) { c.Sources[0].ContentType = strings.Repeat("x", 256) },
 	} {

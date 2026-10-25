@@ -2,6 +2,8 @@ package ship
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -73,6 +75,13 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
 		body, _ := io.ReadAll(r.Body)
+		// Бакет с Object Lock без контрольной суммы тела запись не принимает.
+		sum := md5.Sum(body)
+		if got := r.Header.Get("Content-MD5"); got != base64.StdEncoding.EncodeToString(sum[:]) {
+			f.t.Errorf("PUT %s: Content-MD5 %q does not match the body", path, got)
+			http.Error(w, "BadDigest", http.StatusBadRequest)
+			return
+		}
 		f.objects[path] = body
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet:
@@ -152,6 +161,37 @@ func TestS3Remote_CredentialsRequired(t *testing.T) {
 	u, _ := url.Parse("s3://bucket/prefix")
 	if _, err := newS3Remote(u); err == nil {
 		t.Fatal("без кредов newS3Remote должен вернуть ошибку")
+	}
+}
+
+// Свидетель голов берёт ключи только из своих переменных: ключи копии
+// наружу (AWS_*) ему не подставляются.
+func TestOpenRemoteEnv_OwnCredentials(t *testing.T) {
+	fake := &fakeS3{objects: map[string][]byte{}, t: t}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	t.Setenv("AWS_ACCESS_KEY_ID", "copy-access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "copy-secret")
+	t.Setenv("ES_WITNESS_ACCESS_KEY_ID", "")
+	t.Setenv("ES_WITNESS_SECRET_ACCESS_KEY", "")
+	rawURL := fmt.Sprintf("s3://witness/heads?endpoint=%s&region=us-east-1", srv.URL)
+	if _, err := OpenRemoteEnv(rawURL, "ES_WITNESS"); err == nil {
+		t.Fatal("без своих ключей свидетель открылся с ключами копии")
+	}
+	t.Setenv("ES_WITNESS_ACCESS_KEY_ID", "witness-access")
+	t.Setenv("ES_WITNESS_SECRET_ACCESS_KEY", "witness-secret")
+	r, err := OpenRemoteEnv(rawURL, "ES_WITNESS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.(*s3Remote).accessKey; got != "witness-access" {
+		t.Fatalf("ключ доступа свидетеля %q", got)
+	}
+	if err := r.Put(context.Background(), "heads/00000000000000000001.json", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fake.objects["witness/heads/heads/00000000000000000001.json"]; !ok {
+		t.Fatalf("объекты: %v", keysOf(fake.objects))
 	}
 }
 

@@ -172,6 +172,11 @@ type Store struct {
 	replica       *replicaState
 	replicaRemote ship.Remote
 
+	// Канал свидетеля голов (witness.go). Очередь — под chainMu.
+	witnessRemote ship.Remote
+	witnessQueue  []witnessHead
+	witnessQueued uint64 // наибольшая голова, поставленная в очередь
+
 	stampMu sync.Mutex // метки по одной: фон и оператор не заверяют одну голову дважды
 
 	// epochMu — эпоха сборщика закрепляется по одной (epoch.go). Порядок
@@ -186,6 +191,8 @@ type Store struct {
 	stampErrors   atomic.Uint64
 	replicaErrors atomic.Uint64
 	replicaOK     atomic.Int64 // unix-нс конца последней удачной копии
+	witnessErrors atomic.Uint64
+	witnessOK     atomic.Int64 // unix-нс последней головы, ушедшей свидетелю
 
 	stop      chan struct{}
 	wg        sync.WaitGroup
@@ -489,6 +496,12 @@ func (s *Store) open() error {
 	if cfg.Replica.URL != "" {
 		if s.replicaRemote, err = ship.OpenRemote(cfg.Replica.URL); err != nil {
 			return err
+		}
+	}
+	if cfg.Witness.URL != "" {
+		// Свидетель — чужое хранилище: ключи у него свои (ES_WITNESS_*).
+		if s.witnessRemote, err = ship.OpenRemoteEnv(cfg.Witness.URL, "ES_WITNESS"); err != nil {
+			return fmt.Errorf("witness: %w", err)
 		}
 	}
 	if s.chain, err = auditchain.Open(chainDir); err != nil {

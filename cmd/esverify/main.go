@@ -1,10 +1,14 @@
 // Command esverify — офлайн-проверка пакета доказательств по улике.
 //
-//	esverify -proof proof.json -store-key KEY -tsa-trust root.cer[,intermediate.cer] [-promise p.json] [-body body.bin]
+//	esverify -proof proof.json -store-key KEY -tsa-trust root.cer[,intermediate.cer] [-promise p.json] [-heads DIR] [-body body.bin]
 //
 // Проверяющему не нужен ни сервер хранилища, ни доверие к нему: только
 // пакет, заранее закреплённый открытый ключ хранилища и сертификаты TSA (у
 // НУЦ РК — root_rsa_2020.cer и nca_rsa_2022.cer).
+//
+// -heads — каталог с подписанными головами, которые проверяющий сам взял у
+// свидетеля (канал witness.url, газета, копия в чужом хранилище с
+// блокировкой), все версии: цепь пакета обязана с ними сходиться.
 //
 // -body кладёт тело улики в файл байт в байт — только когда пакет прошёл
 // все проверки: так из хранилища поднимают сам журнал, а отчёт показывает
@@ -12,8 +16,8 @@
 //
 // Код выхода: 0 — пакет проходит; 1 — не проходит (в том числе пакет не
 // разбирается или обещание нарушено); 2 — неверный вызов, не читается
-// файл ключа, сертификатов или обещания, или -body у пакета без ключа
-// записи.
+// файл ключа, сертификатов или обещания, каталог голов, или -body у пакета
+// без ключа записи.
 package main
 
 import (
@@ -25,8 +29,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
@@ -49,15 +55,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM)")
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
+	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them")
 	allowNoTSA := fs.Bool("allow-no-tsa", false, "accept a bundle without a TSA time-stamp after the record (then only the store's own signature vouches for it)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	bodyPath := fs.String("body", "", "once the bundle verifies, write the record body to FILE exactly as the source sent it (the bundle must carry the record key: evidencestore proof -dek)")
 	showVersion := fs.Bool("version", false, "print the version and the commit it was built from")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-allow-no-tsa] [-json] [-body FILE]")
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-heads DIR] [-allow-no-tsa] [-json] [-body FILE]")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
-		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage, an unreadable key, certificate or promise file, or -body for a bundle without the record key")
+		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage, an unreadable key, certificate or promise file or heads directory, or -body for a bundle without the record key")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -90,6 +97,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		if pt.GatewayKey, err = gateway.ParseKey(raw); err != nil {
 			return usageErr(err)
+		}
+	}
+	if *headsDir != "" {
+		if pt.Witness, err = readHeads(*headsDir); err != nil {
+			return usageErr(fmt.Errorf("heads: %w", err))
 		}
 	}
 	var promise *proof.Promise
@@ -139,6 +151,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			out["gateway"] = report.Gateway
 			out["gateway_checkpoint"] = report.GatewayCheckpoint
 		}
+		if report.WitnessChecked {
+			out["witness_head"] = report.WitnessHead
+		}
 		enc.Encode(out)
 	} else {
 		fmt.Fprint(stdout, report.Text())
@@ -177,6 +192,28 @@ func checkPromise(p proof.Promise, key ed25519.PublicKey, r proof.Report, b proo
 		}
 	}
 	return proof.CheckPromise(p, r, linkTime)
+}
+
+// readHeads читает головы, которые проверяющий сам взял у свидетеля: каждый
+// файл каталога, в том числе во вложенных (версии объектов, поколения копии).
+// Файл, который не разбирается как голова, остаётся в списке пустой головой:
+// сверка его не засчитает, а отчёт назовёт, сколько таких.
+func readHeads(dir string) (*proof.Witness, error) {
+	w := &proof.Witness{}
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		st, _ := auditchain.ParseStatement(data)
+		name, _ := filepath.Rel(dir, path)
+		w.Heads = append(w.Heads, proof.PublishedHead{Name: name, Statement: st})
+		return nil
+	})
+	return w, err
 }
 
 func readKey(v string) (ed25519.PublicKey, error) {

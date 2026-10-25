@@ -29,6 +29,7 @@ store.Ingest ─ internal/store/ingest.go           ┐
    │
    ▼ в фоне (internal/store/jobs.go)
    звено раз в тик · метка TSA над головой → токен листом в цепь ·
+   подписанные головы свидетелю (witness.url: под каждой меткой и текущая) ·
    ключи месяцев (повторить копию кейринга, завести, закрыть, уничтожить по
    заявке) · молчание источников · /metrics по запросу
    │
@@ -38,7 +39,8 @@ store.Proof → proof.Bundle ─ internal/store/proofs.go
    ▼
 esverify ─ cmd/esverify, internal/proof
    офлайн: ключ хранилища, сертификаты TSA (у НУЦ — root_rsa_2020),
-   для журналов гейтвея — его ключ (-gateway-key)
+   для журналов гейтвея — его ключ (-gateway-key), головы свидетеля,
+   взятые проверяющим самим (-heads)
 ```
 
 ## Пакеты
@@ -53,16 +55,16 @@ esverify ─ cmd/esverify, internal/proof
 | `internal/evlog` | журнал улик: групповой коммит, ответ после fsync, сегменты только дописываются, fail-stop; хвост режется, только если за ним нет целой записи, и откладывается рядом; `Release` и `floor` — только у буфера сборщика (`AllowRelease`) | `evlog.go` | 17 тестов, 20 мутаций |
 | `internal/auditchain` | цепь (ядро): листья, звено с корнем Меркла, голова в двух слотах, подписанное заявление Ed25519; защёлка отказа записи; сверка листьев с корнями (`ScanVerifiedLeaves`) | `carrier.go`, `chain.go`, `merkle.go`, `export.go`, `query.go`; `sync_linux.go` / `sync_other.go` — `fdatasync` (вне Linux — полный `fsync`: пакет нужен и `esverify` на любой системе) | тесты ядра + `TestReadersDoNotTruncate`, `TestMissingLeavesAreLoud`, `TestLeafTamperIsSeenOnScan`, `TestCarrier_FailureLatches`, `TestTrimToHead`; 12 мутаций |
 | `internal/tsa` | RFC 3161: запрос, офлайн-проверка CMS до корня, встроенная демо-служба | `tsa.go`, `local.go`, `testdata/` (настоящий токен НУЦ) | 13 тестов (один — живой НУЦ, по переменным окружения), 14 мутаций |
-| `internal/proof` | пакет доказательств и его проверка; обещание при приёме; часть пакета для журналов гейтвея | `proof.go`, `promise.go`, `gateway.go` | синтетическая цепь: каждая проверка — свой тест |
-| `internal/store` | движок: приём, эпоха установки сборщика, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `epoch.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `gateway.go`, `metrics.go` | 61 тест (падение, откат кейринга, стирание, копия, журнал Pipelock, окно отмены по TSA, конфликт номера, эпоха сборщика, замок `data_dir`, отказ цепи, часы…; находки 09.10 — `hardening_test.go`); симуляции `TestClockSim` (часы) и `TestStoreCrashSim` (`crashsim_test.go`: падения в каждой точке записи, обрыв записи, `keyring.dat` из резерва и откат, недоступный резерв, чужая установка, ротация сегментов, поворот корня и уничтожение ключей, врущий диск, потеря диска и подъём из копии — и в том числе из копии, чей проход прерван посреди записи, и вместе с падением посреди прохода; параллельная работа (клиенты и фоновые циклы в своих горутинах, одна пачка двумя запросами сразу, чужая установка во время приёма); эталон — каждое обещание выполнено, каждый номер один раз, каждый пропуск в цепи, всё уехавшее полным проходом копии — на месте после подъёма из неё); набор мутаций `store` — 122 (вместе с `proof`, сервером, сборщиком и `esverify`) |
+| `internal/proof` | пакет доказательств и его проверка; обещание при приёме; часть пакета для журналов гейтвея; сверка с головами свидетеля | `proof.go`, `promise.go`, `gateway.go`, `heads.go` | синтетическая цепь: каждая проверка — свой тест |
+| `internal/store` | движок: приём, эпоха установки сборщика, цепь, метки, ключи, полнота, выдача доказательств, восстановление после падения, копия наружу и восстановление из неё, вердикты гейтвея, показатели | `store.go`, `ingest.go`, `epoch.go`, `chain.go`, `keys.go`, `jobs.go`, `proofs.go`, `replica.go`, `witness.go`, `gateway.go`, `metrics.go` | 61 тест (падение, откат кейринга, стирание, копия, журнал Pipelock, окно отмены по TSA, конфликт номера, эпоха сборщика, замок `data_dir`, отказ цепи, часы…; находки 09.10 — `hardening_test.go`); симуляции `TestClockSim` (часы) и `TestStoreCrashSim` (`crashsim_test.go`: падения в каждой точке записи, обрыв записи, `keyring.dat` из резерва и откат, недоступный резерв, чужая установка, ротация сегментов, поворот корня и уничтожение ключей, врущий диск, потеря диска и подъём из копии — и в том числе из копии, чей проход прерван посреди записи, и вместе с падением посреди прохода; параллельная работа (клиенты и фоновые циклы в своих горутинах, одна пачка двумя запросами сразу, чужая установка во время приёма); эталон — каждое обещание выполнено, каждый номер один раз, каждый пропуск в цепи, всё уехавшее полным проходом копии — на месте после подъёма из неё); набор мутаций `store` — 132 (вместе с `proof`, сервером, сборщиком и `esverify`) |
 | `internal/server` | HTTPS-приём с mTLS (эпоха сборщика — заголовок `Collector-Epoch`) и админка через unix-сокет | `server.go` | mTLS, источник из сертификата, эпоха, админка |
 | `internal/collector` | сборщик: реестр файлов (путь журнала или маска) → буфер (`evlog`) → пачки; обещания хранилища проверяются закреплённым ключом; эпоха установки — с каждым запросом | `collector.go` | 67 тестов: доставка, рестарт без дублей, ротация (дочитывание до тишины), переустановка, длинные строки, шарды Pipelock, старт после переустановки, откат буфера, второй сборщик и копия установки, неверные обещания, часы назад, опасные настройки, смена места после падения, права на файлы и каталог; симуляция `TestCollectorSim` (`sim_test.go`: у сценария свой набор помех — длинные строки, падения до, после и посреди записи, потерянные ответы, права, `dateext`; хранилище поддельное в памяти или настоящее по mTLS — у настоящего каждый номер ещё и проходит `proof.Verify`); 69 мутаций сборщика в наборе `edge` |
-| `internal/config` | конфигурация JSON и реестр источников; режим `demo` | `config.go` | предел пути сокета, опасные значения, вложенность каталогов; 7 мутаций (набор `config`); остальное — через тесты движка и сервера |
+| `internal/config` | конфигурация JSON и реестр источников; режим `demo` | `config.go` | предел пути сокета, опасные значения, вложенность каталогов, свидетель не совпадает с копией; 9 мутаций (набор `config`); остальное — через тесты движка и сервера |
 | `internal/pki` | учебный УЦ для стенда | `pki.go` | через тесты сервера |
 | `cmd/evidencestore` | сервер и команды оператора, `version` | `main.go` | `dev-pki` хранит УЦ; демо |
 | `cmd/esverify` | утилита проверяющего: коды выхода 0/1/2, `-allow-no-tsa`, `-version`, `-body` (тело в файл байт в байт — только из пакета, прошедшего проверку); собирается и под macOS и Windows | `main.go` | коды выхода, обещание в вердикте, пакет без TSA, `-version`, `-body` (`TestBodyFlag`: точные байты с управляющими символами, права 0600, чистый JSON, отказы без ключа записи и у непрошедшего пакета); демо |
 | `cmd/escollect` | сборщик, `-version` | `main.go` | демо |
-| `internal/ship` | ядро: транспорт копии наружу `Remote` (S3 с SigV4, каталог), без удаления | `remote.go`, `s3_remote.go`, `file_remote.go` | S3 — свои тесты; каталог — через `TestReplicaRestore` |
+| `internal/ship` | ядро: транспорт копии наружу и канала свидетеля `Remote` (S3 с SigV4 и `Content-MD5` для бакетов с Object Lock, каталог), без удаления; у свидетеля свои ключи (`OpenRemoteEnv`) | `remote.go`, `s3_remote.go`, `file_remote.go` | S3 — против поддельного S3 в памяти (прогон на MinIO с Object Lock 25.10 — разовый, DECISIONS п. 25); каталог — через `TestReplicaRestore`; 2 мутации (набор `ship`) |
 
 ## Что лежит на диске
 
@@ -84,6 +86,7 @@ keys.roots_mirror_dir/ вторая копия корней (другой дис
 keys.backup_dir/       копии keyring.dat (+ keyring.dat.gen — поколение) и sign.key (секреты; не в копию наружу)
 replica.url            копия: evidence/…, chain/… кусками по смещению, heads/<n>.json; докуда доехала — по листингу;
                        поднятое из копии хранилище пишет новое поколение gen/<n>/ (номер — в data_dir/replica-generation)
+witness.url            свидетель: только heads/<n>.json — голова под каждой меткой TSA и текущая раз в witness.every
 ```
 
 У сборщика (`spool_dir`):
@@ -143,6 +146,9 @@ promises-rejected.jsonl  обещания, которые не сошлись: �
 | опасные настройки сборщика и хранилища — ошибка при загрузке | `collector.Config.validate`, `config.Validate` | `TestConfigRejectsDangerousValues`, `TestBadServerAddressIsAnError`, `TestValidateRejectsDangerousValues` |
 | текущий месяц не закрывается случайно | `store.Deactivate` (`-force`) | `TestKeyringRollbackDetected`, `TestAdminProofAndKeys` |
 | копия восстанавливается и сверяется с подписанной головой; прерванный проход не ломает восстановление (цепь обрезается по голове); голова копии не новее её звеньев; куски внахлёст сверяются; поднятое хранилище пишет копию новым поколением, и следующий подъём из неё проходит; копию, которую `data_dir` не продолжает, хранилище не дописывает | `store.ShipOnce` (журнал раньше цепи, голова под замком цепи, сверка хвоста копии), `store.RestoreReplica` (поколения, `auditchain.TrimToHead`) | `TestReplicaRestore`, `TestReplicaInterruptedPassRestores`, `TestReplicaInterruptedBetweenLinksAndLeaves`, `TestRestoredStoreContinuesCopy`, `TestShipRefusesDataDirBehindCopy`, `TestRestoreSkipsGenerationWithoutHead`, `TestRestoreFromChunkCutMidRecord`, `TestReplicaHeadNotAheadOfShippedChain`, `TestRestoreSkipsHeadAheadOfLinks`, `TestReplicaRestoreToleratesOverlap`, `TestTrimToHead`; `TestStoreCrashSim` |
+| пакет сверяется с головами свидетеля: голова свидетеля с номером звена из пакета обязана с ним совпасть; две разные головы с одним номером — развилка; первая голова свидетеля не раньше звена улики закрепляет её, и пакет до неё доходит (иначе отчёт говорит, какой пакет просить); головы под чужим ключом и посторонние файлы не в счёт | `proof.checkWitness`, `esverify -heads` | `TestWitnessHeadFixesRecord`, `TestWitnessHeadOfAnotherChain`, `TestWitnessSeesFork`, `TestWitnessHeadBeyondBundle`, `TestWitnessHasNothingYet`, `TestHeadsFlag` |
+| свидетель получает голову под каждой меткой TSA и текущую; пока он недоступен, в очереди — головы под метками и одна текущая; пакет выдаётся до головы свидетеля (`proof -to-head`) | `store.queueWitnessLocked`, `store.WitnessOnce`, `store.ProofTo`, `server` (`to_head`) | `TestWitnessGetsStampedHeads`, `TestWitnessQueueWhileUnreachable`, `TestProofToWitnessHead`, `TestAdminProofAndKeys` |
+| у свидетеля свои ключи S3, ключи копии ему не подставляются; запись в S3 несёт `Content-MD5`; свидетель не может совпадать с копией | `ship.OpenRemoteEnv`, `s3Remote.do`, `config.Validate` | `TestOpenRemoteEnv_OwnCredentials`, `TestS3Remote_RoundTrip`, `TestValidateRejectsDangerousValues` |
 | копия `keyring.dat` в резерв не держит шифрование; ключ без копии не выдаётся | `keyring.persistLocked` (общий замок отпущен, изменения в очереди на `wmu`), `keyring.Seal` | `TestBackupDoesNotBlockSeal`, `TestNewKeyWaitsForBackup` |
 | пропавшие листья цепи — громкая ошибка, а не «истёкшие» | `auditchain.ReadLeaves`, `ScanLeaves`, `ScanVerifiedLeaves`, `Open` (`ErrLeavesMissing`) | `TestMissingLeavesAreLoud` |
 | квитанция ключа — только по состоянию, дошедшему до резерва; восстановление после сбоя резерва стартует | `store.logKeyLocked` (`KeyInfo.Confirmed`), `keyring.Confirm` | `TestRestoreAfterFailedKeyringBackup`, `TestKeyReceiptWaitsForBackup`, `TestConfirmWaitsForBackup` |
@@ -167,7 +173,7 @@ promises-rejected.jsonl  обещания, которые не сошлись: �
 ```
 go build ./... && go vet ./... && go test -race ./...     # гейт (его же гоняет GitHub Actions на каждый пуш)
 scripts/release.sh dist                                   # бинарники релиза и SHA256SUMS (на тег v* — в Actions)
-python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config   # мутации: каждая поломка должна уронить тест
+python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config|ship   # мутации: каждая поломка должна уронить тест
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # демо с настоящим Pipelock
 scripts/demo.sh                                           # демо на бинарниках, без интернета
 scripts/demo-intruder.sh                                  # взломщик почистил auth.log: удалённые строки — из хранилища

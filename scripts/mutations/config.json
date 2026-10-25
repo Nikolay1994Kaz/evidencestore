@@ -44,6 +44,18 @@
    "file": "internal/config/config.go",
    "old": "\t\tif s.ExpectEvery < 0 {",
    "new": "\t\tif false && s.ExpectEvery < 0 {"
+  },
+  {
+   "name": "F8 свидетель — та же копия наружу",
+   "file": "internal/config/config.go",
+   "old": "if c.Witness.URL != \"\" && c.Witness.URL == c.Replica.URL {",
+   "new": "if false {"
+  },
+  {
+   "name": "F9 отрицательный witness.every принимается",
+   "file": "internal/config/config.go",
+   "old": "\"witness.every\": c.Witness.Every, ",
+   "new": ""
   }
  ]
 }

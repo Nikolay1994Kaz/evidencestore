@@ -330,7 +330,14 @@ func (s *Server) AdminHandler() http.Handler {
 			writeErr(w, http.StatusBadRequest, errors.New("seq required"))
 			return
 		}
-		b, err := s.store.Proof(r.URL.Query().Get("source"), seq, r.URL.Query().Get("dek") == "1")
+		var toHead uint64
+		if v := r.URL.Query().Get("to_head"); v != "" {
+			if toHead, err = strconv.ParseUint(v, 10, 64); err != nil {
+				writeErr(w, http.StatusBadRequest, errors.New("to_head must be a head number"))
+				return
+			}
+		}
+		b, err := s.store.ProofTo(r.URL.Query().Get("source"), seq, r.URL.Query().Get("dek") == "1", toHead)
 		if err != nil {
 			code := http.StatusInternalServerError
 			if errors.Is(err, store.ErrNotFound) {

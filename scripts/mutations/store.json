@@ -738,6 +738,66 @@
    "file": "internal/auditchain/carrier.go",
    "old": "\t\tif seq < from {",
    "new": "\t\tif false {"
+  },
+  {
+   "name": "W1 головы свидетеля не сверяются со звеньями пакета",
+   "file": "internal/proof/heads.go",
+   "old": "if h := heads[seq]; h.Statement.HeadHash != encodeHash(hashes[seq-first]) {",
+   "new": "if h := heads[seq]; false && h.Statement.HeadHash != encodeHash(hashes[seq-first]) {"
+  },
+  {
+   "name": "W2 развилка у свидетеля не видна",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tcase prev.Statement.HeadHash != h.Statement.HeadHash && fork == nil:",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "W3 головы под чужим ключом идут в счёт",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tif auditchain.VerifyStatement(h.Statement, key) != nil {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "W4 пакет может кончаться раньше головы свидетеля",
+   "file": "internal/proof/heads.go",
+   "old": "if a := seqs[i]; a > last {",
+   "new": "if a := seqs[i]; false && a > last {"
+  },
+  {
+   "name": "W5 улику закрепляет голова свидетеля раньше её звена",
+   "file": "internal/proof/heads.go",
+   "old": "return seqs[i] >= evLink",
+   "new": "return seqs[i] >= 1"
+  },
+  {
+   "name": "W6 голова под меткой не уходит свидетелю",
+   "file": "internal/store/jobs.go",
+   "old": "\ts.queueWitnessLocked(head, true) // ею кончаются пакеты: свидетель видит её саму",
+   "new": "\t// мутант: голова под меткой свидетелю не уходит"
+  },
+  {
+   "name": "W7 пакет не доходит до головы свидетеля",
+   "file": "internal/store/proofs.go",
+   "old": "\t\tto = toHead\n",
+   "new": "\t\t_ = toHead\n"
+  },
+  {
+   "name": "W8 текущие головы копятся в очереди к свидетелю",
+   "file": "internal/store/witness.go",
+   "old": "if n := len(s.witnessQueue); n > 0 && !s.witnessQueue[n-1].stamped {",
+   "new": "if n := len(s.witnessQueue); false && n > 0 {"
+  },
+  {
+   "name": "W9 esverify не передаёт головы свидетеля в проверку",
+   "file": "cmd/esverify/main.go",
+   "old": "if pt.Witness, err = readHeads(*headsDir); err != nil {",
+   "new": "if _, err = readHeads(*headsDir); err != nil {"
+  },
+  {
+   "name": "W10 админка не читает to_head",
+   "file": "internal/server/server.go",
+   "old": "r.URL.Query().Get(\"dek\") == \"1\", toHead)",
+   "new": "r.URL.Query().Get(\"dek\") == \"1\", 0*toHead)"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

@@ -274,6 +274,20 @@ func TestAdminProofAndKeys(t *testing.T) {
 	if resp, err := e.admin.Get("http://admin/admin/proof?source=abs-core&seq=99"); err != nil || resp.StatusCode != 404 {
 		t.Fatalf("нет такой улики: %v %v", resp, err)
 	}
+	// Пакет до головы свидетеля (proof -to-head): доходит до неё.
+	head := e.st.Status().HeadSeq
+	resp, err = e.admin.Get(fmt.Sprintf("http://admin/admin/proof?source=abs-core&seq=2&to_head=%d", head))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if tb, err := proof.Parse(data); err != nil || tb.Links[len(tb.Links)-1].Seq != head {
+		t.Fatalf("пакет до головы %d: %v %s", head, err, data)
+	}
+	if resp, err := e.admin.Get("http://admin/admin/proof?source=abs-core&seq=2&to_head=x"); err != nil || resp.StatusCode != 400 {
+		t.Fatalf("to_head не число: %v %v", resp, err)
+	}
 	scope := fmt.Sprintf("abs-core/%s", time.Now().UTC().Format("2006-01"))
 	if resp, _ := post(t, e.admin, "http://admin/admin/keys/deactivate", map[string]any{"scopes": []string{scope}}); resp == nil || resp.StatusCode != 409 {
 		t.Fatalf("текущий месяц без force: %v", resp)

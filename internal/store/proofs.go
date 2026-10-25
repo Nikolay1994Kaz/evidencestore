@@ -20,6 +20,12 @@ import (
 // Метки TSA в пакет кладутся те, что уже есть: нужна свежая верхняя
 // граница — сначала Stamp.
 func (s *Store) Proof(source string, seq uint64, withDEK bool) (proof.Bundle, error) {
+	return s.ProofTo(source, seq, withDEK, 0)
+}
+
+// ProofTo — то же, но пакет доходит не меньше чем до головы toHead: до той,
+// что видел свидетель, когда она позже конца пакета (esverify -heads).
+func (s *Store) ProofTo(source string, seq uint64, withDEK bool, toHead uint64) (proof.Bundle, error) {
 	s.mu.Lock()
 	st, ok := s.sources[source]
 	var pos uint64
@@ -96,6 +102,12 @@ func (s *Store) Proof(source string, seq uint64, withDEK bool) (proof.Bundle, er
 				to = max(to, g.Checkpoint.LinkSeq)
 			}
 		}
+	}
+	if toHead > to {
+		if head := s.chain.Head().Seq; toHead > head {
+			return proof.Bundle{}, fmt.Errorf("store: head %d is not in the chain yet: the head is %d", toHead, head)
+		}
+		to = toHead
 	}
 	links, err := auditchain.ReadLinks(s.chainDir, from, to)
 	if err != nil {

@@ -31,6 +31,8 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		metrics.One("evidencestore_tsa_errors_total", "failed time-stamp attempts", metrics.Counter, float64(s.stampErrors.Load())),
 		metrics.One("evidencestore_replica_last_success_timestamp_seconds", "end of the last successful copy to replica.url, 0 if none since start", metrics.Gauge, seconds(time.Unix(0, s.replicaOK.Load()))),
 		metrics.One("evidencestore_replica_errors_total", "failed copy attempts", metrics.Counter, float64(s.replicaErrors.Load())),
+		metrics.One("evidencestore_witness_last_success_timestamp_seconds", "when the last signed head reached witness.url, 0 if none since start", metrics.Gauge, seconds(time.Unix(0, s.witnessOK.Load()))),
+		metrics.One("evidencestore_witness_errors_total", "failed attempts to send a signed head to witness.url", metrics.Counter, float64(s.witnessErrors.Load())),
 	}
 	records := metrics.Family{Name: "evidencestore_records", Help: "records of the source in the evidence log", Type: metrics.Gauge}
 	last := metrics.Family{Name: "evidencestore_source_last_record_timestamp_seconds", Help: "receive time of the source's last record, 0 if none", Type: metrics.Gauge}

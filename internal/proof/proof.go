@@ -185,6 +185,9 @@ type Trust struct {
 	// время и неизменность подтверждает только подпись хранилища, а держатель
 	// ключа подписи сочинит улику с любой датой. По умолчанию — провал.
 	AllowNoTSA bool
+	// Witness — головы, которые проверяющий сам взял у свидетеля (heads.go).
+	// nil — сверки со свидетелем нет.
+	Witness *Witness
 }
 
 // Check — один пункт отчёта.
@@ -215,6 +218,12 @@ type Report struct {
 	// проверял никто: ключ гейтвея не закреплён ни в хранилище, ни у
 	// проверяющего. Такая точка запись не накрывает.
 	GatewayUnsigned bool
+
+	// WitnessChecked — пакет сверялся с головами свидетеля (Trust.Witness);
+	// WitnessHead — голова свидетеля, которая закрепляет улику: первая не
+	// раньше её звена. Ноль — у свидетеля такой головы ещё нет.
+	WitnessChecked bool
+	WitnessHead    uint64
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -245,7 +254,14 @@ func (r Report) Notes() []string {
 		n = append(n, "body not opened: the bundle carries no record key, or the month key was destroyed (retention)")
 	}
 	n = append(n, r.gatewayNotes()...)
-	n = append(n, "the store's signature proves that THIS store signed the head; only a TSA time-stamp stands against its owner rewriting the whole chain")
+	switch {
+	case r.WitnessHead != 0:
+		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this record would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
+	case r.WitnessChecked:
+		n = append(n, "the witness has no head at or after this record yet: until it gets one, only a TSA time-stamp stands against the store's owner rewriting the chain")
+	default:
+		n = append(n, "the store's signature proves that THIS store signed the head; only a TSA time-stamp stands against its owner rewriting the whole chain")
+	}
 	n = append(n, "what is proven is that these bytes came from the source and have not changed, not that their content is true")
 	return n
 }
@@ -367,6 +383,12 @@ func Verify(b Bundle, trust Trust) Report {
 		verifyGateway(b.Gateway, sealed, &r, trust, linkAt, add)
 	case sealed.ContentType == gateway.ContentType:
 		add("the gateway verdict describes this record", errors.New("the record comes from a gateway journal, but the bundle has no gateway part"), "")
+	}
+
+	// 11. Свидетель голов: цепь пакета сходится с головами, которые
+	// проверяющий сам взял у свидетеля.
+	if trust.Witness != nil {
+		checkWitness(trust.Witness, trust.StoreKey, b.Inclusion.LinkSeq, links, hashes, &r, add)
 	}
 	return r
 }
