@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="150" viewBox="0 0 600 150" role="img" aria-labelledby="title">
+  <title id="title">evidencestore — tamper-evident store for logs, proofs verified offline</title>
+  <defs>
+    <linearGradient id="emblem" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4263eb"/>
+      <stop offset="1" stop-color="#12b886"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(14 19)">
+    <rect width="112" height="112" rx="28" fill="url(#emblem)"/>
+    <path d="M32 30V82" stroke="#fff" stroke-width="4" stroke-linecap="round" opacity=".6"/>
+    <circle cx="32" cy="30" r="6.5" fill="#fff"/>
+    <circle cx="32" cy="56" r="6.5" fill="#fff"/>
+    <circle cx="32" cy="82" r="6.5" fill="#fff"/>
+    <rect x="48" y="25.5" width="42" height="9" rx="4.5" fill="#fff"/>
+    <rect x="48" y="51.5" width="34" height="9" rx="4.5" fill="#fff"/>
+    <rect x="48" y="77.5" width="16" height="9" rx="4.5" fill="#fff"/>
+    <circle cx="86" cy="84" r="16" fill="#fff"/>
+    <path d="M78.5 84.5l5 5 10-11" fill="none" stroke="#0ca678" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="150" y="86" font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="54" font-weight="700" letter-spacing="-1.2" fill="#1f2328">evidence<tspan fill="#4263eb">store</tspan></text>
+  <text x="152" y="119" font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="18.5" fill="#59636e">tamper-evident store for logs · proofs verified offline</text>
+</svg>
