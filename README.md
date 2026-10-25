@@ -6,12 +6,15 @@ Every record is accepted over mutual TLS, encrypted with its own key, written to
 
 Retention is enforced by destroying keys (crypto-erasure). Every record of a source for a month is encrypted under that month's key. Destroying the key needs two approvers and a waiting period, and it makes those bodies unreadable in every copy (log segments, backups). The chain and the proofs stay intact: you can still prove that record #42 from `abs-core` existed, was received at a given time and was never altered. You can no longer read it.
 
+How it works and how it was tested, as one long read: [docs/ARTICLE.md](docs/ARTICLE.md) (на русском: [docs/ARTICLE.ru.md](docs/ARTICLE.ru.md)).
+
 ## Quick start
 
 ```sh
 scripts/demo.sh                    # builds everything, runs a full scenario offline
 DEMO_TSA=digicert scripts/demo.sh  # same, time-stamps from the public DigiCert TSA
 DEMO_TSA=nca scripts/demo.sh       # same, time-stamps from the NCA of Kazakhstan
+scripts/demo-intruder.sh           # an intruder cleans auth.log; every deleted line comes back from the store
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # a real Pipelock gateway, see below
 ```
 
@@ -22,6 +25,8 @@ The demo runs these steps:
 3. Verifies a proof with `esverify`.
 4. Shows that a one-byte forgery is caught.
 5. Destroys the month key (a single approval is refused) and shows that the proof still verifies while the body is gone.
+
+`scripts/demo-intruder.sh` plays an intrusion on a web server. The collector follows a practice `auth.log` (inside the demo directory; nothing on the host is touched). An intruder logs in as root and then removes every line with their address (`sed -i`). The script pulls every record of that source out of the store, verifies each one offline with `esverify` and writes its body with `-body`: the four deleted lines come back byte for byte, each with the window in which the store received it, and the time-stamps show they were in the store before the file was rewritten. `DEMO_TSA=digicert` takes those time-stamps from the public DigiCert TSA.
 
 ## Components
 
@@ -184,6 +189,7 @@ Numbers below are for commit `957345c` (12 October 2026).
 - **A gap event can be missing after a crash.** When the store crashes right after a record that skips sequence numbers, power fails while the chain writes its leaves, or a restore from the copy cuts the chain at its signed head, the record may already be in the chain while the explicit gap event is not, and the event is not announced after restart. The gap itself stays visible in the chain from the record numbers.
 - **Key backup unreachable at restart.** `keyring.dat` knows which of its keys have reached `keys.backup_dir` only up to its previous write, so after a restart the keys created by its last write are not used until the copy succeeds again. If `keys.backup_dir` is unreachable at that moment (a network share is down), intake for those months waits: right after installation until the next keyring change, and in the first minutes of a month. Nothing is lost — collectors keep the lines — and `evidencestore_keyring_backup_pending` shows it.
 - **Bulk proof export.** A proof bundle is built under the chain lock and reads the whole chain file, so its cost grows with the chain (50–100 ms per bundle measured at about 100 thousand records on a loaded host), and intake slows down while bundles are being built. Export many bundles off-peak.
+- **A stopped collector looks like a quiet source.** The collector sends nothing while its log is quiet, so the store cannot tell a stopped collector from a quiet log: `evidencestore_source_silent` fires only after `expect_every` without records. Set `expect_every` above the longest normal quiet period of the source.
 - **Index in memory.** The sequence-to-position index is rebuilt from the evidence log at start and takes 8 bytes per record in memory.
 - **Input.** The collector reads files only; there is no syslog receiver.
 - **Untested failure paths.** Recovery from a failed `fsync` of a directory or of a fresh `sign.key`, and from an S3 listing without a marker, is checked by reading the code, not by tests: those paths need a hardware or service fault.

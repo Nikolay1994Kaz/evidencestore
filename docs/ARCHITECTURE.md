@@ -169,6 +169,7 @@ scripts/release.sh dist                                   # бинарники �
 python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config   # мутации: каждая поломка должна уронить тест
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # демо с настоящим Pipelock
 scripts/demo.sh                                           # демо на бинарниках, без интернета
+scripts/demo-intruder.sh                                  # взломщик почистил auth.log: удалённые строки — из хранилища
 DEMO_TSA=nca scripts/demo.sh                              # то же с настоящей TSA НУЦ РК
 DEMO_TSA=digicert scripts/demo.sh                         # то же с публичной TSA DigiCert
 ES_TSA_URL=http://tsp.pki.gov.kz \
@@ -187,4 +188,4 @@ ES_TSA_ROOTS=configs/tsa/nca-kz/root_rsa_2020.cer,configs/tsa/nca-kz/nca_rsa_202
 7. `internal/proof/proof.go` (шапка, `Verify`): что получает и проверяет проверяющий.
 8. `internal/store/keys.go` и `internal/keyring/lifecycle.go`, `destroy.go`: жизнь ключа и стирание.
 9. `internal/gateway/pipelock.go`, `internal/store/gateway.go`, `internal/proof/gateway.go`: журнал гейтвея от приёма до пакета.
-10. `scripts/demo.sh` и `scripts/demo-pipelock.sh`: всё вместе.
+10. `scripts/demo.sh`, `scripts/demo-intruder.sh` и `scripts/demo-pipelock.sh`: всё вместе.
