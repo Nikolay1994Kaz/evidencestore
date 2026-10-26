@@ -38,6 +38,7 @@ func TestMetrics(t *testing.T) {
 		`evidencestore_ingest_errors_total 1`,
 		`evidencestore_log_failed 0`,
 		`evidencestore_keyring_backup_pending 0`,
+		`evidencestore_sign_key_backup_pending 0`,
 		`evidencestore_keyring_orphan_roots 0`,
 		`evidencestore_keyring_roots_unreachable 0`,
 	} {

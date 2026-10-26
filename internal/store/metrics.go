@@ -23,6 +23,7 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		metrics.One("evidencestore_log_commit_seconds_total", "time spent writing and fsyncing evidence log batches", metrics.Counter, float64(ev.CommitNanos)/1e9),
 		metrics.One("evidencestore_ingest_errors_total", "ingest requests that failed", metrics.Counter, float64(s.ingestErrors.Load())),
 		metrics.One("evidencestore_keyring_backup_pending", "1 when the last keyring.dat write has not reached keys.backup_dir; new month keys are not issued and key receipts wait", metrics.Gauge, metrics.Bool(st.KeyringBackupPending)),
+		metrics.One("evidencestore_sign_key_backup_pending", "1 when sign.key is not confirmed in keys.backup_dir: the copy failed, or another key lies there", metrics.Gauge, metrics.Bool(st.SignKeyBackupPending)),
 		metrics.One("evidencestore_keyring_orphan_roots", "keyring roots unknown to keyring.dat; key destruction is not final while any exist", metrics.Gauge, float64(len(st.OrphanRoots))),
 		metrics.One("evidencestore_keyring_roots_unreachable", "1 when the keyring root directories cannot be listed (keys.roots_mirror_dir down?); key destruction is not final meanwhile", metrics.Gauge, metrics.Bool(st.RootsUnreachable != "")),
 		metrics.One("evidencestore_keys_due", "source months past retention whose keys wait for a destruction request", metrics.Gauge, float64(len(s.RetentionDue(now)))),

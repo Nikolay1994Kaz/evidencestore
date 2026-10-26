@@ -828,6 +828,90 @@
    "file": "internal/proof/heads.go",
    "old": "if len(vs) > 1 && r.WitnessFork == 0 {",
    "new": "if false && len(vs) > 1 {"
+  },
+  {
+   "name": "S86 пропавший каталог резерва создаётся при копии (P-12)",
+   "file": "internal/store/store.go",
+   "old": "\tif err := needDir(dir, \"keys.backup_dir\"); err != nil {\n\t\treturn err\n\t}",
+   "new": "\tif err := os.MkdirAll(dir, 0o700); err != nil {\n\t\treturn err\n\t}"
+  },
+  {
+   "name": "S87 init создаёт пропавшие резерв и зеркало (P-12)",
+   "file": "internal/store/store.go",
+   "old": "\t\tif err := needDir(d[0], d[1]); err != nil {",
+   "new": "\t\tif err := os.MkdirAll(d[0], 0o700); err != nil {"
+  },
+  {
+   "name": "S88 файл на месте каталога резерва проходит проверку (P-12)",
+   "file": "internal/store/store.go",
+   "old": "\tcase !fi.IsDir():",
+   "new": "\tcase false && !fi.IsDir():"
+  },
+  {
+   "name": "S89 нет sign.key, ключ в резерве — заводится новый (P-13)",
+   "file": "internal/store/store.go",
+   "old": "\t\t\treturn fmt.Errorf(\"store: %s is missing, while keys.backup_dir holds the signing key: copy %s there\", path, backup)",
+   "new": "\t\t\treturn nil"
+  },
+  {
+   "name": "S90 нет sign.key, резерв не смонтирован — заводится новый (P-13)",
+   "file": "internal/store/store.go",
+   "old": "\t\t\terr = needDir(dir, \"keys.backup_dir\")",
+   "new": "\t\t\terr = nil"
+  },
+  {
+   "name": "S91 нет sign.key, в резерв не заглянуть — заводится новый (P-13)",
+   "file": "internal/store/store.go",
+   "old": "\t\tif errors.Is(err, os.ErrNotExist) {\n\t\t\terr = needDir(dir, \"keys.backup_dir\")",
+   "new": "\t\tif err != nil {\n\t\t\terr = needDir(dir, \"keys.backup_dir\")"
+  },
+  {
+   "name": "S92 нет sign.key при непустой цепи — заводится новый (S-08)",
+   "file": "internal/store/store.go",
+   "old": "\tcase links > 0:",
+   "new": "\tcase false && links > 0:"
+  },
+  {
+   "name": "S93 в резерве другой ключ подписи, цепь пуста — старт (P-13)",
+   "file": "internal/store/store.go",
+   "old": "\t\tif errors.Is(err, errSignerDiffers) && s.chain.Head().Seq == 0 {",
+   "new": "\t\tif false && errors.Is(err, errSignerDiffers) && s.chain.Head().Seq == 0 {"
+  },
+  {
+   "name": "S94 другой ключ подписи в резерве не замечается (P-13)",
+   "file": "internal/store/store.go",
+   "old": "\tcase err == nil:\n\t\twant, err := os.ReadFile(src)",
+   "new": "\tcase false:\n\t\twant, err := os.ReadFile(src)"
+  },
+  {
+   "name": "S95 нечитаемый ключ подписи в резерве затирается (P-13)",
+   "file": "internal/store/store.go",
+   "old": "\tcase !errors.Is(err, os.ErrNotExist):\n\t\treturn err\n\t}\n\tif err := backupFile(src, dir, 0); err != nil {",
+   "new": "\t}\n\tif err := backupFile(src, dir, 0); err != nil {"
+  },
+  {
+   "name": "S96 тревога о копии ключа подписи не ставится",
+   "file": "internal/store/store.go",
+   "old": "\ts.signerBackupPending.Store(err != nil)",
+   "new": "\ts.signerBackupPending.Store(false)"
+  },
+  {
+   "name": "S97 обслуживание не повторяет копию ключа подписи",
+   "file": "internal/store/keys.go",
+   "old": "\tif s.signerBackupPending.Load() {",
+   "new": "\tif false && s.signerBackupPending.Load() {"
+  },
+  {
+   "name": "S98 тревога о копии ключа подписи не в статусе",
+   "file": "internal/store/proofs.go",
+   "old": "\tout.SignKeyBackupPending = s.signerBackupPending.Load()",
+   "new": "\tout.SignKeyBackupPending = false"
+  },
+  {
+   "name": "S99 метрика копии ключа подписи всегда 0",
+   "file": "internal/store/metrics.go",
+   "old": "metrics.Bool(st.SignKeyBackupPending)",
+   "new": "metrics.Bool(false)"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

@@ -59,6 +59,7 @@ cat >"$WORK/evidencestore.json" <<EOF
 }
 EOF
 CFG=$WORK/evidencestore.json
+mkdir -p "$WORK/keyring-backup" "$WORK/roots-mirror" # в работе — другие диски; init их не создаёт
 STORE_KEY=$("$BIN/evidencestore" init -config "$CFG" | tail -1)
 "$BIN/evidencestore" serve -config "$CFG" 2>"$WORK/server.log" &
 SERVER=$!

@@ -332,8 +332,10 @@ func runStoreSim(t *testing.T, seed uint64, steps int) (msg string, stats simSta
 		},
 	}
 	remoteDir := m.newDir("remote")
-	if err := os.MkdirAll(remoteDir, 0o700); err != nil {
-		t.Fatal(err)
+	for _, d := range []string{remoteDir, m.cfg.Keys.BackupDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	m.cfg.Replica.URL = "file://" + remoteDir
 	m.cfg.Defaults()

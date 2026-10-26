@@ -59,6 +59,7 @@ cat >"$WORK/evidencestore.json" <<EOF
 }
 EOF
 CFG=$WORK/evidencestore.json
+mkdir -p "$WORK/keyring-backup" "$WORK/roots-mirror" # в работе — другие диски; init их не создаёт
 
 step "init: keyring under a root key, the store's signing key"
 "$BIN/evidencestore" init -config "$CFG" | tee "$WORK/init.txt"

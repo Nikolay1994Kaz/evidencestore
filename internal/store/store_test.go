@@ -638,7 +638,7 @@ func TestStampRejectsUntrustedToken(t *testing.T) {
 // подменённым куском не восстанавливается.
 func TestReplicaRestore(t *testing.T) {
 	c := newClock()
-	remoteDir, backupDir := t.TempDir(), filepath.Join(t.TempDir(), "keys-backup")
+	remoteDir, backupDir := t.TempDir(), t.TempDir()
 	cfg := testConfig(t, func(c *config.Config) {
 		c.Replica.URL = "file://" + remoteDir
 		c.Keys.BackupDir = backupDir
@@ -812,7 +812,7 @@ func TestRestoreAfterFailedKeyringBackup(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newClock()
-			remoteDir, backupDir := t.TempDir(), filepath.Join(t.TempDir(), "keys-backup")
+			remoteDir, backupDir := t.TempDir(), t.TempDir()
 			cfg := testConfig(t, func(c *config.Config) {
 				c.Replica.URL = "file://" + remoteDir
 				c.Keys.BackupDir = backupDir
@@ -863,7 +863,7 @@ func TestRestoreAfterFailedKeyringBackup(t *testing.T) {
 // при лежащем резерве — позже, из обслуживания.
 func TestKeyReceiptWaitsForBackup(t *testing.T) {
 	c := newClock()
-	backupDir := filepath.Join(t.TempDir(), "keys-backup")
+	backupDir := t.TempDir()
 	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = backupDir })
 	s := openStore(t, cfg, c)
 	ingest(t, s, "abs-core", 1, 1)

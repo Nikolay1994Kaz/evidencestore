@@ -201,6 +201,9 @@ type Status struct {
 	// KeyringBackupPending — последняя запись keyring.dat не дошла до
 	// резерва (keys.backup_dir); Confirm повторяет копию раз в минуту.
 	KeyringBackupPending bool `json:"keyring_backup_pending,omitempty"`
+	// SignKeyBackupPending — sign.key не подтверждён в keys.backup_dir: копия
+	// не прошла или там другой ключ; обслуживание повторяет раз в минуту.
+	SignKeyBackupPending bool `json:"sign_key_backup_pending,omitempty"`
 	// OrphanRoots — корни, которых не знает keyring.dat: уничтожение не
 	// окончательно, пока оператор их не уничтожит.
 	OrphanRoots []string `json:"orphan_roots,omitempty"`
@@ -237,6 +240,7 @@ func (s *Store) Status() Status {
 		out.ChainFailure = err.Error()
 	}
 	out.KeyringBackupPending = s.keys.BackupPending()
+	out.SignKeyBackupPending = s.signerBackupPending.Load()
 	if orphans, err := s.keys.OrphanRoots(); err != nil {
 		out.RootsUnreachable = err.Error()
 	} else {

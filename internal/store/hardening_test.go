@@ -188,7 +188,7 @@ func replicaConfig(t *testing.T) (*config.Config, ship.Remote) {
 	remoteDir := t.TempDir()
 	cfg := testConfig(t, func(c *config.Config) {
 		c.Replica.URL = "file://" + remoteDir
-		c.Keys.BackupDir = filepath.Join(t.TempDir(), "keys-backup")
+		c.Keys.BackupDir = t.TempDir()
 	})
 	remote, err := ship.OpenRemote(cfg.Replica.URL)
 	if err != nil {
@@ -957,11 +957,22 @@ func TestSigningKeyGuarded(t *testing.T) {
 	ingest(t, s, "abs-core", 1, 1)
 	pub := s.PublicKey()
 	s.Close()
+	_, chainDir, _ := dirs(cfg)
+	key, err := os.ReadFile(filepath.Join(chainDir, "sign.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(chainDir, "sign.key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopen(cfg, c); err == nil || !strings.Contains(err.Error(), "while the chain holds") {
+		t.Fatalf("старт без ключа подписи при непустой цепи, без резерва: %v", err)
+	}
+	os.WriteFile(filepath.Join(chainDir, "sign.key"), key, 0o600)
 
-	cfg.Keys.BackupDir = filepath.Join(t.TempDir(), "keys-backup") // резерв включили позже
+	cfg.Keys.BackupDir = t.TempDir() // резерв включили позже
 	s2 := openStore(t, cfg, c)
 	s2.Close()
-	_, chainDir, _ := dirs(cfg)
 	backup, err := os.ReadFile(filepath.Join(cfg.Keys.BackupDir, "sign.key"))
 	if err != nil {
 		t.Fatalf("ключ подписи не попал в резерв: %v", err)
@@ -979,10 +990,264 @@ func TestSigningKeyGuarded(t *testing.T) {
 	}
 }
 
+// P-13: data_dir потерян, keyring.dat и sign.key положены из резерва в
+// корень data_dir. Цепь пуста, в data_dir/chain/ ключа нет — отказ
+// стартовать: резерв не смонтирован — его не проверить, смонтирован —
+// подсказка, куда положить ключ. Раньше хранилище заводило новый ключ и
+// только предупреждало.
+func TestSigningKeyPutBackWrong(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = t.TempDir() })
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 1)
+	pub := s.PublicKey()
+	s.Close()
+
+	lost := *cfg
+	lost.DataDir = filepath.Join(t.TempDir(), "data") // data_dir потерян
+	lost.AdminSocket = ""
+	lost.Defaults()
+	if err := os.Mkdir(lost.DataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{keyring.FileName, auditchain.SignKeyFileName} {
+		data, err := os.ReadFile(filepath.Join(cfg.Keys.BackupDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(lost.DataDir, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, chainDir, newTSA := dirs(&lost)
+	_, _, oldTSA := dirs(cfg)
+	if err := os.CopyFS(newTSA, os.DirFS(oldTSA)); err != nil { // демо-TSA живёт в data_dir
+		t.Fatal(err)
+	}
+	unmounted := cfg.Keys.BackupDir + "-unmounted"
+	if err := os.Rename(cfg.Keys.BackupDir, unmounted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopen(&lost, c); err == nil || !strings.Contains(err.Error(), "cannot be checked") {
+		t.Fatalf("без sign.key, резерв не смонтирован: %v", err)
+	}
+	if err := os.Rename(unmounted, cfg.Keys.BackupDir); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(cfg.Keys.BackupDir, 0o600) // каталог есть, а заглянуть в него нельзя
+	t.Cleanup(func() { os.Chmod(cfg.Keys.BackupDir, 0o700) })
+	if _, err := reopen(&lost, c); err == nil || !strings.Contains(err.Error(), "cannot be checked") {
+		t.Fatalf("без sign.key, резерв не прочесть: %v", err)
+	}
+	os.Chmod(cfg.Keys.BackupDir, 0o700)
+	if _, err := reopen(&lost, c); err == nil || !strings.Contains(err.Error(), "holds the signing key") {
+		t.Fatalf("без sign.key, ключ в резерве: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(chainDir, auditchain.SignKeyFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("заведён новый ключ подписи")
+	}
+	if err := os.Rename(filepath.Join(lost.DataDir, auditchain.SignKeyFileName), filepath.Join(chainDir, auditchain.SignKeyFileName)); err != nil {
+		t.Fatal(err)
+	}
+	if s2 := openStore(t, &lost, c); s2.PublicKey() != pub {
+		t.Fatal("ключ подписи сменился")
+	}
+}
+
+// P-13: в резерве другой ключ подписи. При пустой цепи — отказ: хранилище
+// этим ключом ещё ничего не подписало, и какой из двух верный, решает
+// человек. С цепью хранилище стартует, резерв не затирает, а расхождение
+// видно в статусе и метрике, пока резерв не поправят.
+func TestSigningKeyDiffersFromBackup(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = t.TempDir() })
+	backup := filepath.Join(cfg.Keys.BackupDir, auditchain.SignKeyFileName)
+	own, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDir := t.TempDir()
+	if _, err := auditchain.LoadOrCreateSigner(otherDir); err != nil {
+		t.Fatal(err)
+	}
+	other, err := os.ReadFile(filepath.Join(otherDir, auditchain.SignKeyFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(key []byte) {
+		t.Helper()
+		if err := os.WriteFile(backup, key, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(other)
+	if _, err := reopen(cfg, c); !errors.Is(err, errSignerDiffers) {
+		t.Fatalf("пустая цепь, в резерве другой ключ: %v", err)
+	}
+
+	put(own)
+	s := openStore(t, cfg, c) // цепь больше не пуста
+	ingest(t, s, "abs-core", 1, 1)
+	s.Close()
+	put(other)
+	s2 := openStore(t, cfg, c)
+	if !s2.Status().SignKeyBackupPending {
+		t.Fatal("расхождение с резервом не видно в статусе")
+	}
+	var b strings.Builder
+	if err := metrics.Write(&b, s2.Metrics(c.now())); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(b.String(), "evidencestore_sign_key_backup_pending 1\n") {
+		t.Fatal("расхождение с резервом не видно в метрике")
+	}
+	if got, _ := os.ReadFile(backup); !bytes.Equal(got, other) {
+		t.Fatal("ключ в резерве затёрт")
+	}
+	put(own)
+	s2.Maintain(c.now())
+	if s2.Status().SignKeyBackupPending {
+		t.Fatal("тревога не снялась, когда резерв поправили")
+	}
+	s2.Close()
+
+	// Ключ в резерве не прочесть (чужие права) — он тоже не затирается.
+	put(other)
+	os.Chmod(backup, 0)
+	t.Cleanup(func() { os.Chmod(backup, 0o600) })
+	s3 := openStore(t, cfg, c)
+	if !s3.Status().SignKeyBackupPending {
+		t.Fatal("нечитаемый ключ в резерве не виден в статусе")
+	}
+	os.Chmod(backup, 0o600)
+	if got, _ := os.ReadFile(backup); !bytes.Equal(got, other) {
+		t.Fatal("нечитаемый ключ в резерве затёрт")
+	}
+}
+
+// P-12: init не заводит каталоги резерва ключей и зеркала корней — их
+// заводит оператор на смонтированном диске. Пропавший каталог — отказ до
+// того, как init что-то запишет. Раньше init создавал оба, и не
+// смонтированный диск оставался незамеченным.
+func TestInitNeedsBackupDirs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		file bool // на месте каталога — файл
+	}{{"keys.backup_dir", false}, {"keys.roots_mirror_dir", false}, {"keys.backup_dir", true}} {
+		t.Run(fmt.Sprintf("%s/file=%v", tc.name, tc.file), func(t *testing.T) {
+			base := t.TempDir()
+			bad := filepath.Join(base, "unmounted")
+			if tc.file {
+				if err := os.WriteFile(bad, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := &config.Config{
+				DataDir: filepath.Join(base, "data"), RootsDir: filepath.Join(base, "roots"),
+				Keys: config.Keys{BackupDir: t.TempDir(), RootsMirrorDir: t.TempDir()},
+			}
+			if tc.name == "keys.backup_dir" {
+				cfg.Keys.BackupDir = bad
+			} else {
+				cfg.Keys.RootsMirrorDir = bad
+			}
+			cfg.Defaults()
+			if _, err := Init(cfg); err == nil || !strings.Contains(err.Error(), tc.name) {
+				t.Fatalf("init без %s: %v", tc.name, err)
+			}
+			if fi, err := os.Stat(bad); tc.file != (err == nil) || err == nil && fi.IsDir() {
+				t.Fatalf("init создал %s", tc.name)
+			}
+			if _, err := os.Stat(filepath.Join(cfg.DataDir, keyring.FileName)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("init записал keyring.dat")
+			}
+		})
+	}
+}
+
+// P-12: каталог резерва ключей пропал (диск не смонтирован) — хранилище его
+// не создаёт: копии keyring.dat и sign.key не ложатся на системный диск, а
+// тревоги видны, пока диск не вернётся. Раньше каталог создавался при
+// каждой копии.
+func TestBackupDirNotCreated(t *testing.T) {
+	c := newClock()
+	backup := t.TempDir()
+	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = backup })
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 1)
+	s.Close()
+	if err := os.RemoveAll(backup); err != nil { // диск не смонтирован
+		t.Fatal(err)
+	}
+	s2 := openStore(t, cfg, c)
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("каталог резерва создан сам")
+	}
+	if st := s2.Status(); !st.KeyringBackupPending || !st.SignKeyBackupPending {
+		t.Fatalf("пропавший резерв не виден: keyring.dat %v, sign.key %v", st.KeyringBackupPending, st.SignKeyBackupPending)
+	}
+	if err := os.Mkdir(backup, 0o700); err != nil { // диск вернулся
+		t.Fatal(err)
+	}
+	s2.Maintain(c.now())
+	if st := s2.Status(); st.KeyringBackupPending || st.SignKeyBackupPending {
+		t.Fatalf("тревоги не снялись, когда резерв вернулся: keyring.dat %v, sign.key %v", st.KeyringBackupPending, st.SignKeyBackupPending)
+	}
+	for _, name := range []string{keyring.FileName, auditchain.SignKeyFileName} {
+		if _, err := os.Stat(filepath.Join(backup, name)); err != nil {
+			t.Fatalf("%s не в резерве: %v", name, err)
+		}
+	}
+}
+
+// P-14: каталогов копии наружу и свидетеля (file://) нет — диск не
+// смонтирован. Хранилище стартует, но проход копии и отправка голов
+// отказывают, и на локальный диск ничего не ложится; каталог появился —
+// проход идёт. Раньше оба каталога создавались при открытии.
+func TestFileRemoteDirsNotCreated(t *testing.T) {
+	c := newClock()
+	ctx := context.Background()
+	base := t.TempDir()
+	copyDir, witnessDir := filepath.Join(base, "copy"), filepath.Join(base, "witness")
+	cfg := testConfig(t, withWitness(witnessDir), func(c *config.Config) { c.Replica.URL = "file://" + copyDir })
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, s.replicaRemote); err == nil || s.replicaErrors.Load() == 0 {
+		t.Fatalf("проход копии без каталога: %v", err)
+	}
+	for _, d := range []string{copyDir, witnessDir} {
+		if _, err := os.Stat(d); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s создан сам", d)
+		}
+	}
+	if err := os.Mkdir(copyDir, 0o700); err != nil { // диск копии смонтирован
+		t.Fatal(err)
+	}
+	if _, err := s.ShipOnce(ctx, s.replicaRemote); err != nil {
+		t.Fatalf("проход копии с каталогом: %v", err)
+	}
+	if err := s.WitnessOnce(ctx); err == nil || s.witnessErrors.Load() == 0 {
+		t.Fatalf("отправка голов без каталога свидетеля: %v", err)
+	}
+	if _, err := os.Stat(witnessDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("каталог свидетеля создан сам")
+	}
+	if err := os.Mkdir(witnessDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WitnessOnce(ctx); err != nil {
+		t.Fatalf("отправка голов с каталогом: %v", err)
+	}
+	if len(witnessHeads(t, witnessDir).Heads) == 0 {
+		t.Fatal("головы не дошли до свидетеля")
+	}
+}
+
 // K-02: init при ключах в резерве — отказ: так выглядит хранилище, потерявшее
 // data_dir, а новый пустой кейринг затёр бы в резерве ключи всех месяцев.
 func TestInitRefusesWithKeysInBackup(t *testing.T) {
-	backupDir := filepath.Join(t.TempDir(), "keys-backup")
+	backupDir := t.TempDir()
 	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = backupDir })
 	before, err := os.ReadFile(filepath.Join(backupDir, keyring.FileName))
 	if err != nil {
@@ -1005,7 +1270,7 @@ func TestInitRefusesWithKeysInBackup(t *testing.T) {
 // поверх старшего не ложится.
 func TestOldKeyringDoesNotOverwriteBackup(t *testing.T) {
 	c := newClock()
-	backupDir := filepath.Join(t.TempDir(), "keys-backup")
+	backupDir := t.TempDir()
 	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = backupDir })
 	s := openStore(t, cfg, c)
 	ingest(t, s, "abs-core", 1, 1)
@@ -1146,7 +1411,7 @@ func TestDestroyWindowFromTSATime(t *testing.T) {
 // стартует: корни читаются из roots_dir. Раньше старт отказывал.
 func TestMirrorDownDoesNotStopStart(t *testing.T) {
 	c := newClock()
-	mirror := filepath.Join(t.TempDir(), "mirror")
+	mirror := t.TempDir()
 	cfg := testConfig(t, func(c *config.Config) { c.Keys.RootsMirrorDir = mirror })
 	s := openStore(t, cfg, c)
 	ingest(t, s, "abs-core", 1, 1)
@@ -1175,7 +1440,7 @@ func TestMirrorDownDoesNotStopStart(t *testing.T) {
 func TestStartsWhileKeyBackupUnreachable(t *testing.T) {
 	c := newClock()
 	c.set(time.Date(2026, 9, 10, 10, 0, 0, 0, time.UTC))
-	backup := filepath.Join(t.TempDir(), "backup")
+	backup := t.TempDir()
 	cfg := testConfig(t, func(c *config.Config) { c.Keys.BackupDir = backup })
 	s := openStore(t, cfg, c)
 	s.Close()

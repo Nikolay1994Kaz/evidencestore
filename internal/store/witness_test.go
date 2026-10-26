@@ -150,7 +150,7 @@ func TestWitnessNeverAheadOfCopy(t *testing.T) {
 	remoteDir, wdir := t.TempDir(), t.TempDir()
 	cfg := testConfig(t, withWitness(wdir), func(c *config.Config) {
 		c.Replica.URL = "file://" + remoteDir
-		c.Keys.BackupDir = filepath.Join(t.TempDir(), "keys-backup")
+		c.Keys.BackupDir = t.TempDir()
 	})
 	s := openStore(t, cfg, c)
 	remote, err := ship.OpenRemote(cfg.Replica.URL)

@@ -14,6 +14,30 @@
    "file": "internal/ship/remote.go",
    "old": "\t\tif id == \"\" || key == \"\" {",
    "new": "\t\tif false {"
+  },
+  {
+   "name": "H3 каталог file:// создаётся при открытии (P-14)",
+   "file": "internal/ship/remote.go",
+   "old": "\t\treturn &fileRemote{root: u.Path}, nil",
+   "new": "\t\tos.MkdirAll(u.Path, 0o755)\n\t\treturn &fileRemote{root: u.Path}, nil"
+  },
+  {
+   "name": "H4 запись создаёт пропавший каталог file:// (P-14)",
+   "file": "internal/ship/file_remote.go",
+   "old": "\tif err := f.checkRoot(); err != nil {\n\t\treturn err\n\t}",
+   "new": "\tif err := f.checkRoot(); false && err != nil {\n\t\treturn err\n\t}"
+  },
+  {
+   "name": "H5 листинг пропавшего каталога file:// — пустая копия (P-14)",
+   "file": "internal/ship/file_remote.go",
+   "old": "\tif err := f.checkRoot(); err != nil {\n\t\treturn nil, err\n\t}",
+   "new": "\tif err := f.checkRoot(); false && err != nil {\n\t\treturn nil, err\n\t}"
+  },
+  {
+   "name": "H6 файл на месте каталога file:// проходит проверку (P-14)",
+   "file": "internal/ship/file_remote.go",
+   "old": "\tcase !fi.IsDir():\n\t\treturn fmt.Errorf(\"ship: %s is not a directory\", f.root)",
+   "new": "\tcase false && !fi.IsDir():\n\t\treturn fmt.Errorf(\"ship: %s is not a directory\", f.root)"
   }
  ]
 }

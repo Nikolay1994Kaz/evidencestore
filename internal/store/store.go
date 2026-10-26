@@ -187,6 +187,9 @@ type Store struct {
 	epochMu sync.Mutex
 
 	orphanWarned string // о каких сиротах уже предупредили (Maintain)
+	// signerBackupPending — sign.key не подтверждён в keys.backup_dir
+	// (confirmSigner): копия не прошла или там другой ключ.
+	signerBackupPending atomic.Bool
 
 	// Счётчики для /metrics с запуска (metrics.go).
 	ingestErrors  atomic.Uint64
@@ -281,7 +284,7 @@ func backupFile(src, dir string, gen uint64) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := needDir(dir, "keys.backup_dir"); err != nil {
 		return err
 	}
 	dst := filepath.Join(dir, filepath.Base(src))
@@ -298,6 +301,20 @@ func backupFile(src, dir string, gen uint64) error {
 	}
 	if gen > 0 {
 		return writeAtomic(genPath, []byte(strconv.FormatUint(gen, 10)+"\n"))
+	}
+	return nil
+}
+
+// needDir — каталог на месте. Пропавший не создаётся: так выглядит и не
+// смонтированный диск, и созданный каталог лёг бы на системный, а копии в
+// нём — незаметно (P-12). Каталог заводит оператор.
+func needDir(dir, name string) error {
+	fi, err := os.Stat(dir)
+	switch {
+	case err != nil:
+		return fmt.Errorf("store: %s: %w (is the disk mounted? the store does not create this directory)", name, err)
+	case !fi.IsDir():
+		return fmt.Errorf("store: %s: %s is not a directory", name, dir)
 	}
 	return nil
 }
@@ -356,10 +373,18 @@ var ErrBackupExists = errors.New("store: keys.backup_dir already holds keyring.d
 // ключах в резерве — тоже ошибка: так выглядит хранилище, потерявшее
 // data_dir, и новый пустой кейринг затёр бы в резерве ключи всех месяцев.
 func Init(cfg *config.Config) (publicKey string, err error) {
-	for _, d := range []string{cfg.DataDir, cfg.RootsDir, cfg.Keys.RootsMirrorDir} {
-		if d == "" {
+	// Резерв ключей и зеркало корней лежат на других дисках, и каталоги на
+	// них заводит оператор (needDir) — проверка до того, как init что-то
+	// запишет.
+	for _, d := range [][2]string{{cfg.Keys.BackupDir, "keys.backup_dir"}, {cfg.Keys.RootsMirrorDir, "keys.roots_mirror_dir"}} {
+		if d[0] == "" {
 			continue
 		}
+		if err := needDir(d[0], d[1]); err != nil {
+			return "", err
+		}
+	}
+	for _, d := range []string{cfg.DataDir, cfg.RootsDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return "", err
 		}
@@ -514,17 +539,20 @@ func (s *Store) open() error {
 		s.chain.SetSegmentBytes(s.chainSegment)
 	}
 	s.logChainRecovery(s.chain.Recovery())
-	// Ключ подписи заводит init. Цепь есть, а ключа нет — ключ потерян: новый
-	// ключ молча сменил бы подпись, и сборщики с проверяющими, закрепившие
-	// старый, перестали бы принимать хранилище.
-	if _, err := os.Stat(filepath.Join(chainDir, auditchain.SignKeyFileName)); errors.Is(err, os.ErrNotExist) && s.chain.Head().Seq > 0 {
-		return fmt.Errorf("store: %s is missing while the chain holds %d links: put sign.key back from keys.backup_dir",
-			filepath.Join(chainDir, auditchain.SignKeyFileName), s.chain.Head().Seq)
+	if err := checkLostSigner(cfg, chainDir, s.chain.Head().Seq); err != nil {
+		return err
 	}
 	if s.signer, err = auditchain.LoadOrCreateSigner(chainDir); err != nil {
 		return err
 	}
-	if err := backupSigner(cfg, chainDir); err != nil {
+	if err := s.confirmSigner(); err != nil {
+		// Цепь пуста: этим ключом хранилище ещё ничего не подписало, и
+		// остановка ничего не стоит — какой из двух ключей верный, решает
+		// человек (P-13). С цепью хранилище стартует, а расхождение
+		// показывает тревога.
+		if errors.Is(err, errSignerDiffers) && s.chain.Head().Seq == 0 {
+			return err
+		}
 		s.log.Warn("signing key backup", "err", err)
 	}
 	cs, err := s.scanChain()
@@ -767,18 +795,56 @@ func (s *Store) logChainRecovery(r auditchain.Recovery) {
 	}
 }
 
-// backupSigner кладёт ключ подписи в keys.backup_dir, если там его нет или
-// он другой: в копию наружу он не уезжает, а без него восстановленное
-// хранилище подписывало бы головы новым ключом, и проверяющие с закреплённым
-// старым ключом их не приняли бы.
+// checkLostSigner — можно ли завести ключ подписи, если его нет в
+// data_dir/chain/. Ключ заводит init, и новый молча сменил бы подпись:
+// сборщики и проверяющие, закрепившие старый, перестали бы принимать
+// хранилище. Поэтому новый заводится, только пока цепь пуста и ключа нет и
+// в keys.backup_dir: иначе ключ потерян или положен не туда (S-08, P-13).
+func checkLostSigner(cfg *config.Config, chainDir string, links uint64) error {
+	path := filepath.Join(chainDir, auditchain.SignKeyFileName)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	// unchecked — резерв не прочесть (диск не смонтирован): он не
+	// подтверждает, что ключа в нём нет.
+	var unchecked error
+	if dir := cfg.Keys.BackupDir; dir != "" {
+		backup := filepath.Join(dir, auditchain.SignKeyFileName)
+		_, err := os.Stat(backup)
+		if err == nil {
+			return fmt.Errorf("store: %s is missing, while keys.backup_dir holds the signing key: copy %s there", path, backup)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			err = needDir(dir, "keys.backup_dir")
+		}
+		unchecked = err
+	}
+	switch {
+	case links > 0:
+		return fmt.Errorf("store: %s is missing while the chain holds %d links: put sign.key back from keys.backup_dir", path, links)
+	case unchecked != nil:
+		return fmt.Errorf("store: %s is missing, and the backup cannot be checked for it: %w", path, unchecked)
+	}
+	return nil
+}
+
+// errSignerDiffers — в keys.backup_dir лежит другой ключ подписи.
+var errSignerDiffers = errors.New("store: keys.backup_dir holds another signing key")
+
+// backupSigner кладёт ключ подписи в keys.backup_dir, если там его нет: в
+// копию наружу он не уезжает, а без него восстановленное хранилище
+// подписывало бы головы новым ключом, и проверяющие с закреплённым старым
+// ключом их не приняли бы. Другой ключ в резерве не затирается.
 func backupSigner(cfg *config.Config, chainDir string) error {
 	dir := cfg.Keys.BackupDir
 	if dir == "" {
 		return nil
 	}
 	src := filepath.Join(chainDir, auditchain.SignKeyFileName)
-	have, err := os.ReadFile(filepath.Join(dir, auditchain.SignKeyFileName))
-	if err == nil {
+	backup := filepath.Join(dir, auditchain.SignKeyFileName)
+	have, err := os.ReadFile(backup)
+	switch {
+	case err == nil:
 		want, err := os.ReadFile(src)
 		if err != nil {
 			return err
@@ -786,13 +852,22 @@ func backupSigner(cfg *config.Config, chainDir string) error {
 		if bytes.Equal(have, want) {
 			return nil
 		}
-		return fmt.Errorf("store: %s differs from the signing key in data_dir: not overwritten, check which one is right",
-			filepath.Join(dir, auditchain.SignKeyFileName))
+		return fmt.Errorf("%w: %s differs from %s: not overwritten, check which one is right", errSignerDiffers, backup, src)
+	case !errors.Is(err, os.ErrNotExist):
+		return err
 	}
 	if err := backupFile(src, dir, 0); err != nil {
 		return fmt.Errorf("backup signing key: %w", err)
 	}
 	return nil
+}
+
+// confirmSigner — backupSigner с тревогой: пока ключ подписи не подтверждён
+// в резерве, sign_key_backup_pending, и обслуживание повторяет раз в минуту.
+func (s *Store) confirmSigner() error {
+	err := backupSigner(s.cfg, s.chainDir)
+	s.signerBackupPending.Store(err != nil)
+	return err
 }
 
 // Время приёма и якорь TSA.

@@ -67,7 +67,7 @@ func openRemote(rawURL string, creds credsFunc) (Remote, error) {
 		if u.Host != "" || u.Path == "" {
 			return nil, fmt.Errorf("ship: file URL must be file:///abs/path, got %q", rawURL)
 		}
-		return newFileRemote(u.Path)
+		return &fileRemote{root: u.Path}, nil
 	case "s3":
 		return newS3RemoteWith(u, creds)
 	default:
