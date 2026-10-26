@@ -22,9 +22,12 @@ Retention is enforced by destroying keys (crypto-erasure). Every record of a sou
 
 How it works and how it was tested, as one long read: [docs/ARTICLE.md](docs/ARTICLE.md) (на русском: [docs/ARTICLE.ru.md](docs/ARTICLE.ru.md)).
 
-## Quick start
+## Try it
+
+The demos run on Linux with bash and python3 (the Pipelock one also needs curl). They build the binaries with Go 1.25.4 or newer; with binaries installed from a release, `ES_BIN=/usr/local/bin` runs the demos on those instead ([Install](#install)).
 
 ```sh
+git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore
 scripts/demo.sh                    # builds everything, runs a full scenario offline
 DEMO_TSA=digicert scripts/demo.sh  # same, time-stamps from the public DigiCert TSA
 DEMO_TSA=nca scripts/demo.sh       # same, time-stamps from the NCA of Kazakhstan
@@ -41,6 +44,62 @@ The demo runs these steps:
 5. Destroys the month key (a single approval is refused) and shows that the proof still verifies while the body is gone.
 
 `scripts/demo-intruder.sh` plays an intrusion on a web server. The collector follows a practice `auth.log` (inside the demo directory; nothing on the host is touched). An intruder logs in as root and then removes every line with their address (`sed -i`). The script pulls every record of that source out of the store, verifies each one offline with `esverify` and writes its body with `-body`: the four deleted lines come back byte for byte, each with the window in which the store received it, and the time-stamps show they were in the store before the file was rewritten. `DEMO_TSA=digicert` takes those time-stamps from the public DigiCert TSA.
+
+## Run it yourself
+
+The first three steps of the demo, by hand and on a log of your own. Everything runs on one machine. You need the three binaries on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone. Time-stamps come from a demo TSA built into the store (`"url": "local"`), so nothing leaves the machine; a real TSA is set in `tsa` ([Configuration](#configuration)).
+
+Certificates and the store. `dev-pki` writes a demo CA, a server certificate and a client certificate for the source `app` into `pki/` (the store takes the source name from the certificate's CommonName). The last line `init` prints is the store's public key:
+
+```sh
+mkdir -p ~/es-try && cd ~/es-try
+evidencestore dev-pki -source app
+cat > store.json <<'EOF'
+{
+  "data_dir": "data",
+  "roots_dir": "roots",
+  "listen": "127.0.0.1:8443",
+  "tls": {"cert": "pki/server.crt", "key": "pki/server.key", "client_ca": "pki/ca.crt"},
+  "tsa": {"url": "local"},
+  "sources": [{"name": "app", "content_type": "text"}]
+}
+EOF
+evidencestore init -config store.json | tee init.txt
+tail -1 init.txt > store.pub
+```
+
+Start the store in a second terminal and leave it running. It warns that `keys.backup_dir` is not set, which is fine for a try:
+
+```sh
+cd ~/es-try && evidencestore serve -config store.json
+```
+
+The collector pins the store's public key and reads `app.log`; `file` can name any log your user can read. With `-once` it sends what the file holds and exits; a collector running as a service leaves `-once` out and follows the file:
+
+```sh
+cat > collector.json <<EOF
+{
+  "server": "https://127.0.0.1:8443",
+  "ca": "pki/ca.crt", "cert": "pki/app.crt", "key": "pki/app.key",
+  "store_key": "$(cat store.pub)",
+  "spool_dir": "spool",
+  "file": "app.log", "from_start": true
+}
+EOF
+echo "$(date -Is) user=alice action=login" >> app.log
+escollect -config collector.json -once
+```
+
+A proof of record 1, checked the way an auditor does it. A bundle verifies only once a time-stamp lies over the chain after its record: the store takes one every `tsa.every` (10 minutes by default), and `stamp` takes one now. `-dek` adds the key of this one record, so `esverify` also prints the body; a bundle without it proves the record and leaves the body closed. `esverify` runs offline, with the store's public key and the TSA certificate:
+
+```sh
+evidencestore stamp -config store.json
+evidencestore proof -config store.json -source app -seq 1 -dek -out proof.json
+evidencestore tsa-root -config store.json -out tsa-root.crt
+esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt
+```
+
+`esverify` ends with `VERIFIED` (exit code 0); `evidencestore status -config store.json` shows how many records each source has. A real installation also needs certificates from your own PKI, a real TSA, `keys.backup_dir` and `keys.roots_mirror_dir` on other disks, and the store on another machine than its sources ([Install](#install)). To start over, stop the store and remove `~/es-try`.
 
 ## Components
 
@@ -252,7 +311,7 @@ STORESIM_SEEDS=1000 go test -timeout 0 -run TestStoreCrashSim ./internal/store/ 
 
 `go test` runs the simulations with a few dozen scenarios each; a failure prints `SIM_SEED=` (`CLOCKSIM_SEED=`, `STORESIM_SEED=`), which replays that scenario with its full trace (a store scenario with parallel intake replays its steps, not the exact interleaving). Every collector scenario draws its own set of faults; `SIM_FAULTS=all` (or a comma list: `long,after,torn,flaky,perm-new,perm-file,perm-dir,perm-spool,dateext`) fixes it.
 
-Design notes in Russian: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (code map), [`docs/DECISIONS.md`](docs/DECISIONS.md) (decisions and open questions), [`docs/CONCEPT.md`](docs/CONCEPT.md), [`docs/PROVENANCE.md`](docs/PROVENANCE.md).
+Design notes in Russian: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (code map), [`docs/DECISIONS.md`](docs/DECISIONS.md) (decisions and open questions).
 
 ## License
 
