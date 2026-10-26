@@ -104,10 +104,14 @@ Operator (talks to the running server via its admin socket):
   stamp     -config FILE                       time-stamp the chain head now
   proof     -config FILE -source S -seq N [-dek] [-to-head H] [-out FILE]
                                                -to-head: the bundle reaches at least head H (one a witness saw)
-  proof     -config FILE -from T -to T [-source S -dek] [-to-head H] [-out FILE]
-                                               every record received in the window (RFC 3339 times),
-                                               complete between two time-stamps; -source S -dek attaches
-                                               that source's records with their record keys
+  proof     -config FILE -source S -from T -to T [-dek] [-to-head H] [-out FILE]
+                                               every record of S received in the window (RFC 3339 times),
+                                               complete between two time-stamps, other sources unseen:
+                                               for an auditor from outside
+  proof     -config FILE -window -from T -to T [-source S -dek] [-to-head H] [-out FILE]
+                                               every record of every source in the window: for an
+                                               investigation inside the organization; -source S -dek
+                                               attaches that source's records with their record keys
   tsa-root  -config FILE -out FILE             root certificate of the built-in demo TSA
   keys list|due      -config FILE
   keys deactivate    -config FILE -scope S [-force]
@@ -232,15 +236,25 @@ func cmdProof(args []string) error {
 	dek := fs.Bool("dek", false, "attach the key of this one record so the auditor can open the body")
 	toHead := fs.Uint64("to-head", 0, "extend the bundle at least up to this chain head: one a witness saw (esverify -heads names it)")
 	out := fs.String("out", "", "write the bundle here instead of stdout")
-	from := fs.String("from", "", "window bundle: every record received from this time (RFC 3339, with -to)")
-	to := fs.String("to", "", "window bundle: up to this time (RFC 3339)")
+	from := fs.String("from", "", "a window of time: every record received from this time (RFC 3339, with -to)")
+	to := fs.String("to", "", "a window of time: up to this time (RFC 3339)")
+	window := fs.Bool("window", false, "with -from and -to: every source in the window, not one (for an investigation inside the organization)")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
 		return err
 	}
-	if *from != "" || *to != "" {
+	if *from != "" || *to != "" || *window {
 		if *from == "" || *to == "" || *seq != 0 {
 			return errors.New("proof: a window takes both -from and -to, and no -seq")
+		}
+		// Без -window — пакет по источнику (п. 28): чужих источников
+		// аудитор не видит. Все источники — только явно.
+		path := "/admin/proof-source"
+		switch {
+		case *window:
+			path = "/admin/proof-window"
+		case *source == "":
+			return errors.New("proof: a window takes -source S (one source, for an auditor from outside) or -window (every source, for an investigation inside the organization)")
 		}
 		q := url.Values{"from": {*from}, "to": {*to}, "source": {*source}}
 		if *dek {
@@ -249,7 +263,7 @@ func cmdProof(args []string) error {
 		if *toHead > 0 {
 			q.Set("to_head", fmt.Sprint(*toHead))
 		}
-		body, err := adminDo(cfg, http.MethodGet, "/admin/proof-window?"+q.Encode(), nil)
+		body, err := adminDo(cfg, http.MethodGet, path+"?"+q.Encode(), nil)
 		if err != nil {
 			return err
 		}

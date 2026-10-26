@@ -127,6 +127,25 @@ func MerkleProof(leaves []Leaf, idx int) ([]ProofStep, error) {
 	return path, nil
 }
 
+// ProofShape — форма пути Меркла листа idx в батче из count листьев: для
+// каждого шага — слева ли сосед (как его отдаёт MerkleProof). Разные места в
+// батче дают разные формы, поэтому по форме пути проверяющий узнаёт место
+// листа в звене, не видя соседей: например, что лист — последний.
+func ProofShape(count, idx int) ([]bool, error) {
+	if idx < 0 || idx >= count {
+		return nil, fmt.Errorf("auditchain: leaf %d is outside a batch of %d", idx, count)
+	}
+	var shape []bool
+	for pos, n := idx, count; n > 1; pos, n = pos/2, (n+1)/2 {
+		// Одинокий последний узел поднимается без соседа — шага в пути нет.
+		if pos == n-1 && n%2 == 1 {
+			continue
+		}
+		shape = append(shape, pos%2 == 1)
+	}
+	return shape, nil
+}
+
 // VerifyProof проверяет, что лист входит в батч с этим корнем.
 //
 // Проверяющему не нужны ни остальные листья, ни сама цепь — только лист, путь

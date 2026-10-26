@@ -18,9 +18,10 @@ import (
 
 // windowWorld — хранилище по часам теста и пакет за окно 10:04–10:06:
 // улики 1–2 в 10:00 и метка, улики 3–4 в 10:05, метка в 10:10. С -source
-// abs-core -dek — с телами улик 3–4.
+// abs-core -dek — с телами улик 3–4. source — пакет по abs-core за то же
+// окно, с телами.
 type windowWorld struct {
-	dir, bundle, bare, single, key, trust string
+	dir, bundle, bare, source, single, key, trust string
 }
 
 func newWindowWorld(t *testing.T) windowWorld {
@@ -89,6 +90,11 @@ func newWindowWorld(t *testing.T) windowWorld {
 		t.Fatal(err)
 	}
 	w.bare = write("window-bare.json", bare)
+	src, err := s.ProofSource("abs-core", from, to, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.source = write("source.json", src)
 	single, err := s.Proof("abs-core", 3, true)
 	if err != nil {
 		t.Fatal(err)
@@ -207,6 +213,67 @@ func TestWindowForged(t *testing.T) {
 		t.Fatal(err)
 	}
 	if code, out, _ := w.run(t, broken, "-json"); code != exitInvalid || !strings.Contains(out, "the window bundle parses") {
+		t.Fatalf("неразборчивый пакет: код %d\n%s", code, out)
+	}
+}
+
+// Пакет по источнику — тем же вызовом, что пакет за окно: отчёт, тела,
+// подделка, флаги пакета одной улики.
+func TestSourceBundle(t *testing.T) {
+	w := newWindowWorld(t)
+	code, out, _ := w.run(t, w.source)
+	if code != exitValid || !strings.HasPrefix(out, "VERIFIED") ||
+		!strings.Contains(out, "Every record abs-core put into the store's chain from the time-stamp of 2026-10-26 10:00:00 UTC to the time-stamp of 2026-10-26 10:10:00 UTC is in this bundle: records 3–4 (2, 2 received in the window)") {
+		t.Fatalf("код %d:\n%s", code, out)
+	}
+	dir := filepath.Join(w.dir, "bodies")
+	code, out, errOut := w.run(t, w.source, "-bodies", dir, "-json")
+	var rep map[string]any
+	if err := json.Unmarshal([]byte(out), &rep); err != nil || code != exitValid || rep["kind"] != "source" || rep["valid"] != true ||
+		rep["source"] != "abs-core" || rep["records"] != float64(2) || rep["first_seq"] != float64(3) || rep["last_seq"] != float64(4) || rep["bodies_opened"] != float64(2) {
+		t.Fatalf("код %d, %v:\n%s", code, err, out)
+	}
+	if !strings.Contains(errOut, "2 bodies written to") {
+		t.Fatalf("stderr: %s", errOut)
+	}
+	for _, q := range []string{"3", "4"} {
+		if data, err := os.ReadFile(filepath.Join(dir, "abs-core-"+q)); err != nil || string(data) != "line \x1b[31m"+q+"\n" {
+			t.Fatalf("тело %s: %q, %v", q, data, err)
+		}
+	}
+	for _, extra := range [][]string{{"-body", "b.bin"}, {"-allow-no-tsa"}, {"-from", "вчера", "-to", "2026-10-26T10:06:00Z"}} {
+		if code, out, errOut := w.run(t, w.source, extra...); code != exitUsage {
+			t.Fatalf("%v с пакетом по источнику: код %d\n%s%s", extra, code, out, errOut)
+		}
+	}
+
+	// Выброшенная запись — провал, тела не пишутся.
+	data, err := os.ReadFile(w.source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := proof.ParseSource(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Records = b.Records[1:]
+	forged, _ := json.Marshal(b)
+	path := filepath.Join(w.dir, "forged.json")
+	if err := os.WriteFile(path, forged, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir = filepath.Join(w.dir, "forged-bodies")
+	if code, out, errOut := w.run(t, path, "-bodies", dir); code != exitInvalid || !strings.HasPrefix(out, "NOT VERIFIED") || !strings.Contains(errOut, "bodies not written") {
+		t.Fatalf("подделка: код %d\n%s%s", code, out, errOut)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("тела подделки записаны: %v", err)
+	}
+	broken := filepath.Join(w.dir, "broken.json")
+	if err := os.WriteFile(broken, []byte(`{"kind": "source", "v": 3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ := w.run(t, broken, "-json"); code != exitInvalid || !strings.Contains(out, "the source bundle parses") {
 		t.Fatalf("неразборчивый пакет: код %d\n%s", code, out)
 	}
 }

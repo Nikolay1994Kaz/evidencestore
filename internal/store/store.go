@@ -163,9 +163,15 @@ type Store struct {
 	evLeaf        []uint64            // evLeaf[pos-1] = номер листа улики + 1
 	tokens        []tokenRef          // метки TSA, лёгшие в цепь листьями
 	lastStamped   uint64              // голова, заверенная последней
-	stampedLeaves uint64              // листьев в цепи сразу после последнего токена
+	stampedLeaves uint64              // листьев в цепи сразу после последней метки (токена и хвостов за ним)
 	gwLeaf        map[uint64]uint64   // позиция улики гейтвея → лист её вердикта
 	gwMarks       map[string][]gwMark // источник → контрольные точки и поломки по порядку
+	// srcTail — последний лист улики каждого источника в порядке цепи: на него
+	// ссылается следующий лист источника, он же уходит в хвосты (п. 28).
+	srcTail map[string]srcTailRef
+	// preTailsHead — звено хвостов перед запросом, ещё не заверенное: метка,
+	// повторённая без новых листьев (TSA не ответила), берёт его же.
+	preTailsHead uint64
 
 	// Копия наружу (replica.go).
 	replicaMu     sync.Mutex
@@ -216,6 +222,13 @@ type tokenRef struct {
 	head uint64 // заверенная голова
 	leaf uint64 // номер листа с токеном
 	gen  time.Time
+}
+
+// srcTailRef — последний лист улики источника в цепи: номер записи и хэш
+// листа.
+type srcTailRef struct {
+	seq  uint64
+	hash [32]byte
 }
 
 type sourceState struct {
@@ -449,6 +462,7 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 		sources:   make(map[string]*sourceState),
 		gwLeaf:    make(map[uint64]uint64),
 		gwMarks:   make(map[string][]gwMark),
+		srcTail:   make(map[string]srcTailRef),
 		scopes:    make(map[string]bool),
 		keyLabels: make(map[string]string),
 		stop:      make(chan struct{}),

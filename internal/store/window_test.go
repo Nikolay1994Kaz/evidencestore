@@ -29,9 +29,10 @@ import (
 //	10:10 метка B
 //	10:11 улики 7–8, метка C
 //
-// Метка сворачивает хвост в звено, а свой токен — в следующее звено сразу:
-// звено 2 — улики 1–3 (A заверяет голову 2), 3 — токен A, 4 — улики 4–6
-// (B заверяет голову 4), 5 — токен B, 6 — улики 7–8, 7 — токен C.
+// Метка сворачивает хвост цепи в звено, кладёт хвосты источников одни в
+// следующее звено и заверяет его (п. 28), а токен с хвостами за ним — ещё в
+// следующее: звено 2 — улики 1–3, 3 — хвосты (A заверяет голову 3), 4 —
+// токен A и хвосты, 5 — улики 4–6, 6 — хвосты (B), 7 — токен B и хвосты.
 func windowStore(t *testing.T, opt Options) (*Store, *clock, *config.Config) {
 	t.Helper()
 	c := newClock()
@@ -320,11 +321,12 @@ func TestWindowProofForgedByStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := func(seq uint64) auditchain.Record { return links[seq-1] }
-	if len(good.Links) != 4 || good.LowerHead != 2 || good.StretchEnd != 5 || len(good.Leaves) != 5 {
+	if len(good.Links) != 5 || good.LowerHead != 3 || good.StretchEnd != 7 || len(good.Leaves) != 8 {
 		t.Fatalf("раскладка теста поменялась: звеньев %d, нижняя голова %d, конец %d, листьев %d",
 			len(good.Links), good.LowerHead, good.StretchEnd, len(good.Leaves))
 	}
-	// Звенья 2…5; листья: [токен A] (звено 3), [улики 4–6] (4), [токен B] (5).
+	// Звенья 3…7; листья: [токен A, хвосты] (звено 4), [улики 4–6] (5),
+	// [хвосты перед запросом B] (6), [токен B, хвосты] (7).
 
 	b := clone()
 	b.Leaves = append(b.Leaves[:2], b.Leaves[3:]...)
@@ -337,42 +339,48 @@ func TestWindowProofForgedByStore(t *testing.T) {
 	// Конец участка заявлен дальше звеньев пакета: отчёт назвал бы ложный
 	// конец, а свидетеля сверяли бы от него.
 	b = clone()
-	b.StretchEnd = 6
+	b.StretchEnd = 8
 	failedCheck(t, verify(b), "the bundle holds every leaf")
 
 	// Конец участка отрезан вместе с токеном B, голова переподписана.
 	b = clone()
-	b.Links, b.Leaves, b.StretchEnd = b.Links[:3], b.Leaves[:4], 4
-	sign(&b, link(4))
+	b.Links, b.Leaves, b.StretchEnd = b.Links[:4], b.Leaves[:6], 6
+	sign(&b, link(6))
 	failedCheck(t, verify(b), "a TSA time-stamp in the stretch after the window (T2)")
 
 	// Начало сдвинуто за улики 4–6: участок после головы под B.
 	b = clone()
-	b.Links, b.Leaves, b.LowerHead = b.Links[2:], b.Leaves[4:], 4
+	b.Links, b.Leaves, b.LowerHead = b.Links[3:], b.Leaves[6:], 6
 	failedCheck(t, verify(b), "the time-stamps bracket the window")
 
-	// Улика 5 выброшена из звена 4, звенья 4 и 5 пересчитаны и сцеплены
+	// Улика 5 выброшена из звена 5, звенья 5–7 пересчитаны и сцеплены
 	// заново, голова переподписана: корни сходятся, но метка B заверяла
-	// прежнюю голову 4.
+	// прежнюю голову 6.
 	b = clone()
-	leaves4 := []auditchain.Leaf{b.Leaves[1].Chain(), b.Leaves[3].Chain()}
-	p4, _ := auditchain.DecodeBatchPayload(link(4).Payload)
-	l4, err := auditchain.LinkBatch(auditchain.Head{Seq: 3, Hash: auditchain.Hash(link(3))}, link(4).UnixNano, p4.FirstLeaf, leaves4)
+	p5, _ := auditchain.DecodeBatchPayload(link(5).Payload)
+	l5, err := auditchain.LinkBatch(auditchain.Head{Seq: 4, Hash: auditchain.Hash(link(4))}, link(5).UnixNano, p5.FirstLeaf,
+		[]auditchain.Leaf{b.Leaves[2].Chain(), b.Leaves[4].Chain()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	l5, err := auditchain.LinkBatch(auditchain.Head{Seq: 4, Hash: auditchain.Hash(l4)}, link(5).UnixNano, p4.FirstLeaf+2, []auditchain.Leaf{b.Leaves[4].Chain()})
+	l6, err := auditchain.LinkBatch(auditchain.Head{Seq: 5, Hash: auditchain.Hash(l5)}, link(6).UnixNano, p5.FirstLeaf+2,
+		[]auditchain.Leaf{b.Leaves[5].Chain()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b.Links = []proof.Link{proof.FromLink(link(2)), proof.FromLink(link(3)), proof.FromLink(l4), proof.FromLink(l5)}
-	b.Leaves = append(b.Leaves[:2], b.Leaves[3:]...)
-	sign(&b, l5)
+	l7, err := auditchain.LinkBatch(auditchain.Head{Seq: 6, Hash: auditchain.Hash(l6)}, link(7).UnixNano, p5.FirstLeaf+3,
+		[]auditchain.Leaf{b.Leaves[6].Chain(), b.Leaves[7].Chain()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Links = []proof.Link{proof.FromLink(link(3)), proof.FromLink(link(4)), proof.FromLink(l5), proof.FromLink(l6), proof.FromLink(l7)}
+	b.Leaves = append(b.Leaves[:3], b.Leaves[4:]...)
+	sign(&b, l7)
 	failedCheck(t, verify(b), "every TSA time-stamp in the stretch verifies")
 
 	// Голова подписана своим ключом, но не над последним звеном пакета.
 	b = clone()
-	sign(&b, link(4))
+	sign(&b, link(6))
 	failedCheck(t, verify(b), "the head is signed with the store key")
 
 	// Чужой ключ подписи.
@@ -381,7 +389,7 @@ func TestWindowProofForgedByStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	b = clone()
-	b.Statement = other.Sign(auditchain.Head{Seq: 5, Hash: auditchain.Hash(link(5))}, 5, 0)
+	b.Statement = other.Sign(auditchain.Head{Seq: 7, Hash: auditchain.Hash(link(7))}, 7, 0)
 	failedCheck(t, verify(b), "the head is signed with the store key")
 
 	// Приложенные улики: испорченный байт, чужой ключ записи, улика не с участка.
@@ -467,8 +475,23 @@ func TestWindowProofAcrossLeafFiles(t *testing.T) {
 	if src := r.Sources[0]; src.FirstSeq != 4 || src.LastSeq != 40 || len(r.Bodies) != 37 {
 		t.Fatalf("сводка %+v, тел %d", src, len(r.Bodies))
 	}
-	// Файл листьев посреди участка пропал — пакет не собирается.
-	if err := os.Remove(files[1]); err != nil {
+	// Файл листьев посреди участка пропал — пакет не собирается. Файл берётся
+	// по номерам листьев: начинается внутри участка.
+	s.chainMu.Lock()
+	lower, upper := s.links[b.LowerHead-1], s.links[b.StretchEnd-1]
+	s.chainMu.Unlock()
+	inside := ""
+	for _, f := range files {
+		first, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(filepath.Base(f), "leaves_"), ".log"), 10, 64)
+		if err == nil && first > lower.first+lower.count && first < upper.first+upper.count {
+			inside = f
+			break
+		}
+	}
+	if inside == "" {
+		t.Fatalf("нет файла листьев внутри участка: %v", files)
+	}
+	if err := os.Remove(inside); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 11, 10), "", false, 0); !errors.Is(err, auditchain.ErrLeavesMissing) {

@@ -104,8 +104,8 @@ wait_seq() {
 # Строка syslog со временем UTC: тем же, в котором хранилище показывает приём.
 log() { printf '%s web-1 %s\n' "$(LC_ALL=C date -u '+%b %e %H:%M:%S')" "$*" >>"$LOG"; }
 
-# Начало окна для пакета за окно в конце: больше чем через секунду после
-# метки T1 — тогда нижняя метка окна она (DECISIONS, п. 27). Время приёма
+# Начало окна для пакета по источнику в конце: больше чем через секунду
+# после метки T1 — тогда нижняя метка окна она (DECISIONS, п. 27, 28). Время приёма
 # идёт по якорю TSA (время в метке — до секунды) и может отставать от часов
 # хоста до секунды: первая строка — заметно позже начала окна.
 sleep 1.2
@@ -206,7 +206,7 @@ step "one deleted line in full: esverify, offline, with the store's pinned key"
 "$BIN/esverify" -proof "$B/5.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST" -body "$B/5.restored"
 echo "restored line: $(cat "$B/5.restored")"
 
-step "the auditor asks for the whole session in one window bundle: nothing in it can be left out"
+step "the auditor asks for the whole session of web-1 in one bundle: nothing in it can be left out"
 TO=$(date -u +%FT%T.%NZ)
 echo "window (receive time): $FROM – $TO"
 echo "(a window is closed by a time-stamp taken more than a minute after its end: a minute passes, web-1 lives on)"

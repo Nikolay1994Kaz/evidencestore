@@ -77,13 +77,35 @@ func EvidenceLeaf(h evidence.Header, pos uint64, digest [32]byte) auditchain.Lea
 	}
 }
 
+// EvidenceLeafLinked — лист улики со ссылкой на прежний лист улики того же
+// источника в порядке цепи (prev — его хэш, нули у первой записи источника):
+// цепочка источника внутри общей цепи (DECISIONS, п. 28). Предмет —
+// позиция, отпечаток и prev, 72 байта; хранилище пишет такие листья с этого
+// изменения, EvidenceLeaf (40 байт) — прежний формат.
+func EvidenceLeafLinked(h evidence.Header, pos uint64, digest, prev [32]byte) auditchain.Leaf {
+	l := EvidenceLeaf(h, pos, digest)
+	l.Payload = append(l.Payload, prev[:]...)
+	return l
+}
+
 // ParseEvidenceLeaf разбирает предмет листа улики: позиция и отпечаток.
+// Читает оба формата: прежний (40 байт) и со ссылкой (72).
 func ParseEvidenceLeaf(l auditchain.Leaf) (pos uint64, digest [32]byte, err error) {
-	if l.Type != auditchain.EventEvidence || len(l.Payload) != 8+32 {
+	if l.Type != auditchain.EventEvidence || len(l.Payload) != 8+32 && len(l.Payload) != 8+32+32 {
 		return 0, digest, errors.New("proof: not an evidence leaf")
 	}
-	copy(digest[:], l.Payload[8:])
+	copy(digest[:], l.Payload[8:40])
 	return binary.BigEndian.Uint64(l.Payload), digest, nil
+}
+
+// EvidencePrev — ссылка листа улики на прежний лист того же источника;
+// ok = false — лист прежнего формата, без ссылки.
+func EvidencePrev(l auditchain.Leaf) (prev [32]byte, ok bool) {
+	if l.Type != auditchain.EventEvidence || len(l.Payload) != 8+32+32 {
+		return prev, false
+	}
+	copy(prev[:], l.Payload[40:])
+	return prev, true
 }
 
 // Leaf — лист в пакете.

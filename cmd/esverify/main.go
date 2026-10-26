@@ -64,12 +64,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	bodyPath := fs.String("body", "", "once the bundle verifies, write the record body to FILE exactly as the source sent it (the bundle must carry the record key: evidencestore proof -dek)")
 	showVersion := fs.Bool("version", false, "print the version and the commit it was built from")
-	windowFrom := fs.String("from", "", "window bundle: the start of your window (RFC 3339); without -from and -to the window named in the bundle is used")
-	windowTo := fs.String("to", "", "window bundle: the end of your window (RFC 3339)")
-	bodiesDir := fs.String("bodies", "", "window bundle: once it verifies, write every opened body to DIR/<source>-<seq> exactly as the source sent it")
+	windowFrom := fs.String("from", "", "bundle over a window of time: the start of your window (RFC 3339); without -from and -to the window named in the bundle is used")
+	windowTo := fs.String("to", "", "bundle over a window of time: the end of your window (RFC 3339)")
+	bodiesDir := fs.String("bodies", "", "bundle over a window of time: once it verifies, write every opened body to DIR/<source>-<seq> exactly as the source sent it")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-heads DIR] [-allow-no-tsa] [-json] [-body FILE]")
 		fmt.Fprintln(stderr, "       esverify -proof WINDOW -store-key KEY -tsa-trust CERT[,CERT] [-from T -to T] [-heads DIR] [-json] [-bodies DIR]")
+		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
 		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage, an unreadable key, certificate or promise file or heads directory, or -body for a bundle without the record key")
@@ -127,19 +128,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return usageErr(err)
 	}
-	// Пакет за окно — своими правилами; флаги пакета одной улики к нему не
+	// Пакеты за окно — своими правилами; флаги пакета одной улики к ним не
 	// подходят, и наоборот.
-	if kind, _ := proof.BundleKind(data); kind == proof.WindowKind {
+	if kind, _ := proof.BundleKind(data); kind == proof.WindowKind || kind == proof.SourceKind {
 		var single []string
 		for name, set := range map[string]bool{"-promise": *promisePath != "", "-gateway-key": *gatewayKey != "", "-allow-no-tsa": *allowNoTSA, "-body": *bodyPath != ""} {
 			if set {
 				single = append(single, name)
 			}
 		}
-		return runWindow(data, windowArgs{trust: pt, from: *windowFrom, to: *windowTo, bodies: *bodiesDir, asJSON: *asJSON, single: single}, stdout, stderr)
+		return runWindow(data, kind, windowArgs{trust: pt, from: *windowFrom, to: *windowTo, bodies: *bodiesDir, asJSON: *asJSON, single: single}, stdout, stderr)
 	}
 	if *windowFrom != "" || *windowTo != "" || *bodiesDir != "" {
-		return usageErr(errors.New("-from, -to and -bodies are for a window bundle (evidencestore proof -from -to)"))
+		return usageErr(errors.New("-from, -to and -bodies are for a bundle over a window of time (evidencestore proof -from -to)"))
 	}
 
 	// Пакет, который не разбирается, — не неверный вызов, а провал проверки:

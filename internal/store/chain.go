@@ -52,9 +52,11 @@ func (s *Store) scanChain() (chainScan, error) {
 			}
 			s.setEvLeaf(pos, num)
 			cs.maxPos = max(cs.maxPos, pos)
-			if seq, err := strconv.ParseUint(l.Subject, 10, 64); err == nil {
+			seq, err := strconv.ParseUint(l.Subject, 10, 64)
+			if err == nil {
 				cs.maxSeq[l.Scope] = max(cs.maxSeq[l.Scope], seq)
 			}
+			s.srcTail[l.Scope] = srcTailRef{seq: seq, hash: auditchain.LeafHash(l)}
 			delete(cs.silent, l.Scope)
 		case auditchain.EventSilence:
 			cs.silent[l.Scope] = true
@@ -128,9 +130,22 @@ func (s *Store) onCommit(first uint64, records [][]byte) {
 	}
 }
 
+// appendEvidenceLocked кладёт лист улики со ссылкой на прежний лист того же
+// источника (п. 28): из цепочки источника запись не выбросить незаметно.
 func (s *Store) appendEvidenceLocked(h evidence.Header, pos uint64, digest [32]byte) {
-	num := s.appendLeafLocked(proof.EvidenceLeaf(h, pos, digest))
+	l := proof.EvidenceLeafLinked(h, pos, digest, s.srcTail[h.Source].hash)
+	num := s.appendLeafLocked(l)
 	s.setEvLeaf(pos, num)
+	s.srcTail[h.Source] = srcTailRef{seq: h.Seq, hash: auditchain.LeafHash(l)}
+}
+
+// tailsLocked — хвосты источников к этому месту цепи (лист события 13).
+func (s *Store) tailsLocked() auditchain.Leaf {
+	tails := make([]proof.Tail, 0, len(s.srcTail))
+	for name, t := range s.srcTail {
+		tails = append(tails, proof.Tail{Source: name, Seq: t.seq, Hash: t.hash})
+	}
+	return proof.TailsLeaf(tails, s.nowTime().UnixNano())
 }
 
 func (s *Store) appendLeafLocked(l auditchain.Leaf) uint64 {

@@ -349,6 +349,22 @@ func (c *clockSim) finish() {
 	case len(seqs["abs-core"]) != len(c.accepted):
 		c.fail("в пакете за окно %d улик, принято %d", len(seqs["abs-core"]), len(c.accepted))
 	}
+	// И пакетом по источнику: цепочка abs-core сходится, принятое — в ней.
+	sr, err := wholeChainSource(c.s, "abs-core", trust)
+	switch {
+	case err != nil:
+		c.fail("пакет по источнику: %v", err)
+	case !sr.Valid():
+		c.fail("пакет по источнику не проходит: %s", sourceFailedChecks(sr))
+	case sr.Records != len(c.accepted):
+		c.fail("в пакете по источнику %d улик, принято %d", sr.Records, len(c.accepted))
+	}
+	switch mr, ok, err := midChainSource(c.s, "abs-core", trust); {
+	case err != nil:
+		c.fail("пакет по источнику от середины цепи: %v", err)
+	case ok && (!mr.Valid() || mr.FromStart):
+		c.fail("пакет по источнику от середины цепи не проходит: %s", sourceFailedChecks(mr))
+	}
 }
 
 // clockSimBackground — шаг keepAnchor: якорь несвеж — метка сейчас, даже в

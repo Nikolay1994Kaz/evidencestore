@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -348,39 +349,35 @@ func (s *Server) AdminHandler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, b)
 	})
-	// Пакет за окно времени (DECISIONS, п. 27): from и to — RFC 3339.
+	// Пакет за окно времени (DECISIONS, п. 27) и пакет по источнику (п. 28):
+	// from и to — RFC 3339.
 	mux.HandleFunc("GET /admin/proof-window", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		from, ferr := time.Parse(time.RFC3339Nano, q.Get("from"))
-		to, terr := time.Parse(time.RFC3339Nano, q.Get("to"))
-		if ferr != nil || terr != nil {
-			writeErr(w, http.StatusBadRequest, errors.New("from and to must be RFC 3339 times, e.g. 2026-10-26T00:00:00Z"))
+		from, to, head, err := windowQuery(q)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
 			return
-		}
-		var head uint64
-		if v := q.Get("to_head"); v != "" {
-			var err error
-			if head, err = strconv.ParseUint(v, 10, 64); err != nil {
-				writeErr(w, http.StatusBadRequest, errors.New("to_head must be a head number"))
-				return
-			}
 		}
 		b, err := s.store.ProofWindow(from, to, q.Get("source"), q.Get("dek") == "1", head)
 		if err != nil {
-			code := http.StatusInternalServerError
-			switch {
-			case errors.Is(err, store.ErrWindow):
-				code = http.StatusBadRequest
-			case errors.Is(err, store.ErrNotFound):
-				code = http.StatusNotFound
-			}
-			writeErr(w, code, err)
+			windowError(w, err)
 			return
 		}
-		// Без отступов: в пакете за окно — до сотен тысяч листьев.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(b)
+		writeCompact(w, b)
+	})
+	mux.HandleFunc("GET /admin/proof-source", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		from, to, head, err := windowQuery(q)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		b, err := s.store.ProofSource(q.Get("source"), from, to, q.Get("dek") == "1", head)
+		if err != nil {
+			windowError(w, err)
+			return
+		}
+		writeCompact(w, b)
 	})
 	mux.HandleFunc("POST /admin/stamp", func(w http.ResponseWriter, r *http.Request) {
 		head, err := s.store.Stamp(r.Context())
@@ -548,6 +545,42 @@ func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 		return false
 	}
 	return true
+}
+
+// windowQuery — окно из запроса админки: from и to (RFC 3339), to_head.
+func windowQuery(q url.Values) (from, to time.Time, head uint64, err error) {
+	from, ferr := time.Parse(time.RFC3339Nano, q.Get("from"))
+	to, terr := time.Parse(time.RFC3339Nano, q.Get("to"))
+	if ferr != nil || terr != nil {
+		return from, to, 0, errors.New("from and to must be RFC 3339 times, e.g. 2026-10-26T00:00:00Z")
+	}
+	if v := q.Get("to_head"); v != "" {
+		if head, err = strconv.ParseUint(v, 10, 64); err != nil {
+			return from, to, 0, errors.New("to_head must be a head number")
+		}
+	}
+	return from, to, head, nil
+}
+
+// windowError — отказ пакета за окно или по источнику: окно задано неверно
+// или ещё не закрыто — 400, нет источника — 404.
+func windowError(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, store.ErrWindow):
+		code = http.StatusBadRequest
+	case errors.Is(err, store.ErrNotFound):
+		code = http.StatusNotFound
+	}
+	writeErr(w, code, err)
+}
+
+// writeCompact — JSON без отступов: в пакетах за окно — до сотен тысяч
+// листьев.
+func writeCompact(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(v)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

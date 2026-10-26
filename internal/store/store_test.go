@@ -618,7 +618,8 @@ func TestKeyEventRecoveredAfterCrash(t *testing.T) {
 // потом не примет.
 func TestStampRejectsUntrustedToken(t *testing.T) {
 	c := newClock()
-	s := openStore(t, testConfig(t), c)
+	cfg := testConfig(t)
+	s := openStore(t, cfg, c)
 	ingest(t, s, "abs-core", 1, 1)
 	s.tsaTrust = openStore(t, testConfig(t), c).TSATrust() // чужой корень
 	if err := s.flush(); err != nil {
@@ -628,8 +629,25 @@ func TestStampRejectsUntrustedToken(t *testing.T) {
 	if _, err := s.Stamp(context.Background()); err == nil {
 		t.Fatal("непроверенный токен принят")
 	}
-	if s.Head() != before {
-		t.Fatal("отвергнутый токен изменил цепь")
+	// До запроса в цепь легли хвосты источников (п. 28) — одни в своём
+	// звене; токена нет. Повтор метки звено хвостов не множит: при лежащей
+	// TSA цепь не растёт на каждую попытку.
+	after := s.Head()
+	if after.Seq != before.Seq+1 {
+		t.Fatalf("голова %d, до метки %d: ждали одно звено хвостов", after.Seq, before.Seq)
+	}
+	if _, err := s.Stamp(context.Background()); err == nil {
+		t.Fatal("непроверенный токен принят при повторе")
+	}
+	if s.Head() != after {
+		t.Fatal("повтор отвергнутой метки изменил цепь")
+	}
+	s.Close()
+	if n := len(leavesOf(t, cfg, auditchain.EventTimestamp)); n != 0 {
+		t.Fatalf("в цепи %d листов метки после отвергнутого токена", n)
+	}
+	if tails := leavesOf(t, cfg, auditchain.EventTails); len(tails) != 1 {
+		t.Fatalf("листов хвостов %d, ждали один", len(tails))
 	}
 }
 

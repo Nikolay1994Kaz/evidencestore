@@ -1186,8 +1186,8 @@
   {
    "name": "B39 админка: ошибка окна — 500, а не 400",
    "file": "internal/server/server.go",
-   "old": "case errors.Is(err, store.ErrWindow):\n\t\t\t\tcode = http.StatusBadRequest",
-   "new": "case false:\n\t\t\t\tcode = http.StatusBadRequest"
+   "old": "case errors.Is(err, store.ErrWindow):\n\t\tcode = http.StatusBadRequest",
+   "new": "case false:\n\t\tcode = http.StatusBadRequest"
   },
   {
    "name": "B40 админка: to_head окна не читается",
@@ -1230,6 +1230,402 @@
    "file": "cmd/esverify/window.go",
    "old": "fmt.Fprintf(stderr, \"%d bodies written to %s\\n\"",
    "new": "fmt.Fprintf(stdout, \"%d bodies written to %s\\n\""
+  },
+  {
+   "name": "U1 хвосты: номер не входит в обязательство",
+   "file": "internal/proof/tails.go",
+   "old": "\tbinary.Write(&buf, binary.BigEndian, seq)\n",
+   "new": ""
+  },
+  {
+   "name": "U2 хвосты: лист зависит от порядка источников",
+   "file": "internal/proof/tails.go",
+   "old": "\tslices.SortFunc(entries, func(a, b tailEntry) int { return bytes.Compare([]byte(a.Tag), []byte(b.Tag)) })\n",
+   "new": "\tslices.Reverse(entries)\n"
+  },
+  {
+   "name": "U3 хвосты: источник, названный дважды, не отвергается",
+   "file": "internal/proof/tails.go",
+   "old": "\t\tif found != nil {\n\t\t\treturn [32]byte{}, fmt.Errorf(\"the tails leaf names %s twice\", source)",
+   "new": "\t\tif false {\n\t\t\treturn [32]byte{}, fmt.Errorf(\"the tails leaf names %s twice\", source)"
+  },
+  {
+   "name": "U4 хвосты: источника нет — всё равно ошибка",
+   "file": "internal/proof/tails.go",
+   "old": "\tcase found == nil && open == nil:",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "U5 хвосты: короткий хэш раскрытия не отвергается",
+   "file": "internal/proof/tails.go",
+   "old": "if err != nil || len(h) != 32 {",
+   "new": "if err != nil {"
+  },
+  {
+   "name": "U6 хвосты: раскрытие не сверяется с обязательством",
+   "file": "internal/proof/tails.go",
+   "old": "\tif found.Commit != hex.EncodeToString(commit[:]) {",
+   "new": "\tif false && found.Commit != hex.EncodeToString(commit[:]) {"
+  },
+  {
+   "name": "U7 хвосты: не лист хвостов принимается",
+   "file": "internal/proof/tails.go",
+   "old": "\tif l.Type != auditchain.EventTails {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U8 лист улики без ссылки на прежний",
+   "file": "internal/proof/proof.go",
+   "old": "\tl.Payload = append(l.Payload, prev[:]...)\n",
+   "new": ""
+  },
+  {
+   "name": "U9 лист со ссылкой не разбирается",
+   "file": "internal/proof/proof.go",
+   "old": " && len(l.Payload) != 8+32+32 {",
+   "new": " {"
+  },
+  {
+   "name": "U10 ссылка берётся из отпечатка",
+   "file": "internal/proof/proof.go",
+   "old": "\tcopy(prev[:], l.Payload[40:])",
+   "new": "\tcopy(prev[:], l.Payload[8:40])"
+  },
+  {
+   "name": "U11 ссылка у листа любой длины",
+   "file": "internal/proof/proof.go",
+   "old": "\tif l.Type != auditchain.EventEvidence || len(l.Payload) != 8+32+32 {\n\t\treturn prev, false",
+   "new": "\tif l.Type != auditchain.EventEvidence || len(l.Payload) < 8+32+32 {\n\t\treturn prev, false"
+  },
+  {
+   "name": "U12 источник: голова — не последнее звено",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {",
+   "new": "\t\tif false && (b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last])) {"
+  },
+  {
+   "name": "U13 источник: «с начала цепи» не сверяется",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif links[0].Seq != 1 || links[0].PrevHash != ([32]byte{}) {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "U14 источник: первое звено — не звено нижних хвостов",
+   "file": "internal/proof/source.go",
+   "old": "\tcase link.Seq != b.LowerHead:",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "U15 источник: в звене нижних хвостов не только они",
+   "file": "internal/proof/source.go",
+   "old": "\tif auditchain.MerkleRoot([]auditchain.Leaf{tails}) != p.Root {",
+   "new": "\tif false && auditchain.MerkleRoot([]auditchain.Leaf{tails}) != p.Root {"
+  },
+  {
+   "name": "U16 источник: нижние хвосты не раскрываются",
+   "file": "internal/proof/source.go",
+   "old": "\tstart, err := OpenTail(tails, b.Source, b.LowerOpen)\n\tif err != nil {",
+   "new": "\tstart, err := OpenTail(tails, b.Source, b.LowerOpen)\n\tif false {"
+  },
+  {
+   "name": "U17 источник: нижняя метка не проверяется",
+   "file": "internal/proof/source.go",
+   "old": "\tinfo, err := tsa.Verify(b.LowerToken, HeadImprint(b.LowerHead, hash), trust)\n\tif err != nil {",
+   "new": "\tinfo, err := tsa.Verify(b.LowerToken, HeadImprint(b.LowerHead, hash), trust)\n\tif false {"
+  },
+  {
+   "name": "U18 источник: T1 не запоминается",
+   "file": "internal/proof/source.go",
+   "old": "\tr.Lower = info.GenTime.UTC()\n",
+   "new": "\t_ = info\n"
+  },
+  {
+   "name": "U19 источник: токен и хвосты в разных звеньях",
+   "file": "internal/proof/source.go",
+   "old": "\tif b.UpperToken.LinkSeq != u {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U20 источник: хвосты не последние в звене",
+   "file": "internal/proof/source.go",
+   "old": "\tif b.UpperTails.Index != n-1 || b.UpperToken.Index != n-2 {",
+   "new": "\tif b.UpperToken.Index != n-2 {"
+  },
+  {
+   "name": "U21 источник: хвосты не сразу за токеном",
+   "file": "internal/proof/source.go",
+   "old": "\tif b.UpperTails.Index != n-1 || b.UpperToken.Index != n-2 {",
+   "new": "\tif b.UpperTails.Index != n-1 {"
+  },
+  {
+   "name": "U22 источник: перед хвостами не токен",
+   "file": "internal/proof/source.go",
+   "old": "\tif tok.Type != auditchain.EventTimestamp {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U23 источник: верхние хвосты не раскрываются",
+   "file": "internal/proof/source.go",
+   "old": "\tend, err := OpenTail(b.UpperTails.Leaf.chain(), b.Source, b.UpperOpen)\n\tif err != nil {",
+   "new": "\tend, err := OpenTail(b.UpperTails.Leaf.chain(), b.Source, b.UpperOpen)\n\tif false {"
+  },
+  {
+   "name": "U24 источник: T2 не запоминается",
+   "file": "internal/proof/source.go",
+   "old": "\tr.Upper = info.GenTime.UTC()\n",
+   "new": "\t_ = info\n"
+  },
+  {
+   "name": "U25 источник: окно наоборот проходит",
+   "file": "internal/proof/source.go",
+   "old": "\tcase r.To.Before(r.From):",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "U26 источник: начало окна на T1 + 1 с проходит",
+   "file": "internal/proof/source.go",
+   "old": "!r.From.After(r.Lower.Add(ReceiveSlack))",
+   "new": "r.From.Before(r.Lower.Add(ReceiveSlack))"
+  },
+  {
+   "name": "U27 источник: конец окна на T2 − 1 мин проходит",
+   "file": "internal/proof/source.go",
+   "old": "!r.To.Before(r.Upper.Add(-ReceiveSkew))",
+   "new": "r.To.After(r.Upper.Add(-ReceiveSkew))"
+  },
+  {
+   "name": "U28 источник: без окна проверка идёт",
+   "file": "internal/proof/source.go",
+   "old": "\tcase r.From.IsZero() || r.To.IsZero():",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "U29 источник: запись чужого источника",
+   "file": "internal/proof/source.go",
+   "old": " || l.Scope != b.Source || serr != nil:",
+   "new": " || serr != nil:"
+  },
+  {
+   "name": "U30 источник: не лист улики за запись",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase l.Type != auditchain.EventEvidence || l.Scope",
+   "new": "\t\tcase l.Scope"
+  },
+  {
+   "name": "U31 источник: запись без ссылки принимается",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase !linked:",
+   "new": "\t\tcase false && !linked:"
+  },
+  {
+   "name": "U32 источник: путь записи не проверяется",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif _, err := placed(rec.Leaf, linkAt); err != nil {",
+   "new": "\t\tif _, err := placed(rec.Leaf, linkAt); false && err != nil {"
+  },
+  {
+   "name": "U33 источник: запись за верхними хвостами",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase rec.Leaf.LinkSeq > b.UpperTails.LinkSeq:",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "U34 источник: ссылка на прежнюю не сверяется",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase prev != expect:",
+   "new": "\t\tcase false && prev != expect:"
+  },
+  {
+   "name": "U35 источник: конец цепочки не сверяется с верхними хвостами",
+   "file": "internal/proof/source.go",
+   "old": "\tif expect != end {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U36 источник: номер в верхнем раскрытии не сверяется",
+   "file": "internal/proof/source.go",
+   "old": "\tif b.UpperOpen != nil && b.UpperOpen.Seq != last {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U37 источник: без записей номер — не из нижнего раскрытия",
+   "file": "internal/proof/source.go",
+   "old": "\tif b.LowerOpen != nil {\n\t\tlast = b.LowerOpen.Seq\n\t}\n",
+   "new": ""
+  },
+  {
+   "name": "U38 источник: дыры не считаются",
+   "file": "internal/proof/source.go",
+   "old": "\t\tr.Holes = unexplained(slices.Compact(seqs), nil)",
+   "new": "\t\t_ = slices.Compact(seqs)"
+  },
+  {
+   "name": "U39 источник: номера не упорядочены",
+   "file": "internal/proof/source.go",
+   "old": "\t\tslices.Sort(seqs)\n",
+   "new": ""
+  },
+  {
+   "name": "U40 источник: в окне не считаются",
+   "file": "internal/proof/source.go",
+   "old": "\t\t\tr.InWindow++",
+   "new": "\t\t\t_ = recv"
+  },
+  {
+   "name": "U41 источник: приложенные улики не проверяются",
+   "file": "internal/proof/source.go",
+   "old": "\tif slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U42 источник: свидетель — по нижней голове",
+   "file": "internal/proof/source.go",
+   "old": "checkWitness(trust.Witness, trust.StoreKey, b.UpperTails.LinkSeq, links, hashes, &wr, add)",
+   "new": "checkWitness(trust.Witness, trust.StoreKey, max(b.LowerHead, 1), links, hashes, &wr, add)"
+  },
+  {
+   "name": "U43 хранилище: лист ссылается на нули",
+   "file": "internal/store/chain.go",
+   "old": "proof.EvidenceLeafLinked(h, pos, digest, s.srcTail[h.Source].hash)",
+   "new": "proof.EvidenceLeafLinked(h, pos, digest, [32]byte{})"
+  },
+  {
+   "name": "U44 хранилище: хвост источника не обновляется",
+   "file": "internal/store/chain.go",
+   "old": "\ts.srcTail[h.Source] = srcTailRef{seq: h.Seq, hash: auditchain.LeafHash(l)}\n",
+   "new": ""
+  },
+  {
+   "name": "U45 хранилище: хвосты не восстанавливаются из цепи",
+   "file": "internal/store/chain.go",
+   "old": "\t\t\ts.srcTail[l.Scope] = srcTailRef{seq: seq, hash: auditchain.LeafHash(l)}\n",
+   "new": ""
+  },
+  {
+   "name": "U46 хранилище: номер в хвостах — ноль",
+   "file": "internal/store/chain.go",
+   "old": "proof.Tail{Source: name, Seq: t.seq, Hash: t.hash}",
+   "new": "proof.Tail{Source: name, Hash: t.hash}"
+  },
+  {
+   "name": "U47 метка: хвосты перед запросом множатся при повторе",
+   "file": "internal/store/jobs.go",
+   "old": "\tif !already && head.Seq != s.preTailsHead {",
+   "new": "\tif !already {"
+  },
+  {
+   "name": "U48 метка: хвостов перед запросом нет",
+   "file": "internal/store/jobs.go",
+   "old": "\t\ts.appendLeafLocked(s.tailsLocked())\n\t\tif err := s.flushLocked(); err != nil {",
+   "new": "\t\tif err := s.flushLocked(); err != nil {"
+  },
+  {
+   "name": "U49 метка: хвостов после токена нет",
+   "file": "internal/store/jobs.go",
+   "old": "\ts.appendLeafLocked(s.tailsLocked())\n\ts.tokens = append(",
+   "new": "\ts.tokens = append("
+  },
+  {
+   "name": "U50 метка: хвосты после токена — новые листья",
+   "file": "internal/store/jobs.go",
+   "old": "\ts.stampedLeaves = num + 2",
+   "new": "\ts.stampedLeaves = num + 1"
+  },
+  {
+   "name": "U51 пакет по источнику: без источника — не ErrWindow",
+   "file": "internal/store/source.go",
+   "old": "\tcase source == \"\":\n\t\treturn proof.SourceBundle{}, fmt.Errorf(\"%w: name the source\", ErrWindow)\n",
+   "new": ""
+  },
+  {
+   "name": "U52 пакет по источнику: верхняя метка без допуска минуты",
+   "file": "internal/store/source.go",
+   "old": "if t.gen.After(to.Add(proof.ReceiveSkew)) {",
+   "new": "if t.gen.After(to) {"
+  },
+  {
+   "name": "U53 пакет по источнику: нижняя метка без допуска секунды",
+   "file": "internal/store/source.go",
+   "old": "if s.tokens[i].gen.Before(from.Add(-proof.ReceiveSlack)) {",
+   "new": "if s.tokens[i].gen.Before(from) {"
+  },
+  {
+   "name": "U54 пакет по источнику: предел листьев не держится",
+   "file": "internal/store/source.go",
+   "old": "\tif end-first > maxWindowLeaves {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U55 пакет по источнику: to_head не доводит звенья",
+   "file": "internal/store/source.go",
+   "old": "\tif toHead > last {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "U56 пакет по источнику: нижняя метка без хвостов не отказ",
+   "file": "internal/store/source.go",
+   "old": "\t\tif len(ls) != 1 || ls[0].Type != auditchain.EventTails {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "U57 пакет по источнику: верхняя метка без хвостов не отказ",
+   "file": "internal/store/source.go",
+   "old": "\t\t\tif tokIdx != len(ls)-2 || ls[tokIdx+1].Type != auditchain.EventTails {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "U58 пакет по источнику: чужие записи в пакете",
+   "file": "internal/store/source.go",
+   "old": " || leaf.Scope != source {",
+   "new": " {"
+  },
+  {
+   "name": "U59 пакет по источнику: записи без ссылок не отказ",
+   "file": "internal/store/source.go",
+   "old": "\t\t\tif _, linked := proof.EvidencePrev(leaf); !linked {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "U60 пакет по источнику: тела не прикладываются",
+   "file": "internal/store/source.go",
+   "old": "\t\t\tif withDEK {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "U61 пакет по источнику: нижний хвост — первый лист, а не последний",
+   "file": "internal/store/source.go",
+   "old": "l < limit && (!ok || l > leaf)",
+   "new": "l < limit && !ok"
+  },
+  {
+   "name": "U62 пакет по источнику: без записей верхнее раскрытие пусто",
+   "file": "internal/store/source.go",
+   "old": "\tb.UpperOpen = b.LowerOpen\n",
+   "new": ""
+  },
+  {
+   "name": "U63 пакет по источнику: верхнее раскрытие — по первой записи",
+   "file": "internal/store/source.go",
+   "old": "\t\tl := b.Records[n-1].Leaf.Leaf.Chain()",
+   "new": "\t\tl := b.Records[0].Leaf.Leaf.Chain()"
+  },
+  {
+   "name": "U64 админка: пакет по источнику без тел",
+   "file": "internal/server/server.go",
+   "old": "s.store.ProofSource(q.Get(\"source\"), from, to, q.Get(\"dek\") == \"1\", head)",
+   "new": "s.store.ProofSource(q.Get(\"source\"), from, to, false, head)"
+  },
+  {
+   "name": "U65 esverify: пакет по источнику — как пакет одной улики",
+   "file": "cmd/esverify/main.go",
+   "old": " || kind == proof.SourceKind {",
+   "new": " {"
+  },
+  {
+   "name": "U66 esverify: пакет по источнику — как пакет за окно",
+   "file": "cmd/esverify/window.go",
+   "old": "\tif kind == proof.SourceKind {\n\t\tverify = verifySource\n\t}\n",
+   "new": ""
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений."

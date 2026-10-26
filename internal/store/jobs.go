@@ -209,12 +209,25 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	}
 	s.stampMu.Lock()
 	defer s.stampMu.Unlock()
-	if err := s.flush(); err != nil {
+	s.chainMu.Lock()
+	if err := s.flushLocked(); err != nil {
+		s.chainMu.Unlock()
 		return 0, gen, err
 	}
-	s.chainMu.Lock()
 	head := s.chain.Head()
 	already := head.Seq == 0 || head.Seq <= s.lastStamped || (!force && s.nextLeaf <= s.stampedLeaves)
+	if !already && head.Seq != s.preTailsHead {
+		// Хвосты перед запросом — одни в своём звене, его метка и заверяет:
+		// состояние источников к моменту метки (п. 28). Метка, повторённая
+		// без новых листьев, заверяет то же звено.
+		s.appendLeafLocked(s.tailsLocked())
+		if err := s.flushLocked(); err != nil {
+			s.chainMu.Unlock()
+			return 0, gen, err
+		}
+		head = s.chain.Head()
+		s.preTailsHead = head.Seq
+	}
 	s.chainMu.Unlock()
 	if already {
 		return 0, gen, nil
@@ -243,10 +256,13 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 		Subject:  strconv.FormatUint(head.Seq, 10),
 		Payload:  token,
 	})
+	// Хвосты сразу после токена — последним листом его звена: в счёт входит
+	// всё, что легло, пока шёл запрос (верхняя граница пакета по источнику).
+	s.appendLeafLocked(s.tailsLocked())
 	s.tokens = append(s.tokens, tokenRef{head: head.Seq, leaf: num, gen: info.GenTime})
 	s.queueWitnessLocked(head, true) // ею кончаются пакеты: свидетель видит её саму
 	s.lastStamped = max(s.lastStamped, head.Seq)
-	s.stampedLeaves = num + 1
+	s.stampedLeaves = num + 2
 	err = s.flushLocked()
 	s.chainMu.Unlock()
 	s.anchorClock(info.GenTime, s.mono()-asked)

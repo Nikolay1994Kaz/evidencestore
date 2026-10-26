@@ -1846,6 +1846,29 @@ func (m *storeSim) check() {
 		if n != len(where) {
 			m.fail("в пакете за окно %d улик, в журнале улик %d", n, len(where))
 		}
+		// И по каждому источнику (п. 28): его цепочка сходится от начала
+		// цепи до последней метки, и в ней все его улики журнала.
+		perSource := map[string]int{}
+		for k := range where {
+			perSource[k.source]++
+		}
+		for _, c := range m.clients {
+			r, err := wholeChainSource(s, c.source, trust)
+			switch {
+			case err != nil:
+				m.fail("пакет по источнику %s: %v", c.source, err)
+			case !r.Valid():
+				m.fail("пакет по источнику %s не проходит: %s", c.source, sourceFailedChecks(r))
+			case r.Records != perSource[c.source]:
+				m.fail("в пакете по источнику %s %d улик, в журнале улик %d", c.source, r.Records, perSource[c.source])
+			}
+			switch r, ok, err := midChainSource(s, c.source, trust); {
+			case err != nil:
+				m.fail("пакет по источнику %s от середины цепи: %v", c.source, err)
+			case ok && (!r.Valid() || r.FromStart):
+				m.fail("пакет по источнику %s от середины цепи не проходит: %s", c.source, sourceFailedChecks(r))
+			}
+		}
 	}
 	s.Close()
 	m.s = nil
