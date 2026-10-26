@@ -181,6 +181,11 @@ type SourceStatus struct {
 	Silent   bool      `json:"silent"`
 	// Epoch — эпоха сборщика, закреплённая за источником (epoch.go).
 	Epoch string `json:"collector_epoch,omitempty"`
+	// LastContact — последнее обращение сборщика, пропущенное Admit (с
+	// запуска хранилища); ContactLost — идёт эпизод «сборщик пропал»
+	// (contact.go).
+	LastContact time.Time `json:"last_contact"`
+	ContactLost bool      `json:"contact_lost"`
 }
 
 // Status — сводка для оператора.
@@ -219,6 +224,7 @@ func (s *Store) Status() Status {
 		out.Sources = append(out.Sources, SourceStatus{
 			Name: name, Known: st.known, Disabled: st.cfg.Disabled, Records: st.count,
 			MaxSeq: st.maxSeq, LastAt: st.lastAt.UTC(), Silent: st.silent, Epoch: st.epoch,
+			LastContact: st.contactAt.UTC(), ContactLost: !st.lostSince.IsZero(),
 		})
 		out.Records += st.count
 	}

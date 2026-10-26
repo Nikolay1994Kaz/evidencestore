@@ -228,6 +228,13 @@ type sourceState struct {
 	inflight map[uint64]bool
 	silent   bool
 
+	// Связь со сборщиком (contact.go): последнее обращение, пропущенное
+	// Admit; последний контакт перед эпизодом «сборщик пропал» (ноль —
+	// эпизода нет) и первый после него (ноль — ещё не вернулся).
+	contactAt time.Time
+	lostSince time.Time
+	backAt    time.Time
+
 	pendingGaps []gap // найденные пропуски, ещё не записанные в цепь
 
 	// Журнал гейтвея (gateway.go); gw == nil — источник не гейтвей.

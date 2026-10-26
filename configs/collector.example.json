@@ -8,5 +8,6 @@
   "file": "/var/log/abs/audit.log",
   "from_start": false,
   "batch": 256,
-  "flush_every": "1s"
+  "flush_every": "1s",
+  "heartbeat_every": "30s"
 }

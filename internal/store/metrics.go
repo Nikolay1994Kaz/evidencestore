@@ -38,6 +38,8 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 	records := metrics.Family{Name: "evidencestore_records", Help: "records of the source in the evidence log", Type: metrics.Gauge}
 	last := metrics.Family{Name: "evidencestore_source_last_record_timestamp_seconds", Help: "receive time of the source's last record, 0 if none", Type: metrics.Gauge}
 	silent := metrics.Family{Name: "evidencestore_source_silent", Help: "1 when the source has been silent longer than its expect_every", Type: metrics.Gauge}
+	lost := metrics.Family{Name: "evidencestore_source_contact_lost", Help: "1 when the source's collector has not contacted the store (a batch or a heartbeat) for longer than its expect_contact: stopped, crashed, host down or network cut", Type: metrics.Gauge}
+	contact := metrics.Family{Name: "evidencestore_source_last_contact_timestamp_seconds", Help: "when the source's collector last contacted the store, 0 if not since start", Type: metrics.Gauge}
 	dups := metrics.Family{Name: "evidencestore_records_duplicate_total", Help: "records resent by the source that had already been accepted", Type: metrics.Counter}
 	conflicts := metrics.Family{Name: "evidencestore_records_conflict_total", Help: "records resent under a taken seq with another body: a collector rolled back to an old copy, or two collectors with one certificate", Type: metrics.Counter}
 	epochs := metrics.Family{Name: "evidencestore_epoch_refused_total", Help: "requests refused because another collector installation (another epoch) uses the source certificate", Type: metrics.Counter}
@@ -54,6 +56,8 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		records.Samples = append(records.Samples, metrics.Sample{Labels: l, Value: float64(src.count)})
 		last.Samples = append(last.Samples, metrics.Sample{Labels: l, Value: seconds(src.lastAt)})
 		silent.Samples = append(silent.Samples, metrics.Sample{Labels: l, Value: metrics.Bool(src.silent)})
+		lost.Samples = append(lost.Samples, metrics.Sample{Labels: l, Value: metrics.Bool(!src.lostSince.IsZero())})
+		contact.Samples = append(contact.Samples, metrics.Sample{Labels: l, Value: seconds(src.contactAt)})
 		dups.Samples = append(dups.Samples, metrics.Sample{Labels: l, Value: float64(src.dups.Load())})
 		conflicts.Samples = append(conflicts.Samples, metrics.Sample{Labels: l, Value: float64(src.conflicts.Load())})
 		epochs.Samples = append(epochs.Samples, metrics.Sample{Labels: l, Value: float64(src.epochRefused.Load())})
@@ -62,7 +66,7 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		}
 	}
 	s.mu.Unlock()
-	return append(fams, records, last, silent, dups, conflicts, epochs, gw)
+	return append(fams, records, last, silent, lost, contact, dups, conflicts, epochs, gw)
 }
 
 // receiveAhead — насколько последнее время приёма впереди часов хоста.

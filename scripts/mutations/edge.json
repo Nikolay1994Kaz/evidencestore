@@ -435,6 +435,48 @@
    "file": "internal/collector/collector.go",
    "old": "\t\t} else if strings.ContainsAny(filepath.Dir(c.Glob), `*?[\\`) {",
    "new": "\t\t} else if false {"
+  },
+  {
+   "name": "C76 пульса нет (P-05)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif now.Sub(c.contactAt) < c.cfg.HeartbeatEvery.D() {",
+   "new": "\tif true || now.Sub(c.contactAt) < c.cfg.HeartbeatEvery.D() {"
+  },
+  {
+   "name": "C77 пульс на каждом проходе (P-05)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif now.Sub(c.contactAt) < c.cfg.HeartbeatEvery.D() {",
+   "new": "\tif now.Sub(c.contactAt) < 0 {"
+  },
+  {
+   "name": "C78 ответ на state не продлевает связь (P-05)",
+   "file": "internal/collector/collector.go",
+   "old": "\tc.contactAt = c.now()\n\treturn st, nil",
+   "new": "\treturn st, nil"
+  },
+  {
+   "name": "C79 ответ на приём не продлевает связь (P-05)",
+   "file": "internal/collector/collector.go",
+   "old": "\tc.contactAt = c.now()\n\tvar out ingestResponse",
+   "new": "\tvar out ingestResponse"
+  },
+  {
+   "name": "C80 отказ в ответе на пульс проглатывается (P-05)",
+   "file": "internal/collector/collector.go",
+   "old": "\t_, err := c.fetchState(ctx)\n\treturn err\n}",
+   "new": "\tc.fetchState(ctx)\n\treturn nil\n}"
+  },
+  {
+   "name": "C81 heartbeat_every по умолчанию не ставится",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tc.HeartbeatEvery = config.Duration(30 * time.Second)",
+   "new": "\t\tc.HeartbeatEvery = 0"
+  },
+  {
+   "name": "C82 отрицательный heartbeat_every принимается",
+   "file": "internal/collector/collector.go",
+   "old": "\tif c.HeartbeatEvery < 0 {",
+   "new": "\tif false && c.HeartbeatEvery < 0 {"
   }
  ],
  "note": "V3 (имя из сертификата не сверяется с реестром на входе) снят как равносильный: store.Ingest и store.LastSeq сами отказывают неизвестному источнику (ErrUnknownSource → 403)."

@@ -58,6 +58,8 @@ func (s *Store) scanChain() (chainScan, error) {
 			delete(cs.silent, l.Scope)
 		case auditchain.EventSilence:
 			cs.silent[l.Scope] = true
+		case auditchain.EventContact:
+			return s.replayContact(num, l)
 		case auditchain.EventTimestamp:
 			head, err := strconv.ParseUint(l.Subject, 10, 64)
 			if err != nil {

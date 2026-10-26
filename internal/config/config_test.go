@@ -101,6 +101,9 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 	if c.Sources[0].CertSHA256 != strings.Repeat("ab", 32) {
 		t.Fatalf("отпечаток не приведён к нижнему регистру: %s", c.Sources[0].CertSHA256)
 	}
+	if c.Sources[0].ExpectContact.D() != DefaultExpectContact {
+		t.Fatalf("expect_contact по умолчанию: %v", c.Sources[0].ExpectContact.D())
+	}
 	for name, spoil := range map[string]func(*Config){
 		"корни внутри данных":   func(c *Config) { c.RootsDir = filepath.Join(c.DataDir, "roots") },
 		"данные внутри корней":  func(c *Config) { c.DataDir = filepath.Join(c.RootsDir, "data") },
@@ -114,6 +117,8 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 			c.Replica.URL, c.Witness.URL = "file:///srv/copy", "file:///srv/copy"
 		},
 		"expect_every -1s":      func(c *Config) { c.Sources[0].ExpectEvery = Duration(-time.Second) },
+		"expect_contact 30s":    func(c *Config) { c.Sources[0].ExpectContact = Duration(30 * time.Second) },
+		"expect_contact -1m":    func(c *Config) { c.Sources[0].ExpectContact = Duration(-time.Minute) },
 		"content_type 256 байт": func(c *Config) { c.Sources[0].ContentType = strings.Repeat("x", 256) },
 	} {
 		c := good()

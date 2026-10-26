@@ -56,6 +56,18 @@
    "file": "internal/config/config.go",
    "old": "\"witness.every\": c.Witness.Every, ",
    "new": ""
+  },
+  {
+   "name": "F10 expect_contact по умолчанию не ставится",
+   "file": "internal/config/config.go",
+   "old": "\t\t\tc.Sources[i].ExpectContact = Duration(DefaultExpectContact)",
+   "new": "\t\t\tc.Sources[i].ExpectContact = 0"
+  },
+  {
+   "name": "F11 expect_contact короче минуты принимается",
+   "file": "internal/config/config.go",
+   "old": "\t\tif s.ExpectContact != 0 && s.ExpectContact.D() < MinExpectContact {",
+   "new": "\t\tif false && s.ExpectContact != 0 && s.ExpectContact.D() < MinExpectContact {"
   }
  ]
 }

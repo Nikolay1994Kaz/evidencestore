@@ -200,8 +200,8 @@ echo "restored line: $(cat "$B/5.restored")"
 
 step "what this does not cover"
 echo "- lines the intruder destroys before the collector reads them (within flush_every, here 200 ms) are not in the store;"
-echo "- an intruder who stops the collector first shows only as a source gone quiet (evidencestore_source_silent after"
-echo "  expect_every): the store cannot tell a stopped collector from a quiet log;"
+echo "- an intruder who stops the collector first shows as a lost collector after expect_contact (2 minutes; in the chain"
+echo "  and as evidencestore_source_contact_lost); a shorter stop goes unseen, and root here can fake the heartbeat;"
 echo "- the store keeps what the server wrote; it does not make a line true, it makes it impossible to remove unnoticed;"
 echo "- the store runs on another host: editing its files is caught too (scripts/demo.sh shows a one-byte forgery)."
 echo

@@ -6,11 +6,13 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1241,6 +1243,178 @@ func TestFileRemoteDirsNotCreated(t *testing.T) {
 	}
 	if len(witnessHeads(t, witnessDir).Heads) == 0 {
 		t.Fatal("головы не дошли до свидетеля")
+	}
+}
+
+func sourceStatus(t *testing.T, s *Store, name string) SourceStatus {
+	t.Helper()
+	for _, src := range s.Status().Sources {
+		if src.Name == name {
+			return src
+		}
+	}
+	t.Fatalf("источника %s нет в статусе", name)
+	return SourceStatus{}
+}
+
+// contactEvents — события связи со сборщиком источника в цепи: вид, с какого
+// контакта, до какого.
+func contactEvents(t *testing.T, cfg *config.Config, source string) []string {
+	t.Helper()
+	var out []string
+	for _, l := range leavesOf(t, cfg, auditchain.EventContact) {
+		if l.Scope != source {
+			continue
+		}
+		var ev struct {
+			Since time.Time `json:"since"`
+			Back  time.Time `json:"back"`
+		}
+		if err := json.Unmarshal(l.Payload, &ev); err != nil {
+			t.Fatal(err)
+		}
+		e := l.Subject + " " + ev.Since.Format(time.TimeOnly)
+		if !ev.Back.IsZero() {
+			e += "–" + ev.Back.Format(time.TimeOnly)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// P-05: сборщик не выходит на связь дольше expect_contact — в цепи
+// «сборщик пропал» с последним контактом, статус и тревога; вернулся — в
+// цепи окно без связи. Событие одно на эпизод. Раньше пропажа сборщика была
+// видна только как молчание журнала, и то через expect_every.
+func TestCollectorLostAndBack(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t)
+	s := openStore(t, cfg, c)
+	if err := s.Admit("abs-core", ""); err != nil {
+		t.Fatal(err)
+	}
+	t0 := c.now()
+	c.add(2 * time.Minute)
+	s.CheckContact(c.now())
+	if sourceStatus(t, s, "abs-core").ContactLost {
+		t.Fatal("две минуты без связи — уже «пропал»")
+	}
+	c.add(time.Second)
+	s.CheckContact(c.now())
+	c.add(time.Minute)
+	s.CheckContact(c.now())
+	if st := sourceStatus(t, s, "abs-core"); !st.ContactLost || !st.LastContact.Equal(t0) {
+		t.Fatalf("пропавший сборщик не виден: %+v", st)
+	}
+	var b strings.Builder
+	if err := metrics.Write(&b, s.Metrics(c.now())); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(b.String(), `evidencestore_source_contact_lost{source="abs-core"} 1`+"\n") {
+		t.Fatal("пропавший сборщик не виден в метрике")
+	}
+	if err := s.Admit("abs-core", ""); err != nil {
+		t.Fatal(err)
+	}
+	t1 := c.now()
+	c.add(5 * time.Second) // окно без связи кончается первым контактом, а не последним до проверки
+	if err := s.Admit("abs-core", ""); err != nil {
+		t.Fatal(err)
+	}
+	s.CheckContact(c.now())
+	if sourceStatus(t, s, "abs-core").ContactLost {
+		t.Fatal("вернувшийся сборщик всё ещё «пропал»")
+	}
+	s.Close()
+	want := []string{"lost " + t0.Format(time.TimeOnly), "back " + t0.Format(time.TimeOnly) + "–" + t1.Format(time.TimeOnly)}
+	if got := contactEvents(t, cfg, "abs-core"); !slices.Equal(got, want) {
+		t.Fatalf("события связи %q, ожидали %q", got, want)
+	}
+}
+
+// P-05: журнал молчит, а сборщик на связи (пульс без записей) — это не
+// пропажа: «сборщик пропал» нет, а молчание журнала — своим чередом
+// (expect_every). Так тихий журнал и остановленный сборщик различаются.
+func TestQuietLogIsNotLostCollector(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	ingest(t, s, "abs-core", 1, 1)
+	for range 24 { // 12 минут, пульс раз в 30 с
+		c.add(30 * time.Second)
+		if err := s.Admit("abs-core", ""); err != nil {
+			t.Fatal(err)
+		}
+		s.CheckContact(c.now())
+		s.CheckSilence(c.now())
+	}
+	if st := sourceStatus(t, s, "abs-core"); st.ContactLost || !st.Silent {
+		t.Fatalf("тихий журнал при живом сборщике: пропал %v, молчит %v", st.ContactLost, st.Silent)
+	}
+}
+
+// P-05: обращения установки, которой хранилище отказало (чужая эпоха), — не
+// контакт: подменённый сборщик не прикрывает пропажу настоящего.
+func TestRefusedCollectorIsNoContact(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	if err := s.Admit("abs-core", epochA); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		c.add(30 * time.Second)
+		if err := s.Admit("abs-core", epochB); !errors.Is(err, ErrEpochMismatch) {
+			t.Fatalf("чужая установка: %v", err)
+		}
+		s.CheckContact(c.now())
+	}
+	if !sourceStatus(t, s, "abs-core").ContactLost {
+		t.Fatal("отказанная установка продлила связь")
+	}
+}
+
+// P-05: простой самого хранилища — не пропажа сборщика: отсчёт — с его
+// старта. Эпизод «пропал» переживает рестарт: второго события нет, а
+// «вернулся» после рестарта называет контакт до пропажи.
+func TestCollectorContactAcrossRestart(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t)
+	s := openStore(t, cfg, c)
+	if err := s.Admit("abs-core", ""); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	c.add(10 * time.Minute) // хранилище лежало
+	s2 := openStore(t, cfg, c)
+	c.add(time.Minute)
+	s2.CheckContact(c.now())
+	if sourceStatus(t, s2, "abs-core").ContactLost {
+		t.Fatal("простой хранилища засчитан пропажей сборщика")
+	}
+	if err := s2.Admit("abs-core", ""); err != nil {
+		t.Fatal(err)
+	}
+	t0 := c.now()
+	c.add(3 * time.Minute)
+	s2.CheckContact(c.now()) // пропал
+	s2.Close()
+	s3 := openStore(t, cfg, c)
+	c.add(3 * time.Minute)
+	s3.CheckContact(c.now())
+	if !sourceStatus(t, s3, "abs-core").ContactLost {
+		t.Fatal("эпизод «пропал» потерян при рестарте")
+	}
+	if err := s3.Admit("abs-core", ""); err != nil {
+		t.Fatal(err)
+	}
+	t1 := c.now()
+	s3.CheckContact(c.now())
+	s3.Close()
+	if sourceStatus(t, openStore(t, cfg, c), "abs-core").ContactLost { // «вернулся» в цепи закрыл эпизод
+		t.Fatal("после «вернулся» и рестарта сборщик снова «пропал»")
+	}
+	want := []string{"lost " + t0.Format(time.TimeOnly), "back " + t0.Format(time.TimeOnly) + "–" + t1.Format(time.TimeOnly)}
+	if got := contactEvents(t, cfg, "abs-core"); !slices.Equal(got, want) {
+		t.Fatalf("события связи %q, ожидали %q", got, want)
 	}
 }
 

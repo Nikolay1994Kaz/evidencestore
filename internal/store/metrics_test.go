@@ -34,6 +34,7 @@ func TestMetrics(t *testing.T) {
 		`evidencestore_records_duplicate_total{source="abs-core"} 1`,
 		`evidencestore_records_conflict_total{source="abs-core"} 0`,
 		`evidencestore_epoch_refused_total{source="abs-core"} 0`,
+		`evidencestore_source_contact_lost{source="abs-core"} 0`,
 		`evidencestore_gateway_problems_total{source="agent-gw"} 1`,
 		`evidencestore_ingest_errors_total 1`,
 		`evidencestore_log_failed 0`,

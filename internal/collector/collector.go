@@ -89,6 +89,11 @@ type Config struct {
 	FromStart  bool            `json:"from_start"`
 	Batch      int             `json:"batch"`       // записей в пачке, 1–512; 0 — 256
 	FlushEvery config.Duration `json:"flush_every"` // пауза между проходами; 0 — 1 с
+	// HeartbeatEvery — пульс: отправлять нечего, а хранилище не отвечало
+	// сборщику дольше этого — GET /v1/state, и хранилище отличает тихий
+	// журнал от остановленного сборщика (expect_contact источника, по
+	// умолчанию 2 мин). 0 — 30 с.
+	HeartbeatEvery config.Duration `json:"heartbeat_every"`
 }
 
 const (
@@ -130,6 +135,9 @@ func (c *Config) validate() error {
 	if c.FlushEvery == 0 {
 		c.FlushEvery = config.Duration(time.Second)
 	}
+	if c.HeartbeatEvery == 0 {
+		c.HeartbeatEvery = config.Duration(30 * time.Second)
+	}
 	c.Server = strings.TrimRight(c.Server, "/")
 	var errs []error
 	for name, v := range map[string]string{"server": c.Server, "ca": c.CA, "cert": c.Cert, "key": c.Key, "store_key": c.StoreKey, "spool_dir": c.SpoolDir} {
@@ -154,6 +162,9 @@ func (c *Config) validate() error {
 	}
 	if c.FlushEvery < 0 {
 		errs = append(errs, fmt.Errorf("flush_every %v: must not be negative", c.FlushEvery.D()))
+	}
+	if c.HeartbeatEvery < 0 {
+		errs = append(errs, fmt.Errorf("heartbeat_every %v: must not be negative", c.HeartbeatEvery.D()))
 	}
 	if (c.File == "") == (c.Glob == "") {
 		errs = append(errs, errors.New("exactly one of file and glob is required"))
@@ -201,6 +212,10 @@ type Collector struct {
 	sentPos  uint64 // позиция в буфере: всё до неё включительно доставлено
 	pending  int    // строк в буфере после sentPos
 	promises promiseFile
+	// contactAt — когда хранилище последний раз ответило сборщику (приём или
+	// state): старше heartbeat_every — пульс (SendOnce). Ноль — ещё не
+	// отвечало; отсчёт тогда с первого прохода.
+	contactAt time.Time
 
 	warned map[string]time.Time // когда последний раз сказали «читать нечего (нельзя)» — по пути
 
@@ -583,6 +598,7 @@ func (c *Collector) fetchState(ctx context.Context) (stateResponse, error) {
 	if base64.RawStdEncoding.EncodeToString(c.storeKey) != st.PublicKey {
 		return st, ErrStoreKey
 	}
+	c.contactAt = c.now()
 	return st, nil
 }
 
@@ -691,7 +707,7 @@ func (c *Collector) Run(ctx context.Context) error {
 				backoff = min(max(backoff*2, time.Second), time.Minute)
 				sendAt = time.Now().Add(backoff)
 				level := slog.LevelWarn
-				if errors.Is(err, ErrBadPromise) {
+				if errors.Is(err, ErrBadPromise) || errors.Is(err, ErrStoreKey) {
 					level = slog.LevelError
 				}
 				c.log.Log(ctx, level, "send", "err", err, "pending", c.pending, "retry_in", backoff)
@@ -1395,6 +1411,14 @@ const maxBatchBytes = 1 << 20
 
 // SendOnce отправляет накопленное пачками, пока есть что и пока хранилище
 // принимает. Доставленные сегменты буфера удаляются.
+//
+// Отправлять нечего, а хранилище не отвечало дольше heartbeat_every, —
+// пульс: GET /v1/state, тот же запрос, что при старте. Без него хранилище
+// не отличает тихий журнал от остановленного сборщика (P-05). Пульс идёт из
+// того же цикла, что читает журнал: зависший цикл замолчит, как убитый
+// процесс. Отказ эпохе в ответе на пульс — стоп, как при отправке: прежняя
+// установка после sources bind останавливается и тогда, когда ей нечего
+// слать.
 func (c *Collector) SendOnce(ctx context.Context) error {
 	for c.pending > 0 {
 		batch, last, err := c.nextBatch()
@@ -1417,7 +1441,15 @@ func (c *Collector) SendOnce(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	now := c.now()
+	if c.contactAt.IsZero() {
+		c.contactAt = now
+	}
+	if now.Sub(c.contactAt) < c.cfg.HeartbeatEvery.D() {
+		return nil
+	}
+	_, err := c.fetchState(ctx)
+	return err
 }
 
 // nextBatch — следующая пачка из буфера: строки после sentPos, не больше
@@ -1527,6 +1559,7 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 		}
 		return fmt.Errorf("store answered %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
+	c.contactAt = c.now()
 	var out ingestResponse
 	if err := json.Unmarshal(body, &out); err != nil {
 		return fmt.Errorf("store answered garbage: %w", err)

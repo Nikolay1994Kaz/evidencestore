@@ -648,13 +648,14 @@ func TestConfigRejectsDangerousValues(t *testing.T) {
 	if err := c.validate(); err != nil {
 		t.Fatal(err)
 	}
-	if c.Batch != defaultBatch || c.FlushEvery.D() != time.Second || c.Server != "https://store:8443" {
+	if c.Batch != defaultBatch || c.FlushEvery.D() != time.Second || c.HeartbeatEvery.D() != 30*time.Second || c.Server != "https://store:8443" {
 		t.Fatalf("умолчания: %+v", c)
 	}
 	for name, spoil := range map[string]func(*Config){
 		"batch 1000":             func(c *Config) { c.Batch = 1000 },
 		"batch -5":               func(c *Config) { c.Batch = -5 },
 		"flush_every -1s":        func(c *Config) { c.FlushEvery = config.Duration(-time.Second) },
+		"heartbeat_every -1s":    func(c *Config) { c.HeartbeatEvery = config.Duration(-time.Second) },
 		"http://":                func(c *Config) { c.Server = "http://store:8443" },
 		"кривой порт":            func(c *Config) { c.Server = "https://127.0.0.1:abc" },
 		"без хоста":              func(c *Config) { c.Server = "https://" },
@@ -992,6 +993,70 @@ func TestRunStopsWhenRebound(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("Run не остановился после отказа")
+	}
+}
+
+// P-05: сборщику нечего слать — раз в heartbeat_every он делает пульс
+// (GET /v1/state), и хранилище видит, что он на связи. Пока идут пачки,
+// пульса нет: на связи держат сами пачки.
+func TestPulseWhenIdle(t *testing.T) {
+	var states atomic.Int64
+	r := newRig(t, func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == "/v1/state" {
+				states.Add(1)
+			}
+			h.ServeHTTP(w, req)
+		})
+	})
+	r.cfg.HeartbeatEvery = config.Duration(100 * time.Millisecond)
+	c := r.collector(t) // запуск: первый state
+	contact := func() time.Time {
+		for _, src := range r.st.Status().Sources {
+			if src.Name == "abs-core" {
+				return src.LastContact
+			}
+		}
+		return time.Time{}
+	}
+	ctx := context.Background()
+	started := contact()
+	if err := c.SendOnce(ctx); err != nil || states.Load() != 1 {
+		t.Fatalf("пульс сразу после ответа хранилища: %v, state %d", err, states.Load())
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := c.SendOnce(ctx); err != nil || states.Load() != 2 {
+		t.Fatalf("нет пульса в простое: %v, state %d", err, states.Load())
+	}
+	if !contact().After(started) {
+		t.Fatal("хранилище не заметило пульса")
+	}
+	if err := c.SendOnce(ctx); err != nil || states.Load() != 2 {
+		t.Fatalf("второй пульс сразу за первым: %v, state %d", err, states.Load())
+	}
+	appendLines(t, r.cfg.File, "x\n")
+	time.Sleep(150 * time.Millisecond)
+	if _, err := c.ReadOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SendOnce(ctx); err != nil || states.Load() != 2 {
+		t.Fatalf("пульс поверх пачки: %v, state %d", err, states.Load())
+	}
+}
+
+// P-05: прежняя установка после sources bind останавливается и тогда, когда
+// ей нечего слать: отказ приходит в ответ на пульс. Раньше она узнавала об
+// отказе только со следующей строкой журнала.
+func TestIdleCollectorStopsWhenRebound(t *testing.T) {
+	r := newRig(t)
+	r.cfg.HeartbeatEvery = config.Duration(50 * time.Millisecond)
+	c := r.collector(t)
+	if err := r.st.BindEpoch("abs-core", strings.Repeat("b", 32)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if err := c.SendOnce(context.Background()); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("простаивающая прежняя установка: %v", err)
 	}
 }
 

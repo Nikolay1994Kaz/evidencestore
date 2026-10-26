@@ -73,6 +73,10 @@ const (
 	// установке с другой эпохой. Scope = источник, Payload = эпоха, прежняя
 	// или закреплённая эпоха и причина (см. пакет store).
 	EventEpoch EventType = 11
+	// EventContact — связь со сборщиком источника: Subject "lost" — сборщик
+	// не выходил на связь дольше expect_contact, "back" — вернулся. Scope =
+	// источник, Payload — с какого контакта и до какого (см. пакет store).
+	EventContact EventType = 12
 )
 
 // ⭐ЛИСТ И ЗВЕНО — ПОЧЕМУ ЭТО РАЗНЫЕ ТИПЫ.

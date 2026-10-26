@@ -20,8 +20,8 @@
     "roots_mirror_dir": "/mnt/roots-mirror/evidencestore"
   },
   "sources": [
-    {"name": "abs-core", "content_type": "syslog", "retention_months": 36, "expect_every": "10m"},
-    {"name": "pipelock", "content_type": "pipelock/recorder", "retention_months": 36, "expect_every": "1h",
+    {"name": "abs-core", "content_type": "syslog", "retention_months": 36, "expect_every": "10m", "expect_contact": "2m"},
+    {"name": "pipelock", "content_type": "pipelock/recorder", "retention_months": 36, "expect_every": "1h", "expect_contact": "2m",
      "cert_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
      "gateway_key": "0000000000000000000000000000000000000000000000000000000000000000"}
   ]

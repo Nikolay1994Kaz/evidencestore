@@ -167,6 +167,7 @@ type simStats struct {
 	copyDeaths                                   int // диск потерян вместе с падением посреди прохода копии
 	rushes, rushBatches                          int // заходов параллельной работы; пачек, посланных в них
 	twins, rogueRaces                            int // одна пачка двумя запросами сразу; чужая установка во время приёма
+	lostCollectors                               int // эпизодов «сборщик пропал» в цепи
 }
 
 func (a *simStats) add(b simStats) {
@@ -196,12 +197,13 @@ func (a *simStats) add(b simStats) {
 	a.rushBatches += b.rushBatches
 	a.twins += b.twins
 	a.rogueRaces += b.rogueRaces
+	a.lostCollectors += b.lostCollectors
 }
 
 func (a simStats) String() string {
-	return fmt.Sprintf("падений %d (посреди записи %d, посреди записи головы %d, с недописанными .tmp %d), штатных перезапусков %d, keyring.dat из резерва %d, откатов keyring.dat %d; сегментов журнала %d, файлов листьев %d; заявок на уничтожение %d, отмен %d, уничтожений сирот %d, ключей уничтожено %d; падений посреди поворота корня %d, подъёмов с сиротами %d; подъёмов из копии %d, врущий диск %d (громких отказов %d), принятых потеряно с диском %d, копия не продолжается data_dir %d, переведена на новое место %d, диск потерян посреди прохода копии %d; параллельной работы %d заходов (%d пачек, из них двумя запросами сразу %d; чужая установка во время приёма %d)",
+	return fmt.Sprintf("падений %d (посреди записи %d, посреди записи головы %d, с недописанными .tmp %d), штатных перезапусков %d, keyring.dat из резерва %d, откатов keyring.dat %d; сегментов журнала %d, файлов листьев %d; заявок на уничтожение %d, отмен %d, уничтожений сирот %d, ключей уничтожено %d; падений посреди поворота корня %d, подъёмов с сиротами %d; подъёмов из копии %d, врущий диск %d (громких отказов %d), принятых потеряно с диском %d, копия не продолжается data_dir %d, переведена на новое место %d, диск потерян посреди прохода копии %d; параллельной работы %d заходов (%d пачек, из них двумя запросами сразу %d; чужая установка во время приёма %d); эпизодов «сборщик пропал» %d",
 		a.crashes, a.torn, a.headTears, a.litter, a.restarts, a.restores, a.rollbacks, a.evSegments, a.leafFiles,
-		a.schedules, a.cancels, a.orphanRuns, a.destroyed, a.rootCrashes, a.orphansSeen, a.drs, a.lies, a.loud, a.drLost, a.divergedCopies, a.relocations, a.copyDeaths, a.rushes, a.rushBatches, a.twins, a.rogueRaces)
+		a.schedules, a.cancels, a.orphanRuns, a.destroyed, a.rootCrashes, a.orphansSeen, a.drs, a.lies, a.loud, a.drLost, a.divergedCopies, a.relocations, a.copyDeaths, a.rushes, a.rushBatches, a.twins, a.rogueRaces, a.lostCollectors)
 }
 
 // storeSim — один сценарий.
@@ -1416,6 +1418,7 @@ func (m *storeSim) rushBackground() {
 	if now.Sub(m.lastAnchor) >= anchorRetry {
 		m.lastAnchor = now
 		m.s.CheckSilence(now)
+		m.s.CheckContact(now)
 		if m.s.anchorStale() {
 			if _, err := m.s.stampNow(context.Background()); err != nil {
 				m.fail("якорь: %v", err)
@@ -1495,6 +1498,9 @@ func (m *storeSim) background() {
 	if now.Sub(m.lastAnchor) >= anchorRetry {
 		m.lastAnchor = now
 		m.op("молчание", false, func() error { m.s.CheckSilence(now); return nil })
+		if m.s != nil {
+			m.op("связь", false, func() error { m.s.CheckContact(now); return nil })
+		}
 		if m.s != nil && m.s.anchorStale() {
 			if err, crashed := m.op("якорь", true, func() error { _, err := m.s.stampNow(context.Background()); return err }); err != nil && !crashed {
 				m.fail("якорь: %v", err)
@@ -1830,9 +1836,20 @@ func (m *storeSim) check() {
 	gaps := map[string][][2]uint64{}
 	lastKey := map[string]string{}
 	silent := map[string]bool{}
+	lost := map[string]bool{} // эпизод «сборщик пропал» идёт
 	verdicts := map[uint64][]gateway.Verdict{}
 	err = auditchain.ScanLeaves(chainDir, func(num uint64, l auditchain.Leaf) error {
 		switch l.Type {
+		case auditchain.EventContact:
+			switch {
+			case l.Subject == contactLost && lost[l.Scope]:
+				m.fail("«сборщик %s пропал» дважды за один эпизод (лист %d)", l.Scope, num)
+			case l.Subject == contactBack && !lost[l.Scope]:
+				m.fail("«сборщик %s вернулся» без «пропал» (лист %d)", l.Scope, num)
+			case l.Subject == contactLost:
+				m.stats.lostCollectors++
+			}
+			lost[l.Scope] = l.Subject == contactLost
 		case auditchain.EventGateway:
 			pos, v, err := proof.ParseGatewayLeaf(l)
 			if err != nil {

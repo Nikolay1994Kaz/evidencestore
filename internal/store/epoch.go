@@ -61,8 +61,17 @@ const (
 // прежней версии: принимается, пока за источником ничего не закреплено.
 //
 // Ingest эпоху не сверяет: это делает сервер через Admit до приёма, как
-// источник — по сертификату.
+// источник — по сертификату. Пропущенный запрос — контакт со сборщиком
+// (contact.go); отказанный — нет.
 func (s *Store) Admit(source, epoch string) error {
+	if err := s.admit(source, epoch); err != nil {
+		return err
+	}
+	s.noteContact(source)
+	return nil
+}
+
+func (s *Store) admit(source, epoch string) error {
 	if epoch != "" && !ValidEpoch(epoch) {
 		return fmt.Errorf("%w: collector epoch %q is not %d hex digits", ErrBadRecord, epoch, EpochLen)
 	}

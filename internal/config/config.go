@@ -136,6 +136,12 @@ type Source struct {
 	// ExpectEvery — ожидаемый ритм записей. Молчание дольше — событие
 	// «источник молчит» в цепи. 0 — не следить.
 	ExpectEvery Duration `json:"expect_every"`
+	// ExpectContact — сборщик источника выходит на связь не реже: отправкой
+	// или пульсом, когда отправлять нечего (heartbeat_every сборщика, 30 с).
+	// Дольше — событие «сборщик пропал» в цепи. В отличие от expect_every,
+	// порог зависит не от журнала, а от пульса, и одно значение годится
+	// всем: 0 — 2 мин.
+	ExpectContact Duration `json:"expect_contact"`
 	// Disabled — источник выведен из работы: приём отклоняется.
 	Disabled bool `json:"disabled"`
 	// GatewayKey — открытый ключ гейтвея (Ed25519, 64 hex) для источника с
@@ -247,8 +253,20 @@ func (c *Config) Defaults() {
 	for i := range c.Sources {
 		c.Sources[i].CertSHA256 = strings.ToLower(c.Sources[i].CertSHA256)
 		c.Sources[i].GatewayKey = strings.ToLower(c.Sources[i].GatewayKey)
+		if c.Sources[i].ExpectContact == 0 {
+			c.Sources[i].ExpectContact = Duration(DefaultExpectContact)
+		}
 	}
 }
+
+// DefaultExpectContact — expect_contact по умолчанию: четыре пульса
+// сборщика (30 с). MinExpectContact — меньше нельзя: после рестарта
+// хранилища сборщик возвращается с паузой до минуты (его пауза между
+// повторами растёт до минуты), и каждый рестарт давал бы «сборщик пропал».
+const (
+	DefaultExpectContact = 2 * time.Minute
+	MinExpectContact     = time.Minute
+)
 
 // MinWaitFloor — наименьший keys.min_wait вне режима demo.
 const MinWaitFloor = time.Hour
@@ -326,6 +344,9 @@ func (c *Config) Validate() error {
 		}
 		if s.ExpectEvery < 0 {
 			errs = append(errs, fmt.Errorf("sources[%d] %s: expect_every must not be negative (0 — off)", i, s.Name))
+		}
+		if s.ExpectContact != 0 && s.ExpectContact.D() < MinExpectContact {
+			errs = append(errs, fmt.Errorf("sources[%d] %s: expect_contact %v is shorter than %v: after a store restart its collector comes back within a minute, so every restart would read as a lost collector", i, s.Name, s.ExpectContact.D(), MinExpectContact))
 		}
 		if s.CertSHA256 != "" {
 			if b, err := hex.DecodeString(s.CertSHA256); err != nil || len(b) != sha256.Size {

@@ -912,6 +912,84 @@
    "file": "internal/store/metrics.go",
    "old": "metrics.Bool(st.SignKeyBackupPending)",
    "new": "metrics.Bool(false)"
+  },
+  {
+   "name": "S100 пропущенное обращение — не контакт (P-05)",
+   "file": "internal/store/epoch.go",
+   "old": "\ts.noteContact(source)\n\treturn nil",
+   "new": "\treturn nil"
+  },
+  {
+   "name": "S101 отказанная установка продлевает связь (P-05)",
+   "file": "internal/store/epoch.go",
+   "old": "\tif err := s.admit(source, epoch); err != nil {\n\t\treturn err\n\t}\n\ts.noteContact(source)",
+   "new": "\terr := s.admit(source, epoch)\n\ts.noteContact(source)\n\tif err != nil {\n\t\treturn err\n\t}"
+  },
+  {
+   "name": "S102 пропажа сборщика не замечается (P-05)",
+   "file": "internal/store/contact.go",
+   "old": "\t\tif now.Sub(last) > expect {",
+   "new": "\t\tif false && now.Sub(last) > expect {"
+  },
+  {
+   "name": "S103 «пропал» уже на пороге expect_contact",
+   "file": "internal/store/contact.go",
+   "old": "\t\tif now.Sub(last) > expect {",
+   "new": "\t\tif now.Sub(last) >= expect {"
+  },
+  {
+   "name": "S104 простой хранилища — пропажа сборщика (P-05)",
+   "file": "internal/store/contact.go",
+   "old": "\t\tif last.Before(s.opened) {",
+   "new": "\t\tif false && last.Before(s.opened) {"
+  },
+  {
+   "name": "S105 «пропал» на каждой проверке эпизода (P-05)",
+   "file": "internal/store/contact.go",
+   "old": "\t\tif !st.lostSince.IsZero() {",
+   "new": "\t\tif false && !st.lostSince.IsZero() {"
+  },
+  {
+   "name": "S106 возвращение сборщика не замечается (P-05)",
+   "file": "internal/store/contact.go",
+   "old": "\t\t\tif !st.backAt.IsZero() {",
+   "new": "\t\t\tif false && !st.backAt.IsZero() {"
+  },
+  {
+   "name": "S107 эпизод «пропал» не переживает рестарт (P-05)",
+   "file": "internal/store/contact.go",
+   "old": "\t\tst.lostSince = ev.Since",
+   "new": "\t\tst.lostSince = time.Time{}"
+  },
+  {
+   "name": "S108 «вернулся» в цепи не закрывает эпизод при подъёме (P-05)",
+   "file": "internal/store/contact.go",
+   "old": "\tcase contactBack:\n\t\tst.lostSince = time.Time{}",
+   "new": "\tcase contactBack:"
+  },
+  {
+   "name": "S109 пропажа сборщика не в статусе",
+   "file": "internal/store/proofs.go",
+   "old": "ContactLost: !st.lostSince.IsZero(),",
+   "new": "ContactLost: false,"
+  },
+  {
+   "name": "S110 метрика пропажи сборщика всегда 0",
+   "file": "internal/store/metrics.go",
+   "old": "metrics.Bool(!src.lostSince.IsZero())",
+   "new": "metrics.Bool(false)"
+  },
+  {
+   "name": "S111 последний контакт не в статусе",
+   "file": "internal/store/proofs.go",
+   "old": "LastContact: st.contactAt.UTC(),",
+   "new": "LastContact: time.Time{},"
+  },
+  {
+   "name": "S112 окно без связи кончается последним контактом, а не первым (P-05)",
+   "file": "internal/store/contact.go",
+   "old": "\t\tif !st.lostSince.IsZero() && st.backAt.IsZero() {",
+   "new": "\t\tif !st.lostSince.IsZero() {"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."

@@ -14,7 +14,7 @@ import (
 )
 
 // startBackground запускает фоновые циклы: звено раз в тик, метку TSA раз
-// в tsa.every, обслуживание ключей и контроль молчания.
+// в tsa.every, обслуживание ключей, контроль молчания и связи со сборщиками.
 func (s *Store) startBackground() {
 	s.loop(s.cfg.Chain.Tick.D(), func() {
 		if err := s.flush(); err != nil {
@@ -49,7 +49,11 @@ func (s *Store) startBackground() {
 		})
 	}
 	s.loop(time.Minute, func() { s.Maintain(s.nowTime()) })
-	s.loop(10*time.Second, func() { s.CheckSilence(s.nowTime()) })
+	s.loop(10*time.Second, func() {
+		now := s.nowTime()
+		s.CheckSilence(now)
+		s.CheckContact(now)
+	})
 }
 
 // anchorRetry — как часто проверять, свеж ли якорь, и повторять метку,
