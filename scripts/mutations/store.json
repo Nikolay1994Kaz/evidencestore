@@ -70,7 +70,7 @@
   {
    "name": "P11 время приёма позже T2 допустимо",
    "file": "internal/proof/proof.go",
-   "old": "\t\tif !r.Upper.IsZero() && recv.After(r.Upper.Add(time.Second)) {",
+   "old": "\t\tif !r.Upper.IsZero() && recv.After(r.Upper.Add(ReceiveSlack)) {",
    "new": "\t\tif false {"
   },
   {
@@ -376,8 +376,8 @@
   {
    "name": "S45 цепь без sign.key стартует с новым ключом",
    "file": "internal/store/store.go",
-   "old": "errors.Is(err, os.ErrNotExist) && s.chain.Head().Seq > 0 {",
-   "new": "errors.Is(err, os.ErrNotExist) && false {"
+   "old": "\tif _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {",
+   "new": "\tif _, err := os.Stat(path); true || !errors.Is(err, os.ErrNotExist) {"
   },
   {
    "name": "S46 init затирает резерв ключей",
@@ -990,7 +990,247 @@
    "file": "internal/store/contact.go",
    "old": "\t\tif !st.lostSince.IsZero() && st.backAt.IsZero() {",
    "new": "\t\tif !st.lostSince.IsZero() {"
+  },
+  {
+   "name": "B1 окно: корень звена не сверяется с его листьями",
+   "file": "internal/proof/window.go",
+   "old": "if auditchain.MerkleRoot(leaves[at:at+n]) != p.Root {",
+   "new": "if false {"
+  },
+  {
+   "name": "B4 окно: «с начала цепи» без первого звена",
+   "file": "internal/proof/window.go",
+   "old": "if links[0].Seq != 1 || links[0].PrevHash != ([32]byte{}) {",
+   "new": "if false {"
+  },
+  {
+   "name": "B5 окно: лишние листья за участком допустимы",
+   "file": "internal/proof/window.go",
+   "old": "case at != len(leaves):",
+   "new": "case false:"
+  },
+  {
+   "name": "B6 окно: участок может не доходить до заявленного конца",
+   "file": "internal/proof/window.go",
+   "old": "case len(out) == 0 || out[len(out)-1].seq != b.StretchEnd:",
+   "new": "case len(out) == 0:"
+  },
+  {
+   "name": "B7 окно: токен метки на участке не проверяется",
+   "file": "internal/proof/window.go",
+   "old": "info, err := tsa.Verify(l.Payload, HeadImprint(head, hash), trust)\n\t\t\tif err != nil {",
+   "new": "info, err := tsa.Verify(l.Payload, HeadImprint(head, hash), trust)\n\t\t\tif false {"
+  },
+  {
+   "name": "B9 окно: нижняя метка — над более поздней головой",
+   "file": "internal/proof/window.go",
+   "old": "if st.head == b.LowerHead {",
+   "new": "if st.head > b.LowerHead {"
+  },
+  {
+   "name": "B10 окно: верхней метки, кроме нижней, может не быть",
+   "file": "internal/proof/window.go",
+   "old": "if len(stamps) == 0 || len(stamps)-1 == lower {",
+   "new": "if len(stamps) == 0 {"
+  },
+  {
+   "name": "B11 окно: начало окна у самой нижней метки допустимо",
+   "file": "internal/proof/window.go",
+   "old": "case !r.Lower.IsZero() && !r.From.After(r.Lower.Add(ReceiveSlack)):",
+   "new": "case !r.Lower.IsZero() && r.From.Before(r.Lower.Add(ReceiveSlack)):"
+  },
+  {
+   "name": "B12 окно: конец окна у самой верхней метки минус минута допустим",
+   "file": "internal/proof/window.go",
+   "old": "case !r.Upper.IsZero() && !r.To.Before(r.Upper.Add(-ReceiveSkew)):",
+   "new": "case !r.Upper.IsZero() && r.To.After(r.Upper.Add(-ReceiveSkew)):"
+  },
+  {
+   "name": "B13 окно: время приёма позже первой метки над звеном допустимо",
+   "file": "internal/proof/window.go",
+   "old": "case t2 != nil && recv.After(t2.gen.Add(ReceiveSlack)):",
+   "new": "case false:"
+  },
+  {
+   "name": "B14 окно: время приёма раньше последней метки до звена допустимо",
+   "file": "internal/proof/window.go",
+   "old": "case t1 != nil && recv.Before(t1.gen.Add(-ReceiveSkew)):",
+   "new": "case false:"
+  },
+  {
+   "name": "B15 окно: верхняя граница улики — последняя, а не первая метка над звеном",
+   "file": "internal/proof/window.go",
+   "old": "if t2 == nil && stamps[i].head >= n {",
+   "new": "if stamps[i].head >= n {"
+  },
+  {
+   "name": "B16 окно: нижняя граница улики — первая, а не последняя метка до звена",
+   "file": "internal/proof/window.go",
+   "old": "if stamps[i].link < n {",
+   "new": "if t1 == nil && stamps[i].link < n {"
+  },
+  {
+   "name": "B17 окно: номер у источника дважды не замечается",
+   "file": "internal/proof/window.go",
+   "old": "if seen[l.Scope][seq] && leafErr == nil {",
+   "new": "if false && leafErr == nil {"
+  },
+  {
+   "name": "B18 окно: приложенная улика не сверяется с отпечатком листа",
+   "file": "internal/proof/window.go",
+   "old": "case digest != evidence.Digest(rec.Evidence):",
+   "new": "case false && digest != evidence.Digest(rec.Evidence):"
+  },
+  {
+   "name": "B19 окно: улика приложена дважды",
+   "file": "internal/proof/window.go",
+   "old": "case used[key]:",
+   "new": "case false:"
+  },
+  {
+   "name": "B20 окно: время приёма приложенной улики не сверяется с листом",
+   "file": "internal/proof/window.go",
+   "old": "case l.UnixNano != sealed.ReceivedAt:",
+   "new": "case false:"
+  },
+  {
+   "name": "B21 окно: тело, не вскрытое ключом записи, не провал",
+   "file": "internal/proof/window.go",
+   "old": "if err != nil {\n\t\t\treturn fmt.Errorf(\"the body of",
+   "new": "if false {\n\t\t\treturn fmt.Errorf(\"the body of"
+  },
+  {
+   "name": "B22 окно: подпись головы не проверяется",
+   "file": "internal/proof/window.go",
+   "old": "err = auditchain.VerifyStatement(b.Statement, trust.StoreKey)",
+   "new": "err = nil"
+  },
+  {
+   "name": "B23 окно: голова не сверяется с последним звеном",
+   "file": "internal/proof/window.go",
+   "old": "if b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {",
+   "new": "if false && (b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last])) {"
+  },
+  {
+   "name": "B24 окно: свидетель не сверяется",
+   "file": "internal/proof/window.go",
+   "old": "if trust.Witness != nil {\n\t\tvar wr Report",
+   "new": "if false {\n\t\tvar wr Report"
+  },
+  {
+   "name": "B25 окно: свидетель закрепляет участок головой с его начала",
+   "file": "internal/proof/window.go",
+   "old": "checkWitness(trust.Witness, trust.StoreKey, b.StretchEnd,",
+   "new": "checkWitness(trust.Witness, trust.StoreKey, b.LowerHead,"
+  },
+  {
+   "name": "B26 окно: вид и версия пакета не сверяются",
+   "file": "internal/proof/window.go",
+   "old": "if b.Kind != WindowKind || b.Version != WindowVersion {",
+   "new": "if false {"
+  },
+  {
+   "name": "B30 пакет за окно: нижняя метка — первая, а не последняя до окна",
+   "file": "internal/store/window.go",
+   "old": "for i := upper - 1; i >= 0; i-- {",
+   "new": "for i := 0; i < upper; i++ {"
+  },
+  {
+   "name": "B31 пакет за окно: верхняя метка — не первая после окна",
+   "file": "internal/store/window.go",
+   "old": "upper = i\n\t\t\tbreak",
+   "new": "upper = i"
+  },
+  {
+   "name": "B32 пакет за окно: участок начинается с нижней головы, а не после неё",
+   "file": "internal/store/window.go",
+   "old": "first = s.links[i].first + s.links[i].count",
+   "new": "first = s.links[i].first"
+  },
+  {
+   "name": "B33 пакет за окно: улики без ключей записей",
+   "file": "internal/store/window.go",
+   "old": "case err == nil:\n\t\t\trec.DEK = dek",
+   "new": "case err == nil:\n\t\t\t_ = dek"
+  },
+  {
+   "name": "B34 пакет за окно: прикладываются улики всех источников",
+   "file": "internal/store/window.go",
+   "old": "if l.Type != auditchain.EventEvidence || l.Scope != source {",
+   "new": "if l.Type != auditchain.EventEvidence {"
+  },
+  {
+   "name": "B35 пакет за окно: предел листьев не проверяется",
+   "file": "internal/store/window.go",
+   "old": "n > maxWindowLeaves {",
+   "new": "false && n > maxWindowLeaves {"
+  },
+  {
+   "name": "B36 пакет за окно: -source без -dek собирается",
+   "file": "internal/store/window.go",
+   "old": "case source != \"\" && !withDEK:",
+   "new": "case false:"
+  },
+  {
+   "name": "B37 пакет за окно: нижняя метка без допуска в секунду",
+   "file": "internal/store/window.go",
+   "old": "if s.tokens[i].gen.Before(from.Add(-proof.ReceiveSlack)) {",
+   "new": "if !s.tokens[i].gen.After(from) {"
+  },
+  {
+   "name": "B38 пакет за окно: верхняя метка ровно через минуту после окна",
+   "file": "internal/store/window.go",
+   "old": "if t.gen.After(to.Add(proof.ReceiveSkew)) {",
+   "new": "if !t.gen.Before(to.Add(proof.ReceiveSkew)) {"
+  },
+  {
+   "name": "B39 админка: ошибка окна — 500, а не 400",
+   "file": "internal/server/server.go",
+   "old": "case errors.Is(err, store.ErrWindow):\n\t\t\t\tcode = http.StatusBadRequest",
+   "new": "case false:\n\t\t\t\tcode = http.StatusBadRequest"
+  },
+  {
+   "name": "B40 админка: to_head окна не читается",
+   "file": "internal/server/server.go",
+   "old": "if v := q.Get(\"to_head\"); v != \"\" {",
+   "new": "if v := q.Get(\"to_head\"); false && v != \"\" {"
+  },
+  {
+   "name": "B41 esverify: флаги пакета одной улики принимаются с окном",
+   "file": "cmd/esverify/main.go",
+   "old": "if set {\n\t\t\t\tsingle = append(single, name)",
+   "new": "if set && false {\n\t\t\t\tsingle = append(single, name)"
+  },
+  {
+   "name": "B42 esverify: флаги окна принимаются с пакетом одной улики",
+   "file": "cmd/esverify/main.go",
+   "old": "if *windowFrom != \"\" || *windowTo != \"\" || *bodiesDir != \"\" {",
+   "new": "if false {"
+  },
+  {
+   "name": "B43 esverify: тела пишутся из непрошедшего пакета",
+   "file": "cmd/esverify/window.go",
+   "old": "\tif !valid {\n\t\tif a.bodies != \"\" {",
+   "new": "\tif false {\n\t\tif a.bodies != \"\" {"
+  },
+  {
+   "name": "B44 esverify: файл тела читают все",
+   "file": "cmd/esverify/window.go",
+   "old": "os.WriteFile(filepath.Join(dir, name), b.Body, 0o600)",
+   "new": "os.WriteFile(filepath.Join(dir, name), b.Body, 0o644)"
+  },
+  {
+   "name": "B45 esverify: имя источника выводит файл тела из каталога",
+   "file": "cmd/esverify/window.go",
+   "old": "\t\treturn '_'\n",
+   "new": "\t\treturn c\n"
+  },
+  {
+   "name": "B46 esverify: сообщение о телах — в stdout, JSON ломается",
+   "file": "cmd/esverify/window.go",
+   "old": "fmt.Fprintf(stderr, \"%d bodies written to %s\\n\"",
+   "new": "fmt.Fprintf(stdout, \"%d bodies written to %s\\n\""
   }
  ],
- "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения."
+ "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений."
 }

@@ -747,6 +747,60 @@ func ReadLeaves(dir string, first uint64, count int) ([]Leaf, error) {
 	return out, nil
 }
 
+// ReadLeafRange читает листья с номерами [first, end) подряд, через границы
+// файлов листьев: каждый нужный файл читается один раз. ReadLeaves читает
+// файл целиком на каждый вызов и в следующий не переходит — для пакета за
+// окно (тысячи звеньев) это чтение одного файла тысячи раз (Z-11).
+//
+// Номер берётся из файла с наибольшим началом не больше номера — как в
+// ReadLeaves. Нет файла или в нём нет нужных записей — ErrLeavesMissing.
+func ReadLeafRange(dir string, first, end uint64) ([]Leaf, error) {
+	if end < first {
+		return nil, fmt.Errorf("auditchain: leaves %d…%d requested", first, end)
+	}
+	segs, err := leafSegments(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Leaf, 0, end-first)
+	for next := first; next < end; {
+		idx := sort.Search(len(segs), func(i int) bool { return segs[i] > next }) - 1
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: no leaf file holds number %d", ErrLeavesMissing, next)
+		}
+		f, err := os.Open(leafPath(dir, segs[idx]))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %w", ErrLeavesMissing, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		bodies, err := readFramesRO(f)
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+		// Этот файл отвечает за номера до начала следующего.
+		stop := min(end, segs[idx]+uint64(len(bodies)))
+		if idx+1 < len(segs) {
+			stop = min(stop, segs[idx+1])
+		}
+		if stop <= next {
+			return nil, fmt.Errorf("%w: leaf file %d holds %d records, number %d requested",
+				ErrLeavesMissing, segs[idx], len(bodies), next)
+		}
+		for i := next - segs[idx]; i < stop-segs[idx]; i++ {
+			l, err := decodeLeaf(bodies[i])
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, l)
+		}
+		next = stop
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // Кадрирование и разбор
 // ---------------------------------------------------------------------------

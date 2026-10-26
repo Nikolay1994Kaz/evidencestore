@@ -104,6 +104,14 @@ wait_seq() {
 # Строка syslog со временем UTC: тем же, в котором хранилище показывает приём.
 log() { printf '%s web-1 %s\n' "$(LC_ALL=C date -u '+%b %e %H:%M:%S')" "$*" >>"$LOG"; }
 
+# Начало окна для пакета за окно в конце: больше чем через секунду после
+# метки T1 — тогда нижняя метка окна она (DECISIONS, п. 27). Время приёма
+# идёт по якорю TSA (время в метке — до секунды) и может отставать от часов
+# хоста до секунды: первая строка — заметно позже начала окна.
+sleep 1.2
+FROM=$(date -u +%FT%T.%NZ)
+sleep 1.5
+
 step "an ordinary morning on web-1 (times in UTC)"
 log "sshd[1021]: Accepted publickey for deploy from 10.0.0.5 port 51234 ssh2: ED25519 SHA256:k3Vq1rQ8"
 log "sudo:   deploy : TTY=pts/0 ; PWD=/srv/app ; USER=root ; COMMAND=/usr/bin/systemctl restart app"
@@ -197,6 +205,30 @@ PY
 step "one deleted line in full: esverify, offline, with the store's pinned key"
 "$BIN/esverify" -proof "$B/5.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST" -body "$B/5.restored"
 echo "restored line: $(cat "$B/5.restored")"
+
+step "the auditor asks for the whole session in one window bundle: nothing in it can be left out"
+TO=$(date -u +%FT%T.%NZ)
+echo "window (receive time): $FROM – $TO"
+echo "(a window is closed by a time-stamp taken more than a minute after its end: a minute passes, web-1 lives on)"
+sleep 65
+log "sshd[1302]: Accepted publickey for deploy from 10.0.0.5 port 51260 ssh2: ED25519 SHA256:k3Vq1rQ8"
+wait_seq 9
+"$BIN/evidencestore" stamp -config "$CFG" >/dev/null # метка больше чем через минуту после окна
+"$BIN/evidencestore" proof -config "$CFG" -from "$FROM" -to "$TO" -source web-1 -dek -out "$WORK/session.json"
+"$BIN/esverify" -proof "$WORK/session.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST" -bodies "$WORK/session"
+python3 -I - "$WORK/session" "$LOG" <<'PY'
+import os, sys
+d, log = sys.argv[1], sys.argv[2]
+now = set(open(log, "rb").read().splitlines())
+bodies = [open(os.path.join(d, f), "rb").read() for f in sorted(os.listdir(d), key=lambda f: int(f.rsplit("-", 1)[1]))]
+deleted = list(dict.fromkeys(b.rstrip(b"\n") for b in bodies if b.rstrip(b"\n") not in now))
+for line in deleted:
+    print("in the window, gone from web-1:", line.decode(errors="replace"))
+if len(deleted) != 4:
+    sys.exit(f"ERROR: expected the 4 deleted lines in the window, found {len(deleted)}")
+print(f"every line the store received from web-1 between the two time-stamps is in this one bundle ({len(bodies)} records),"
+      " and none of them can be left out: the four deleted lines are among them")
+PY
 
 step "what this does not cover"
 echo "- lines the intruder destroys before the collector reads them (within flush_every, here 200 ms) are not in the store;"

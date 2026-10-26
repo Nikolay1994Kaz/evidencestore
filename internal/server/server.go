@@ -348,6 +348,40 @@ func (s *Server) AdminHandler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, b)
 	})
+	// Пакет за окно времени (DECISIONS, п. 27): from и to — RFC 3339.
+	mux.HandleFunc("GET /admin/proof-window", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		from, ferr := time.Parse(time.RFC3339Nano, q.Get("from"))
+		to, terr := time.Parse(time.RFC3339Nano, q.Get("to"))
+		if ferr != nil || terr != nil {
+			writeErr(w, http.StatusBadRequest, errors.New("from and to must be RFC 3339 times, e.g. 2026-10-26T00:00:00Z"))
+			return
+		}
+		var head uint64
+		if v := q.Get("to_head"); v != "" {
+			var err error
+			if head, err = strconv.ParseUint(v, 10, 64); err != nil {
+				writeErr(w, http.StatusBadRequest, errors.New("to_head must be a head number"))
+				return
+			}
+		}
+		b, err := s.store.ProofWindow(from, to, q.Get("source"), q.Get("dek") == "1", head)
+		if err != nil {
+			code := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, store.ErrWindow):
+				code = http.StatusBadRequest
+			case errors.Is(err, store.ErrNotFound):
+				code = http.StatusNotFound
+			}
+			writeErr(w, code, err)
+			return
+		}
+		// Без отступов: в пакете за окно — до сотен тысяч листьев.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(b)
+	})
 	mux.HandleFunc("POST /admin/stamp", func(w http.ResponseWriter, r *http.Request) {
 		head, err := s.store.Stamp(r.Context())
 		if err != nil {

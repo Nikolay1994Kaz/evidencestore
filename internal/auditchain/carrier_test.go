@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -79,6 +80,81 @@ func TestReadLinks(t *testing.T) {
 		if _, err := ReadLinks(dir, r[0], r[1]); err == nil {
 			t.Fatalf("звенья %d…%d прочитаны без ошибки", r[0], r[1])
 		}
+	}
+}
+
+// ReadLeafRange — листья подряд через границы файлов, те же, что у
+// ScanLeaves; пропавший файл и номера за записанным — ErrLeavesMissing.
+// Файлы, перекрывшиеся от порчи, читаются как у ReadLeaves: номер — из файла
+// с наибольшим началом не больше него.
+func TestReadLeafRange(t *testing.T) {
+	dir := t.TempDir()
+	c := mustOpen(t, dir)
+	c.SetSegmentBytes(1) // каждое звено — в новый файл листьев
+	for i := 0; i < 12; i++ {
+		c.Append(leafN(i))
+		if i%2 == 1 {
+			if _, err := c.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	c.Close()
+	segs, err := leafSegments(dir)
+	if err != nil || len(segs) != 6 {
+		t.Fatalf("файлов листьев %d (%v), %v", len(segs), segs, err)
+	}
+	var all []Leaf
+	if err := ScanLeaves(dir, func(_ uint64, l Leaf) error { all = append(all, l); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range [][2]uint64{{0, 12}, {1, 11}, {3, 4}, {5, 5}, {2, 9}} {
+		got, err := ReadLeafRange(dir, r[0], r[1])
+		if err != nil || !reflect.DeepEqual(got, all[r[0]:r[1]]) {
+			t.Fatalf("листья %d…%d: %d прочитано, %v", r[0], r[1], len(got), err)
+		}
+	}
+	if _, err := ReadLeafRange(dir, 10, 13); !errors.Is(err, ErrLeavesMissing) {
+		t.Fatalf("за записанным: %v", err)
+	}
+	if _, err := ReadLeafRange(dir, 5, 4); err == nil || errors.Is(err, ErrLeavesMissing) {
+		t.Fatalf("конец раньше начала: %v", err)
+	}
+
+	// Порча: файл, начатый с номера 5, повторяет листья 6–7.
+	frames, err := os.ReadFile(leafPath(dir, 6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(leafPath(dir, 5), frames, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadLeafRange(dir, 3, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, l := range got {
+		want, err := ReadLeaves(dir, 3+uint64(i), 1)
+		if err != nil || !reflect.DeepEqual(l, want[0]) {
+			t.Fatalf("лист %d расходится с ReadLeaves: %v", 3+i, err)
+		}
+	}
+
+	// Файл посреди пропал: через него не читается, до него — читается.
+	if err := os.Remove(leafPath(dir, 4)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadLeafRange(dir, 0, 12); !errors.Is(err, ErrLeavesMissing) {
+		t.Fatalf("через пропавший файл: %v", err)
+	}
+	if got, err := ReadLeafRange(dir, 0, 4); err != nil || len(got) != 4 {
+		t.Fatalf("до пропавшего файла: %d, %v", len(got), err)
+	}
+	if err := os.Remove(leafPath(dir, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadLeafRange(dir, 0, 2); !errors.Is(err, ErrLeavesMissing) {
+		t.Fatalf("первого файла нет: %v", err)
 	}
 }
 

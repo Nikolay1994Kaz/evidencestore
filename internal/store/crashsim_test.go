@@ -1823,6 +1823,30 @@ func (m *storeSim) check() {
 			}
 		}
 	}
+	// Вся цепь одним пакетом за окно (DECISIONS, п. 27): честная история —
+	// падения, подъёмы, пропуски, ротации — проходит правила окна, и в пакете
+	// ровно улики журнала, каждая один раз (дубль проверка окна валит сама).
+	m.clk.add(2 * time.Minute)
+	if _, err := s.stampNow(context.Background()); err != nil {
+		m.fail("метка для пакета за окно: %v", err)
+	} else if r, seqs, err := wholeChainWindow(s, trust); err != nil {
+		m.fail("пакет за окно: %v", err)
+	} else if !r.Valid() {
+		m.fail("пакет за окно не проходит: %s", failedChecks(r))
+	} else {
+		n := 0
+		for source, list := range seqs {
+			for _, q := range list {
+				n++
+				if _, ok := where[key{source, q}]; !ok {
+					m.fail("в пакете за окно %s/%d, а в журнале улик её нет", source, q)
+				}
+			}
+		}
+		if n != len(where) {
+			m.fail("в пакете за окно %d улик, в журнале улик %d", n, len(where))
+		}
+	}
 	s.Close()
 	m.s = nil
 	m.checkNoResurrection(keys)

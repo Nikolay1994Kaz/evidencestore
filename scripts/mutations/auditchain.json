@@ -74,6 +74,24 @@
    "file": "internal/auditchain/carrier.go",
    "old": "\t\t\tfor k := first; k < covered; k++ {",
    "new": "\t\t\tfor k := first; k <= covered; k++ {"
+  },
+  {
+   "name": "A13 ReadLeafRange: граница следующего файла не учитывается",
+   "file": "internal/auditchain/carrier.go",
+   "old": "if idx+1 < len(segs) {\n\t\t\tstop = min(stop, segs[idx+1])",
+   "new": "if false {\n\t\t\tstop = min(stop, segs[idx+1])"
+  },
+  {
+   "name": "A14 ReadLeafRange: нехватка записей в файле без ErrLeavesMissing",
+   "file": "internal/auditchain/carrier.go",
+   "old": "return nil, fmt.Errorf(\"%w: leaf file %d holds %d records, number %d requested\",",
+   "new": "return nil, fmt.Errorf(\"%v: leaf file %d holds %d records, number %d requested\","
+  },
+  {
+   "name": "A15 ReadLeafRange: нет файла с первым номером без ErrLeavesMissing",
+   "file": "internal/auditchain/carrier.go",
+   "old": "fmt.Errorf(\"%w: no leaf file holds number %d\", ErrLeavesMissing, next)",
+   "new": "fmt.Errorf(\"%v: no leaf file holds number %d\", ErrLeavesMissing, next)"
   }
  ]
 }

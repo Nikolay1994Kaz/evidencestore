@@ -104,6 +104,10 @@ Operator (talks to the running server via its admin socket):
   stamp     -config FILE                       time-stamp the chain head now
   proof     -config FILE -source S -seq N [-dek] [-to-head H] [-out FILE]
                                                -to-head: the bundle reaches at least head H (one a witness saw)
+  proof     -config FILE -from T -to T [-source S -dek] [-to-head H] [-out FILE]
+                                               every record received in the window (RFC 3339 times),
+                                               complete between two time-stamps; -source S -dek attaches
+                                               that source's records with their record keys
   tsa-root  -config FILE -out FILE             root certificate of the built-in demo TSA
   keys list|due      -config FILE
   keys deactivate    -config FILE -scope S [-force]
@@ -228,9 +232,28 @@ func cmdProof(args []string) error {
 	dek := fs.Bool("dek", false, "attach the key of this one record so the auditor can open the body")
 	toHead := fs.Uint64("to-head", 0, "extend the bundle at least up to this chain head: one a witness saw (esverify -heads names it)")
 	out := fs.String("out", "", "write the bundle here instead of stdout")
+	from := fs.String("from", "", "window bundle: every record received from this time (RFC 3339, with -to)")
+	to := fs.String("to", "", "window bundle: up to this time (RFC 3339)")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
 		return err
+	}
+	if *from != "" || *to != "" {
+		if *from == "" || *to == "" || *seq != 0 {
+			return errors.New("proof: a window takes both -from and -to, and no -seq")
+		}
+		q := url.Values{"from": {*from}, "to": {*to}, "source": {*source}}
+		if *dek {
+			q.Set("dek", "1")
+		}
+		if *toHead > 0 {
+			q.Set("to_head", fmt.Sprint(*toHead))
+		}
+		body, err := adminDo(cfg, http.MethodGet, "/admin/proof-window?"+q.Encode(), nil)
+		if err != nil {
+			return err
+		}
+		return output(*out, body)
 	}
 	q := url.Values{"source": {*source}, "seq": {fmt.Sprint(*seq)}}
 	if *dek {

@@ -44,6 +44,16 @@ const Version = 1
 // HeadDomain — домен хэша головы, который уходит в TSA.
 const HeadDomain = "evidencestore/head/v1"
 
+// Допуски времени приёма относительно меток TSA — одни для пакета одной
+// улики и для пакета за окно (window.go). Сверху — секунда: время в метке —
+// с точностью до секунды. Снизу — минута: улика записывается на диск и
+// встаёт в цепь за миллисекунды после приёма, но метка T1 могла лечь в цепь
+// между этими моментами.
+const (
+	ReceiveSlack = time.Second
+	ReceiveSkew  = time.Minute
+)
+
 // HeadImprint — что заверяет TSA: номер и хэш головы цепи.
 func HeadImprint(seq uint64, hash [32]byte) [32]byte {
 	var b [8 + 32]byte
@@ -360,14 +370,10 @@ func Verify(b Bundle, trust Trust) Report {
 	if !r.Upper.IsZero() || !r.Lower.IsZero() {
 		recv := time.Unix(0, sealed.ReceivedAt).UTC()
 		err = nil
-		// Улика записывается на диск и встаёт в цепь за миллисекунды после
-		// приёма, но метка T1 могла лечь в цепь между этими моментами:
-		// допускаем минуту перекоса.
-		const skew = time.Minute
-		if !r.Upper.IsZero() && recv.After(r.Upper.Add(time.Second)) {
+		if !r.Upper.IsZero() && recv.After(r.Upper.Add(ReceiveSlack)) {
 			err = fmt.Errorf("receive time %s is later than time-stamp T2 %s: the store's clock lies", fmtTime(recv), fmtTime(r.Upper))
 		}
-		if !r.Lower.IsZero() && recv.Before(r.Lower.Add(-skew)) {
+		if !r.Lower.IsZero() && recv.Before(r.Lower.Add(-ReceiveSkew)) {
 			err = fmt.Errorf("receive time %s is earlier than time-stamp T1 %s: the store's clock lies", fmtTime(recv), fmtTime(r.Lower))
 		}
 		add("the receive time lies between the TSA time-stamps", err, fmtTime(recv))

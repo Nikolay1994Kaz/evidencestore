@@ -338,6 +338,17 @@ func (c *clockSim) finish() {
 	if bad > 2 {
 		c.fail("и ещё %d", bad-2)
 	}
+	// Вся цепь одним пакетом за окно: при любых часах хоста время приёма
+	// каждой улики сходится с метками вокруг неё, и принятое — в пакете.
+	r, seqs, err := wholeChainWindow(c.s, trust)
+	switch {
+	case err != nil:
+		c.fail("пакет за окно: %v", err)
+	case !r.Valid():
+		c.fail("пакет за окно не проходит: %s", failedChecks(r))
+	case len(seqs["abs-core"]) != len(c.accepted):
+		c.fail("в пакете за окно %d улик, принято %d", len(seqs["abs-core"]), len(c.accepted))
+	}
 }
 
 // clockSimBackground — шаг keepAnchor: якорь несвеж — метка сейчас, даже в
