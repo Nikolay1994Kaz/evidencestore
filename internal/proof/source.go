@@ -18,18 +18,23 @@ import (
 // Пакет по источнику (DECISIONS, п. 28): записи одного источника за окно и
 // доказательство, что других нет, без записей чужих систем.
 //
-//	нижний край    хвосты одни в звене, которое заверила нижняя метка (g1):
+//	нижний край    хвосты одни в звене, которое заверила нижняя метка (T1):
 //	               хэш последнего листа S к этому месту — начало цепочки
 //	записи S       листья с путями Меркла (чужие листья — только хэши);
 //	               каждый ссылается на хэш прежнего листа S
-//	верхний край   то же у верхней метки (g2) — конец цепочки
+//	T2             лист токена первой метки позже окна — закрывающей
+//	верхний край   хвосты следующей метки, после токена T2, — конец цепочки
 //
-// Ссылки сходятся от начала до конца — значит, между двумя заверенными
-// звеньями S не положил в цепь ничего, кроме этих записей: выброшенную
-// запись выдала бы ссылка следующей. Оба края — под метками окна: сдвинуть
-// их можно, только переписав цепь и взяв свежую метку, а свежая метка видна
-// в отчёте. На слове хранилища — только то, что хвосты оно записало честно,
-// когда ставило метки.
+// Ссылки сходятся от начала до конца — значит, между краями S не положил в
+// цепь ничего, кроме этих записей: выброшенную запись выдала бы ссылка
+// следующей. Нижнему краю нужна верхняя граница времени — её даёт метка над
+// ним. Верхнему нужна нижняя: всё, что легло в цепь после него, легло после
+// окна. Метка над краем её не даёт — метку над старым звеном можно взять
+// когда угодно и дописать в цепь, ничего не переписывая. Даёт её только
+// токен, лежащий в цепи раньше края: всё, что за ним, легло позже его
+// времени. Края заверены метками (и свидетелем): сдвинуть их можно, только
+// переписав цепь. На слове хранилища — только то, что хвосты оно записало
+// честно, когда ставило метки.
 
 // SourceKind — вид пакета по источнику; версия та же, что у пакета за окно.
 const SourceKind = "source"
@@ -37,9 +42,8 @@ const SourceKind = "source"
 // SourceEdge — край пакета: звено Head, в котором одни хвосты источников,
 // лист токена метки TSA над ним — с путём Меркла, в звене цепи после края, —
 // и раскрытие хвоста своего источника (nil — источника там нет: записей ещё
-// не было). Токен — листом в цепи, а не просто байтами: метку над старым
-// звеном можно взять когда угодно, а положить её в цепь задним числом —
-// только переписав цепь.
+// не было). Метка над краем заверяет его и даёт верхнюю границу его времени;
+// от звена её токена сверяется свидетель.
 type SourceEdge struct {
 	Head  uint64    `json:"head"`
 	Tails *Leaf     `json:"tails,omitempty"`
@@ -69,6 +73,9 @@ type SourceBundle struct {
 	// начинается с нулей. Upper — верхний край.
 	Lower SourceEdge `json:"lower"`
 	Upper SourceEdge `json:"upper"`
+	// Closing — лист токена закрывающей метки (T2: первая позже конца окна
+	// больше чем на WindowEdge) с путём Меркла, в звене раньше верхнего края.
+	Closing Inclusion `json:"closing"`
 	// Links — звенья подряд от нижнего края (или первого звена цепи) до
 	// звена токена верхней метки, а с -to-head и дальше; последнее — голова
 	// Statement.
@@ -97,9 +104,10 @@ type SourceReport struct {
 	// From, To — окно, с которым сверялись; FromBundle — окно взято из пакета.
 	From, To   time.Time
 	FromBundle bool
-	// Lower, Upper — время нижней и верхней меток (g1, g2); FromStart —
-	// с начала цепи, нижней метки нет.
+	// Lower, Upper — время нижней и закрывающей меток (T1, T2); UpperEdge —
+	// метки над верхним краем; FromStart — с начала цепи, нижней метки нет.
 	Lower, Upper time.Time
+	UpperEdge    time.Time
 	FromStart    bool
 	LowerHead    uint64
 	UpperHead    uint64
@@ -118,6 +126,9 @@ type SourceReport struct {
 	// поломанными.
 	GatewayRecords int
 	GatewayBroken  []uint64
+	// withheld — тел поломанных записей гейтвея, не вскрытых нарочно: ключ
+	// у них есть, и «нет ключа записи» о них неверно.
+	withheld       int
 	WitnessChecked bool
 	WitnessHead    uint64
 	WitnessNone    bool
@@ -198,14 +209,17 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 			fmt.Sprintf("T1 = %s, link %d", fmtTime(r.Lower), b.Lower.Head))
 	}
 
-	// 4. Верхний край — так же, у верхней метки: всё, что S положил в цепь
-	// до звена, которое она заверила, — до этих хвостов. Её токен лежит в
-	// цепи после края: свежую метку над старым звеном сюда не подставить, не
-	// переписав цепь.
-	end, upper, err := sourceEdge(b.Source, b.Upper, linkAt, trust.TSA)
-	r.Upper = upper
-	add("the upper tails are the only leaf of the link the upper time-stamp certifies (T2)", err,
-		fmt.Sprintf("T2 = %s, link %d", fmtTime(r.Upper), b.Upper.Head))
+	// 4. Верхний край — хвосты, заверенные своей меткой, после токена
+	// закрывающей метки T2: всё, что S положил в цепь до T2, — до этих
+	// хвостов. Свежая метка над старым звеном хвостов, дописанная в конец
+	// цепи, краем его не делает: токена позже окна перед ним нет.
+	end, edgeAt, err := sourceEdge(b.Source, b.Upper, linkAt, trust.TSA)
+	if err == nil {
+		r.Upper, err = closingStamp(b, linkAt, trust.TSA)
+	}
+	r.UpperEdge = edgeAt
+	add("the upper tails are the only leaf of a link certified by a time-stamp, and lie after the token of the time-stamp that closes the window (T2)", err,
+		fmt.Sprintf("T2 = %s, token in link %d; tails in link %d", fmtTime(r.Upper), b.Closing.LinkSeq, b.Upper.Head))
 
 	// 5. Окно строго между метками — те же допуски, что у пакета за окно.
 	add("the time-stamps bracket the window", windowBracket(r.From, r.To, r.Lower, r.Upper), fmt.Sprintf("%s – %s", fmtTime(r.From), fmtTime(r.To)))
@@ -217,12 +231,23 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 
 	// 7. Время приёма записей — между метками краёв: запись после нижних
 	// хвостов принята позже T1 − WindowEdge (запрос к TSA короче
-	// StampLatency), запись до верхних — не позже T2 + 1 с.
-	add("every receive time lies between the time-stamps of the edges", sourceTimes(b, r.Lower, r.Upper), "")
+	// StampLatency), запись до верхних — не позже времени их метки + 1 с.
+	add("every receive time lies between the time-stamps of the edges", sourceTimes(b, r.Lower, r.UpperEdge), "")
 
-	// 8. Вердикты хранилища по записям журнала гейтвея.
-	if slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return rec.Verdict != nil }) {
-		add("the store's verdicts on gateway journal records are in the chain next to them", sourceVerdicts(b, linkAt, &r),
+	// 8. Вердикты хранилища по записям журнала гейтвея. Вид источника —
+	// из раскрытия верхнего хвоста, под обязательством: у журнала гейтвея
+	// вердикт обязан быть у каждой записи, и пакет без улик его не потеряет.
+	gw := b.Upper.Open != nil && b.Upper.Open.Kind == gateway.ContentType
+	var kindErr error
+	if b.Lower.Open != nil && b.Upper.Open != nil && b.Lower.Open.Kind != b.Upper.Open.Kind {
+		kindErr = fmt.Errorf("the tails name the kind of %s %q at the lower edge and %q at the upper one", b.Source, b.Lower.Open.Kind, b.Upper.Open.Kind)
+	}
+	if gw || kindErr != nil || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return rec.Verdict != nil }) {
+		err := kindErr
+		if err == nil {
+			err = sourceVerdicts(b, gw, linkAt, &r)
+		}
+		add("the store's verdicts on gateway journal records are in the chain next to them", err,
 			fmt.Sprintf("%d gateway records, %d broken at intake", r.GatewayRecords, len(r.GatewayBroken)))
 	}
 
@@ -269,6 +294,9 @@ func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Rec
 	if err := checkInclusion(e.Token, linkAt); err != nil {
 		return [32]byte{}, time.Time{}, fmt.Errorf("the token of the time-stamp: %w", err)
 	}
+	if e.Token.LinkSeq <= e.Head {
+		return [32]byte{}, time.Time{}, fmt.Errorf("the token of the time-stamp lies in link %d, not after link %d it certifies", e.Token.LinkSeq, e.Head)
+	}
 	// Тип и номер в листе — сверка для ясного отказа: метка над этим звеном
 	// проверяется подписью TSA ниже.
 	if tok := e.Token.Leaf.chain(); tok.Type != auditchain.EventTimestamp || tok.Subject != strconv.FormatUint(e.Head, 10) {
@@ -279,6 +307,33 @@ func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Rec
 		return [32]byte{}, time.Time{}, fmt.Errorf("the time-stamp: %w", err)
 	}
 	return last, info.GenTime.UTC(), nil
+}
+
+// closingStamp — закрывающая метка окна: лист её токена с путём Меркла в
+// звене раньше верхнего края, метка заверяет голову из пакета. Возвращает её
+// время (T2).
+func closingStamp(b SourceBundle, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) (time.Time, error) {
+	c := b.Closing
+	if err := checkInclusion(c, linkAt); err != nil {
+		return time.Time{}, fmt.Errorf("the token of the time-stamp that closes the window: %w", err)
+	}
+	if c.LinkSeq >= b.Upper.Head {
+		return time.Time{}, fmt.Errorf("the token of the time-stamp that closes the window lies in link %d, not before the upper tails in link %d", c.LinkSeq, b.Upper.Head)
+	}
+	tok := c.Leaf.chain()
+	head, err := strconv.ParseUint(tok.Subject, 10, 64)
+	if tok.Type != auditchain.EventTimestamp || err != nil {
+		return time.Time{}, fmt.Errorf("the leaf in link %d is not a time-stamp token", c.LinkSeq)
+	}
+	_, hash, ok := linkAt(head)
+	if !ok {
+		return time.Time{}, fmt.Errorf("link %d, which the time-stamp that closes the window certifies, is not in the bundle", head)
+	}
+	info, err := tsa.Verify(tok.Payload, HeadImprint(head, hash), trust)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("the time-stamp that closes the window: %w", err)
+	}
+	return info.GenTime.UTC(), nil
 }
 
 // windowBracket — окно строго между метками с допусками времени приёма:
@@ -374,14 +429,18 @@ func sourceTimes(b SourceBundle, lower, upper time.Time) error {
 	return nil
 }
 
-// sourceVerdicts проверяет листы вердиктов: каждый — в цепи, о той же
-// улике того же источника. Поломанные — в отчёт.
-func sourceVerdicts(b SourceBundle, linkAt func(uint64) (auditchain.Record, [32]byte, bool), r *SourceReport) error {
+// sourceVerdicts проверяет листы вердиктов: каждый — в цепи, о той же улике
+// того же источника; у журнала гейтвея (gw) вердикт обязан быть у каждой
+// записи. Поломанные — в отчёт.
+func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Record, [32]byte, bool), r *SourceReport) error {
 	for _, rec := range b.Records {
+		l := rec.Leaf.Leaf.chain()
 		if rec.Verdict == nil {
+			if gw {
+				return fmt.Errorf("record %s/%s lacks the store's verdict, and the tails name %s a gateway journal", b.Source, l.Subject, b.Source)
+			}
 			continue
 		}
-		l := rec.Leaf.Leaf.chain()
 		pos, _, err := ParseEvidenceLeaf(l)
 		if err != nil {
 			return fmt.Errorf("record %s/%s: %w", b.Source, l.Subject, err)
@@ -413,14 +472,23 @@ func sourceAttached(b SourceBundle, r *SourceReport) error {
 	var leaves []auditchain.Leaf
 	var attached []WindowRecord
 	for _, rec := range b.Records {
-		leaves = append(leaves, rec.Leaf.Leaf.chain())
+		l := rec.Leaf.Leaf.chain()
+		leaves = append(leaves, l)
 		if len(rec.Evidence) == 0 {
 			continue
 		}
-		if rec.Verdict == nil {
-			if sealed, err := evidence.Unmarshal(rec.Evidence); err == nil && sealed.ContentType == gateway.ContentType {
-				return fmt.Errorf("record %s/%d is a gateway journal entry, and the bundle lacks the store's verdict on it", sealed.Source, sealed.Seq)
-			}
+		sealed, err := evidence.Unmarshal(rec.Evidence)
+		if err != nil {
+			return fmt.Errorf("the record attached to %s/%s does not parse: %w", b.Source, l.Subject, err)
+		}
+		// Улика — только при своём листе: проверка вердикта ниже — по ячейке,
+		// и тело записи, переложенное в ячейку другой (с её чистым
+		// вердиктом), обходило бы её (E2-01).
+		if sealed.Source != l.Scope || strconv.FormatUint(sealed.Seq, 10) != l.Subject {
+			return fmt.Errorf("the record attached next to %s/%s is %s/%d: a record goes with its own leaf", b.Source, l.Subject, sealed.Source, sealed.Seq)
+		}
+		if rec.Verdict == nil && sealed.ContentType == gateway.ContentType {
+			return fmt.Errorf("record %s/%d is a gateway journal entry, and the bundle lacks the store's verdict on it", sealed.Source, sealed.Seq)
 		}
 		attached = append(attached, WindowRecord{Evidence: rec.Evidence, DEK: rec.DEK})
 	}
@@ -430,9 +498,11 @@ func sourceAttached(b SourceBundle, r *SourceReport) error {
 	// Тело записи гейтвея, которую хранилище при приёме признало поломанной,
 	// здесь не вскрывается: что с ней не так, показывает пакет одной улики.
 	for _, body := range wr.Bodies {
-		if !slices.Contains(r.GatewayBroken, body.Seq) {
-			r.Bodies = append(r.Bodies, body)
+		if slices.Contains(r.GatewayBroken, body.Seq) {
+			r.withheld++
+			continue
 		}
+		r.Bodies = append(r.Bodies, body)
 	}
 	return err
 }
@@ -455,8 +525,11 @@ func (r SourceReport) Notes() []string {
 	if r.FromBundle {
 		n = append(n, "the window was taken from the bundle itself: check the bundle against your own window with esverify -from and -to")
 	}
-	if r.Attached > len(r.Bodies) {
-		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction", r.Attached-len(r.Bodies), r.Attached))
+	if r.Attached > 0 && r.Attached < r.Records {
+		n = append(n, fmt.Sprintf("%d of the %d records come without their evidence: the bundle carries no body for them", r.Records-r.Attached, r.Records))
+	}
+	if keyless := r.Attached - len(r.Bodies) - r.withheld; keyless > 0 {
+		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction", keyless, r.Attached))
 	}
 	if len(r.GatewayBroken) > 0 {
 		var parts []string
@@ -475,7 +548,7 @@ func (r SourceReport) Notes() []string {
 	case r.WitnessHead != 0:
 		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this part would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
 	case r.WitnessNone:
-		n = append(n, "the witness has no head at or after the upper tails yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
+		n = append(n, "the witness has no head at or after the link that holds the upper time-stamp's token yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
 	default:
 		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the chain: a rewrite after the lower time-stamp needs a fresh upper one, and a T2 more than an hour after the window is a sign of it; a witness (esverify -heads) catches one made sooner")
 	}
@@ -493,16 +566,18 @@ func (r SourceReport) Text() string {
 		asked = "named in the bundle"
 	}
 	fmt.Fprintf(&b, "Source: %s\nWindow (receive time): %s – %s (%s)\n", r.Source, fmtTime(r.From), fmtTime(r.To), asked)
-	start := "the beginning of the chain"
-	if !r.FromStart {
-		start = fmt.Sprintf("the time-stamp of %s", fmtTime(r.Lower))
-	}
 	records := "no records"
 	if r.Records > 0 {
 		records = fmt.Sprintf("records %d–%d (%d, %d received in the window)", r.FirstSeq, r.LastSeq, r.Records, r.InWindow)
 	}
 	if r.Valid() {
-		fmt.Fprintf(&b, "Every record %s put into the store's chain from %s to the time-stamp of %s is in this bundle: %s\n", r.Source, start, fmtTime(r.Upper), records)
+		// Края — хвосты, а не время меток: нижние положены перед запросом T1,
+		// верхние — первые после токена T2.
+		span := fmt.Sprintf("from the beginning of the chain to the first source tails laid after the time-stamp of %s", fmtTime(r.Upper))
+		if !r.FromStart {
+			span = fmt.Sprintf("from the source tails laid right before the time-stamp of %s to the first source tails laid after the time-stamp of %s", fmtTime(r.Lower), fmtTime(r.Upper))
+		}
+		fmt.Fprintf(&b, "Every record %s put into the store's chain %s is in this bundle: %s\n", r.Source, span, records)
 	} else {
 		fmt.Fprintf(&b, "Records in the bundle: %s\n", records)
 	}

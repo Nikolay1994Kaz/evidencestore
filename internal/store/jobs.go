@@ -61,9 +61,13 @@ func (s *Store) startBackground() {
 // пока он не свеж. Переменная — чтобы тесты не ждали.
 var anchorRetry = 10 * time.Second
 
+// stampTimeout — сколько ждать ответа TSA: ответ дольше proof.StampLatency
+// всё равно не берётся.
+const stampTimeout = proof.StampLatency + 5*time.Second
+
 // stampLogged — метка по расписанию; ошибка — в журнал.
 func (s *Store) stampLogged() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), stampTimeout)
 	defer cancel()
 	if _, err := s.Stamp(ctx); err != nil {
 		s.log.Error("tsa stamp", "err", err)
@@ -91,7 +95,7 @@ func (s *Store) keepAnchor() {
 		if s.anchored() != nil {
 			s.log.Warn("intake waits for a fresh TSA time-stamp")
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), stampTimeout)
 		if _, err := s.stampNow(ctx); err != nil {
 			s.log.Error("tsa stamp", "err", err)
 		}
@@ -191,9 +195,14 @@ func (s *Store) Stamp(ctx context.Context) (uint64, error) {
 	return head, err
 }
 
-// stampNow ставит метку над текущей головой и отдаёт её время: так берётся
-// доверенное время для уничтожения ключей. Ставится всегда: голова после
-// прошлой метки новее заверенной — в ней лежит сам прошлый токен.
+// StampNow — метка по просьбе оператора (evidencestore stamp): ставится и
+// без новых листьев, с новыми хвостами после прошлого токена — в простое
+// так закрывается окно и появляется верхний край пакета по источнику.
+func (s *Store) StampNow(ctx context.Context) (uint64, error) {
+	head, _, err := s.stamp(ctx, true)
+	return head, err
+}
+
 // lockGateways берёт замки пачек всех источников журнала гейтвея — по
 // одному, в порядке имён (Ingest держит не больше одного) — и возвращает,
 // чем их отпустить.
@@ -221,6 +230,9 @@ func (s *Store) lockGateways() func() {
 	}
 }
 
+// stampNow ставит метку над текущей головой и отдаёт её время: так берётся
+// доверенное время для уничтожения ключей. Ставится всегда: голова после
+// прошлой метки новее заверенной — в ней лежит сам прошлый токен.
 func (s *Store) stampNow(ctx context.Context) (time.Time, error) {
 	_, gen, err := s.stamp(ctx, true)
 	return gen, err
@@ -237,6 +249,23 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	}
 	s.stampMu.Lock()
 	defer s.stampMu.Unlock()
+	head, gen, err := s.stampOnce(ctx, force)
+	if errors.Is(err, errClockLost) {
+		// Якорь уже взят по этой метке. Повтор кладёт новые хвосты — после
+		// того, что легло в цепь, пока шёл запрос, — и метка их заверяет.
+		s.log.Warn("the TSA time is ahead of the receive-time window: the monotonic clock lost time (host suspended or VM paused?); stamping again", "err", err)
+		head, gen, err = s.stampOnce(ctx, true)
+	}
+	return head, gen, err
+}
+
+// errClockLost — время TSA позже окна по якорю: монотонные часы потеряли
+// время (сон хоста, пауза ВМ), и время приёма отставало от времени TSA
+// больше, чем допускает граница окна пакетов (proof.WindowEdge).
+var errClockLost = errors.New("store: the TSA time is ahead of the receive-time window")
+
+// stampOnce — одна метка под stampMu.
+func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.Time, err error) {
 	// Пачка журнала гейтвея кладёт в цепь улики и вердикты к ним не разом:
 	// хвосты перед запросом не встают между уликой и её вердиктом — пакет по
 	// источнику берёт вердикт своей записи до края.
@@ -287,7 +316,9 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	// Ответ дольше StampLatency в цепь не ложится: что легло в цепь, пока шёл
 	// запрос, — после заверенного звена, и граница окна пакетов
 	// (proof.WindowEdge) держится на том, что запрос был коротким.
-	if took := s.mono() - asked; took > proof.StampLatency {
+	answered := s.mono()
+	took := answered - asked
+	if took > proof.StampLatency {
 		return 0, gen, fmt.Errorf("store: the TSA answered after %s, longer than %s: the time-stamp is not used", took.Round(time.Millisecond), proof.StampLatency)
 	}
 	// Токен проверяется до того, как лечь в цепь: в цепь не попадает то,
@@ -295,6 +326,20 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	info, err := tsa.Verify(token, imprint, s.tsaTrust)
 	if err != nil {
 		return 0, gen, fmt.Errorf("store: TSA token rejected: %w", err)
+	}
+	// Время TSA позже окна по якорю: монотонные часы стояли (сон хоста,
+	// пауза ВМ), и время приёма отставало на всю паузу. Запись, принятая,
+	// пока шёл запрос, легла после заверенного звена со временем внутри окна,
+	// которое эта метка закрыла бы, и пакеты за такое окно её бы не
+	// показали. Токен не ложится; якорь — по нему, и метка повторяется.
+	s.mu.Lock()
+	_, hi, _ := s.anchorWindowAt(answered)
+	s.mu.Unlock()
+	// Якорь — до времени листа токена: после старта якоря ещё нет, и лист
+	// токена получил бы часы хоста как есть.
+	s.anchorClock(info.GenTime, took)
+	if hi != 0 && info.GenTime.UnixNano() > hi+int64(clockLost) {
+		return 0, gen, fmt.Errorf("%w by %s", errClockLost, time.Duration(info.GenTime.UnixNano()-hi).Round(time.Second))
 	}
 	after := s.leafTime()
 	s.chainMu.Lock()
@@ -313,7 +358,6 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 		s.queueWitnessLocked(s.chain.Head(), true)
 	}
 	s.chainMu.Unlock()
-	s.anchorClock(info.GenTime, s.mono()-asked)
 	s.log.Info("tsa stamp", "head", head.Seq, "gen_time", info.GenTime)
 	return head.Seq, info.GenTime, err
 }

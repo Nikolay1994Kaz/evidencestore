@@ -346,8 +346,8 @@
   {
    "name": "S40 метка TSA не ставит якорь часов",
    "file": "internal/store/jobs.go",
-   "old": "\ts.anchorClock(info.GenTime, s.mono()-asked)",
-   "new": "\t_, _ = info.GenTime, asked"
+   "old": "\ts.anchorClock(info.GenTime, took)",
+   "new": "\t_, _ = info.GenTime, took"
   },
   {
    "name": "S41 метка ставится и без новых листьев",
@@ -622,8 +622,8 @@
   {
    "name": "S74 якорь не стареет: в простой метка не освежает его (Y-01)",
    "file": "internal/store/store.go",
-   "old": "\treturn !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2)",
-   "new": "\t_, _ = lo, hi\n\treturn !ok"
+   "old": "\tif !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) {",
+   "new": "\tif _ = hi; !ok {"
   },
   {
    "name": "S75 часы хоста позади окна — без тревоги",
@@ -1316,10 +1316,10 @@
    "new": "\t\tstart, _, err = sourceEdge("
   },
   {
-   "name": "U24 источник: T2 не запоминается",
+   "name": "U24 источник: время метки верхнего края не запоминается",
    "file": "internal/proof/source.go",
-   "old": "\tr.Upper = upper\n",
-   "new": "\t_ = upper\n"
+   "old": "\tr.UpperEdge = edgeAt\n",
+   "new": "\t_ = edgeAt\n"
   },
   {
    "name": "U25 окно: наоборот проходит",
@@ -1478,10 +1478,10 @@
    "new": ""
   },
   {
-   "name": "U52 пакет по источнику: верхняя метка без допуска WindowEdge",
+   "name": "U52 пакет по источнику: закрывающая метка без допуска WindowEdge",
    "file": "internal/store/source.go",
-   "old": "if t.gen.After(to.Add(proof.WindowEdge)) {\n\t\t\tupper = i\n\t\t\tbreak\n\t\t}\n\t}\n\tif upper < 0 {\n\t\ts.chainMu.Unlock()\n\t\treturn proof.SourceBundle{}",
-   "new": "if t.gen.After(to.Add(proof.ReceiveSkew)) {\n\t\t\tupper = i\n\t\t\tbreak\n\t\t}\n\t}\n\tif upper < 0 {\n\t\ts.chainMu.Unlock()\n\t\treturn proof.SourceBundle{}"
+   "old": "if t.gen.After(to.Add(proof.WindowEdge)) {\n\t\t\tclosing = i\n\t\t\tbreak\n\t\t}\n\t}\n\tif closing < 0 {\n\t\ts.chainMu.Unlock()\n\t\treturn proof.SourceBundle{}",
+   "new": "if t.gen.After(to.Add(proof.ReceiveSkew)) {\n\t\t\tclosing = i\n\t\t\tbreak\n\t\t}\n\t}\n\tif closing < 0 {\n\t\ts.chainMu.Unlock()\n\t\treturn proof.SourceBundle{}"
   },
   {
    "name": "U53 пакет по источнику: нижняя метка без допуска секунды",
@@ -1534,7 +1534,7 @@
   {
    "name": "U62 пакет по источнику: верхнее раскрытие не выдаётся",
    "file": "internal/store/source.go",
-   "old": "\tif tail != nil {\n\t\ttail.Salt = s.tailSalt(top.first, source)\n\t\tb.Upper.Open = proof.TailOf(*tail)\n\t}\n",
+   "old": "\tif tail != nil {\n\t\ttail.Salt = s.tailSalt(top.first, source)\n\t\tb.Upper.Open = open(b.Upper.Tails, *tail)\n\t}\n",
    "new": ""
   },
   {
@@ -1564,8 +1564,8 @@
   {
    "name": "Q1 метка: долгий ответ TSA ложится в цепь",
    "file": "internal/store/jobs.go",
-   "old": "\tif took := s.mono() - asked; took > proof.StampLatency {",
-   "new": "\tif took := s.mono() - asked; false && took > proof.StampLatency {"
+   "old": "\tif took > proof.StampLatency {",
+   "new": "\tif false && took > proof.StampLatency {"
   },
   {
    "name": "Q2 окно: незаверенный хвост участка в сводке",
@@ -1612,14 +1612,14 @@
   {
    "name": "Q9 источник: тело поломанной записи гейтвея вскрывается",
    "file": "internal/proof/source.go",
-   "old": "\t\tif !slices.Contains(r.GatewayBroken, body.Seq) {",
-   "new": "\t\tif true {"
+   "old": "\t\tif slices.Contains(r.GatewayBroken, body.Seq) {",
+   "new": "\t\tif false && slices.Contains(r.GatewayBroken, body.Seq) {"
   },
   {
    "name": "Q10 источник: запись гейтвея без вердикта",
    "file": "internal/proof/source.go",
-   "old": "\t\tif rec.Verdict == nil {\n\t\t\tif sealed, err := evidence.Unmarshal",
-   "new": "\t\tif false {\n\t\t\tif sealed, err := evidence.Unmarshal"
+   "old": "\t\tif rec.Verdict == nil && sealed.ContentType == gateway.ContentType {",
+   "new": "\t\tif false && rec.Verdict == nil && sealed.ContentType == gateway.ContentType {"
   },
   {
    "name": "Q11 пакет по источнику: вердикты не прикладываются",
@@ -1686,6 +1686,114 @@
    "file": "internal/proof/window.go",
    "old": "\t\tif top < 0 || st.head > stamps[top].head {",
    "new": "\t\tif top < 0 || false && st.head > stamps[top].head {"
+  },
+  {
+   "name": "V1 пакет по источнику: улика принимается и при чужом листе",
+   "file": "internal/proof/source.go",
+   "old": "if sealed.Source != l.Scope || strconv.FormatUint(sealed.Seq, 10) != l.Subject {",
+   "new": "if false && (sealed.Source != l.Scope || strconv.FormatUint(sealed.Seq, 10) != l.Subject) {"
+  },
+  {
+   "name": "V2 пакет по источнику: тело поломанной записи гейтвея — «без ключа»",
+   "file": "internal/proof/source.go",
+   "old": "keyless := r.Attached - len(r.Bodies) - r.withheld",
+   "new": "keyless := r.Attached - len(r.Bodies)"
+  },
+  {
+   "name": "V3 окно: время приёма записей за головой верхней метки не сверяется",
+   "file": "internal/proof/window.go",
+   "old": "if l.Type != auditchain.EventEvidence || timeErr != nil || t0 == nil {",
+   "new": "if true || l.Type != auditchain.EventEvidence || timeErr != nil || t0 == nil {"
+  },
+  {
+   "name": "V4 метка: токен со временем позже окна по якорю ложится в цепь",
+   "file": "internal/store/jobs.go",
+   "old": "if hi != 0 && info.GenTime.UnixNano() > hi+int64(clockLost) {",
+   "new": "if false && hi != 0 && info.GenTime.UnixNano() > hi+int64(clockLost) {"
+  },
+  {
+   "name": "V5 якорь не просит метки после остановки монотонных часов",
+   "file": "internal/store/store.go",
+   "old": "return time.Duration(s.nowTime().UnixNano()-lo)-s.anchorHost > clockSlack",
+   "new": "return false && time.Duration(s.nowTime().UnixNano()-lo)-s.anchorHost > clockSlack"
+  },
+  {
+   "name": "V6 пакет по источнику: вид «журнал гейтвея» не требует вердиктов",
+   "file": "internal/proof/source.go",
+   "old": "gw := b.Upper.Open != nil && b.Upper.Open.Kind == gateway.ContentType",
+   "new": "gw := false && b.Upper.Open != nil && b.Upper.Open.Kind == gateway.ContentType"
+  },
+  {
+   "name": "V7 хвосты: вид источника не входит в обязательство",
+   "file": "internal/proof/tails.go",
+   "old": "\tbinary.Write(&buf, binary.BigEndian, uint32(len(kind)))\n\tbuf.WriteString(kind)\n",
+   "new": ""
+  },
+  {
+   "name": "V8 хранилище не пишет вид источника в хвосты",
+   "file": "internal/store/chain.go",
+   "old": "Kind: s.tailKind(name)})",
+   "new": "Kind: \"\"})"
+  },
+  {
+   "name": "V9 пакет по источнику: разный вид на краях не провал",
+   "file": "internal/proof/source.go",
+   "old": "if b.Lower.Open != nil && b.Upper.Open != nil && b.Lower.Open.Kind != b.Upper.Open.Kind {",
+   "new": "if false && b.Lower.Open != nil && b.Upper.Open != nil && b.Lower.Open.Kind != b.Upper.Open.Kind {"
+  },
+  {
+   "name": "V10 индекс номеров: редкие куски не перебираются",
+   "file": "internal/store/ingest.go",
+   "old": "for i, pos := range c.sparse {",
+   "new": "for i, pos := range map[uint16]uint64{} {"
+  },
+  {
+   "name": "V11 пакет по источнику: закрывающий токен не обязан лежать до края",
+   "file": "internal/proof/source.go",
+   "old": "if c.LinkSeq >= b.Upper.Head {",
+   "new": "if false && c.LinkSeq >= b.Upper.Head {"
+  },
+  {
+   "name": "V12 пакет по источнику: T2 — время метки края, а не закрывающей",
+   "file": "internal/proof/source.go",
+   "old": "r.Upper, err = closingStamp(b, linkAt, trust.TSA)",
+   "new": "_, err = closingStamp(b, linkAt, trust.TSA); r.Upper = edgeAt"
+  },
+  {
+   "name": "V13 хранилище: край — хвосты любой следующей метки, хоть над звеном до закрывающего токена",
+   "file": "internal/store/source.go",
+   "old": "\t\tif s.tokens[i].head > clTok.seq {\n\t\t\tupper = i",
+   "new": "\t\tif true {\n\t\t\tupper = i"
+  },
+  {
+   "name": "V14 пакет по источнику: токен края до самого края не провал",
+   "file": "internal/proof/source.go",
+   "old": "if e.Token.LinkSeq <= e.Head {",
+   "new": "if false && e.Token.LinkSeq <= e.Head {"
+  },
+  {
+   "name": "V15 пакет по источнику: записи без приложенной улики не названы",
+   "file": "internal/proof/source.go",
+   "old": "if r.Attached > 0 && r.Attached < r.Records {",
+   "new": "if false && r.Attached > 0 && r.Attached < r.Records {"
+  },
+  {
+   "name": "V16 хранилище раскрывает хвосты только текущим видом источника",
+   "file": "internal/store/source.go",
+   "old": "for _, kind := range []string{s.tailKind(source), \"\", gateway.ContentType} {",
+   "new": "for _, kind := range []string{s.tailKind(source), s.tailKind(source), s.tailKind(source) + gateway.ContentType[:0]} {"
+  },
+  {
+   "name": "V17 потеря хода монотонных часов — только больше clockSlack",
+   "file": "internal/store/jobs.go",
+   "old": "if hi != 0 && info.GenTime.UnixNano() > hi+int64(clockLost) {",
+   "new": "if hi != 0 && info.GenTime.UnixNano() > hi+int64(clockSlack) {"
+  },
+  {
+   "name": "V18 evidencestore stamp без новых листьев ничего не делает",
+   "file": "internal/server/server.go",
+   "old": "head, err := s.store.StampNow(r.Context())",
+   "new": "head, err := s.store.Stamp(r.Context())"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6."

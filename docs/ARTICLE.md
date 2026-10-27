@@ -68,7 +68,7 @@ None of the pieces are new: hash chains, Merkle trees, the signed promises of Ce
 
 ## The demo, step by step
 
-You need Go 1.25 or newer, and python3, which the script uses to print the table. Nothing on your machine is touched, because "web-1" is just a directory inside a temporary folder.
+You need Go 1.25.4 or newer, and python3, which the script uses to print the table. Nothing on your machine is touched, because "web-1" is just a directory inside a temporary folder.
 
 ```sh
 git clone https://github.com/Nikolay1994Kaz/evidencestore
@@ -76,7 +76,7 @@ cd evidencestore
 scripts/demo-intruder.sh
 ```
 
-The script builds the three programs, makes demo certificates and starts the store on 127.0.0.1. The collector follows web-1's `auth.log` the way it would follow `/var/log/auth.log`. The script writes the morning, then the intrusion, one line per second, then the cleanup with `sed`, and along the way asks the store for a time-stamp four times: before the first line, after the morning, after the intrusion and at the end. Then it asks the store for a proof bundle for every record number of web-1, checks each bundle offline with `esverify` and saves each body with `esverify -body`. That's the table at the top.
+The script builds the three programs, makes demo certificates and starts the store on 127.0.0.1. The collector follows web-1's `auth.log` the way it would follow `/var/log/auth.log`. The script writes the morning, then the intrusion, one line per second, then the cleanup with `sed`, and along the way asks the store for a time-stamp four times: before the first line, after the morning, after the intrusion and at the end. Then it asks the store for a proof bundle for every record number of web-1, checks each bundle offline with `esverify` and saves each body with `esverify -body`. That's the table at the top. Last, it asks for the whole session of web-1 in one bundle over a window of time, and the four deleted lines are in it too; such bundles are newer than release v0.2.0.
 
 Under the table the script prints when each deleted record arrived:
 
@@ -176,7 +176,7 @@ Everything the store does before it answers "accepted" is in one function, `Inge
 2. The receive time is the host clock, held inside a window derived from the last TSA time-stamp (details below).
 3. The body is encrypted with a fresh key that exists for this one record (the DEK). The DEK is wrapped by the key of this source for this month (the KEK) and stored next to the ciphertext. The header (source, number, time, type) stays readable.
 4. The sealed record goes into the evidence log, and the batch is fsynced. While one batch is being fsynced the next one collects, so there's no artificial delay. After the first failed write or fsync the log refuses everything: after a failed fsync on Linux you no longer know what is on disk.
-5. A leaf goes into the hash chain: source, number, receive time, position in the log and the digest of the sealed record.
+5. A leaf goes into the hash chain: source, number, receive time, position in the log, the digest of the sealed record and the hash of the previous leaf of the same source.
 6. The promise is signed and the answer goes out.
 
 The answer doesn't wait for a chain link; links are written once a second in the background. That's what the deadline in the promise is for. If the record isn't in the chain by then, the promise in the collector's hands proves the breach.
@@ -311,7 +311,7 @@ evidencestore has a source type for such journals. At intake the store recompute
 
 We tried a scenario that Pipelock's documentation lists as an open limit: deleting a whole run. The gateway ran twice, the second run linked to the first by a chain-link file, and the collector picked up the shards. Then the first run's shards and its chain-link were deleted. Pipelock's verifier said `RESTART CONTINUITY OK` on what was left, exit code 0: from the inside the deletion was invisible. From the store both runs came back byte for byte, and the same verifier said `CHAIN VALID` for each. The store narrows this gap rather than closing it: only what was written within the last `flush_every` before the deletion can still disappear unnoticed. The chain-link files aren't collected yet, so restored runs show up as unlinked.
 
-The Pipelock-specific code is 665 lines out of about 14.5 thousand. Everything else is the same for any log, which is why the first demo is an `auth.log`.
+The Pipelock-specific code is 665 lines out of about 17.5 thousand. Everything else is the same for any log, which is why the first demo is an `auth.log`.
 
 ## What it can't do
 
@@ -326,9 +326,9 @@ The full list is in the README under [Known limitations](../README.md#known-limi
 
 ## How it was tested
 
-The numbers are for commit `957345c`, 12 October 2026.
+The numbers are for commit `957345c`, 12 October 2026; the mutation count is for 27 October.
 
-GitHub Actions runs the tests (`go build ./... && go vet ./... && go test -race ./...`) on every push. On top of that there's mutation testing: [`scripts/mutate.py`](../scripts/mutate.py) injects deliberate bugs into the code one at a time (flip a comparison, skip a check) and expects some test to fail. All 316 were caught.
+GitHub Actions runs the tests (`go build ./... && go vet ./... && go test -race ./...`) on every push to master and every pull request. On top of that there's mutation testing: [`scripts/mutate.py`](../scripts/mutate.py) injects deliberate bugs into the code one at a time (flip a comparison, skip a check) and expects some test to fail. All 520 were caught.
 
 The collector, the clock and the store itself are also checked by simulations against an oracle: random scenarios in virtual time with crashes in the middle of disk writes, three kinds of rotation, lost answers, wrong clocks and a disappearing TSA. The oracle demands that every line arrives exactly once, every loss shows up as a gap and every promise is kept. The store went through 2,000 scenarios of 300 steps without a failure, with 36,038 crashes, 6,649 restores from the copy, 1,368 disks that lied about fsync and 2,185 destroyed keys along the way.
 
@@ -347,7 +347,7 @@ DEMO_TSA=digicert scripts/demo-intruder.sh   # real time-stamps from DigiCert (n
 go build ./... && go vet ./... && go test -race ./...
 ```
 
-Release binaries are on the [Releases](https://github.com/Nikolay1994Kaz/evidencestore/releases) page: the store and the collector for Linux, and `esverify` also for macOS and Windows, with `SHA256SUMS` and build attestations. The latest release is v0.2.0: it has the intruder demo, `esverify -body` and the witness of chain heads.
+Release binaries are on the [Releases](https://github.com/Nikolay1994Kaz/evidencestore/releases) page: the store and the collector for Linux, and `esverify` also for macOS and Windows, with `SHA256SUMS` and build attestations. The latest release is v0.2.0: it has the intruder demo, `esverify -body` and the witness of chain heads. Bundles over a window of time came after it and will be in the next release.
 
 Further reading: the [README](../README.md) (configuration, installation, limits), and in Russian [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (a code map with the order to read it in) and [`docs/DECISIONS.md`](DECISIONS.md) (design decisions).
 

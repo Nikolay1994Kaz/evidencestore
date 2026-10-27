@@ -411,6 +411,25 @@ func (x *seqIndex) get(seq uint64) uint64 {
 	return c.sparse[uint16(seq%seqChunk)]
 }
 
+// each проходит все номера индекса с их позициями — по кускам, а не по
+// номерам подряд: у источника, прыгнувшего номером далеко вперёд, перебор
+// от 1 до последнего номера был бы бесконечным.
+func (x *seqIndex) each(fn func(seq, pos uint64)) {
+	for base, c := range x.chunks {
+		if c.dense != nil {
+			for i, pos := range c.dense {
+				if pos != 0 {
+					fn(base*seqChunk+uint64(i), pos)
+				}
+			}
+			continue
+		}
+		for i, pos := range c.sparse {
+			fn(base*seqChunk+uint64(i), pos)
+		}
+	}
+}
+
 func (x *seqIndex) set(seq, pos uint64) {
 	if x.chunks == nil {
 		x.chunks = map[uint64]*seqChunkIdx{}

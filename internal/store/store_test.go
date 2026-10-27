@@ -107,6 +107,16 @@ func mustStamp(t *testing.T, s *Store) {
 	}
 }
 
+// mustStampNow — метка и без новых листьев, как у keepAnchor: хвосты
+// следующей метки — верхний край пакета по источнику за окно, которое
+// закрыла предыдущая.
+func mustStampNow(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.stampNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // copyDirs — снимок дисков «на ходу», как они лежат в момент падения:
 // журнал улик уже на диске (fsync), листья цепи ещё в памяти.
 func copyDirs(t *testing.T, cfg *config.Config) *config.Config {

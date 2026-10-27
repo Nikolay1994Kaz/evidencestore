@@ -76,7 +76,7 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 			latest = "the latest is " + s.tokens[n-1].gen.UTC().Format(time.RFC3339)
 		}
 		s.chainMu.Unlock()
-		return proof.WindowBundle{}, fmt.Errorf("%w: no time-stamp after %s, %s past the window (%s): the store takes one every tsa.every while records arrive and at least once an hour; evidencestore stamp takes one now if anything entered the chain since the last",
+		return proof.WindowBundle{}, fmt.Errorf("%w: no time-stamp after %s, %s past the window (%s): the store takes one every tsa.every while records arrive and at least once an hour; from that time on, evidencestore stamp takes one at once",
 			ErrWindow, to.Add(proof.WindowEdge).UTC().Format(time.RFC3339), proof.WindowEdge, latest)
 	}
 	var lowerHead uint64

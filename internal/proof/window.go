@@ -326,7 +326,10 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 
 	// 8–9. Листья улик: разбираются, номер у источника — один раз, время
 	// приёма — между метками вокруг звена. Заодно — сводка по источникам.
-	r.Sources = summarize(leaves, certified, stamps, &r, add)
+	// Записи после головы верхней метки в сводку не идут, но время их приёма
+	// сверяется с ней: иначе запрос к TSA, затянутый ради того, чтобы
+	// спрятать запись окна за голову ВЕРХНЕЙ метки, не виден (E1-02).
+	r.Sources = summarize(leaves, stretch, len(certified), stamps, &r, add)
 
 	// 10. Приложенные улики — с заверенной части участка, тела вскрываются
 	// ключами записей.
@@ -467,7 +470,7 @@ func stampsAround(stamps []windowStamp, n uint64) (t1, t2 *windowStamp) {
 // summarize проходит листья участка: улики разбираются, номер у источника
 // встречается один раз, время приёма — между метками вокруг звена (пункты
 // 8–9). Возвращает сводку по источникам.
-func summarize(leaves []auditchain.Leaf, stretch []stretchLink, stamps []windowStamp, r *WindowReport, add func(string, error, string) bool) []SourceSummary {
+func summarize(leaves []auditchain.Leaf, stretch []stretchLink, certified int, stamps []windowStamp, r *WindowReport, add func(string, error, string) bool) []SourceSummary {
 	sums := map[string]*SourceSummary{}
 	sum := func(name string) *SourceSummary {
 		s, ok := sums[name]
@@ -481,9 +484,22 @@ func summarize(leaves []auditchain.Leaf, stretch []stretchLink, stamps []windowS
 	seen := map[string]map[uint64]bool{}
 	var leafErr, timeErr error
 	records := 0
-	for _, sl := range stretch {
+	for k, sl := range stretch {
 		t1, t2 := stampsAround(stamps, sl.seq)
 		t0 := stampBefore(stamps, sl.seq)
+		if k >= certified {
+			// Незаверенный хвост участка: только время приёма по метке, чью
+			// голову звено прошло.
+			for _, l := range leaves[sl.at : sl.at+sl.count] {
+				if l.Type != auditchain.EventEvidence || timeErr != nil || t0 == nil {
+					continue
+				}
+				if recv := time.Unix(0, l.UnixNano).UTC(); !recv.After(t0.gen.Add(-WindowEdge)) {
+					timeErr = fmt.Errorf("record %s/%s lies in link %d, after head %d the time-stamp of %s certifies, yet its receive time %s is not later than %s before it", l.Scope, l.Subject, sl.seq, t0.head, fmtTime(t0.gen), fmtTime(recv), WindowEdge)
+				}
+			}
+			continue
+		}
 		for i, l := range leaves[sl.at : sl.at+sl.count] {
 			switch l.Type {
 			case auditchain.EventEvidence:

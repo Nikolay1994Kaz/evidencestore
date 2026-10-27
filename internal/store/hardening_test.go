@@ -1743,3 +1743,116 @@ func TestHostClockAheadKeepsPromise(t *testing.T) {
 		t.Errorf("честное хранилище «нарушило» обещание: %v", err)
 	}
 }
+
+// Монотонные часы стояли (сон хоста, пауза ВМ: CLOCK_MONOTONIC в Linux во
+// сне не идёт), и время приёма отстаёт от времени TSA на всю паузу до
+// следующей метки. Запись, принятая, пока шёл запрос этой метки, легла бы
+// после заверенного звена со временем внутри окна, которое метка закрывает,
+// и пакеты за окно и по источнику её бы не показали. Метка, чьё время позже
+// окна по якорю, в цепь не ложится: якорь — по ней, метка повторяется с
+// новыми хвостами. Якорь просит метки сразу, как часы хоста ушли вперёд
+// оценки по нему.
+func TestMonoPauseKeepsWindowRecords(t *testing.T) {
+	clk := newClock() // истинное время = часы хоста = время TSA, 10:00
+	var mono atomic.Int64
+	mono.Store(int64(1000 * time.Hour))
+	advance := func(real, monoD time.Duration) {
+		clk.add(real)
+		mono.Add(int64(monoD))
+	}
+	cfg := testConfig(t)
+	s, err := Open(cfg, Options{Logger: quiet, Now: clk.now, NoBackground: true, Mono: func() time.Duration { return time.Duration(mono.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.tsaLocal.Now = clk.now
+
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s)     // A, 10:00 — якорь
+	s.needAnchor = true // как в serve с TSA: приём только по якорю
+	advance(time.Minute, time.Minute)
+	ingest(t, s, "abs-core", 2, 2) // 10:01
+	if s.anchorStale() {
+		t.Fatal("якорь минутной давности просит метки")
+	}
+	advance(9*time.Minute, 0) // машина стояла 9 минут
+	if !s.anchorStale() {
+		t.Error("часы хоста ушли вперёд оценки по якорю на 9 минут, а якорь не просит метки")
+	}
+	ingest(t, s, "abs-core", 3, 3) // 10:10 по TSA и хосту
+
+	// Метка B (10:10); пока шёл запрос, пришла запись 4.
+	inject := true
+	s.tsaLocal.Now = func() time.Time {
+		if inject {
+			inject = false
+			ingest(t, s, "abs-core", 4, 4)
+			if err := s.flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return clk.now()
+	}
+	mustStamp(t, s)
+	s.tsaLocal.Now = clk.now
+	if s.anchorStale() {
+		t.Error("якорь по свежей метке просит метки")
+	}
+	advance(10*time.Minute, 10*time.Minute)
+	ingest(t, s, "abs-core", 5, 5)
+	mustStamp(t, s) // C, 10:20
+
+	from, to := clockAt(10, 0, 30), clockAt(10, 5, 0)
+	var recv4 time.Time
+	for _, l := range leavesOf(t, cfg, auditchain.EventEvidence) {
+		if l.Scope == "abs-core" && l.Subject == "4" {
+			recv4 = time.Unix(0, l.UnixNano).UTC()
+		}
+	}
+	if recv4.Before(from) || recv4.After(to) {
+		t.Fatalf("время приёма записи 4 (%s) вне окна %s–%s: пауза не воспроизведена", recv4, from, to)
+	}
+	tr := trustOf(t, s)
+	w, err := s.ProofWindow(from, to, "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wr := proof.VerifyWindow(w, tr, from, to)
+	var last uint64
+	for _, src := range wr.Sources {
+		if src.Name == "abs-core" {
+			last = src.LastSeq
+		}
+	}
+	if !wr.Valid() || last < 4 {
+		t.Fatalf("пакет за окно без записи 4 (время приёма %s):\n%s", recv4, wr.Text())
+	}
+	sb, err := s.ProofSource("abs-core", from, to, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sr := proof.VerifySource(sb, tr, from, to); !sr.Valid() || sr.LastSeq < 4 {
+		t.Fatalf("пакет по источнику без записи 4:\n%s", sr.Text())
+	}
+	w2, err := s.ProofWindow(from, clockAt(10, 17, 0), "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.VerifyWindow(w2, tr, from, clockAt(10, 17, 0)); !r.Valid() {
+		t.Fatalf("пакет за окно 10:00:30–10:17:\n%s", r.Text())
+	}
+
+	// Короткая пауза (5 с, миграция ВМ) — тоже: первый токен не ложится,
+	// метка повторяется — два запроса к TSA, один токен в цепи.
+	advance(time.Minute, time.Minute)
+	ingest(t, s, "abs-core", 6, 6)
+	advance(5*time.Second, 0)
+	asked := 0
+	s.tsaLocal.Now = func() time.Time { asked++; return clk.now() }
+	n := len(s.tokens)
+	mustStamp(t, s)
+	if asked != 2 || len(s.tokens) != n+1 {
+		t.Fatalf("после паузы 5 с: запросов к TSA %d, меток %d → %d", asked, n, len(s.tokens))
+	}
+}

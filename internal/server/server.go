@@ -380,7 +380,7 @@ func (s *Server) AdminHandler() http.Handler {
 		writeCompact(w, b)
 	})
 	mux.HandleFunc("POST /admin/stamp", func(w http.ResponseWriter, r *http.Request) {
-		head, err := s.store.Stamp(r.Context())
+		head, err := s.store.StampNow(r.Context())
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err)
 			return

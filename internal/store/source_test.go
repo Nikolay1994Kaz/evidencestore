@@ -35,8 +35,9 @@ import (
 //
 //	10:00 abs-core 1–3, pipelock 1–2, метка A
 //	10:05 abs-core 4–6, pipelock 3–5
-//	10:10 метка B
-//	10:11 abs-core 7–8, метка C
+//	10:10 метка B, сразу за ней B′ (её хвосты — верхний край окон, которые
+//	      закрывает B)
+//	10:11 abs-core 7–8, метка C, сразу за ней C′
 func sourceStore(t *testing.T) (*Store, *clock) {
 	t.Helper()
 	c := newClock()
@@ -49,9 +50,11 @@ func sourceStore(t *testing.T) (*Store, *clock) {
 	ingest(t, s, "pipelock", 3, 5)
 	c.add(5 * time.Minute)
 	mustStamp(t, s)
+	mustStampNow(t, s)
 	c.add(time.Minute)
 	ingest(t, s, "abs-core", 7, 8)
 	mustStamp(t, s)
+	mustStampNow(t, s)
 	return s, c
 }
 
@@ -60,14 +63,15 @@ func sourceStore(t *testing.T) (*Store, *clock) {
 // история — падения, подъёмы, повторная привязка листьев — даёт цепочку
 // источника без разрыва.
 func wholeChainSource(s *Store, source string, trust proof.Trust) (proof.SourceReport, error) {
+	// Окно закрывает предпоследняя метка: хвосты последней — верхний край.
 	s.chainMu.Lock()
 	var last time.Time
-	if n := len(s.tokens); n > 0 {
-		last = s.tokens[n-1].gen
+	if n := len(s.tokens); n > 1 {
+		last = s.tokens[n-2].gen
 	}
 	s.chainMu.Unlock()
 	if last.IsZero() {
-		return proof.SourceReport{}, errors.New("в цепи нет меток")
+		return proof.SourceReport{}, errors.New("в цепи меньше двух меток")
 	}
 	from, to := time.Unix(1, 0).UTC(), last.Add(-proof.WindowEdge-time.Nanosecond)
 	b, err := s.ProofSource(source, from, to, false, 0)
@@ -77,19 +81,20 @@ func wholeChainSource(s *Store, source string, trust proof.Trust) (proof.SourceR
 	return proof.VerifySource(b, trust, from, to), nil
 }
 
-// midChainSource — пакет по источнику от метки в середине цепи до последней:
-// нижние хвосты и их раскрытие после падений и подъёмов. ok = false — меток
-// меньше трёх или они слишком близко: окна между ними нет.
+// midChainSource — пакет по источнику от метки в середине цепи до
+// предпоследней (хвосты последней — верхний край): нижние хвосты и их
+// раскрытие после падений и подъёмов. ok = false — меток меньше четырёх или
+// они слишком близко: окна между ними нет.
 func midChainSource(s *Store, source string, trust proof.Trust) (r proof.SourceReport, ok bool, err error) {
 	s.chainMu.Lock()
 	n := len(s.tokens)
 	var mid, last time.Time
-	if n >= 3 {
-		mid, last = s.tokens[n/2].gen, s.tokens[n-1].gen
+	if n >= 4 {
+		mid, last = s.tokens[n/2-1].gen, s.tokens[n-2].gen
 	}
 	s.chainMu.Unlock()
 	from, to := mid.Add(proof.ReceiveSlack+time.Nanosecond), last.Add(-proof.WindowEdge-time.Nanosecond)
-	if n < 3 || !to.After(from) {
+	if n < 4 || !to.After(from) {
 		return r, false, nil
 	}
 	b, err := s.ProofSource(source, from, to, false, 0)
@@ -207,7 +212,7 @@ func TestSourceProofFromChainStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := proof.VerifySource(sourceRoundTrip(t, b), trustOf(t, s), time.Time{}, time.Time{})
-	if !r.Valid() || !r.FromStart || r.FirstSeq != 1 || r.LastSeq != 3 || r.InWindow != 0 {
+	if !r.Valid() || !r.FromStart || r.FirstSeq != 1 || r.LastSeq != 6 || r.InWindow != 0 {
 		t.Fatalf("с начала цепи:\n%s", r.Text())
 	}
 }
@@ -282,6 +287,13 @@ func TestSourceProofForged(t *testing.T) {
 	b = clone()
 	b.Records[0].DEK, b.Records[1].DEK = b.Records[1].DEK, b.Records[0].DEK
 	sourceFailed(t, verify(b), "the records attached")
+
+	// Тело одной записи не приложено: пакет проходит, отчёт это называет.
+	b = clone()
+	b.Records[1].Evidence, b.Records[1].DEK = nil, nil
+	if r := verify(b); !r.Valid() || !strings.Contains(r.Text(), "1 of the 3 records come without their evidence") {
+		t.Fatalf("тело снято:\n%s", r.Text())
+	}
 }
 
 // Окно без записей источника: пакет пуст, нижнее и верхнее раскрытия —
@@ -291,6 +303,7 @@ func TestSourceProofEmptyWindow(t *testing.T) {
 	c.add(5 * time.Minute)
 	ingest(t, s, "pipelock", 6, 6)
 	mustStamp(t, s) // 10:16
+	mustStampNow(t, s)
 	b, err := s.ProofSource("abs-core", clockAt(10, 11, 2), clockAt(10, 13, 0), false, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -317,6 +330,7 @@ func TestSourceProofAcrossRestart(t *testing.T) {
 	ingest(t, s, "abs-core", 4, 6)
 	c.add(5 * time.Minute)
 	mustStamp(t, s) // 10:10
+	mustStampNow(t, s)
 	b, err := s.ProofSource("abs-core", clockAt(10, 4, 0), clockAt(10, 6, 0), false, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -366,7 +380,7 @@ func TestSourceProofWitness(t *testing.T) {
 }
 
 // oldStamp — метка, как её ставило хранилище до хвостов источников: токен
-// над текущей головой, без хвостов до запроса и после токена.
+// над текущей головой, без хвостов перед запросом.
 func oldStamp(t *testing.T, s *Store) {
 	t.Helper()
 	s.chainMu.Lock()
@@ -414,9 +428,14 @@ func TestSourceProofPredatesTails(t *testing.T) {
 	c.add(5 * time.Minute)
 	mustStamp(t, s) // 10:20
 	c.add(5 * time.Minute)
+	mustStampNow(t, s) // 10:25 — верхний край окна 10:14–10:16
+	c.add(2 * time.Minute)
 	ingest(t, s, "abs-core", 6, 6)
-	c.add(5 * time.Minute)
-	oldStamp(t, s) // 10:30
+	c.add(3 * time.Minute)
+	mustStamp(t, s) // 10:30 — закрывает окно 10:24–10:26
+	c.add(time.Minute)
+	ingest(t, s, "abs-core", 7, 7)
+	oldStamp(t, s) // 10:31 — её звено и было бы верхним краем
 	for _, w := range []struct {
 		name     string
 		from, to time.Time
@@ -589,6 +608,7 @@ func TestSourceProofHidesForeignActivity(t *testing.T) {
 	ingest(t, s, "abs-core", 7, 8) // pipelock молчит между B и C
 	c.add(5 * time.Minute)
 	mustStamp(t, s) // C, 10:20
+	mustStampNow(t, s)
 
 	trust := trustOf(t, s)
 	check := func(from, to time.Time) (changed bool, foreign int) {
@@ -786,7 +806,7 @@ func TestSourceProofLostRecordsWording(t *testing.T) {
 	c.add(5 * time.Minute)
 	mustStamp(t, s2)
 	c.add(2 * time.Minute)
-	mustStamp(t, s2)
+	mustStampNow(t, s2)
 
 	from, to := clockAt(10, 0, 2), clockAt(10, 5, 0)
 	b, err := s2.ProofSource("abs-core", from, to, false, 0)
@@ -821,6 +841,7 @@ func TestSourceProofGatewayVerdicts(t *testing.T) {
 	ingestLines(t, s, 1, readLines(t, filepath.Join(pipelockVectors, "tampered.jsonl")))
 	c.add(5 * time.Minute)
 	mustStamp(t, s) // верхняя, 10:06
+	mustStampNow(t, s)
 
 	single, err := s.Proof("agent-gw", 3, true) // запись гейтвея seq 2, в ней изменён байт
 	if err != nil {
@@ -927,11 +948,12 @@ func TestWindowProofAttachesCertifiedOnly(t *testing.T) {
 	}
 }
 
-// Q-19: верхний край — звено хвостов метки B посреди окна, а к нему свежая
-// метка, взятая через 10 минут после окна: тогда «полный» пакет прятал бы
-// записи, принятые между B и концом окна. Токен края обязан лежать в цепи
-// листом после края: свежий — только в переписанном звене, а его
-// опровергает свидетель (-heads).
+// Q-19 и Q-26: верхний край — звено хвостов метки B посреди окна. Свежая
+// метка над ним, дописанная в конец цепи, краем его не делает: перед ним нет
+// токена позже окна (proof, TestSourceFreshTokenOverOldTails). Остаётся
+// перепись: цепь после B заново — свежий закрывающий токен, новые хвосты без
+// записей 5–6, метка над ними. Её опровергает свидетель (-heads); без него
+// перепись в пределах часа после окна не отличить (README, Not proven).
 func TestSourceProofFreshTokenNeedsRewrite(t *testing.T) {
 	c := newClock() // 10:00
 	wdir := t.TempDir()
@@ -947,6 +969,7 @@ func TestSourceProofFreshTokenNeedsRewrite(t *testing.T) {
 	ingest(t, s, src, 5, 6) // 10:07 — их и прятали бы
 	c.add(10 * time.Minute)
 	mustStamp(t, s) // C, 10:17
+	mustStampNow(t, s)
 	for i := 0; i < 2; i++ {
 		if err := s.WitnessOnce(context.Background()); err != nil {
 			t.Fatal(err)
@@ -975,45 +998,55 @@ func TestSourceProofFreshTokenNeedsRewrite(t *testing.T) {
 	}
 	linkB := links[len(links)-1]
 	bp, _ := auditchain.DecodeBatchPayload(linkB.Payload)
-	tl, err := auditchain.ReadLeaves(s.chainDir, bp.FirstLeaf, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
 	c.add(3 * time.Minute) // 10:20
-	imprint := proof.HeadImprint(linkB.Seq, auditchain.Hash(linkB))
-	fresh, err := s.tsaLocal.Sign(imprint[:], nil)
-	if err != nil {
-		t.Fatal(err)
+	// Цепь после B переписана: закрывающий токен (над B), хвосты, где
+	// последняя запись abs-core — 4, токен над ними; голова переподписана.
+	sign := func(h auditchain.Record) []byte {
+		imprint := proof.HeadImprint(h.Seq, auditchain.Hash(h))
+		tok, err := s.tsaLocal.Sign(imprint[:], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok
 	}
-	// Свежий токен — листом в новом звене сразу за краем: цепь после края
-	// переписана, голова переподписана.
-	tokLeaf := auditchain.Leaf{UnixNano: c.now().UnixNano(), Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(linkB.Seq, 10), Payload: fresh}
-	next, err := auditchain.LinkBatch(auditchain.Head{Seq: linkB.Seq, Hash: auditchain.Hash(linkB)}, c.now().UnixNano(), bp.FirstLeaf+1, []auditchain.Leaf{tokLeaf})
-	if err != nil {
-		t.Fatal(err)
+	at := c.now().UnixNano()
+	link := func(prev auditchain.Record, first uint64, l auditchain.Leaf) auditchain.Record {
+		r, err := auditchain.LinkBatch(auditchain.Head{Seq: prev.Seq, Hash: auditchain.Hash(prev)}, at, first, []auditchain.Leaf{l})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
 	}
+	closeLeaf := auditchain.Leaf{UnixNano: at, Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(linkB.Seq, 10), Payload: sign(linkB)}
+	l1 := link(linkB, bp.FirstLeaf+1, closeLeaf)
+	var lastRec auditchain.Leaf
 	forged := honest
-	forged.Links = nil
-	for _, l := range append(links, next) {
-		forged.Links = append(forged.Links, proof.FromLink(l))
-	}
 	forged.Records = nil
 	for _, rec := range honest.Records {
 		if rec.Leaf.LinkSeq < linkB.Seq {
 			forged.Records = append(forged.Records, rec)
+			lastRec = rec.Leaf.Leaf.Chain()
 		}
 	}
-	lastRec := forged.Records[len(forged.Records)-1].Leaf.Leaf.Chain()
-	tails := proof.FromLeaf(tl[0])
-	forged.Upper = proof.SourceEdge{Head: linkB.Seq, Tails: &tails, Token: proof.Inclusion{Leaf: proof.FromLeaf(tokLeaf), LinkSeq: next.Seq},
-		Open: proof.TailOf(proof.Tail{Source: src, Seq: 4, Hash: auditchain.LeafHash(lastRec), Salt: s.tailSalt(bp.FirstLeaf, src)})}
-	forged.Statement = s.signer.Sign(auditchain.Head{Seq: next.Seq, Hash: auditchain.Hash(next)}, int(next.Seq), 0)
+	tail := proof.Tail{Source: src, Seq: 4, Hash: auditchain.LeafHash(lastRec), Salt: s.tailSalt(bp.FirstLeaf+2, src)}
+	tailsLeaf := proof.TailsLeaf([]proof.Tail{tail}, at)
+	l2 := link(l1, bp.FirstLeaf+2, tailsLeaf)
+	edgeLeaf := auditchain.Leaf{UnixNano: at, Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(l2.Seq, 10), Payload: sign(l2)}
+	l3 := link(l2, bp.FirstLeaf+3, edgeLeaf)
+	forged.Links = nil
+	for _, l := range append(links, l1, l2, l3) {
+		forged.Links = append(forged.Links, proof.FromLink(l))
+	}
+	tails := proof.FromLeaf(tailsLeaf)
+	forged.Upper = proof.SourceEdge{Head: l2.Seq, Tails: &tails, Token: proof.Inclusion{Leaf: proof.FromLeaf(edgeLeaf), LinkSeq: l3.Seq}, Open: proof.TailOf(tail)}
+	forged.Closing = proof.Inclusion{Leaf: proof.FromLeaf(closeLeaf), LinkSeq: l1.Seq}
+	forged.Statement = s.signer.Sign(auditchain.Head{Seq: l3.Seq, Hash: auditchain.Hash(l3)}, int(l3.Seq), 0)
 
 	sourceFailed(t, proof.VerifySource(forged, trust, from, to), "the chain in the bundle agrees with the heads the witness saw")
 	// Без свидетеля переписанное со свежей меткой в пределах часа после окна
 	// не отличить (README, Not proven): T2 — 10:20, в обычном ритме меток.
 	trust.Witness = nil
-	if r := proof.VerifySource(forged, trust, from, to); !r.Valid() || !r.Upper.Equal(clockAt(10, 20, 0)) {
+	if r := proof.VerifySource(forged, trust, from, to); !r.Valid() || !r.Upper.Equal(clockAt(10, 20, 0)) || r.Records != 2 {
 		t.Fatalf("без свидетеля:\n%s", r.Text())
 	}
 }
@@ -1061,8 +1094,14 @@ func TestSourceProofEndsAtWitnessHead(t *testing.T) {
 	c.add(3 * time.Minute)
 	ingest(t, s, "abs-core", 3, 4)
 	c.add(5 * time.Minute)
-	mustStamp(t, s)                // B, 10:08
+	mustStamp(t, s)                // B, 10:08 — закрывает окно
 	ingest(t, s, "pipelock", 1, 1) // после метки, до обхода свидетеля
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	c.add(time.Minute)
+	mustStamp(t, s)                // C, 10:09 — её хвосты: верхний край пакета по источнику
+	ingest(t, s, "pipelock", 2, 2) // после метки, до обхода свидетеля
 	if err := s.flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -1085,5 +1124,257 @@ func TestSourceProofEndsAtWitnessHead(t *testing.T) {
 	}
 	if r := proof.VerifyWindow(w, tr, from, to); !r.Valid() || r.WitnessHead != w.StretchEnd {
 		t.Fatalf("пакет за окно с -heads (кончается звеном %d):\n%s", w.StretchEnd, r.Text())
+	}
+}
+
+// Улика в пакете по источнику — только при своём листе: вердикт сверяется по
+// ячейке пакета, и тело поломанной записи гейтвея, переложенное в ячейку
+// другой записи с чистым вердиктом (у самой поломанной вердикт и тело сняты),
+// иначе вскрывалось бы, а поломанных в отчёте не было бы. Подписанное при
+// этом не тронуто — ключ не нужен.
+func TestSourceProofBodyStaysWithItsLeaf(t *testing.T) {
+	key := pipelockKey(t)
+	c := newClock()
+	s := openStore(t, testConfig(t, withGateway(key)), c)
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // нижняя метка, 10:00
+	c.add(time.Minute)
+	ingestLines(t, s, 1, readLines(t, filepath.Join(pipelockVectors, "tampered.jsonl")))
+	c.add(5 * time.Minute)
+	mustStamp(t, s) // верхняя, 10:06
+	mustStampNow(t, s)
+	from, to := clockAt(10, 0, 30), clockAt(10, 3, 30)
+	honest, err := s.ProofSource("agent-gw", from, to, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trustOf(t, s)
+	r := proof.VerifySource(honest, tr, from, to)
+	if !r.Valid() || !slices.Contains(r.GatewayBroken, 3) {
+		t.Fatalf("честный пакет:\n%s", r.Text())
+	}
+	// Ключа месяца нет только у нерасшифрованных по сроку: тело поломанной
+	// записи не вскрыто нарочно, ключ к нему приложен.
+	if strings.Contains(r.Text(), "carry no record key") {
+		t.Fatalf("тело поломанной записи названо записью без ключа:\n%s", r.Text())
+	}
+
+	b := sourceRoundTrip(t, honest)
+	broken, other := -1, -1
+	for i, rec := range b.Records {
+		switch rec.Leaf.Leaf.Chain().Subject {
+		case "3":
+			broken = i
+		case "4":
+			other = i
+		}
+	}
+	if broken < 0 || other < 0 {
+		t.Fatal("нет записей 3 и 4")
+	}
+	b.Records[other].Evidence, b.Records[other].DEK = b.Records[broken].Evidence, b.Records[broken].DEK
+	b.Records[broken].Evidence, b.Records[broken].DEK, b.Records[broken].Verdict = nil, nil, nil
+	if fr := proof.VerifySource(b, tr, from, to); fr.Valid() {
+		t.Fatalf("тело записи 3 в ячейке записи 4 принято:\n%s", fr.Text())
+	} else if !strings.Contains(fr.Text(), "goes with its own leaf") {
+		t.Fatalf("отказ не по месту улики:\n%s", fr.Text())
+	}
+}
+
+// Пакет журнала гейтвея без улик (без -dek): вердикты хранилища не
+// снимаются — вид источника лежит в хвостах под обязательством, и у каждой
+// записи журнала гейтвея вердикт обязан быть. Иначе поломанная запись
+// пропала бы из отчёта, а README обещает её назвать.
+func TestSourceProofGatewayVerdictsWithoutBodies(t *testing.T) {
+	key := pipelockKey(t)
+	c := newClock()
+	s := openStore(t, testConfig(t, withGateway(key)), c)
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // 10:00
+	c.add(time.Minute)
+	ingestLines(t, s, 1, readLines(t, filepath.Join(pipelockVectors, "tampered.jsonl")))
+	c.add(5 * time.Minute)
+	mustStamp(t, s) // 10:06
+	mustStampNow(t, s)
+	from, to := clockAt(10, 0, 30), clockAt(10, 3, 30)
+	b, err := s.ProofSource("agent-gw", from, to, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trustOf(t, s)
+	if r := proof.VerifySource(b, tr, from, to); !r.Valid() || !slices.Contains(r.GatewayBroken, 3) {
+		t.Fatalf("честный пакет без -dek: поломанные %v\n%s", r.GatewayBroken, r.Text())
+	}
+	stripped := sourceRoundTrip(t, b)
+	for i := range stripped.Records {
+		stripped.Records[i].Verdict = nil
+	}
+	if r := proof.VerifySource(stripped, tr, from, to); r.Valid() || !strings.Contains(r.Text(), "lacks the store's verdict, and the tails name agent-gw a gateway journal") {
+		t.Fatalf("вердикты сняты, поломанная запись 3 не названа:\n%s", r.Text())
+	}
+	// Вид в раскрытии сменить нельзя: он под обязательством.
+	plain := sourceRoundTrip(t, stripped)
+	plain.Upper.Open.Kind = ""
+	if r := proof.VerifySource(plain, tr, from, to); r.Valid() {
+		t.Fatalf("раскрытие без вида принято:\n%s", r.Text())
+	}
+	// Источник не журнал гейтвея — вердиктов от него не требуют.
+	a, err := s.ProofSource("abs-core", from, clockAt(10, 3, 30), false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.VerifySource(a, tr, from, to); !r.Valid() || a.Upper.Open == nil || a.Upper.Open.Kind != "" {
+		t.Fatalf("abs-core:\n%s", r.Text())
+	}
+}
+
+// Номер источника прыгнул далеко вперёд (сборщик ошибся или подделан):
+// пакет по источнику ищет последнюю запись до края по индексу номеров, а не
+// перебором от 1 до последнего номера — иначе запрос висел бы под замками
+// хранилища, и приём стоял.
+func TestSourceProofAfterSeqJump(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	ingest(t, s, "abs-core", 1, 2)
+	mustStamp(t, s) // 10:00
+	c.add(3 * time.Minute)
+	ingest(t, s, "abs-core", 1<<40, 1<<40)
+	c.add(5 * time.Minute)
+	mustStamp(t, s) // 10:08
+	mustStampNow(t, s)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ProofSource("abs-core", clockAt(10, 1, 0), clockAt(10, 5, 0), false, 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("пакет по источнику перебирает номера до 2^40")
+	}
+}
+
+// Вид источника сменился между краями (журнал гейтвея стал обычным
+// источником — конфиг поменяли): хранилище раскрывает хвосты с тем видом,
+// что был при метке, и пакет не проходит с ясной причиной, а не молча без
+// вердиктов.
+func TestSourceProofKindChanged(t *testing.T) {
+	key := pipelockKey(t)
+	c := newClock()
+	cfg := testConfig(t, withGateway(key))
+	s := openStore(t, cfg, c)
+	ingestLines(t, s, 1, readLines(t, filepath.Join(pipelockVectors, "tampered.jsonl"))[:2])
+	mustStamp(t, s) // 10:00
+	s.Close()
+	for i := range cfg.Sources {
+		if cfg.Sources[i].Name == "agent-gw" {
+			cfg.Sources[i].ContentType, cfg.Sources[i].GatewayKey = "syslog", ""
+		}
+	}
+	c.add(time.Minute)
+	s = openStore(t, cfg, c)
+	ingest(t, s, "agent-gw", 3, 3)
+	c.add(5 * time.Minute)
+	mustStamp(t, s) // 10:06
+	mustStampNow(t, s)
+	from, to := clockAt(10, 0, 30), clockAt(10, 3, 30)
+	b, err := s.ProofSource("agent-gw", from, to, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.VerifySource(b, trustOf(t, s), from, to); r.Valid() || !strings.Contains(r.Text(), `the tails name the kind of agent-gw "pipelock/recorder" at the lower edge and "" at the upper one`) {
+		t.Fatalf("смена вида:\n%s", r.Text())
+	}
+}
+
+// Хранилище солгало о виде источника в хвостах (журнал гейтвея назван
+// обычным): без улик снятые вердикты не видны — это ложь в цепи, как
+// заниженный хвост. С уликами (-dek) вид записи виден по самой улике, и
+// запись журнала гейтвея без вердикта не проходит.
+func TestSourceProofGatewayKindLie(t *testing.T) {
+	key := pipelockKey(t)
+	c := newClock()
+	s := openStore(t, testConfig(t, withGateway(key)), c)
+	s.gwSources["agent-gw"] = false
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // 10:00
+	c.add(time.Minute)
+	ingestLines(t, s, 1, readLines(t, filepath.Join(pipelockVectors, "tampered.jsonl")))
+	c.add(5 * time.Minute)
+	mustStamp(t, s) // 10:06
+	mustStampNow(t, s)
+	from, to := clockAt(10, 0, 30), clockAt(10, 3, 30)
+	b, err := s.ProofSource("agent-gw", from, to, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Upper.Open == nil || b.Upper.Open.Kind != "" {
+		t.Fatal("хвосты назвали журнал гейтвея журналом гейтвея")
+	}
+	for i := range b.Records {
+		b.Records[i].Verdict = nil
+	}
+	if r := proof.VerifySource(b, trustOf(t, s), from, to); r.Valid() || !strings.Contains(r.Text(), "is a gateway journal entry, and the bundle lacks the store's verdict on it") {
+		t.Fatalf("вердикты сняты, улики приложены:\n%s", r.Text())
+	}
+}
+
+// Свежая метка над старыми хвостами, дописанная в цепь сразу за
+// закрывающей, верхним краем не становится и честный пакет не ломает:
+// край — хвосты первой метки над звеном после закрывающего токена.
+func TestSourceProofSkipsAppendedOldTailsToken(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	ingest(t, s, "abs-core", 1, 2)
+	mustStamp(t, s) // A, 10:00
+	c.add(3 * time.Minute)
+	ingest(t, s, "abs-core", 3, 4)
+	c.add(2 * time.Minute)
+	mustStamp(t, s) // B, 10:05 — посреди окна
+	c.add(2 * time.Minute)
+	ingest(t, s, "abs-core", 5, 6)
+	c.add(10 * time.Minute)
+	mustStamp(t, s) // C, 10:17 — закрывает окно
+
+	// Владелец дописывает свежий токен над хвостами B.
+	var pb uint64
+	for _, tok := range s.tokens {
+		if tok.gen.Equal(clockAt(10, 5, 0)) {
+			pb = tok.head
+		}
+	}
+	links, err := auditchain.ReadLinks(s.chainDir, pb, pb)
+	if err != nil || pb == 0 {
+		t.Fatalf("звено B %d: %v", pb, err)
+	}
+	imprint := proof.HeadImprint(pb, auditchain.Hash(links[0]))
+	fresh, err := s.tsaLocal.Sign(imprint[:], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := tsa.Verify(fresh, imprint, s.tsaTrust)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.chainMu.Lock()
+	num := s.appendLeafLocked(auditchain.Leaf{UnixNano: c.now().UnixNano(), Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(pb, 10), Payload: fresh})
+	s.tokens = append(s.tokens, tokenRef{head: pb, leaf: num, gen: info.GenTime})
+	if err := s.flushLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.chainMu.Unlock()
+	c.add(time.Minute)
+	mustStampNow(t, s) // D — её хвосты и есть верхний край
+
+	from, to := clockAt(10, 1, 0), clockAt(10, 10, 0)
+	b, err := s.ProofSource("abs-core", from, to, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.VerifySource(b, trustOf(t, s), from, to); !r.Valid() || r.LastSeq != 6 {
+		t.Fatalf("честный пакет с дописанным токеном в цепи:\n%s", r.Text())
 	}
 }

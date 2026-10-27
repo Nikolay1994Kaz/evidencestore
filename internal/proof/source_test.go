@@ -21,10 +21,10 @@ import (
 // srcOpts — отступления синтетической цепи от честной.
 type srcOpts struct {
 	unlinked   bool   // записи abs-core 2–4 — листья прежнего формата, без ссылок
-	upperSeq   uint64 // номер abs-core в верхних хвостах (ноль — честный, 3)
+	upperSeq   uint64 // номер abs-core в верхних хвостах (ноль — честный, 4)
 	lowerExtra bool   // в звене нижних хвостов ещё один лист
 	upperExtra bool   // в звене верхних хвостов ещё один лист
-	gap        bool   // abs-core 2 пришла под номером 6: в цепи номера 6, 3, а 4–5 нет
+	gap        bool   // abs-core 2 пришла под номером 7: в цепи номера 7, 3, 4, а 5–6 нет
 	late       bool   // abs-core 3 «принята» в 10:15, позже метки верхнего края
 	early      bool   // abs-core 2 «принята» в 9:57, раньше нижней метки на 3 минуты
 }
@@ -37,18 +37,22 @@ type srcOpts struct {
 //	звено 4: [abs-core 2, pipelock 1, abs-core 3]     10:05
 //	звено 5: [хвосты: abs-core 3, pipelock 1]         метка B над головой 5 — 10:10
 //	звено 6: [abs-core 4, токен B]                    abs-core 4 — пока шёл запрос
-//	звено 7: [abs-core 5]                             10:11
+//	звено 7: [хвосты: abs-core 4, pipelock 1]         метка C над головой 7 — 10:11
+//	звено 8: [токен C]
+//	звено 9: [abs-core 5]                             10:12
 //
-// Окно 10:04–10:06 закрыто хвостами в звеньях 2 и 5.
+// Окно 10:04–10:06: нижний край — хвосты в звене 2 (метка A), закрывает
+// окно метка B (токен в звене 6), верхний край — хвосты в звене 7, после
+// него (метка C).
 type srcWorld struct {
 	*world
 	o    srcOpts
 	recs map[uint64]auditchain.Leaf // листья abs-core по месту в мире
-	toks [2][]byte                  // токены меток A и B
+	toks [3][]byte                  // токены меток A, B и C
 }
 
-// salt — соль хвоста в листе хвостов звена link: у хранилища это HMAC от
-// секрета, здесь — любое значение, своё для звена и источника.
+// salt — соль хвоста в листе хвостов звена link: у хранилища это хэш
+// подписи, здесь — любое значение, своё для звена и источника.
 func salt(link uint64, source string) [32]byte {
 	return sha256.Sum256([]byte(strconv.FormatUint(link, 10) + source))
 }
@@ -59,7 +63,7 @@ func newSrcWorld(t *testing.T, o srcOpts) *srcWorld {
 	add := func(at uint64, when time.Time) auditchain.Leaf {
 		num := at
 		if o.gap && at == 2 {
-			num = 6
+			num = 7
 		}
 		data := sealedBytes(t, num, when, "line "+strconv.FormatUint(num, 10))
 		l := EvidenceLeafLinked(evidence.Header{Source: "abs-core", Seq: num, ReceivedAt: when.UnixNano()}, at, evidence.Digest(data), prev)
@@ -98,38 +102,43 @@ func newSrcWorld(t *testing.T, o srcOpts) *srcWorld {
 	}
 	w.wlink(add(2, t2), other, add(3, t3))
 	w.now = at(10, 10, 0)
-	upperSeq := uint64(3)
+	w.wlink(tails(5, 3, 3, true))
+	hB, tB := w.stamp()
+	w.wlink(add(4, w.now), tokenLeaf(hB, tB))
+	w.now = at(10, 11, 0)
+	upperSeq := uint64(4)
 	if o.upperSeq != 0 {
 		upperSeq = o.upperSeq
 	}
-	upper := []auditchain.Leaf{tails(5, 3, upperSeq, true)}
+	upper := []auditchain.Leaf{tails(7, 4, upperSeq, true)}
 	if o.upperExtra {
 		upper = append(upper, auditchain.Leaf{Type: auditchain.EventStart})
 	}
 	w.wlink(upper...)
-	hB, tB := w.stamp()
-	w.wlink(add(4, w.now), tokenLeaf(hB, tB))
-	w.now = at(10, 11, 0)
+	hC, tC := w.stamp()
+	w.wlink(tokenLeaf(hC, tC))
+	w.now = at(10, 12, 0)
 	w.wlink(add(5, w.now))
-	w.toks = [2][]byte{tA, tB}
+	w.toks = [3][]byte{tA, tB, tC}
 	return w
 }
 
-// bundle — пакет по abs-core за окно from–to: звенья 2–6 (до токена метки
-// B), записи 2–3.
+// bundle — пакет по abs-core за окно from–to: звенья 2–8 (до токена метки
+// C), закрывающий токен B, записи 2–4.
 func (w *srcWorld) bundle(from, to time.Time) SourceBundle {
 	b := SourceBundle{Version: WindowVersion, Kind: SourceKind, Source: "abs-core", From: from, To: to}
-	lt, ut := FromLeaf(w.leaves[1][0]), FromLeaf(w.leaves[4][0])
-	upperSeq := uint64(3)
+	lt, ut := FromLeaf(w.leaves[1][0]), FromLeaf(w.leaves[6][0])
+	upperSeq := uint64(4)
 	if w.o.upperSeq != 0 {
 		upperSeq = w.o.upperSeq
 	}
 	b.Lower = SourceEdge{Head: 2, Tails: &lt, Token: w.inclusion(3, 0),
 		Open: TailOf(Tail{Source: "abs-core", Seq: 1, Hash: auditchain.LeafHash(w.recs[1]), Salt: salt(2, "abs-core")})}
-	b.Upper = SourceEdge{Head: 5, Tails: &ut, Token: w.inclusion(6, 1),
-		Open: TailOf(Tail{Source: "abs-core", Seq: upperSeq, Hash: auditchain.LeafHash(w.recs[3]), Salt: salt(5, "abs-core")})}
-	b.Records = []SourceRecord{{Leaf: w.inclusion(4, 0)}, {Leaf: w.inclusion(4, 2)}}
-	w.sign(&b, 6)
+	b.Upper = SourceEdge{Head: 7, Tails: &ut, Token: w.inclusion(8, 0),
+		Open: TailOf(Tail{Source: "abs-core", Seq: upperSeq, Hash: auditchain.LeafHash(w.recs[4]), Salt: salt(7, "abs-core")})}
+	b.Closing = w.inclusion(6, 1)
+	b.Records = []SourceRecord{{Leaf: w.inclusion(4, 0)}, {Leaf: w.inclusion(4, 2)}, {Leaf: w.inclusion(6, 0)}}
+	w.sign(&b, 8)
 	return b
 }
 
@@ -166,12 +175,12 @@ func TestSourceVerifies(t *testing.T) {
 	if !r.Valid() {
 		t.Fatalf("пакет не прошёл:\n%s", r.Text())
 	}
-	if !r.FromBundle || r.Lower != at(10, 0, 0) || r.Upper != at(10, 10, 0) || r.LowerHead != 2 || r.UpperHead != 5 || r.HeadSeq != 6 ||
-		r.Records != 2 || r.InWindow != 2 || r.FirstSeq != 2 || r.LastSeq != 3 || len(r.Holes) != 0 {
+	if !r.FromBundle || r.Lower != at(10, 0, 0) || r.Upper != at(10, 10, 0) || r.UpperEdge != at(10, 11, 0) || r.LowerHead != 2 || r.UpperHead != 7 || r.HeadSeq != 8 ||
+		r.Records != 3 || r.InWindow != 2 || r.FirstSeq != 2 || r.LastSeq != 4 || len(r.Holes) != 0 {
 		t.Fatalf("отчёт: %+v", r)
 	}
 	text := r.Text()
-	if !strings.Contains(text, "Every record abs-core put into the store's chain from the time-stamp of 2026-10-03 10:00:00 UTC to the time-stamp of 2026-10-03 10:10:00 UTC is in this bundle: records 2–3 (2, 2 received in the window)") ||
+	if !strings.Contains(text, "Every record abs-core put into the store's chain from the source tails laid right before the time-stamp of 2026-10-03 10:00:00 UTC to the first source tails laid after the time-stamp of 2026-10-03 10:10:00 UTC is in this bundle: records 2–4 (3, 2 received in the window)") ||
 		!strings.HasSuffix(text, "VERIFIED\n") {
 		t.Fatalf("отчёт:\n%s", text)
 	}
@@ -202,13 +211,13 @@ func TestSourceVerifies(t *testing.T) {
 func TestSourceToHead(t *testing.T) {
 	w := newSrcWorld(t, srcOpts{})
 	b := w.bundle(at(10, 4, 0), at(10, 6, 0))
-	w.sign(&b, 7)
-	if r := VerifySource(b, w.trust(), time.Time{}, time.Time{}); !r.Valid() || r.HeadSeq != 7 || r.UpperHead != 5 {
-		t.Fatalf("до головы 7:\n%s", r.Text())
+	w.sign(&b, 9)
+	if r := VerifySource(b, w.trust(), time.Time{}, time.Time{}); !r.Valid() || r.HeadSeq != 9 || r.UpperHead != 7 {
+		t.Fatalf("до головы 9:\n%s", r.Text())
 	}
-	b.Records = append(b.Records, SourceRecord{Leaf: w.inclusion(6, 0)})
+	b.Records = append(b.Records, SourceRecord{Leaf: w.inclusion(9, 0)})
 	sourceCheckFailed(t, VerifySource(b, w.trust(), time.Time{}, time.Time{}),
-		"the records are the whole chain of the source between the tails", "after the upper tails in link 5")
+		"the records are the whole chain of the source between the tails", "after the upper tails in link 7")
 }
 
 // Владелец ключа переписывает звено верхних хвостов — занижает хвост, чтобы
@@ -217,41 +226,73 @@ func TestSourceToHead(t *testing.T) {
 func TestSourceRewrittenUpperEdge(t *testing.T) {
 	w := newSrcWorld(t, srcOpts{})
 	b := w.bundle(at(10, 4, 0), at(10, 6, 0))
-	forged := TailsLeaf([]Tail{{Source: "abs-core", Seq: 2, Hash: auditchain.LeafHash(w.recs[2]), Salt: salt(5, "abs-core")}}, w.now.UnixNano())
-	h4 := w.links[3]
+	forged := TailsLeaf([]Tail{{Source: "abs-core", Seq: 2, Hash: auditchain.LeafHash(w.recs[2]), Salt: salt(7, "abs-core")}}, w.now.UnixNano())
+	h6 := w.links[5]
 	var first uint64
-	for _, ls := range w.leaves[:4] {
+	for _, ls := range w.leaves[:6] {
 		first += uint64(len(ls))
 	}
-	link, err := auditchain.LinkBatch(auditchain.Head{Seq: h4.Seq, Hash: auditchain.Hash(h4)}, w.now.UnixNano(), first, []auditchain.Leaf{forged})
+	link, err := auditchain.LinkBatch(auditchain.Head{Seq: h6.Seq, Hash: auditchain.Hash(h6)}, w.now.UnixNano(), first, []auditchain.Leaf{forged})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Звено токена B — тоже заново, сцепленное с поддельным краем: токен в
+	// Звено токена C — тоже заново, сцепленное с поддельным краем: токен в
 	// нём тот же.
-	six := w.leaves[5]
-	link6, err := auditchain.LinkBatch(auditchain.Head{Seq: link.Seq, Hash: auditchain.Hash(link)}, w.now.UnixNano(), first+1, six)
+	eight := w.leaves[7]
+	link8, err := auditchain.LinkBatch(auditchain.Head{Seq: link.Seq, Hash: auditchain.Hash(link)}, w.now.UnixNano(), first+1, eight)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, err := auditchain.MerkleProof(six, 1)
+	path, err := auditchain.MerkleProof(eight, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok := Inclusion{Leaf: FromLeaf(six[1]), LinkSeq: 6}
+	tok := Inclusion{Leaf: FromLeaf(eight[0]), LinkSeq: 8}
 	for _, st := range path {
 		tok.Path = append(tok.Path, Step{Hash: st.Hash[:], Left: st.SiblingLeft})
 	}
 	ft := FromLeaf(forged)
 	b.Upper.Tails = &ft
 	b.Upper.Token = tok
-	b.Upper.Open = TailOf(Tail{Source: "abs-core", Seq: 2, Hash: auditchain.LeafHash(w.recs[2]), Salt: salt(5, "abs-core")})
+	b.Upper.Open = TailOf(Tail{Source: "abs-core", Seq: 2, Hash: auditchain.LeafHash(w.recs[2]), Salt: salt(7, "abs-core")})
 	b.Records = b.Records[:1]
 	b.Links[len(b.Links)-2] = FromLink(link)
-	b.Links[len(b.Links)-1] = FromLink(link6)
-	b.Statement = w.signer.Sign(auditchain.Head{Seq: link6.Seq, Hash: auditchain.Hash(link6)}, int(link6.Seq), w.now.Unix())
+	b.Links[len(b.Links)-1] = FromLink(link8)
+	b.Statement = w.signer.Sign(auditchain.Head{Seq: link8.Seq, Hash: auditchain.Hash(link8)}, int(link8.Seq), w.now.Unix())
 	sourceCheckFailed(t, VerifySource(b, w.trust(), time.Time{}, time.Time{}),
-		"the upper tails are the only leaf of the link the upper time-stamp certifies", "the time-stamp")
+		"the upper tails are the only leaf of a link certified by a time-stamp", "the time-stamp")
+}
+
+// Свежая метка над старым звеном хвостов (B, посреди окна), взятая после
+// окна и дописанная в конец цепи, — без переписи. Краем это звено не стать:
+// перед ним нет токена позже окна, а закрывающий токен B лежит после него.
+func TestSourceFreshTokenOverOldTails(t *testing.T) {
+	w := newSrcWorld(t, srcOpts{})
+	w.now = at(10, 20, 0)
+	imprint := HeadImprint(5, auditchain.Hash(w.links[4]))
+	fresh, err := w.tsa.Sign(imprint[:], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.wlink(tokenLeaf(5, fresh)) // звено 10
+	b := w.bundle(at(10, 4, 0), at(10, 6, 0))
+	ut := FromLeaf(w.leaves[4][0])
+	b.Upper = SourceEdge{Head: 5, Tails: &ut, Token: w.inclusion(10, 0),
+		Open: TailOf(Tail{Source: "abs-core", Seq: 3, Hash: auditchain.LeafHash(w.recs[3]), Salt: salt(5, "abs-core")})}
+	b.Records = b.Records[:2] // запись 4 спрятана
+	w.sign(&b, 10)
+	for name, c := range map[string]struct {
+		closing      Inclusion
+		check, cause string
+	}{
+		"закрывает метка A — до края":    {w.inclusion(3, 0), "the time-stamps bracket the window", "before time-stamp T2 2026-10-03 10:00:00 UTC"},
+		"закрывает метка B — после края": {w.inclusion(6, 1), "the upper tails are the only leaf of a link certified by a time-stamp", "lies in link 6, not before the upper tails in link 5"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b.Closing = c.closing
+			sourceCheckFailed(t, VerifySource(b, w.trust(), time.Time{}, time.Time{}), c.check, c.cause)
+		})
+	}
 }
 
 func TestSourceForgedSynthetic(t *testing.T) {
@@ -259,7 +300,7 @@ func TestSourceForgedSynthetic(t *testing.T) {
 		head  = "the head is signed with the store key"
 		start = "the bundle starts at the beginning of the chain"
 		lower = "the lower tails are the only leaf of the link the lower time-stamp certifies"
-		upper = "the upper tails are the only leaf of the link the upper time-stamp certifies"
+		upper = "the upper tails are the only leaf of a link certified by a time-stamp"
 		chain = "the records are the whole chain of the source between the tails"
 	)
 	for _, c := range []struct {
@@ -269,7 +310,7 @@ func TestSourceForgedSynthetic(t *testing.T) {
 		check, detail string
 	}{
 		{"записи без ссылок", srcOpts{unlinked: true}, nil, chain, "has no link to the previous record"},
-		{"номер в верхнем раскрытии не тот", srcOpts{upperSeq: 7}, nil, chain, "name record 7 of abs-core as the last, but the chain of its records ends at 3"},
+		{"номер в верхнем раскрытии не тот", srcOpts{upperSeq: 7}, nil, chain, "name record 7 of abs-core as the last, but the chain of its records ends at 4"},
 		{"в звене нижних хвостов не только они", srcOpts{lowerExtra: true}, nil, lower, "does not hold just the tails"},
 		{"в звене верхних хвостов не только они", srcOpts{upperExtra: true}, nil, upper, "does not hold just the tails"},
 		{"звено выброшено", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
@@ -287,20 +328,41 @@ func TestSourceForgedSynthetic(t *testing.T) {
 		{"нижняя метка — над другой головой", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
 			b.Lower.Token = w.inclusion(6, 1)
 		}, lower, "is not a time-stamp token over link 2"},
+		{"токен верхней метки — до края", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			b.Upper.Token = w.inclusion(6, 1)
+		}, upper, "not after link 7 it certifies"},
 		{"верхняя метка — над другой головой", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
-			b.Upper.Token = w.inclusion(3, 0)
-		}, upper, "is not a time-stamp token over link 5"},
+			b.Upper.Token = w.inclusion(9, 0)
+			w.sign(b, 9)
+		}, upper, "is not a time-stamp token over link 7"},
+		{"закрывающего токена нет", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			b.Closing = Inclusion{}
+		}, upper, "the token of the time-stamp that closes the window"},
+		{"закрывающий токен — после края", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			b.Closing = w.inclusion(8, 0)
+		}, upper, "lies in link 8, not before the upper tails in link 7"},
+		{"закрывающий лист — не токен", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			b.Closing = w.inclusion(6, 0)
+		}, upper, "is not a time-stamp token"},
+		{"край — хвосты самой закрывающей метки", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			ut := FromLeaf(w.leaves[4][0])
+			b.Upper = SourceEdge{Head: 5, Tails: &ut, Token: w.inclusion(6, 1),
+				Open: TailOf(Tail{Source: "abs-core", Seq: 3, Hash: auditchain.LeafHash(w.recs[3]), Salt: salt(5, "abs-core")})}
+			b.Records = b.Records[:2]
+			w.sign(b, 6)
+		}, upper, "lies in link 6, not before the upper tails in link 5"},
 		{"верхний край — звено записей", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
 			b.Upper.Head = 4
 		}, upper, "does not hold just the tails"},
 		{"токен верхней метки — не из цепи", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
-			b.Upper.Token.Path = nil
+			b.Upper.Token.LinkSeq = 9
+			w.sign(b, 9)
 		}, upper, "the token of the time-stamp"},
 		{"верхнего края нет в пакете", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
 			b.Upper.Head = 9
 		}, upper, "link 9 is not in the bundle"},
 		{"соль раскрытия не та", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
-			b.Upper.Open = TailOf(Tail{Source: "abs-core", Seq: 3, Hash: auditchain.LeafHash(w.recs[3]), Salt: salt(2, "abs-core")})
+			b.Upper.Open = TailOf(Tail{Source: "abs-core", Seq: 4, Hash: auditchain.LeafHash(w.recs[4]), Salt: salt(2, "abs-core")})
 		}, upper, "does not match the tails leaf"},
 		{"запись чужого источника", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
 			b.Records[1].Leaf = w.inclusion(4, 1)
@@ -309,7 +371,7 @@ func TestSourceForgedSynthetic(t *testing.T) {
 			l := w.inclusion(5, 0)
 			l.Leaf.Scope, l.Leaf.Subject = "abs-core", "9"
 			b.Records = append(b.Records, SourceRecord{Leaf: l})
-		}, chain, "record 3 of the bundle is not a record of abs-core"},
+		}, chain, "record 4 of the bundle is not a record of abs-core"},
 		{"запись переставлена", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
 			b.Records[0], b.Records[1] = b.Records[1], b.Records[0]
 		}, chain, "record abs-core/3 does not refer to the record before it"},
@@ -338,17 +400,17 @@ func TestSourceForgedSynthetic(t *testing.T) {
 func TestSourceHoles(t *testing.T) {
 	w := newSrcWorld(t, srcOpts{gap: true})
 	r := VerifySource(w.bundle(at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{})
-	if !r.Valid() || r.FirstSeq != 3 || r.LastSeq != 6 || len(r.Holes) != 1 || r.Holes[0] != (SeqRange{From: 4, To: 5}) {
+	if !r.Valid() || r.FirstSeq != 3 || r.LastSeq != 7 || len(r.Holes) != 1 || r.Holes[0] != (SeqRange{From: 5, To: 6}) {
 		t.Fatalf("дыры %v:\n%s", r.Holes, r.Text())
 	}
-	if !strings.Contains(r.Text(), "numbers 4–5 are not in the chain between the edges") || !strings.Contains(r.Text(), "or the store lost them after accepting them") {
+	if !strings.Contains(r.Text(), "numbers 5–6 are not in the chain between the edges") || !strings.Contains(r.Text(), "or the store lost them after accepting them") {
 		t.Fatalf("отчёт:\n%s", r.Text())
 	}
 }
 
 func TestTailsLeaf(t *testing.T) {
 	a := Tail{Source: "abs-core", Seq: 3, Hash: [32]byte{3}, Salt: [32]byte{30}}
-	p := Tail{Source: "pipelock", Seq: 1, Hash: [32]byte{1}, Salt: [32]byte{10}}
+	p := Tail{Source: "pipelock", Seq: 1, Hash: [32]byte{1}, Salt: [32]byte{10}, Kind: "pipelock/recorder"}
 	l := TailsLeaf([]Tail{a, p}, 5)
 	if auditchain.LeafHash(l) != auditchain.LeafHash(TailsLeaf([]Tail{p, a}, 5)) {
 		t.Fatal("лист хвостов зависит от порядка источников")
@@ -371,7 +433,7 @@ func TestTailsLeaf(t *testing.T) {
 	for _, e := range entries.Sources {
 		for q := uint64(0); q < 1000; q++ {
 			for _, guess := range [][32]byte{{}, p.Hash} {
-				commit := tailCommit("pipelock", q, p.Hash, guess)
+				commit := tailCommit("pipelock", q, p.Hash, guess, p.Kind)
 				if e.Commit == hexOf(commit) {
 					t.Fatalf("номер чужого источника подобран: %d", q)
 				}
@@ -393,6 +455,7 @@ func TestTailsLeaf(t *testing.T) {
 		"номер не тот":           {l, "abs-core", TailOf(Tail{Source: "abs-core", Seq: 4, Hash: a.Hash, Salt: a.Salt}), "does not match"},
 		"хэш не тот":             {l, "abs-core", TailOf(Tail{Source: "abs-core", Seq: 3, Hash: [32]byte{4}, Salt: a.Salt}), "does not match"},
 		"соль не та":             {l, "abs-core", TailOf(Tail{Source: "abs-core", Seq: 3, Hash: a.Hash, Salt: [32]byte{31}}), "does not match"},
+		"вид не тот":             {l, "abs-core", TailOf(Tail{Source: "abs-core", Seq: 3, Hash: a.Hash, Salt: a.Salt, Kind: "pipelock/recorder"}), "does not match"},
 		"хэш не разбирается":     {l, "abs-core", &TailOpen{Seq: 3, Leaf: "zz", Salt: hexOf(a.Salt)}, "hash does not parse"},
 		"хэш короче":             {l, "abs-core", &TailOpen{Seq: 3, Leaf: "0300", Salt: hexOf(a.Salt)}, "hash does not parse"},
 		"соль не разбирается":    {l, "abs-core", &TailOpen{Seq: 3, Leaf: hexOf(a.Hash), Salt: "zz"}, "salt does not parse"},

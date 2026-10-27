@@ -441,3 +441,43 @@ func TestUnexplained(t *testing.T) {
 		}
 	}
 }
+
+// Q-10 и для верхней метки: хранилище, затянувшее запрос к TSA, прятало бы
+// записи окна за голову под ВЕРХНЕЙ меткой пакета — записи после неё в сводку
+// не идут, но время их приёма обязано быть позже времени этой метки минус
+// WindowEdge.
+//
+//	звено 1: [запуск]                         10:00, метка A над головой 1
+//	звено 2: [токен A, abs-core 1 (10:02)]    10:02
+//	звено 3: [событие]                        10:05 — голова, которую понесут в TSA
+//	звено 4: [abs-core 2 (10:07), 3 (10:08)]  10:08 — пришли, пока «шёл» запрос
+//	звено 5: [токен B]                        10:15 — метка B над головой 3
+func TestWindowStalledUpperStamp(t *testing.T) {
+	w := newWorld(t)
+	w.now = at(10, 0, 0)
+	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+	hA, tA := w.stamp()
+	w.now = at(10, 2, 0)
+	w.wlink(tokenLeaf(hA, tA), rec(t, 1, at(10, 2, 0)))
+	w.now = at(10, 5, 0)
+	w.wlink(auditchain.Leaf{UnixNano: w.now.UnixNano(), Type: auditchain.EventSilence, Scope: "other"})
+	headB := w.head()
+	w.now = at(10, 8, 0)
+	w.wlink(rec(t, 2, at(10, 7, 0)), rec(t, 3, at(10, 8, 0)))
+	w.now = at(10, 15, 0)
+	imprint := HeadImprint(headB.Seq, headB.Hash)
+	tB, err := w.tsa.Sign(imprint[:], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.wlink(tokenLeaf(headB.Seq, tB))
+
+	b := w.window(1, 5, at(10, 1, 0), at(10, 10, 0))
+	r := VerifyWindow(b, w.trust(), at(10, 1, 0), at(10, 10, 0))
+	if r.Valid() {
+		t.Fatalf("записи 2 и 3 (приняты 10:07 и 10:08) спрятаны за голову под затянутой верхней меткой:\n%s", r.Text())
+	}
+	if !strings.Contains(r.Text(), "record abs-core/2 lies in link 4, after head 3") {
+		t.Fatalf("отказ не по записи за головой верхней метки:\n%s", r.Text())
+	}
+}

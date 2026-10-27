@@ -209,11 +209,15 @@ echo "restored line: $(cat "$B/5.restored")"
 step "the auditor asks for the whole session of web-1 in one bundle: nothing in it can be left out"
 TO=$(date -u +%FT%T.%NZ)
 echo "window (receive time): $FROM – $TO"
-echo "(a window is closed by a time-stamp taken more than two minutes after its end: two minutes pass, web-1 lives on)"
-sleep 125
+echo "(a window is closed by a time-stamp taken more than two minutes after its end, and the bundle ends at the source"
+echo " tails of the time-stamp after that one: two minutes pass, web-1 lives on)"
+sleep 135 # две минуты и запас на часы хоста, спешащие перед TSA (DEMO_TSA=digicert)
 log "sshd[1302]: Accepted publickey for deploy from 10.0.0.5 port 51260 ssh2: ED25519 SHA256:k3Vq1rQ8"
 wait_seq 9
-"$BIN/evidencestore" stamp -config "$CFG" >/dev/null # метка больше чем через две минуты после окна
+"$BIN/evidencestore" stamp -config "$CFG" >/dev/null # метка больше чем через две минуты после окна — закрывающая
+log "sshd[1302]: pam_unix(sshd:session): session opened for user deploy(uid=1001) by (uid=0)"
+wait_seq 10
+"$BIN/evidencestore" stamp -config "$CFG" >/dev/null # её хвосты — верхний край пакета по источнику
 "$BIN/evidencestore" proof -config "$CFG" -from "$FROM" -to "$TO" -source web-1 -dek -out "$WORK/session.json"
 "$BIN/esverify" -proof "$WORK/session.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST" -bodies "$WORK/session"
 python3 -I - "$WORK/session" "$LOG" <<'PY'

@@ -17,9 +17,10 @@ import (
 )
 
 // windowWorld — хранилище по часам теста и пакет за окно 10:04–10:06:
-// улики 1–2 в 10:00 и метка, улики 3–4 в 10:05, метка в 10:10. С -source
-// abs-core -dek — с телами улик 3–4. source — пакет по abs-core за то же
-// окно, с телами.
+// улики 1–2 в 10:00 и метка, улики 3–4 в 10:05, метка в 10:10, запись
+// web-1 и метка в 10:11 (её хвосты — верхний край пакета по источнику). С
+// -source abs-core -dek — с телами улик 3–4. source — пакет по abs-core за
+// то же окно, с телами.
 type windowWorld struct {
 	dir, bundle, bare, source, single, key, trust string
 }
@@ -30,7 +31,7 @@ func newWindowWorld(t *testing.T) windowWorld {
 	cfg := &config.Config{
 		DataDir: filepath.Join(dir, "data"), RootsDir: filepath.Join(dir, "roots"),
 		TSA:     config.TSA{URL: "local"},
-		Sources: []config.Source{{Name: "abs-core", ContentType: "syslog"}},
+		Sources: []config.Source{{Name: "abs-core", ContentType: "syslog"}, {Name: "web-1", ContentType: "syslog"}},
 		Demo:    true,
 	}
 	cfg.Defaults()
@@ -64,6 +65,13 @@ func newWindowWorld(t *testing.T) windowWorld {
 		}
 	}
 	advance(5 * time.Minute)
+	if _, err := s.Stamp(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	advance(time.Minute)
+	if _, err := s.Ingest("web-1", in(1)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.Stamp(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +231,7 @@ func TestSourceBundle(t *testing.T) {
 	w := newWindowWorld(t)
 	code, out, _ := w.run(t, w.source)
 	if code != exitValid || !strings.HasPrefix(out, "VERIFIED") ||
-		!strings.Contains(out, "Every record abs-core put into the store's chain from the time-stamp of 2026-10-26 10:00:00 UTC to the time-stamp of 2026-10-26 10:10:00 UTC is in this bundle: records 3–4 (2, 2 received in the window)") {
+		!strings.Contains(out, "Every record abs-core put into the store's chain from the source tails laid right before the time-stamp of 2026-10-26 10:00:00 UTC to the first source tails laid after the time-stamp of 2026-10-26 10:10:00 UTC is in this bundle: records 3–4 (2, 2 received in the window)") {
 		t.Fatalf("код %d:\n%s", code, out)
 	}
 	dir := filepath.Join(w.dir, "bodies")

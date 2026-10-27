@@ -135,6 +135,7 @@ type Store struct {
 	anchorTSA  time.Time
 	anchorMono time.Duration
 	anchorLag  time.Duration // от запроса к TSA до якоря: подпись — где-то в этом окне
+	anchorHost time.Duration // часы хоста минус время TSA в момент якоря
 	clockOff   bool          // часы хоста сейчас вне окна (о начале — в журнал один раз)
 	// needAnchor — приём ждёт свежего якоря: TSA настроена, фоновые циклы
 	// работают (serve). Без якоря время приёма не с чем сверить: часы хоста,
@@ -169,6 +170,9 @@ type Store struct {
 	// srcTail — последний лист улики каждого источника в порядке цепи: на него
 	// ссылается следующий лист источника, он же уходит в хвосты (п. 28).
 	srcTail map[string]srcTailRef
+	// gwSources — источники журнала гейтвея: заданы при старте и не
+	// меняются, читаются без замка. Их вид — в хвостах (tailKind).
+	gwSources map[string]bool
 	// preTailsHead — звено хвостов перед запросом, ещё не заверенное: метка,
 	// повторённая без новых листьев (TSA не ответила), берёт его же.
 	preTailsHead uint64
@@ -490,8 +494,11 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 			s.mono = func() time.Duration { return time.Since(start) }
 		}
 	}
+	s.gwSources = map[string]bool{}
 	for _, src := range cfg.Sources {
-		s.sources[src.Name] = &sourceState{cfg: src, known: true, inflight: map[uint64]bool{}, gw: newTracker(src)}
+		st := &sourceState{cfg: src, known: true, inflight: map[uint64]bool{}, gw: newTracker(src)}
+		s.sources[src.Name] = st
+		s.gwSources[src.Name] = st.gw != nil
 	}
 	lock, err := lockDataDir(cfg.DataDir)
 	if err != nil {
@@ -918,7 +925,11 @@ const (
 	// clockSlack — на сколько часы хоста могут выйти за окно по якорю,
 	// прежде чем это тревога, а не обычное отставание оценки.
 	clockSlack = 10 * time.Second
-	driftPPM   = 10000 // 1/driftPPM — уход монотонных часов, 100 ppm
+	// clockLost — на сколько время TSA может быть позже окна по якорю, прежде
+	// чем это потеря хода монотонных часов (сон хоста, пауза ВМ): их уход за
+	// час якоря — меньше 2 с даже при подстройке NTP до 500 ppm.
+	clockLost = 3 * time.Second
+	driftPPM  = 10000 // 1/driftPPM — уход монотонных часов, 100 ppm
 )
 
 // anchorWindowLocked — lo и hi по якорю сейчас (unix-нс); ok — якорь есть и
@@ -950,7 +961,7 @@ func (s *Store) clockLocked() int64 {
 		floor := hi - int64(recvWindow)
 		switch {
 		case t > hi+int64(clockSlack):
-			s.clockAlarm("host clock is ahead of TSA time: receive times follow the last time-stamp and the monotonic clock", time.Duration(t-hi))
+			s.clockAlarm("host clock is ahead of TSA time, or the monotonic clock stopped (host suspended, VM paused): receive times follow the last time-stamp and the monotonic clock", time.Duration(t-hi))
 		case t < floor-int64(clockSlack):
 			s.clockAlarm("host clock is behind TSA time: receive times follow the last time-stamp and the monotonic clock", time.Duration(floor-t))
 		default:
@@ -1009,19 +1020,28 @@ func (s *Store) anchored() error {
 	return nil
 }
 
-// anchorStale — якорь пора освежить: его нет, он старше anchorRefresh или
-// окно по нему разошлось больше чем на половину recvWindow.
+// anchorStale — якорь пора освежить: его нет, он старше anchorRefresh,
+// окно по нему разошлось больше чем на половину recvWindow или часы хоста
+// ушли вперёд оценки по якорю больше чем на clockSlack сверх того, где были
+// при якоре: монотонные часы стояли (сон хоста, пауза ВМ), и время приёма
+// отстаёт на всю паузу. Часы хоста, просто идущие впереди, метку не зовут:
+// их сдвиг при якоре тот же.
 func (s *Store) anchorStale() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lo, hi, ok := s.anchorWindowLocked()
-	return !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2)
+	if !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) {
+		return true
+	}
+	return time.Duration(s.nowTime().UnixNano()-lo)-s.anchorHost > clockSlack
 }
 
 // anchorClock ставит якорь часов по свежей метке TSA: её время и монотонные
 // часы в момент ответа. lag — сколько шёл ответ, от запроса до якоря.
 func (s *Store) anchorClock(gen time.Time, lag time.Duration) {
+	mono := s.mono() // вне s.mu: часы теста бывают с крючком
 	s.mu.Lock()
-	s.anchorTSA, s.anchorMono, s.anchorLag = gen, s.mono(), lag
+	s.anchorTSA, s.anchorMono, s.anchorLag = gen, mono, lag
+	s.anchorHost = s.nowTime().Sub(gen)
 	s.mu.Unlock()
 }

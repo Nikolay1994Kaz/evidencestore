@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/url"
 	"strconv"
@@ -105,13 +106,16 @@ func TestAdminProofWindow(t *testing.T) {
 }
 
 // Пакет по источнику через админку (п. 28): окно разбирается так же, без
-// источника — 400, чужой источник — 404.
+// источника — 400, чужой источник — 404. Верхний край — хвосты второй метки.
 func TestAdminProofSource(t *testing.T) {
 	e := setup(t)
 	c := e.collector(t, "abs-core")
 	post(t, c, e.url+"/v1/ingest", records(1, 2))
-	if resp, body := post(t, e.admin, "http://admin/admin/stamp", nil); resp == nil || resp.StatusCode != 200 {
-		t.Fatalf("stamp: %v %s", resp, body)
+	for q := uint64(3); q <= 4; q++ {
+		if resp, body := post(t, e.admin, "http://admin/admin/stamp", nil); resp == nil || resp.StatusCode != 200 {
+			t.Fatalf("stamp: %v %s", resp, body)
+		}
+		post(t, c, e.url+"/v1/ingest", records(q, q))
 	}
 	now := time.Now().UTC()
 	get := func(q url.Values) (int, []byte) {
@@ -153,7 +157,9 @@ func TestAdminProofSource(t *testing.T) {
 	trust.TSA.Roots = x509.NewCertPool()
 	trust.TSA.Roots.AddCert(root)
 	r := proof.VerifySource(b, trust, time.Time{}, time.Time{})
-	if !r.Valid() || !r.FromStart || r.Records != 2 || len(r.Bodies) != 2 || string(r.Bodies[1].Body) != "event 2" {
+	// Запись 3 легла после закрывающей метки, до хвостов второй: она тоже в
+	// пакете.
+	if !r.Valid() || !r.FromStart || r.Records != 3 || len(r.Bodies) != 3 || string(r.Bodies[1].Body) != "event 2" {
 		t.Fatalf("пакет по источнику:\n%s", r.Text())
 	}
 
@@ -178,5 +184,28 @@ func TestAdminProofSource(t *testing.T) {
 	q.Set("source", "nobody")
 	if code, data := get(q); code != 404 {
 		t.Fatalf("чужой источник: %d %s", code, data)
+	}
+}
+
+// evidencestore stamp ставит метку и без новых листьев: в простое оператор
+// так закрывает окно и даёт пакету по источнику верхний край.
+func TestAdminStampForced(t *testing.T) {
+	e := setup(t)
+	c := e.collector(t, "abs-core")
+	post(t, c, e.url+"/v1/ingest", records(1, 1))
+	var last uint64
+	for i := 0; i < 2; i++ {
+		resp, body := post(t, e.admin, "http://admin/admin/stamp", nil)
+		if resp == nil || resp.StatusCode != 200 {
+			t.Fatalf("stamp: %v %s", resp, body)
+		}
+		var out map[string]uint64
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out["stamped_head"] <= last {
+			t.Fatalf("метка %d: голова %d после %d", i+1, out["stamped_head"], last)
+		}
+		last = out["stamped_head"]
 	}
 }
