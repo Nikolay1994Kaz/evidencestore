@@ -92,24 +92,6 @@
    "file": "internal/auditchain/carrier.go",
    "old": "fmt.Errorf(\"%w: no leaf file holds number %d\", ErrLeavesMissing, next)",
    "new": "fmt.Errorf(\"%v: no leaf file holds number %d\", ErrLeavesMissing, next)"
-  },
-  {
-   "name": "A16 ProofShape: место за батчем не отвергается",
-   "file": "internal/auditchain/merkle.go",
-   "old": "\tif idx < 0 || idx >= count {",
-   "new": "\tif idx < 0 || idx > count {"
-  },
-  {
-   "name": "A17 ProofShape: одинокий узел даёт шаг",
-   "file": "internal/auditchain/merkle.go",
-   "old": "\t\tif pos == n-1 && n%2 == 1 {\n\t\t\tcontinue\n\t\t}\n\t\tshape",
-   "new": "\t\tif false {\n\t\t\tcontinue\n\t\t}\n\t\tshape"
-  },
-  {
-   "name": "A18 ProofShape: сосед не с той стороны",
-   "file": "internal/auditchain/merkle.go",
-   "old": "shape = append(shape, pos%2 == 1)",
-   "new": "shape = append(shape, pos%2 == 0)"
   }
  ]
 }

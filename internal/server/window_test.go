@@ -39,7 +39,7 @@ func TestAdminProofWindow(t *testing.T) {
 		return url.Values{"from": {from.Format(time.RFC3339Nano)}, "to": {to.Format(time.RFC3339Nano)}}
 	}
 
-	q := window(now.Add(-3*time.Minute), now.Add(-2*time.Minute))
+	q := window(now.Add(-4*time.Minute), now.Add(-3*time.Minute))
 	q.Set("source", "abs-core")
 	q.Set("dek", "1")
 	code, data := get(q)
@@ -71,7 +71,7 @@ func TestAdminProofWindow(t *testing.T) {
 
 	// До головы свидетеля (proof -to-head): пакет доходит до неё.
 	head := e.st.Status().HeadSeq
-	q = window(now.Add(-3*time.Minute), now.Add(-2*time.Minute))
+	q = window(now.Add(-4*time.Minute), now.Add(-3*time.Minute))
 	q.Set("to_head", strconv.FormatUint(head, 10))
 	code, data = get(q)
 	if tb, err := proof.ParseWindow(data); code != 200 || err != nil || tb.Links[len(tb.Links)-1].Seq != head {
@@ -88,15 +88,15 @@ func TestAdminProofWindow(t *testing.T) {
 
 	for name, q := range map[string]url.Values{
 		"время не RFC 3339":     {"from": {"вчера"}, "to": {now.Format(time.RFC3339)}},
-		"конец раньше начала":   window(now.Add(-2*time.Minute), now.Add(-3*time.Minute)),
+		"конец раньше начала":   window(now.Add(-3*time.Minute), now.Add(-4*time.Minute)),
 		"верхней метки ещё нет": window(now.Add(-time.Minute), now.Add(time.Hour)),
-		"-source без -dek":      {"from": {now.Add(-3 * time.Minute).Format(time.RFC3339)}, "to": {now.Add(-2 * time.Minute).Format(time.RFC3339)}, "source": {"abs-core"}},
+		"-source без -dek":      {"from": {now.Add(-4 * time.Minute).Format(time.RFC3339)}, "to": {now.Add(-3 * time.Minute).Format(time.RFC3339)}, "source": {"abs-core"}},
 	} {
 		if code, data := get(q); code != 400 {
 			t.Fatalf("%s: %d %s", name, code, data)
 		}
 	}
-	q = window(now.Add(-3*time.Minute), now.Add(-2*time.Minute))
+	q = window(now.Add(-4*time.Minute), now.Add(-3*time.Minute))
 	q.Set("source", "nobody")
 	q.Set("dek", "1")
 	if code, data := get(q); code != 404 {
@@ -128,7 +128,7 @@ func TestAdminProofSource(t *testing.T) {
 		return url.Values{"from": {from.Format(time.RFC3339Nano)}, "to": {to.Format(time.RFC3339Nano)}, "source": {"abs-core"}}
 	}
 
-	q := window(now.Add(-3*time.Minute), now.Add(-2*time.Minute))
+	q := window(now.Add(-4*time.Minute), now.Add(-3*time.Minute))
 	q.Set("dek", "1")
 	code, data := get(q)
 	if code != 200 {
@@ -158,7 +158,7 @@ func TestAdminProofSource(t *testing.T) {
 	}
 
 	head := e.st.Status().HeadSeq
-	q = window(now.Add(-3*time.Minute), now.Add(-2*time.Minute))
+	q = window(now.Add(-4*time.Minute), now.Add(-3*time.Minute))
 	q.Set("to_head", strconv.FormatUint(head, 10))
 	code, data = get(q)
 	if sb, err := proof.ParseSource(data); code != 200 || err != nil || sb.Links[len(sb.Links)-1].Seq != head {
@@ -166,7 +166,7 @@ func TestAdminProofSource(t *testing.T) {
 	}
 
 	for name, q := range map[string]url.Values{
-		"без источника":         {"from": {now.Add(-3 * time.Minute).Format(time.RFC3339)}, "to": {now.Add(-2 * time.Minute).Format(time.RFC3339)}},
+		"без источника":         {"from": {now.Add(-4 * time.Minute).Format(time.RFC3339)}, "to": {now.Add(-3 * time.Minute).Format(time.RFC3339)}},
 		"время не RFC 3339":     {"from": {"вчера"}, "to": {now.Format(time.RFC3339)}, "source": {"abs-core"}},
 		"верхней метки ещё нет": window(now.Add(-time.Minute), now.Add(time.Hour)),
 	} {
@@ -174,7 +174,7 @@ func TestAdminProofSource(t *testing.T) {
 			t.Fatalf("%s: %d %s", name, code, data)
 		}
 	}
-	q = window(now.Add(-3*time.Minute), now.Add(-2*time.Minute))
+	q = window(now.Add(-4*time.Minute), now.Add(-3*time.Minute))
 	q.Set("source", "nobody")
 	if code, data := get(q); code != 404 {
 		t.Fatalf("чужой источник: %d %s", code, data)

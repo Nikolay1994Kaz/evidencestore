@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
@@ -30,9 +32,9 @@ import (
 //	10:11 улики 7–8, метка C
 //
 // Метка сворачивает хвост цепи в звено, кладёт хвосты источников одни в
-// следующее звено и заверяет его (п. 28), а токен с хвостами за ним — ещё в
-// следующее: звено 2 — улики 1–3, 3 — хвосты (A заверяет голову 3), 4 —
-// токен A и хвосты, 5 — улики 4–6, 6 — хвосты (B), 7 — токен B и хвосты.
+// следующее звено и заверяет его (п. 28), а токен — ещё в следующее:
+// звено 2 — улики 1–3, 3 — хвосты (A заверяет голову 3), 4 — токен A,
+// 5 — улики 4–6, 6 — хвосты (B), 7 — токен B.
 func windowStore(t *testing.T, opt Options) (*Store, *clock, *config.Config) {
 	t.Helper()
 	c := newClock()
@@ -119,7 +121,7 @@ func wholeChainWindow(s *Store, trust proof.Trust) (proof.WindowReport, map[stri
 	if last.IsZero() {
 		return proof.WindowReport{}, nil, errors.New("в цепи нет меток")
 	}
-	from, to := time.Unix(1, 0).UTC(), last.Add(-proof.ReceiveSkew-time.Nanosecond)
+	from, to := time.Unix(1, 0).UTC(), last.Add(-proof.WindowEdge-time.Nanosecond)
 	b, err := s.ProofWindow(from, to, "", false, 0)
 	if err != nil {
 		return proof.WindowReport{}, nil, err
@@ -241,16 +243,17 @@ func TestWindowProofRefusals(t *testing.T) {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 	}
-	// Верхняя метка появилась — окно собирается.
+	// Верхняя метка появилась (D в 10:13) — окно собирается.
 	c.add(2 * time.Minute)
 	ingest(t, s, "abs-core", 9, 9)
 	mustStamp(t, s)
-	if _, err := s.ProofWindow(clockAt(10, 10, 30), clockAt(10, 11, 0), "", false, 0); err != nil {
+	if _, err := s.ProofWindow(clockAt(10, 10, 30), clockAt(10, 10, 50), "", false, 0); err != nil {
 		t.Fatal(err)
 	}
-	// Нижняя — ПОСЛЕДНЯЯ метка не позже начала окна минус минута (из A, B, C
-	// — C в 10:11), верхняя — первая не раньше конца плюс минута (E в 10:14).
-	c.add(time.Minute)
+	// Нижняя — ПОСЛЕДНЯЯ метка раньше начала окна больше чем на секунду (из
+	// A, B, C — C в 10:11), верхняя — первая позже конца больше чем на две
+	// минуты (E в 10:15).
+	c.add(2 * time.Minute)
 	ingest(t, s, "abs-core", 10, 10)
 	mustStamp(t, s)
 	s.chainMu.Lock()
@@ -259,7 +262,7 @@ func TestWindowProofRefusals(t *testing.T) {
 		switch {
 		case tk.gen.Equal(clockAt(10, 11, 0)):
 			headC = tk.head
-		case tk.gen.Equal(clockAt(10, 14, 0)):
+		case tk.gen.Equal(clockAt(10, 15, 0)):
 			l, _ := s.linkOfLocked(tk.leaf)
 			linkE = l.seq
 		}
@@ -269,8 +272,8 @@ func TestWindowProofRefusals(t *testing.T) {
 		t.Fatalf("нижняя голова %d (ждали %d), конец %d (ждали %d): %v", b.LowerHead, headC, b.StretchEnd, linkE, err)
 	}
 	// Границы строгие, как в проверке: метка C (10:11) меньше чем за секунду
-	// до начала окна — нижней берётся B; метка D ровно через минуту после
-	// конца (10:13) — верхней берётся E. Пакет проходит.
+	// до начала окна — нижней берётся B; метка D (10:13) меньше чем через две
+	// минуты после конца — верхней берётся E. Пакет проходит.
 	s.chainMu.Lock()
 	var headB uint64
 	for _, tk := range s.tokens {
@@ -279,12 +282,16 @@ func TestWindowProofRefusals(t *testing.T) {
 		}
 	}
 	s.chainMu.Unlock()
-	b, err := s.ProofWindow(clockAt(10, 11, 0).Add(500*time.Millisecond), clockAt(10, 12, 0), "", false, 0)
+	b, err := s.ProofWindow(clockAt(10, 11, 0).Add(500*time.Millisecond), clockAt(10, 11, 0).Add(900*time.Millisecond), "", false, 0)
 	if err != nil || b.LowerHead != headB || b.StretchEnd != linkE {
 		t.Fatalf("нижняя голова %d (ждали %d), конец %d (ждали %d): %v", b.LowerHead, headB, b.StretchEnd, linkE, err)
 	}
 	if r := proof.VerifyWindow(roundTrip(t, b), trustOf(t, s), time.Time{}, time.Time{}); !r.Valid() {
 		t.Fatalf("пакет на строгих границах:\n%s", r.Text())
+	}
+	// Метка D ровно через две минуты после конца окна — ещё не верхняя.
+	if b, err := s.ProofWindow(clockAt(10, 10, 30), clockAt(10, 11, 0), "", false, 0); err != nil || b.StretchEnd != linkE {
+		t.Fatalf("конец %d (ждали %d) при метке ровно на границе: %v", b.StretchEnd, linkE, err)
 	}
 	// До головы, которой ещё нет, пакет не тянется.
 	if _, err := s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 6, 0), "", false, 1000); err == nil {
@@ -321,12 +328,12 @@ func TestWindowProofForgedByStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := func(seq uint64) auditchain.Record { return links[seq-1] }
-	if len(good.Links) != 5 || good.LowerHead != 3 || good.StretchEnd != 7 || len(good.Leaves) != 8 {
+	if len(good.Links) != 5 || good.LowerHead != 3 || good.StretchEnd != 7 || len(good.Leaves) != 6 {
 		t.Fatalf("раскладка теста поменялась: звеньев %d, нижняя голова %d, конец %d, листьев %d",
 			len(good.Links), good.LowerHead, good.StretchEnd, len(good.Leaves))
 	}
-	// Звенья 3…7; листья: [токен A, хвосты] (звено 4), [улики 4–6] (5),
-	// [хвосты перед запросом B] (6), [токен B, хвосты] (7).
+	// Звенья 3…7; листья: [токен A] (звено 4), [улики 4–6] (5), [хвосты
+	// перед запросом B] (6), [токен B] (7).
 
 	b := clone()
 	b.Leaves = append(b.Leaves[:2], b.Leaves[3:]...)
@@ -344,13 +351,13 @@ func TestWindowProofForgedByStore(t *testing.T) {
 
 	// Конец участка отрезан вместе с токеном B, голова переподписана.
 	b = clone()
-	b.Links, b.Leaves, b.StretchEnd = b.Links[:4], b.Leaves[:6], 6
+	b.Links, b.Leaves, b.StretchEnd = b.Links[:4], b.Leaves[:5], 6
 	sign(&b, link(6))
 	failedCheck(t, verify(b), "a TSA time-stamp in the stretch after the window (T2)")
 
 	// Начало сдвинуто за улики 4–6: участок после головы под B.
 	b = clone()
-	b.Links, b.Leaves, b.LowerHead = b.Links[3:], b.Leaves[6:], 6
+	b.Links, b.Leaves, b.LowerHead = b.Links[3:], b.Leaves[5:], 6
 	failedCheck(t, verify(b), "the time-stamps bracket the window")
 
 	// Улика 5 выброшена из звена 5, звенья 5–7 пересчитаны и сцеплены
@@ -359,22 +366,22 @@ func TestWindowProofForgedByStore(t *testing.T) {
 	b = clone()
 	p5, _ := auditchain.DecodeBatchPayload(link(5).Payload)
 	l5, err := auditchain.LinkBatch(auditchain.Head{Seq: 4, Hash: auditchain.Hash(link(4))}, link(5).UnixNano, p5.FirstLeaf,
-		[]auditchain.Leaf{b.Leaves[2].Chain(), b.Leaves[4].Chain()})
+		[]auditchain.Leaf{b.Leaves[1].Chain(), b.Leaves[3].Chain()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	l6, err := auditchain.LinkBatch(auditchain.Head{Seq: 5, Hash: auditchain.Hash(l5)}, link(6).UnixNano, p5.FirstLeaf+2,
-		[]auditchain.Leaf{b.Leaves[5].Chain()})
+		[]auditchain.Leaf{b.Leaves[4].Chain()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	l7, err := auditchain.LinkBatch(auditchain.Head{Seq: 6, Hash: auditchain.Hash(l6)}, link(7).UnixNano, p5.FirstLeaf+3,
-		[]auditchain.Leaf{b.Leaves[6].Chain(), b.Leaves[7].Chain()})
+		[]auditchain.Leaf{b.Leaves[5].Chain()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	b.Links = []proof.Link{proof.FromLink(link(3)), proof.FromLink(link(4)), proof.FromLink(l5), proof.FromLink(l6), proof.FromLink(l7)}
-	b.Leaves = append(b.Leaves[:3], b.Leaves[4:]...)
+	b.Leaves = append(b.Leaves[:2], b.Leaves[3:]...)
 	sign(&b, l7)
 	failedCheck(t, verify(b), "every TSA time-stamp in the stretch verifies")
 
@@ -567,5 +574,56 @@ func TestWindowProofOneSource(t *testing.T) {
 		if body.Source != "abs-core" {
 			t.Fatalf("тело чужого источника: %s/%d", body.Source, body.Seq)
 		}
+	}
+}
+
+// Q-02: звено токена верхней метки (u) не заверено ни одной меткой
+// пакета — верхняя метка заверяет голову P (хвосты перед запросом), P < u.
+// Держатель sign.key не только прячет записи (Q-01), но и ВПИСЫВАЕТ в звено
+// u выдуманную запись со временем приёма внутри окна, без всякой новой
+// метки. esverify принимает: в пакете по источнику время приёма не сверяется
+// с метками вовсе, в пакете за окно у записи после P нет T2 (t2 == nil) —
+// только нижняя граница. README: «T2 is required: … whoever holds sign.key
+// can make up a record with any date».
+
+func jFakeLeaf(source string, seq uint64, recv time.Time, prev [32]byte) auditchain.Leaf {
+	digest := sha256.Sum256([]byte("выдуманная запись"))
+	return proof.EvidenceLeafLinked(evidence.Header{Source: source, Seq: seq, ReceivedAt: recv.UnixNano(), ContentType: "syslog"}, 999, digest, prev)
+}
+
+func TestWindowProofIgnoresUncertifiedTail(t *testing.T) {
+	s, _, cfg := windowStore(t, Options{})
+	from, to := clockAt(10, 4, 0), clockAt(10, 6, 0)
+	b, err := s.ProofWindow(from, to, "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trust := trustOf(t, s)
+	// Звенья 3…7; листья: [токен A] (4), [улики 4–6] (5), [хвосты перед
+	// запросом B] (6), [токен B] (7).
+	if len(b.Links) != 5 || b.StretchEnd != 7 || len(b.Leaves) != 6 {
+		t.Fatalf("раскладка: звеньев %d, конец %d, листьев %d", len(b.Links), b.StretchEnd, len(b.Leaves))
+	}
+	_, chainDir, _ := dirs(cfg)
+	links, err := auditchain.ReadLinks(chainDir, 6, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bp, _ := auditchain.DecodeBatchPayload(links[1].Payload)
+	fake := jFakeLeaf("abs-core", 100, clockAt(10, 5, 0), [32]byte{})
+	leaves := []auditchain.Leaf{fake, b.Leaves[5].Chain()}
+	forged, err := auditchain.LinkBatch(auditchain.Head{Seq: 6, Hash: auditchain.Hash(links[0])}, links[1].UnixNano, bp.FirstLeaf, leaves)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Links[len(b.Links)-1] = proof.FromLink(forged)
+	b.Leaves = append(b.Leaves[:5:5], proof.FromLeaf(fake), b.Leaves[5])
+	b.Statement = s.signer.Sign(auditchain.Head{Seq: forged.Seq, Hash: auditchain.Hash(forged)}, int(forged.Seq), 0)
+
+	// Звено 7 лежит после головы 6, которую заверила метка B: в нём ничто не
+	// заверено, и выдуманная запись не попадает ни в сводку, ни в окно.
+	r := proof.VerifyWindow(roundTrip(t, b), trust, from, to)
+	if len(r.Sources) != 1 || r.Sources[0].Records != 3 || r.Sources[0].LastSeq != 6 || r.Sources[0].InWindow != 3 {
+		t.Fatalf("выдуманная запись abs-core/100 в сводке:\n%s", r.Text())
 	}
 }

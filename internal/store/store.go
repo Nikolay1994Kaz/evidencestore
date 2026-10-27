@@ -163,7 +163,7 @@ type Store struct {
 	evLeaf        []uint64            // evLeaf[pos-1] = номер листа улики + 1
 	tokens        []tokenRef          // метки TSA, лёгшие в цепь листьями
 	lastStamped   uint64              // голова, заверенная последней
-	stampedLeaves uint64              // листьев в цепи сразу после последней метки (токена и хвостов за ним)
+	stampedLeaves uint64              // листьев в цепи сразу после последнего токена
 	gwLeaf        map[uint64]uint64   // позиция улики гейтвея → лист её вердикта
 	gwMarks       map[string][]gwMark // источник → контрольные точки и поломки по порядку
 	// srcTail — последний лист улики каждого источника в порядке цепи: на него
@@ -924,10 +924,15 @@ const (
 // anchorWindowLocked — lo и hi по якорю сейчас (unix-нс); ok — якорь есть и
 // окно не шире recvWindow.
 func (s *Store) anchorWindowLocked() (lo, hi int64, ok bool) {
+	return s.anchorWindowAt(s.mono())
+}
+
+// anchorWindowAt — то же при монотонных часах mono (под s.mu).
+func (s *Store) anchorWindowAt(mono time.Duration) (lo, hi int64, ok bool) {
 	if s.anchorTSA.IsZero() {
 		return 0, 0, false
 	}
-	el := s.mono() - s.anchorMono
+	el := mono - s.anchorMono
 	lo = s.anchorTSA.Add(el - el/driftPPM).UnixNano()
 	run := el + s.anchorLag
 	hi = s.anchorTSA.Add(time.Second + run + run/driftPPM).UnixNano()
@@ -959,6 +964,24 @@ func (s *Store) clockLocked() int64 {
 		t = s.lastRecv + 1
 	}
 	s.lastRecv = t
+	return t
+}
+
+// leafTime — время листа события (пропуск, молчание, связь, эпоха, ключи,
+// хвосты, токен): часы хоста в том же окне по якорю, что время приёма, без
+// строгого роста. Время звена — время его последнего листа, и обещание
+// сверяется по нему (proof.CheckPromise): событие по часам хоста, убежавшим
+// вперёд TSA, делало звено «позже срока» обещания, данного по зажатому
+// времени приёма. Зовётся без s.mu и до chainMu.
+func (s *Store) leafTime() int64 {
+	t := s.nowTime().UnixNano()
+	mono := s.mono() // вне s.mu: часы теста бывают с крючком
+	s.mu.Lock()
+	lo, hi, _ := s.anchorWindowAt(mono)
+	s.mu.Unlock()
+	if hi != 0 {
+		t = min(max(t, hi-int64(recvWindow)), lo)
+	}
 	return t
 }
 

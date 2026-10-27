@@ -209,11 +209,11 @@ echo "restored line: $(cat "$B/5.restored")"
 step "the auditor asks for the whole session of web-1 in one bundle: nothing in it can be left out"
 TO=$(date -u +%FT%T.%NZ)
 echo "window (receive time): $FROM – $TO"
-echo "(a window is closed by a time-stamp taken more than a minute after its end: a minute passes, web-1 lives on)"
-sleep 65
+echo "(a window is closed by a time-stamp taken more than two minutes after its end: two minutes pass, web-1 lives on)"
+sleep 125
 log "sshd[1302]: Accepted publickey for deploy from 10.0.0.5 port 51260 ssh2: ED25519 SHA256:k3Vq1rQ8"
 wait_seq 9
-"$BIN/evidencestore" stamp -config "$CFG" >/dev/null # метка больше чем через минуту после окна
+"$BIN/evidencestore" stamp -config "$CFG" >/dev/null # метка больше чем через две минуты после окна
 "$BIN/evidencestore" proof -config "$CFG" -from "$FROM" -to "$TO" -source web-1 -dek -out "$WORK/session.json"
 "$BIN/esverify" -proof "$WORK/session.json" -store-key "$STORE_KEY" -tsa-trust "$TSA_TRUST" -bodies "$WORK/session"
 python3 -I - "$WORK/session" "$LOG" <<'PY'

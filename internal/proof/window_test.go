@@ -110,8 +110,10 @@ func TestWindowVerifies(t *testing.T) {
 	if len(r.Sources) != 1 {
 		t.Fatalf("источники: %+v", r.Sources)
 	}
+	// Улика 3 легла после головы, которую заверила метка B (шёл запрос к
+	// TSA): метка её не заверяет, и в сводку она не входит.
 	s := r.Sources[0]
-	if s.Name != "abs-core" || s.Records != 3 || s.InWindow != 2 || s.FirstSeq != 1 || s.LastSeq != 3 || len(s.Unexplained) != 0 {
+	if s.Name != "abs-core" || s.Records != 2 || s.InWindow != 2 || s.FirstSeq != 1 || s.LastSeq != 2 || len(s.Unexplained) != 0 {
 		t.Fatalf("сводка: %+v", s)
 	}
 	if text := r.Text(); !strings.Contains(text, "Every record the store put into its chain from head 1") || !strings.HasSuffix(text, "VERIFIED\n") {
@@ -124,7 +126,7 @@ func TestWindowVerifies(t *testing.T) {
 	r = VerifyWindow(w.window(1, 3, at(10, 4, 0), at(10, 6, 0)), w.trust(), at(10, 4, 0), at(10, 9, 30))
 	checkFailed(t, r, "the time-stamps bracket the window")
 	// Своё окно внутри меток — проходит, и отчёт говорит, что окно аудитора.
-	if r := VerifyWindow(w.window(1, 3, at(10, 4, 0), at(10, 6, 0)), w.trust(), at(10, 1, 0), at(10, 8, 0)); !r.Valid() || r.FromBundle {
+	if r := VerifyWindow(w.window(1, 3, at(10, 4, 0), at(10, 6, 0)), w.trust(), at(10, 1, 0), at(10, 7, 0)); !r.Valid() || r.FromBundle {
 		t.Fatalf("окно аудитора внутри меток:\n%s", r.Text())
 	}
 	// Границы строгие: запись до участка законно получает время T1 + 1 с, а
@@ -135,8 +137,8 @@ func TestWindowVerifies(t *testing.T) {
 	}{
 		{at(10, 0, 1), at(10, 6, 0), false},
 		{at(10, 0, 1).Add(time.Nanosecond), at(10, 6, 0), true},
-		{at(10, 4, 0), at(10, 9, 0), false},
-		{at(10, 4, 0), at(10, 9, 0).Add(-time.Nanosecond), true},
+		{at(10, 4, 0), at(10, 8, 0), false},
+		{at(10, 4, 0), at(10, 8, 0).Add(-time.Nanosecond), true},
 	} {
 		if r := VerifyWindow(w.window(1, 3, at(10, 4, 0), at(10, 6, 0)), w.trust(), c.from, c.to); r.Valid() != c.ok {
 			t.Fatalf("окно %v – %v: прошло %v, ждали %v", c.from, c.to, r.Valid(), c.ok)
@@ -192,10 +194,59 @@ func TestWindowReceiveTimeAgainstFirstStamp(t *testing.T) {
 		t.Fatalf("отчёт не называет улику:\n%s", r.Text())
 	}
 
-	// Улика после метки A со временем раньше A минус минута.
-	w = windowWorld(t, nil, []auditchain.Leaf{rec(t, 1, at(9, 58, 59))})
-	checkFailed(t, VerifyWindow(w.window(1, 3, at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{}),
+	// Улика после токена A со временем раньше A минус минута.
+	w = newWorld(t)
+	w.now = at(10, 0, 0)
+	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+	hA, tA := w.stamp()
+	w.wlink(tokenLeaf(hA, tA))
+	w.wlink(rec(t, 1, at(9, 58, 59)))
+	w.now = at(10, 10, 0)
+	hB, tB := w.stamp()
+	w.wlink(tokenLeaf(hB, tB))
+	checkFailed(t, VerifyWindow(w.window(1, 4, at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{}),
 		"every receive time lies between the time-stamps around its record")
+
+	// Нижняя граница — ПОСЛЕДНЯЯ метка, чей токен лёг раньше звена улики:
+	// улика за токеном B со временем 10:08:30 лжёт (раньше B минус минута),
+	// хотя ни метку A, ни правило по заверенной голове B (позже 10:08) она
+	// не нарушает.
+	w = newWorld(t)
+	w.now = at(10, 0, 0)
+	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+	hA, tA = w.stamp()
+	w.wlink(tokenLeaf(hA, tA))
+	w.now = at(10, 10, 0)
+	hB, tB = w.stamp()
+	w.wlink(tokenLeaf(hB, tB))
+	w.wlink(rec(t, 1, at(10, 8, 30)))
+	w.now = at(10, 20, 0)
+	hC, tC = w.stamp()
+	w.wlink(tokenLeaf(hC, tC))
+	checkFailed(t, VerifyWindow(w.window(1, 5, at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{}),
+		"every receive time lies between the time-stamps around its record")
+
+	// Улика легла после головы, которую метка B понесла в TSA, а время у неё
+	// — раньше B минус WindowEdge: так выглядел бы запрос, затянутый ради
+	// того, чтобы спрятать запись окна за голову под меткой.
+	w = newWorld(t)
+	w.now = at(10, 0, 0)
+	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+	hA, tA = w.stamp()
+	w.wlink(tokenLeaf(hA, tA))
+	w.wlink(rec(t, 1, at(10, 5, 0)))
+	w.now = at(10, 10, 0)
+	hB, tB = w.stamp()
+	w.wlink(rec(t, 2, at(10, 7, 30)))
+	w.wlink(tokenLeaf(hB, tB))
+	w.now = at(10, 20, 0)
+	hC, tC = w.stamp()
+	w.wlink(tokenLeaf(hC, tC))
+	r = VerifyWindow(w.window(1, 6, at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{})
+	checkFailed(t, r, "every receive time lies between the time-stamps around its record")
+	if !strings.Contains(r.Text(), "abs-core/2 lies in link 4, after head 3") {
+		t.Fatalf("отчёт не называет улику и голову:\n%s", r.Text())
+	}
 
 	// Нижняя граница — ПОСЛЕДНЯЯ метка раньше звена улики: улика за меткой B
 	// со временем 10:05 лжёт, хотя метку A (10:00) она не нарушает.
@@ -239,6 +290,11 @@ func TestWindowAttachedRecords(t *testing.T) {
 	h.ReceivedAt = at(10, 5, 1).UnixNano()
 	odd := windowWorld(t, []auditchain.Leaf{EvidenceLeaf(h, 1, evidence.Digest(seven))}, nil)
 	checkFailed(t, verify(odd, seven), name)
+
+	// Улика из звена после головы, которую заверила верхняя метка: метка её
+	// не заверяет, к пакету её не приложить (Q-02).
+	late := windowWorld(t, nil, []auditchain.Leaf{evLeaf(t, seven, 1)})
+	checkFailed(t, verify(late, seven), name)
 }
 
 // Пропуски: записанные в цепь — в сводке; дыры без записи — в замечаниях.

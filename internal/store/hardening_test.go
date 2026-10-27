@@ -1681,3 +1681,65 @@ func TestTamperedLeafStopsStart(t *testing.T) {
 		t.Fatalf("подъём упал не на сверке корня: %v", err)
 	}
 }
+
+// Q-03: часы хоста впереди TSA (тревога evidencestore_receive_clock_capped):
+// время приёма зажато окном по якорю, а листья событий (пропуск номеров,
+// хвосты, токен, «сборщик пропал», молчание) берут часы хоста как есть.
+// Время звена — время его последнего листа, и звено, которое кончается таким
+// событием, «позже срока» обещания: esverify -promise обвиняет честное
+// хранилище в нарушенном обещании.
+func TestHostClockAheadKeepsPromise(t *testing.T) {
+	tsaClock := newClock()
+	host := newClock()
+	host.add(5 * time.Minute) // часы хоста впереди TSA на 5 минут
+	s, err := Open(testConfig(t), Options{Logger: quiet, Now: host.now, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.tsaLocal.Now = tsaClock.now
+	s.needAnchor = true // как в serve с TSA: приём только по якорю
+	mustStamp(t, s)     // якорь по TSA
+	ingest(t, s, "abs-core", 1, 1)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	res := ingest(t, s, "abs-core", 3, 3) // номер 2 пропущен: за уликой — событие пропуска
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	tsaClock.add(time.Minute)
+	host.add(time.Minute)
+	mustStamp(t, s) // T2
+
+	b, err := s.Proof("abs-core", 3, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.Verify(b, trustOf(t, s))
+	if !r.Valid() {
+		t.Fatalf("пакет не проходит:\n%s", r.Text())
+	}
+	p := *res[0].Promise
+	if err := proof.VerifyPromise(p, nil); err != nil {
+		t.Fatal(err)
+	}
+	var linkTime int64
+	for _, l := range b.Links {
+		if l.Seq == r.LinkSeq {
+			linkTime = l.UnixNano
+		}
+	}
+	t.Logf("принята %s, срок %s, время звена %s", time.Unix(0, p.ReceivedAt).UTC(), time.Unix(0, p.Deadline).UTC(), time.Unix(0, linkTime).UTC())
+	if dir := os.Getenv("ES_PROMISE_DUMP"); dir != "" { // для прогона esverify -promise
+		bj, _ := json.Marshal(b)
+		pj, _ := json.Marshal(p)
+		os.WriteFile(filepath.Join(dir, "proof.json"), bj, 0o600)
+		os.WriteFile(filepath.Join(dir, "promise.json"), pj, 0o600)
+		os.WriteFile(filepath.Join(dir, "store.pub"), []byte(s.PublicKey()+"\n"), 0o600)
+		os.WriteFile(filepath.Join(dir, "tsa-root.crt"), s.TSARoot(), 0o600)
+	}
+	if err := proof.CheckPromise(p, r, linkTime); err != nil {
+		t.Errorf("честное хранилище «нарушило» обещание: %v", err)
+	}
+}

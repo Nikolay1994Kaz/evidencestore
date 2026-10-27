@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -193,6 +194,33 @@ func (s *Store) Stamp(ctx context.Context) (uint64, error) {
 // stampNow ставит метку над текущей головой и отдаёт её время: так берётся
 // доверенное время для уничтожения ключей. Ставится всегда: голова после
 // прошлой метки новее заверенной — в ней лежит сам прошлый токен.
+// lockGateways берёт замки пачек всех источников журнала гейтвея — по
+// одному, в порядке имён (Ingest держит не больше одного) — и возвращает,
+// чем их отпустить.
+func (s *Store) lockGateways() func() {
+	s.mu.Lock()
+	var names []string
+	for name, st := range s.sources {
+		if st.gw != nil {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	locked := make([]*sourceState, 0, len(names))
+	for _, name := range names {
+		locked = append(locked, s.sources[name])
+	}
+	s.mu.Unlock()
+	for _, st := range locked {
+		st.gwMu.Lock()
+	}
+	return func() {
+		for _, st := range locked {
+			st.gwMu.Unlock()
+		}
+	}
+}
+
 func (s *Store) stampNow(ctx context.Context) (time.Time, error) {
 	_, gen, err := s.stamp(ctx, true)
 	return gen, err
@@ -209,9 +237,15 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	}
 	s.stampMu.Lock()
 	defer s.stampMu.Unlock()
+	// Пачка журнала гейтвея кладёт в цепь улики и вердикты к ним не разом:
+	// хвосты перед запросом не встают между уликой и её вердиктом — пакет по
+	// источнику берёт вердикт своей записи до края.
+	unlockGW := s.lockGateways()
+	before := s.leafTime()
 	s.chainMu.Lock()
 	if err := s.flushLocked(); err != nil {
 		s.chainMu.Unlock()
+		unlockGW()
 		return 0, gen, err
 	}
 	head := s.chain.Head()
@@ -220,15 +254,22 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 		// Хвосты перед запросом — одни в своём звене, его метка и заверяет:
 		// состояние источников к моменту метки (п. 28). Метка, повторённая
 		// без новых листьев, заверяет то же звено.
-		s.appendLeafLocked(s.tailsLocked())
+		s.appendLeafLocked(s.tailsLocked(before))
 		if err := s.flushLocked(); err != nil {
 			s.chainMu.Unlock()
+			unlockGW()
 			return 0, gen, err
 		}
 		head = s.chain.Head()
 		s.preTailsHead = head.Seq
+		// К свидетелю — сразу, головой под меткой: ею кончаются пакеты. Пока
+		// идёт запрос к TSA, обход свидетеля может поставить в очередь и
+		// отправить голову новее, и эта, встав в очередь после неё, туда бы
+		// уже не попала. Метка не выйдет — свидетель получит лишнюю голову.
+		s.queueWitnessLocked(head, true)
 	}
 	s.chainMu.Unlock()
+	unlockGW()
 	if already {
 		return 0, gen, nil
 	}
@@ -243,27 +284,34 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	if err != nil {
 		return 0, gen, err
 	}
+	// Ответ дольше StampLatency в цепь не ложится: что легло в цепь, пока шёл
+	// запрос, — после заверенного звена, и граница окна пакетов
+	// (proof.WindowEdge) держится на том, что запрос был коротким.
+	if took := s.mono() - asked; took > proof.StampLatency {
+		return 0, gen, fmt.Errorf("store: the TSA answered after %s, longer than %s: the time-stamp is not used", took.Round(time.Millisecond), proof.StampLatency)
+	}
 	// Токен проверяется до того, как лечь в цепь: в цепь не попадает то,
 	// что проверяющий потом не примет.
 	info, err := tsa.Verify(token, imprint, s.tsaTrust)
 	if err != nil {
 		return 0, gen, fmt.Errorf("store: TSA token rejected: %w", err)
 	}
+	after := s.leafTime()
 	s.chainMu.Lock()
 	num := s.appendLeafLocked(auditchain.Leaf{
-		UnixNano: s.nowTime().UnixNano(),
+		UnixNano: after,
 		Type:     auditchain.EventTimestamp,
 		Subject:  strconv.FormatUint(head.Seq, 10),
 		Payload:  token,
 	})
-	// Хвосты сразу после токена — последним листом его звена: в счёт входит
-	// всё, что легло, пока шёл запрос (верхняя граница пакета по источнику).
-	s.appendLeafLocked(s.tailsLocked())
 	s.tokens = append(s.tokens, tokenRef{head: head.Seq, leaf: num, gen: info.GenTime})
-	s.queueWitnessLocked(head, true) // ею кончаются пакеты: свидетель видит её саму
 	s.lastStamped = max(s.lastStamped, head.Seq)
-	s.stampedLeaves = num + 2
-	err = s.flushLocked()
+	s.stampedLeaves = num + 1
+	if err = s.flushLocked(); err == nil {
+		// Звеном токена кончаются пакеты за окно и по источнику: и оно к
+		// свидетелю головой под меткой, не ждать обхода.
+		s.queueWitnessLocked(s.chain.Head(), true)
+	}
 	s.chainMu.Unlock()
 	s.anchorClock(info.GenTime, s.mono()-asked)
 	s.log.Info("tsa stamp", "head", head.Seq, "gen_time", info.GenTime)

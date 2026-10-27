@@ -42,12 +42,9 @@ func (s *Store) queueWitnessLocked(h auditchain.Head, stamped bool) {
 		return
 	}
 	if h.Seq <= s.witnessQueued {
-		// Голова ещё ждёт в очереди текущей, а теперь над ней метка: она
-		// остаётся головой под меткой и не уступит место следующей текущей.
-		// Ушедшая голова у свидетеля уже лежит.
-		if n := len(s.witnessQueue); stamped && n > 0 && s.witnessQueue[n-1].head == h {
-			s.witnessQueue[n-1].stamped = true
-		}
+		// Голова уже в очереди или у свидетеля. Голова под меткой встаёт в
+		// очередь, когда создаётся (хвосты перед запросом, stamp), — раньше
+		// любой текущей новее неё.
 		return
 	}
 	if n := len(s.witnessQueue); n > 0 && !s.witnessQueue[n-1].stamped {

@@ -70,9 +70,10 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 	out := map[string]any{"valid": src.Valid(), "kind": proof.SourceKind, "checks": src.Checks, "notes": src.Notes(),
 		"source": src.Source, "from": src.From, "to": src.To, "window_from_bundle": src.FromBundle,
 		"lower": src.Lower, "upper": src.Upper, "from_start": src.FromStart,
-		"lower_head": src.LowerHead, "upper_link": src.UpperLink, "head": src.HeadSeq,
+		"lower_head": src.LowerHead, "upper_head": src.UpperHead, "head": src.HeadSeq,
 		"records": src.Records, "records_in_window": src.InWindow, "first_seq": src.FirstSeq, "last_seq": src.LastSeq,
-		"holes": src.Holes, "records_attached": src.Attached, "bodies_opened": len(src.Bodies)}
+		"holes": src.Holes, "records_attached": src.Attached, "bodies_opened": len(src.Bodies),
+		"gateway_records": src.GatewayRecords, "gateway_broken": src.GatewayBroken}
 	if src.WitnessChecked {
 		out["witness_head"] = src.WitnessHead
 		out["witness_fork"] = src.WitnessFork

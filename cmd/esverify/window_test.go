@@ -144,7 +144,7 @@ func TestWindowBundle(t *testing.T) {
 	}
 
 	// Окно аудитора: внутри меток — проходит, шире — нет.
-	if code, out, _ := w.run(t, w.bundle, "-from", "2026-10-26T10:01:00Z", "-to", "2026-10-26T10:08:00Z"); code != exitValid || !strings.Contains(out, "asked by the auditor") {
+	if code, out, _ := w.run(t, w.bundle, "-from", "2026-10-26T10:01:00Z", "-to", "2026-10-26T10:07:00Z"); code != exitValid || !strings.Contains(out, "asked by the auditor") {
 		t.Fatalf("окно внутри меток: код %d\n%s", code, out)
 	}
 	if code, out, _ := w.run(t, w.bundle, "-from", "2026-10-26T09:30:00Z", "-to", "2026-10-26T10:06:00Z"); code != exitInvalid {

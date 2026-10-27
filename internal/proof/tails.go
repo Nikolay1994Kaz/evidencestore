@@ -17,16 +17,20 @@ import (
 // источника номер и хэш его последнего листа улики к этому месту цепи.
 //
 // Пакет по источнику несёт лист хвостов целиком, поэтому источники в нём
-// закрыты: метка — хэш имени, обязательство — хэш имени, номера и хэша
-// листа. Пакет раскрывает только свой источник: аудитор сам считает метку,
-// находит её в листе ровно раз и сверяет раскрытые номер и хэш с
-// обязательством. Про чужие источники видно, сколько их; имя подбирается по
-// словарю, номер — нет: в обязательстве хэш листа, которого аудитор не знает.
-// Источника без записей в листе нет: его цепочка начинается с нулей.
+// закрыты: метка — хэш имени, обязательство — хэш имени, номера, хэша листа и
+// соли. Соль своя у каждого источника в каждом листе хвостов, её знает только
+// хранилище (store: HMAC от секрета, выведенного из ключа подписи), и пакет
+// раскрывает её только для своего источника: аудитор сам считает метку,
+// находит её в листе ровно раз и сверяет раскрытые номер, хэш и соль с
+// обязательством. Про чужие источники видно, сколько их, и имя проверяется
+// подбором по словарю; номер не подобрать, даже если хэш чужого листа виден
+// в пути Меркла, и обязательства одного источника в разных листах хвостов не
+// сравнить — не видно, были ли у него записи. Источника без записей в листе
+// нет: его цепочка начинается с нулей.
 
 const (
 	tailTagDomain    = "evidencestore/tails/source/v1"
-	tailCommitDomain = "evidencestore/tails/entry/v1"
+	tailCommitDomain = "evidencestore/tails/entry/v2"
 )
 
 // Tail — последний лист улики источника к месту хвостов, открытым видом.
@@ -34,12 +38,14 @@ type Tail struct {
 	Source string
 	Seq    uint64   // номер его записи у источника
 	Hash   [32]byte // хэш листа (auditchain.LeafHash)
+	Salt   [32]byte // соль обязательства
 }
 
 // TailOpen — раскрытие хвоста своего источника в пакете.
 type TailOpen struct {
 	Seq  uint64 `json:"seq"`
 	Leaf string `json:"leaf"` // хэш листа, hex
+	Salt string `json:"salt"` // соль, hex
 }
 
 type tailEntry struct {
@@ -56,23 +62,25 @@ func TailTag(source string) [32]byte {
 	return sha256.Sum256(append([]byte(tailTagDomain+"\x00"), source...))
 }
 
-// tailCommit — обязательство на хвост источника: имя с длиной, номер, хэш.
-func tailCommit(source string, seq uint64, hash [32]byte) [32]byte {
+// tailCommit — обязательство на хвост источника: имя с длиной, номер, хэш,
+// соль.
+func tailCommit(source string, seq uint64, hash, salt [32]byte) [32]byte {
 	var buf bytes.Buffer
 	buf.WriteString(tailCommitDomain)
 	binary.Write(&buf, binary.BigEndian, uint32(len(source)))
 	buf.WriteString(source)
 	binary.Write(&buf, binary.BigEndian, seq)
 	buf.Write(hash[:])
+	buf.Write(salt[:])
 	return sha256.Sum256(buf.Bytes())
 }
 
-// TailsLeaf — лист хвостов. Записи — по метке: при одном состоянии цепи
-// лист один и тот же.
+// TailsLeaf — лист хвостов. Записи — по метке: порядок источников на лист
+// не влияет.
 func TailsLeaf(tails []Tail, unixNano int64) auditchain.Leaf {
 	entries := make([]tailEntry, 0, len(tails))
 	for _, t := range tails {
-		tag, commit := TailTag(t.Source), tailCommit(t.Source, t.Seq, t.Hash)
+		tag, commit := TailTag(t.Source), tailCommit(t.Source, t.Seq, t.Hash, t.Salt)
 		entries = append(entries, tailEntry{Tag: hex.EncodeToString(tag[:]), Commit: hex.EncodeToString(commit[:])})
 	}
 	slices.SortFunc(entries, func(a, b tailEntry) int { return bytes.Compare([]byte(a.Tag), []byte(b.Tag)) })
@@ -115,8 +123,12 @@ func OpenTail(l auditchain.Leaf, source string, open *TailOpen) ([32]byte, error
 	if err != nil || len(h) != 32 {
 		return [32]byte{}, errors.New("the opened tail hash does not parse")
 	}
+	salt, err := hex.DecodeString(open.Salt)
+	if err != nil || len(salt) != 32 {
+		return [32]byte{}, errors.New("the opened tail salt does not parse")
+	}
 	hash := [32]byte(h)
-	commit := tailCommit(source, open.Seq, hash)
+	commit := tailCommit(source, open.Seq, hash, [32]byte(salt))
 	if found.Commit != hex.EncodeToString(commit[:]) {
 		return [32]byte{}, fmt.Errorf("the opened tail of %s does not match the tails leaf", source)
 	}
@@ -125,5 +137,5 @@ func OpenTail(l auditchain.Leaf, source string, open *TailOpen) ([32]byte, error
 
 // TailOf — раскрытие хвоста источника для пакета (хранилище).
 func TailOf(t Tail) *TailOpen {
-	return &TailOpen{Seq: t.Seq, Leaf: hex.EncodeToString(t.Hash[:])}
+	return &TailOpen{Seq: t.Seq, Leaf: hex.EncodeToString(t.Hash[:]), Salt: hex.EncodeToString(t.Salt[:])}
 }

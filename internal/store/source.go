@@ -17,12 +17,13 @@ import (
 // записи источника между хвостами нижней и верхней меток, с путями Меркла —
 // чужие листья в них только хэшами. Метки выбираются, как у пакета за окно:
 // нижняя — последняя раньше начала окна больше чем на секунду, верхняя —
-// первая позже конца больше чем на минуту. withDEK — приложить улики с
-// ключами записей; toHead — довести звенья до этой головы (свидетель).
+// первая позже конца больше чем на proof.WindowEdge; край — звено хвостов,
+// которое метка заверила. withDEK — приложить улики с ключами записей;
+// toHead — довести звенья до этой головы (свидетель).
 //
-// Окно, край которого приходится на метку до хвостов источников (хранилище
-// обновилось позже), или записи в нём без ссылок — отказ: такое окно
-// отвечает только пакет за окно.
+// Окно, край которого приходится на метку без хвостов источников
+// (хранилище обновилось позже), или записи в нём без ссылок — отказ: такое
+// окно отвечает только пакет за окно.
 func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toHead uint64) (proof.SourceBundle, error) {
 	switch {
 	case source == "":
@@ -48,15 +49,15 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 	}
 	upper := -1
 	for i, t := range s.tokens {
-		if t.gen.After(to.Add(proof.ReceiveSkew)) {
+		if t.gen.After(to.Add(proof.WindowEdge)) {
 			upper = i
 			break
 		}
 	}
 	if upper < 0 {
 		s.chainMu.Unlock()
-		return proof.SourceBundle{}, fmt.Errorf("%w: no time-stamp after %s, a minute past the window, yet: the store takes one every tsa.every while records arrive and at least once an hour",
-			ErrWindow, to.Add(proof.ReceiveSkew).UTC().Format(time.RFC3339))
+		return proof.SourceBundle{}, fmt.Errorf("%w: no time-stamp after %s, %s past the window, yet: the store takes one every tsa.every while records arrive and at least once an hour",
+			ErrWindow, to.Add(proof.WindowEdge).UTC().Format(time.RFC3339), proof.WindowEdge)
 	}
 	lower := -1
 	for i := upper - 1; i >= 0; i-- {
@@ -65,28 +66,37 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 			break
 		}
 	}
-	top, ok := s.linkOfLocked(s.tokens[upper].leaf)
-	tokIdx := int(s.tokens[upper].leaf - top.first)
-	var lowerHead, first, lowerTok uint64
-	if lower >= 0 {
-		lowerHead, lowerTok = s.tokens[lower].head, s.tokens[lower].leaf
-		i := sort.Search(len(s.links), func(i int) bool { return s.links[i].seq >= lowerHead })
-		if i == len(s.links) || s.links[i].seq != lowerHead {
-			ok = false
-		} else {
-			first = s.links[i].first
+	linkAt := func(seq uint64) (linkRef, bool) {
+		i := sort.Search(len(s.links), func(i int) bool { return s.links[i].seq >= seq })
+		if i == len(s.links) || s.links[i].seq != seq {
+			return linkRef{}, false
 		}
+		return s.links[i], true
+	}
+	up := s.tokens[upper]
+	top, ok := linkAt(up.head)
+	// Звено токена верхней метки: пакет доходит до него — токен края лежит
+	// в цепи листом (п. 28).
+	upTok, tok := s.linkOfLocked(up.leaf)
+	ok = ok && tok
+	var low linkRef
+	var lowTok uint64
+	if lower >= 0 {
+		lowTok = s.tokens[lower].leaf
+		var lok bool
+		low, lok = linkAt(s.tokens[lower].head)
+		ok = ok && lok
 	}
 	head := s.chain.Head().Seq
 	s.chainMu.Unlock()
 	if !ok {
 		return proof.SourceBundle{}, errors.New("store: the time-stamps of the window are not linked")
 	}
-	end := top.first + top.count
+	first, end := low.first, upTok.first+upTok.count
 	if end-first > maxWindowLeaves {
 		return proof.SourceBundle{}, fmt.Errorf("%w: the window spans %d leaves of the chain, more than %d in one bundle: ask for shorter windows", ErrWindow, end-first, maxWindowLeaves)
 	}
-	last := top.seq
+	last := upTok.seq
 	if toHead > last {
 		if toHead > head {
 			return proof.SourceBundle{}, fmt.Errorf("store: head %d is not in the chain yet: the head is %d", toHead, head)
@@ -94,7 +104,7 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 		last = toHead
 	}
 
-	links, err := auditchain.ReadLinks(s.chainDir, max(lowerHead, 1), last)
+	links, err := auditchain.ReadLinks(s.chainDir, max(low.seq, 1), last)
 	if err != nil {
 		return proof.SourceBundle{}, err
 	}
@@ -110,93 +120,134 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 		}
 		return leaves[p.FirstLeaf-first : p.FirstLeaf-first+uint64(p.Count)], nil
 	}
-	const predates = "%w: the time-stamp %s the window was taken before the store laid source tails at time-stamps: ask for a later window, or for a window bundle (proof -window)"
+	// linkRec — прочитанное звено по номеру.
+	linkRec := func(seq uint64) auditchain.Record { return links[seq-links[0].Seq] }
+	// edge — край пакета: звено хвостов и лист токена метки над ним с путём
+	// Меркла (токен лежит в цепи позже звена хвостов).
+	edge := func(l auditchain.Record, tokLeaf uint64, which string) (proof.SourceEdge, error) {
+		ls, err := leavesOf(l)
+		if err != nil {
+			return proof.SourceEdge{}, err
+		}
+		if len(ls) != 1 || ls[0].Type != auditchain.EventTails {
+			return proof.SourceEdge{}, fmt.Errorf("%w: the time-stamp %s the window was taken before the store laid source tails at time-stamps: ask for a later window, or for a window bundle (proof -window)", ErrWindow, which)
+		}
+		s.chainMu.Lock()
+		tl, ok := s.linkOfLocked(tokLeaf)
+		s.chainMu.Unlock()
+		if !ok {
+			return proof.SourceEdge{}, errors.New("store: the token of a time-stamp is not linked")
+		}
+		tls, err := leavesOf(linkRec(tl.seq))
+		if err != nil {
+			return proof.SourceEdge{}, err
+		}
+		inc, err := inclusionAt(tl.seq, tls, int(tokLeaf-tl.first))
+		if err != nil {
+			return proof.SourceEdge{}, err
+		}
+		tails := proof.FromLeaf(ls[0])
+		return proof.SourceEdge{Head: l.Seq, Tails: &tails, Token: inc}, nil
+	}
 
 	b := proof.SourceBundle{Version: proof.WindowVersion, Kind: proof.SourceKind, Source: source,
-		From: from.UTC(), To: to.UTC(), LowerHead: lowerHead}
+		From: from.UTC(), To: to.UTC()}
 	for _, l := range links {
 		b.Links = append(b.Links, proof.FromLink(l))
 	}
-	if lowerHead > 0 {
-		ls, err := leavesOf(links[0])
-		if err != nil {
+	if lower >= 0 {
+		if b.Lower, err = edge(links[0], lowTok, "before"); err != nil {
 			return proof.SourceBundle{}, err
 		}
-		if len(ls) != 1 || ls[0].Type != auditchain.EventTails {
-			return proof.SourceBundle{}, fmt.Errorf(predates, ErrWindow, "before")
-		}
-		tails := proof.FromLeaf(ls[0])
-		b.LowerTails = &tails
-		b.LowerToken = leaves[lowerTok-first].Payload
 	}
+	if b.Upper, err = edge(linkRec(top.seq), up.leaf, "after"); err != nil {
+		return proof.SourceBundle{}, err
+	}
+	verdicts := map[uint64]proof.Inclusion{}
 	for _, l := range links {
-		if l.Seq <= lowerHead || l.Seq > top.seq {
+		if l.Seq <= low.seq || l.Seq >= top.seq {
 			continue
 		}
 		ls, err := leavesOf(l)
 		if err != nil {
 			return proof.SourceBundle{}, err
 		}
-		if l.Seq == top.seq {
-			if tokIdx != len(ls)-2 || ls[tokIdx+1].Type != auditchain.EventTails {
-				return proof.SourceBundle{}, fmt.Errorf(predates, ErrWindow, "after")
-			}
-			if b.UpperToken, err = placedLeaf(l.Seq, ls, tokIdx); err != nil {
-				return proof.SourceBundle{}, err
-			}
-			if b.UpperTails, err = placedLeaf(l.Seq, ls, tokIdx+1); err != nil {
-				return proof.SourceBundle{}, err
-			}
-			ls = ls[:tokIdx]
-		}
 		for idx, leaf := range ls {
-			if leaf.Type != auditchain.EventEvidence || leaf.Scope != source {
+			if leaf.Scope != source {
 				continue
 			}
-			if _, linked := proof.EvidencePrev(leaf); !linked {
-				return proof.SourceBundle{}, fmt.Errorf("%w: records of %s in this window were written before the store linked them: ask for a window bundle (proof -window)", ErrWindow, source)
-			}
-			rec := proof.SourceRecord{}
-			if rec.Leaf, err = placedLeaf(l.Seq, ls, idx); err != nil {
-				return proof.SourceBundle{}, err
-			}
-			if withDEK {
-				if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf); err != nil {
+			switch leaf.Type {
+			case auditchain.EventEvidence:
+				if _, linked := proof.EvidencePrev(leaf); !linked {
+					return proof.SourceBundle{}, fmt.Errorf("%w: records of %s in this window were written before the store linked them: ask for a window bundle (proof -window)", ErrWindow, source)
+				}
+				rec := proof.SourceRecord{}
+				if rec.Leaf, err = inclusionAt(l.Seq, ls, idx); err != nil {
+					return proof.SourceBundle{}, err
+				}
+				if withDEK {
+					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf); err != nil {
+						return proof.SourceBundle{}, err
+					}
+				}
+				b.Records = append(b.Records, rec)
+			case auditchain.EventGateway:
+				pos, _, err := proof.ParseGatewayLeaf(leaf)
+				if err != nil {
+					return proof.SourceBundle{}, fmt.Errorf("store: %w", err)
+				}
+				if verdicts[pos], err = inclusionAt(l.Seq, ls, idx); err != nil {
 					return proof.SourceBundle{}, err
 				}
 			}
-			b.Records = append(b.Records, rec)
+		}
+	}
+	// Вердикт — к своей записи: запись журнала гейтвея без него esverify не
+	// примет.
+	for i, rec := range b.Records {
+		pos, _, err := proof.ParseEvidenceLeaf(rec.Leaf.Leaf.Chain())
+		if err != nil {
+			return proof.SourceBundle{}, err
+		}
+		if v, ok := verdicts[pos]; ok {
+			b.Records[i].Verdict = &v
 		}
 	}
 	// Раскрытия хвостов своего источника: внизу — его последний лист до
-	// нижних хвостов, вверху — последняя запись в пакете или тот же лист.
-	if lowerHead > 0 {
-		if seq, num, found := s.lastLeafBefore(source, first); found {
+	// нижних хвостов, вверху — последняя запись в пакете или тот же лист;
+	// соли — свои у каждого листа хвостов.
+	var tail *proof.Tail
+	if lower >= 0 {
+		if seq, num, found := s.lastLeafBefore(source, low.first); found {
 			ls, err := auditchain.ReadLeaves(s.chainDir, num, 1)
 			if err != nil {
 				return proof.SourceBundle{}, err
 			}
-			b.LowerOpen = proof.TailOf(proof.Tail{Source: source, Seq: seq, Hash: auditchain.LeafHash(ls[0])})
+			tail = &proof.Tail{Source: source, Seq: seq, Hash: auditchain.LeafHash(ls[0]), Salt: s.tailSalt(low.first, source)}
+			b.Lower.Open = proof.TailOf(*tail)
 		}
 	}
-	b.UpperOpen = b.LowerOpen
 	if n := len(b.Records); n > 0 {
 		l := b.Records[n-1].Leaf.Leaf.Chain()
 		seq, _ := strconv.ParseUint(l.Subject, 10, 64)
-		b.UpperOpen = proof.TailOf(proof.Tail{Source: source, Seq: seq, Hash: auditchain.LeafHash(l)})
+		tail = &proof.Tail{Source: source, Seq: seq, Hash: auditchain.LeafHash(l)}
+	}
+	if tail != nil {
+		tail.Salt = s.tailSalt(top.first, source)
+		b.Upper.Open = proof.TailOf(*tail)
 	}
 	// Своя сверка до выдачи: раскрытия сходятся с листами хвостов.
-	if b.LowerTails != nil {
-		if _, err := proof.OpenTail(b.LowerTails.Chain(), source, b.LowerOpen); err != nil {
+	if b.Lower.Tails != nil {
+		if _, err := proof.OpenTail(b.Lower.Tails.Chain(), source, b.Lower.Open); err != nil {
 			return proof.SourceBundle{}, fmt.Errorf("store: lower tails of %s: %w", source, err)
 		}
 	}
-	if _, err := proof.OpenTail(b.UpperTails.Leaf.Chain(), source, b.UpperOpen); err != nil {
+	if _, err := proof.OpenTail(b.Upper.Tails.Chain(), source, b.Upper.Open); err != nil {
 		return proof.SourceBundle{}, fmt.Errorf("store: upper tails of %s: %w", source, err)
 	}
 	// Заявление — о последнем звене пакета; подписано при выдаче.
-	tail := links[len(links)-1]
-	b.Statement = s.signer.Sign(auditchain.Head{Seq: tail.Seq, Hash: auditchain.Hash(tail)}, int(tail.Seq), s.nowTime().Unix())
+	tailLink := links[len(links)-1]
+	b.Statement = s.signer.Sign(auditchain.Head{Seq: tailLink.Seq, Hash: auditchain.Hash(tailLink)}, int(tailLink.Seq), s.nowTime().Unix())
 	return b, nil
 }
 
@@ -224,17 +275,17 @@ func (s *Store) lastLeafBefore(source string, limit uint64) (seq, leaf uint64, o
 	return seq, leaf, ok
 }
 
-// placedLeaf — лист idx звена seq с путём Меркла и местом.
-func placedLeaf(seq uint64, leaves []auditchain.Leaf, idx int) (proof.PlacedLeaf, error) {
+// inclusionAt — лист idx звена seq с путём Меркла.
+func inclusionAt(seq uint64, leaves []auditchain.Leaf, idx int) (proof.Inclusion, error) {
 	path, err := auditchain.MerkleProof(leaves, idx)
 	if err != nil {
-		return proof.PlacedLeaf{}, err
+		return proof.Inclusion{}, err
 	}
-	p := proof.PlacedLeaf{Inclusion: proof.Inclusion{Leaf: proof.FromLeaf(leaves[idx]), LinkSeq: seq}, Index: idx}
+	inc := proof.Inclusion{Leaf: proof.FromLeaf(leaves[idx]), LinkSeq: seq}
 	for _, st := range path {
-		p.Path = append(p.Path, proof.Step{Hash: st.Hash[:], Left: st.SiblingLeft})
+		inc.Path = append(inc.Path, proof.Step{Hash: st.Hash[:], Left: st.SiblingLeft})
 	}
-	return p, nil
+	return inc, nil
 }
 
 // sealedWithKey — улика под листом и ключ её записи. Ключ месяца уничтожен

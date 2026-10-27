@@ -1,6 +1,9 @@
 package store
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -139,13 +142,30 @@ func (s *Store) appendEvidenceLocked(h evidence.Header, pos uint64, digest [32]b
 	s.srcTail[h.Source] = srcTailRef{seq: h.Seq, hash: auditchain.LeafHash(l)}
 }
 
-// tailsLocked — хвосты источников к этому месту цепи (лист события 13).
-func (s *Store) tailsLocked() auditchain.Leaf {
+// tailsLocked — хвосты источников к этому месту цепи (лист события 13): лист
+// ляжет под номером s.nextLeaf, соли — свои для этого номера; at — время
+// листа (leafTime, взятое до chainMu).
+func (s *Store) tailsLocked(at int64) auditchain.Leaf {
 	tails := make([]proof.Tail, 0, len(s.srcTail))
 	for name, t := range s.srcTail {
-		tails = append(tails, proof.Tail{Source: name, Seq: t.seq, Hash: t.hash})
+		tails = append(tails, proof.Tail{Source: name, Seq: t.seq, Hash: t.hash, Salt: s.tailSalt(s.nextLeaf, name)})
 	}
-	return proof.TailsLeaf(tails, s.nowTime().UnixNano())
+	return proof.TailsLeaf(tails, at)
+}
+
+// tailSalt — соль хвоста источника в листе хвостов с номером leaf: хэш
+// подписи хранилища над доменом, номером и именем. Подпись Ed25519
+// детерминирована, так что соль воспроизводится к любому пакету; знает её
+// только держатель ключа (и HSM, если ключ уйдёт туда), раскрывает — в
+// пакете своего источника.
+func (s *Store) tailSalt(leaf uint64, source string) [32]byte {
+	const domain = "evidencestore/tails/salt/v1"
+	var msg bytes.Buffer
+	binary.Write(&msg, binary.BigEndian, uint32(len(domain)))
+	msg.WriteString(domain)
+	binary.Write(&msg, binary.BigEndian, leaf)
+	msg.WriteString(source)
+	return sha256.Sum256(s.signer.SignMessage(msg.Bytes()))
 }
 
 func (s *Store) appendLeafLocked(l auditchain.Leaf) uint64 {
@@ -157,10 +177,11 @@ func (s *Store) appendLeafLocked(l auditchain.Leaf) uint64 {
 
 // appendEvent кладёт в цепь событие (ключи, пропуски, молчание, запуск).
 func (s *Store) appendEvent(typ auditchain.EventType, scope, subject string, payload []byte) uint64 {
+	at := s.leafTime()
 	s.chainMu.Lock()
 	defer s.chainMu.Unlock()
 	return s.appendLeafLocked(auditchain.Leaf{
-		UnixNano: s.nowTime().UnixNano(),
+		UnixNano: at,
 		Type:     typ,
 		Scope:    scope,
 		Subject:  subject,

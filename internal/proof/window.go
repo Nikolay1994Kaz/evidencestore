@@ -283,39 +283,55 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 		add("a TSA time-stamp certifies the head the stretch starts after (T1)", err, fmt.Sprintf("T1 = %s, head %d", fmtTime(r.Lower), b.LowerHead))
 	}
 
-	// 6. Верхняя метка — последняя на участке: всё, что легло в цепь после её
-	// токена, вошло туда позже её времени.
+	// 6. Верхняя метка — над наибольшей головой участка (в честной цепи —
+	// последняя): всё, что легло в цепь после её токена, вошло туда позже её
+	// времени, а заверенная часть кончается её головой.
 	err = nil
-	if len(stamps) == 0 || len(stamps)-1 == lower {
+	top := -1
+	for i, st := range stamps {
+		if top < 0 || st.head > stamps[top].head {
+			top = i
+		}
+	}
+	if top < 0 || top == lower {
 		err = errors.New("the stretch holds no time-stamp after the window: what entered the chain at its end is not bounded")
 	} else {
-		r.Upper = stamps[len(stamps)-1].gen
+		r.Upper = stamps[top].gen
 	}
 	add("a TSA time-stamp in the stretch after the window (T2)", err, fmt.Sprintf("T2 = %s", fmtTime(r.Upper)))
 
-	// 7. Окно лежит строго между метками с допусками времени приёма: запись
-	// до участка законно получает время до T1 + 1 с включительно, запись
-	// после — от T2 − 1 мин включительно, и ни та, ни другая в окно не попадёт.
-	err = nil
-	switch {
-	case r.From.IsZero() || r.To.IsZero():
-		err = errors.New("no window to check against: give one with esverify -from and -to")
-	case r.To.Before(r.From):
-		err = fmt.Errorf("the window ends at %s, before it starts at %s", fmtTime(r.To), fmtTime(r.From))
-	case !r.Lower.IsZero() && !r.From.After(r.Lower.Add(ReceiveSlack)):
-		err = fmt.Errorf("the window starts at %s, but the bundle is complete only from a second after time-stamp T1 %s", fmtTime(r.From), fmtTime(r.Lower))
-	case !r.Upper.IsZero() && !r.To.Before(r.Upper.Add(-ReceiveSkew)):
-		err = fmt.Errorf("the window ends at %s, but the bundle is complete only up to a minute before time-stamp T2 %s", fmtTime(r.To), fmtTime(r.Upper))
+	// 7. Окно лежит строго между метками с допусками времени приёма
+	// (windowBracket): ни запись до участка, ни запись после звена, которое
+	// заверила верхняя метка, в окно не попадёт.
+	add("the time-stamps bracket the window", windowBracket(r.From, r.To, r.Lower, r.Upper), fmt.Sprintf("%s – %s", fmtTime(r.From), fmtTime(r.To)))
+
+	// Звенья после головы, которую заверила верхняя метка (пока шёл запрос
+	// к TSA), ничем в пакете не заверены: владелец ключа мог там выдумать
+	// запись или выбросить её. Их записи — не в сводке и не к приложению; в
+	// окно они не попадают (windowBracket).
+	certified := stretch
+	if len(stamps) > 0 {
+		var up uint64
+		for _, st := range stamps {
+			up = max(up, st.head)
+		}
+		for len(certified) > 0 && certified[len(certified)-1].seq > up {
+			certified = certified[:len(certified)-1]
+		}
 	}
-	add("the time-stamps bracket the window", err, fmt.Sprintf("%s – %s", fmtTime(r.From), fmtTime(r.To)))
+	var certLeaves []auditchain.Leaf
+	for _, sl := range certified {
+		certLeaves = append(certLeaves, leaves[sl.at:sl.at+sl.count]...)
+	}
 
 	// 8–9. Листья улик: разбираются, номер у источника — один раз, время
 	// приёма — между метками вокруг звена. Заодно — сводка по источникам.
-	r.Sources = summarize(leaves, stretch, stamps, &r, add)
+	r.Sources = summarize(leaves, certified, stamps, &r, add)
 
-	// 10. Приложенные улики — с участка, тела вскрываются ключами записей.
+	// 10. Приложенные улики — с заверенной части участка, тела вскрываются
+	// ключами записей.
 	if len(b.Records) > 0 {
-		err := windowRecords(b.Records, leaves, &r)
+		err := windowRecords(b.Records, certLeaves, &r)
 		add("the records attached are in the stretch, and their bodies open with their record keys", err,
 			fmt.Sprintf("%d records, %d bodies opened", r.Attached, len(r.Bodies)))
 	}
@@ -420,6 +436,19 @@ func windowStamps(leaves []auditchain.Leaf, stretch []stretchLink, linkAt func(u
 	return out, nil
 }
 
+// stampBefore — последняя метка, чью голову звено n уже прошло: запись в
+// звене n легла в цепь после того, как эта голова ушла в TSA. nil — такой
+// метки на участке нет.
+func stampBefore(stamps []windowStamp, n uint64) *windowStamp {
+	var t0 *windowStamp
+	for i := range stamps {
+		if stamps[i].head < n {
+			t0 = &stamps[i]
+		}
+	}
+	return t0
+}
+
 // stampsAround — метки вокруг звена n, как в пакете одной улики: последняя,
 // чей токен лёг в звено раньше n (T1), и первая над головой не раньше n (T2).
 // nil — такой метки на участке нет.
@@ -454,6 +483,7 @@ func summarize(leaves []auditchain.Leaf, stretch []stretchLink, stamps []windowS
 	records := 0
 	for _, sl := range stretch {
 		t1, t2 := stampsAround(stamps, sl.seq)
+		t0 := stampBefore(stamps, sl.seq)
 		for i, l := range leaves[sl.at : sl.at+sl.count] {
 			switch l.Type {
 			case auditchain.EventEvidence:
@@ -485,6 +515,12 @@ func summarize(leaves []auditchain.Leaf, stretch []stretchLink, stamps []windowS
 					timeErr = fmt.Errorf("record %s/%d: receive time %s is later than %s, the first time-stamp over its link %d", l.Scope, seq, fmtTime(recv), fmtTime(t2.gen), sl.seq)
 				case t1 != nil && recv.Before(t1.gen.Add(-ReceiveSkew)):
 					timeErr = fmt.Errorf("record %s/%d: receive time %s is earlier than %s, the last time-stamp before its link %d", l.Scope, seq, fmtTime(recv), fmtTime(t1.gen), sl.seq)
+				case t0 != nil && !recv.After(t0.gen.Add(-WindowEdge)):
+					// Запись легла в цепь после головы, которую метка t0 уже
+					// понесла в TSA: честно она принята позже t0 − WindowEdge,
+					// а запрос, затянутый ради того, чтобы спрятать её за
+					// голову, виден здесь.
+					timeErr = fmt.Errorf("record %s/%d lies in link %d, after head %d the time-stamp of %s certifies, yet its receive time %s is not later than %s before it", l.Scope, seq, sl.seq, t0.head, fmtTime(t0.gen), fmtTime(recv), WindowEdge)
 				}
 			case auditchain.EventGap:
 				var g SeqRange

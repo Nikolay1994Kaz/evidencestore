@@ -24,9 +24,10 @@ var maxWindowLeaves uint64 = 250_000
 // ProofWindow собирает пакет за окно (DECISIONS, п. 27): все листья цепи
 // между двумя метками TSA. Нижняя — последняя, время которой раньше начала
 // окна больше чем на секунду; верхняя — первая, время которой позже конца
-// окна больше чем на минуту: по правилам времени приёма (proof.ReceiveSlack,
-// ReceiveSkew) запись с временем в окне лежит между ними. Меток пакет не
-// ставит, как и пакет одной улики.
+// окна больше чем на proof.WindowEdge: по правилам времени приёма
+// (proof.ReceiveSlack, WindowEdge) запись с временем в окне лежит между ними,
+// в звеньях, которые метки заверили. Меток пакет не ставит, как и пакет
+// одной улики.
 //
 // source — приложить улики этого источника с участка вместе с ключами
 // записей (withDEK обязателен: без ключей они ничего не добавят). toHead —
@@ -64,7 +65,7 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 	}
 	upper := -1
 	for i, t := range s.tokens {
-		if t.gen.After(to.Add(proof.ReceiveSkew)) {
+		if t.gen.After(to.Add(proof.WindowEdge)) {
 			upper = i
 			break
 		}
@@ -75,8 +76,8 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 			latest = "the latest is " + s.tokens[n-1].gen.UTC().Format(time.RFC3339)
 		}
 		s.chainMu.Unlock()
-		return proof.WindowBundle{}, fmt.Errorf("%w: no time-stamp after %s, a minute past the window (%s): the store takes one every tsa.every while records arrive and at least once an hour; evidencestore stamp takes one now if anything entered the chain since the last",
-			ErrWindow, to.Add(proof.ReceiveSkew).UTC().Format(time.RFC3339), latest)
+		return proof.WindowBundle{}, fmt.Errorf("%w: no time-stamp after %s, %s past the window (%s): the store takes one every tsa.every while records arrive and at least once an hour; evidencestore stamp takes one now if anything entered the chain since the last",
+			ErrWindow, to.Add(proof.WindowEdge).UTC().Format(time.RFC3339), proof.WindowEdge, latest)
 	}
 	var lowerHead uint64
 	for i := upper - 1; i >= 0; i-- {
@@ -86,6 +87,15 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 		}
 	}
 	end, ok := s.linkOfLocked(s.tokens[upper].leaf)
+	// certEnd — конец звена, которое заверила верхняя метка: улики после него
+	// легли, пока шёл запрос к TSA, метка их не заверяет — к пакету их не
+	// прикладываем (esverify их и не примет).
+	var certEnd uint64
+	if i := sort.Search(len(s.links), func(i int) bool { return s.links[i].seq >= s.tokens[upper].head }); i < len(s.links) && s.links[i].seq == s.tokens[upper].head {
+		certEnd = s.links[i].first + s.links[i].count
+	} else {
+		ok = false
+	}
 	var first uint64
 	if lowerHead > 0 {
 		i := sort.Search(len(s.links), func(i int) bool { return s.links[i].seq >= lowerHead })
@@ -134,7 +144,7 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 	tail := links[len(links)-1]
 	b.Statement = s.signer.Sign(auditchain.Head{Seq: tail.Seq, Hash: auditchain.Hash(tail)}, int(tail.Seq), s.nowTime().Unix())
 	if source != "" {
-		if b.Records, err = s.windowRecords(leaves, source); err != nil {
+		if b.Records, err = s.windowRecords(leaves[:certEnd-first], source); err != nil {
 			return proof.WindowBundle{}, err
 		}
 	}

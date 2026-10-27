@@ -128,9 +128,10 @@ func (s *Store) setEpochLocked(st *sourceState, source string, ev epochEvent) er
 	if err != nil {
 		return err
 	}
+	at := s.leafTime()
 	s.chainMu.Lock()
 	s.appendLeafLocked(auditchain.Leaf{
-		UnixNano: s.nowTime().UnixNano(),
+		UnixNano: at,
 		Type:     auditchain.EventEpoch,
 		Scope:    source,
 		Payload:  payload,

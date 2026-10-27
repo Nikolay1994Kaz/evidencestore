@@ -45,9 +45,9 @@ type deadRemote struct{ ship.Remote }
 
 func (deadRemote) Put(context.Context, string, []byte) error { return errors.New("witness is down") }
 
-// ⭐ Свидетель получает головы под метками TSA и текущую. Пакет, сверенный с
-// его головами, проходит, и улику закрепляет голова под T2 — ею пакет и
-// кончается.
+// ⭐ Свидетель получает головы под метками TSA и за их токенами, и текущую.
+// Пакет, сверенный с его головами, проходит, и улику закрепляет голова под
+// T2 — ею пакет и кончается.
 func TestWitnessGetsStampedHeads(t *testing.T) {
 	c := newClock()
 	wdir := t.TempDir()
@@ -67,16 +67,16 @@ func TestWitnessGetsStampedHeads(t *testing.T) {
 	}
 	tr := trustOf(t, s)
 	tr.Witness = witnessHeads(t, wdir)
-	if n := len(tr.Witness.Heads); n != 3 {
-		t.Fatalf("у свидетеля %d голов, ожидали 3: под T1, под T2 и текущая", n)
+	if n := len(tr.Witness.Heads); n != 4 {
+		t.Fatalf("у свидетеля %d голов, ожидали 4: под T1 и за её токеном, под T2 и за её токеном (она же текущая)", n)
 	}
 	if r := proof.Verify(b, tr); !r.Valid() || b.Upper == nil || r.WitnessHead != b.Upper.HeadSeq {
 		t.Fatalf("пакет со свидетелем:\n%s", r.Text())
 	}
 }
 
-// Свидетель недоступен: головы под метками ждут в очереди все, текущая —
-// одна, последней. Свидетель вернулся — уходят все.
+// Свидетель недоступен: головы под метками (и за их токенами) ждут в
+// очереди все, текущая — одна, последней. Свидетель вернулся — уходят все.
 func TestWitnessQueueWhileUnreachable(t *testing.T) {
 	c := newClock()
 	wdir := t.TempDir()
@@ -84,21 +84,31 @@ func TestWitnessQueueWhileUnreachable(t *testing.T) {
 	alive := s.witnessRemote
 	s.witnessRemote = deadRemote{}
 	for q := uint64(1); q <= 3; q++ {
-		ingest(t, s, "abs-core", q, q)
+		ingest(t, s, "abs-core", 2*q-1, 2*q-1)
 		mustStamp(t, s)
+		ingest(t, s, "abs-core", 2*q, 2*q) // новая текущая голова
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
 		if err := s.WitnessOnce(context.Background()); err == nil {
 			t.Fatal("голова ушла недоступному свидетелю")
 		}
 	}
 	q := s.witnessQueue
-	if len(q) != 4 || q[3].stamped || !q[0].stamped || !q[1].stamped || !q[2].stamped {
+	stamped := 0
+	for _, h := range q {
+		if h.stamped {
+			stamped++
+		}
+	}
+	if len(q) != 7 || stamped != 6 || q[6].stamped {
 		t.Fatalf("очередь к свидетелю: %+v", q)
 	}
 	s.witnessRemote = alive
 	if err := s.WitnessOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(witnessHeads(t, wdir).Heads); n != 4 || len(s.witnessQueue) != 0 {
+	if n := len(witnessHeads(t, wdir).Heads); n != 7 || len(s.witnessQueue) != 0 {
 		t.Fatalf("у свидетеля %d голов, в очереди %d", n, len(s.witnessQueue))
 	}
 }
@@ -120,7 +130,7 @@ func TestWitnessKeepsStampedHeadQueuedAsCurrent(t *testing.T) {
 	if err := s.WitnessOnce(context.Background()); err == nil { // голова — в очереди текущей
 		t.Fatal("голова ушла недоступному свидетелю")
 	}
-	mustStamp(t, s) // метка над той же головой
+	mustStamp(t, s)                                             // метка над той же головой
 	if err := s.WitnessOnce(context.Background()); err == nil { // следующая текущая
 		t.Fatal("голова ушла недоступному свидетелю")
 	}
@@ -241,4 +251,88 @@ func TestProofToWitnessHead(t *testing.T) {
 	if _, err := s.ProofTo("abs-core", 5, false, head+1); err == nil {
 		t.Fatal("выдан пакет до головы, которой нет в цепи")
 	}
+}
+
+// Q-06: голова под меткой TSA не доходит до свидетеля, если проход
+// свидетеля (раз в witness.every) пришёлся на время запроса к TSA, а за это
+// время цепь выросла (тик свернул пришедшие записи в звено). Текущая голова
+// h' > h встаёт в очередь раньше, и queueWitnessLocked(h, true) выходит по
+// h.Seq <= witnessQueued — голова h, которой кончаются пакеты, не уходит
+// никогда (остаток P-09).
+func TestStampedHeadReachesWitnessDuringTSA(t *testing.T) {
+	c := newClock()
+	wdir := t.TempDir()
+	s := openStore(t, testConfig(t, withWitness(wdir)), c)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s) // T1
+	if err := s.WitnessOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.add(time.Minute)
+	ingest(t, s, "abs-core", 4, 6)
+	c.add(time.Minute)
+
+	// Пока TSA отвечает: пришла запись, тик свернул её в звено, и сработал
+	// проход свидетеля (фоновые циклы так и работают, chainMu свободен).
+	orig := s.tsaLocal.Now
+	done := false
+	s.tsaLocal.Now = func() time.Time {
+		if !done {
+			done = true
+			ingest(t, s, "abs-core", 7, 7)
+			if err := s.flush(); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.WitnessOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if orig != nil {
+			return orig()
+		}
+		return c.now()
+	}
+	h, err := s.Stamp(context.Background()) // T2 над головой h
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.tsaLocal.Now = orig
+	for i := 0; i < 3; i++ { // следующие проходы свидетеля
+		if err := s.WitnessOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(wdir, "heads", fmtHead(h))); err != nil {
+		t.Errorf("голова %d под меткой T2 у свидетеля отсутствует: %v", h, err)
+	}
+
+	b, err := s.Proof("abs-core", 5, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trustOf(t, s)
+	tr.Witness = witnessHeads(t, wdir)
+	r := proof.Verify(b, tr)
+	t.Logf("пакет кончается головой %d (T2 над %d); у свидетеля голов %d", b.Statement.HeadSeq, b.Upper.HeadSeq, len(tr.Witness.Heads))
+	if !r.Valid() {
+		t.Errorf("пакет одной улики не проходит -heads, хотя хранилище честное:\n%s", r.Text())
+	}
+}
+
+func fmtHead(h uint64) string {
+	return filepathName(h)
+}
+
+func filepathName(h uint64) string {
+	return fmtSeq(h) + ".json"
+}
+
+func fmtSeq(h uint64) string {
+	s := "00000000000000000000"
+	d := []byte(s)
+	for i := len(d) - 1; h > 0 && i >= 0; i-- {
+		d[i] = byte('0' + h%10)
+		h /= 10
+	}
+	return string(d)
 }

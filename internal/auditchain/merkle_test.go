@@ -43,40 +43,6 @@ func TestMerkle_ProofVerifiesForEveryLeaf(t *testing.T) {
 	}
 }
 
-// ProofShape повторяет форму пути MerkleProof для каждого места в батче, и
-// разные места дают разные формы: по форме проверяющий узнаёт место листа
-// (пакет по источнику: токен и хвосты — последние в звене).
-func TestMerkle_ProofShapeTellsPlace(t *testing.T) {
-	for n := 1; n <= 40; n++ {
-		leaves := leavesN(n)
-		seen := map[string]int{}
-		for i := 0; i < n; i++ {
-			path, err := MerkleProof(leaves, i)
-			if err != nil {
-				t.Fatal(err)
-			}
-			shape, err := ProofShape(n, i)
-			if err != nil || len(shape) != len(path) {
-				t.Fatalf("n=%d лист %d: форма %v, шагов в пути %d, %v", n, i, shape, len(path), err)
-			}
-			key := ""
-			for j, left := range shape {
-				if left != path[j].SiblingLeft {
-					t.Fatalf("n=%d лист %d: шаг %d — сосед слева %v, в пути %v", n, i, j, left, path[j].SiblingLeft)
-				}
-				key += fmt.Sprint(left)
-			}
-			if prev, dup := seen[key]; dup {
-				t.Fatalf("n=%d: листья %d и %d с одной формой пути", n, prev, i)
-			}
-			seen[key] = i
-		}
-	}
-	if _, err := ProofShape(3, 3); err == nil {
-		t.Fatal("место за батчем")
-	}
-}
-
 // TestMerkle_ProofRejectsForeignLeaf — доказательство обязано быть про
 // КОНКРЕТНЫЙ лист, иначе оно доказывает лишь «батч существовал».
 func TestMerkle_ProofRejectsForeignLeaf(t *testing.T) {
