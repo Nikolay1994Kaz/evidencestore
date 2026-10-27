@@ -227,6 +227,10 @@ type Collector struct {
 	now         func() time.Time
 	quietFor    time.Duration
 	persistHook func(what string) error
+	// wall — часы, с которыми сверяется время приёма в обещании
+	// (keepPromise): настоящие, и в симуляции тоже — хранилище в ней живёт
+	// по настоящим часам.
+	wall func() time.Time
 }
 
 // promiseFile — файл обещаний (*os.File; тест подставляет обрыв записи).
@@ -287,7 +291,7 @@ func New(cfg *Config, log *slog.Logger) (_ *Collector, err error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
-	c := &Collector{cfg: cfg, log: log, files: map[uint64]*tracked{}, now: time.Now, quietFor: rotateQuiet, firstPass: true}
+	c := &Collector{cfg: cfg, log: log, files: map[uint64]*tracked{}, now: time.Now, wall: time.Now, quietFor: rotateQuiet, firstPass: true}
 	if c.storeKey, err = parseStoreKey(cfg.StoreKey); err != nil {
 		return nil, fmt.Errorf("collector: %w", err)
 	}
@@ -343,6 +347,15 @@ func (c *Collector) epochPath() string    { return filepath.Join(c.cfg.SpoolDir,
 
 // rejectedFile — обещания, которые не сошлись: улика против хранилища.
 const rejectedFile = "promises-rejected.jsonl"
+
+// aheadFile — обещания со временем приёма позже ответа хранилища: улика
+// против хранилища (keepPromise).
+const aheadFile = "promises-ahead.jsonl"
+
+// receiveAhead — насколько время приёма в обещании может быть позже ответа
+// хранилища по часам сборщика: расхождение часов сборщика и TSA. Честное
+// хранилище берёт время приёма не позже времени TSA (окно по якорю).
+const receiveAhead = time.Minute
 
 // spoolSegmentBytes — порог ротации сегмента буфера: доставленное уходит с
 // диска сегментами такого размера. Переменная — чтобы тест увидел удаление.
@@ -573,13 +586,19 @@ type stateResponse struct {
 	PublicKey string `json:"public_key"`
 }
 
-func (c *Collector) fetchState(ctx context.Context) (stateResponse, error) {
+// fetchState — GET /v1/state. issued — последний выданный номер, когда всё
+// выданное доставлено (пульс): по нему хранилище записывает пропуск в конце
+// нумерации; ноль — не сообщать (запуск).
+func (c *Collector) fetchState(ctx context.Context, issued uint64) (stateResponse, error) {
 	var st stateResponse
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.Server+"/v1/state", nil)
 	if err != nil {
 		return st, err
 	}
 	req.Header.Set(epochHeader, c.epoch)
+	if issued > 0 {
+		req.Header.Set(issuedHeader, strconv.FormatUint(issued, 10))
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return st, err
@@ -616,7 +635,7 @@ func (c *Collector) fetchState(ctx context.Context) (stateResponse, error) {
 // диск), — тревога: в буфере лежат его подписанные обещания —
 // доказательство потери.
 func (c *Collector) Bootstrap(ctx context.Context) error {
-	st, err := c.fetchState(ctx)
+	st, err := c.fetchState(ctx, 0)
 	if errors.Is(err, ErrStoreKey) || errors.Is(err, ErrEpoch) {
 		return err
 	}
@@ -1045,9 +1064,14 @@ func (c *Collector) readFile(t *tracked) (int, error) {
 	}
 	if fi.Size() < t.off || c.replaced(t) {
 		c.log.Error("log file truncated or replaced in place, unread lines are lost; leaving a gap in numbering", "file", t.path, "inode", t.ino)
+		off, head := t.off, t.head
 		c.nextSeq++
 		t.off, t.head = 0, ""
 		if err := c.mark(t); err != nil { // пропуск — в той же записи
+			// Записи нет — нет и пропуска: номер и место назад, как в forget,
+			// иначе пульс сообщил бы хранилищу номер, которого нет в буфере.
+			c.nextSeq--
+			t.off, t.head = off, head
 			return 0, err
 		}
 	}
@@ -1448,7 +1472,10 @@ func (c *Collector) SendOnce(ctx context.Context) error {
 	if now.Sub(c.contactAt) < c.cfg.HeartbeatEvery.D() {
 		return nil
 	}
-	_, err := c.fetchState(ctx)
+	// Буфер пуст: всё выданное доставлено, и номер после последней
+	// доставленной строки, пропущенный сборщиком, хранилище запишет
+	// пропуском сейчас (Q-44).
+	_, err := c.fetchState(ctx, c.nextSeq-min(c.nextSeq, 1))
 	return err
 }
 
@@ -1487,6 +1514,9 @@ const (
 	codeEpochMismatch = "epoch_mismatch"
 	// epochHeader — заголовок с эпохой установки (server.EpochHeader).
 	epochHeader = "Collector-Epoch"
+	// issuedHeader — заголовок пульса с последним выданным номером
+	// (server.IssuedHeader).
+	issuedHeader = "Collector-Issued"
 )
 
 // errorResponse — тело ответа хранилища с ошибкой (server.ErrorResponse).
@@ -1560,6 +1590,7 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 		return fmt.Errorf("store answered %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	c.contactAt = c.now()
+	answered := c.wall()
 	var out ingestResponse
 	if err := json.Unmarshal(body, &out); err != nil {
 		return fmt.Errorf("store answered garbage: %w", err)
@@ -1575,7 +1606,7 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 		case r.Status != statusAccepted && r.Status != statusDuplicate:
 			return fmt.Errorf("store result %d: seq %d status %q", i, r.Seq, r.Status)
 		}
-		if err := c.keepPromise(r.Promise, r.Position, batch[i]); err != nil {
+		if err := c.keepPromise(r.Promise, r.Position, batch[i], answered); err != nil {
 			bad = append(bad, err)
 		}
 	}
@@ -1595,7 +1626,14 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 // отпечаток зашифрованной улики. Обещание, которое не сходится, кладётся
 // отдельно (promises-rejected.jsonl) — это улика против хранилища, — а
 // запись остаётся в буфере.
-func (c *Collector) keepPromise(p *proof.Promise, position uint64, r spoolRecord) error {
+//
+// Время приёма в обещании — слово хранилища, и сверить его может только
+// сборщик: хранилище, сдвинувшее его вперёд и придержавшее запись, вывело
+// бы её из окна, в которое она пришла, со сроком обещания, который она
+// уложит (Q-56). Время приёма позже ответа (answered, часы сборщика) больше
+// чем на receiveAhead — ошибка в журнал и обещание в promises-ahead.jsonl;
+// запись доставлена: у хранилища она есть, повтор вернёт то же обещание.
+func (c *Collector) keepPromise(p *proof.Promise, position uint64, r spoolRecord, answered time.Time) error {
 	if p == nil {
 		c.log.Error("store answered without a promise; the record stays in the spool", "seq", r.seq)
 		return fmt.Errorf("seq %d: no promise", r.seq)
@@ -1624,6 +1662,11 @@ func (c *Collector) keepPromise(p *proof.Promise, position uint64, r spoolRecord
 	}
 	if _, err := c.promises.Write(line); err != nil {
 		return errors.Join(err, c.promises.Truncate(fi.Size()))
+	}
+	if recv := time.Unix(0, p.ReceivedAt); recv.After(answered.Add(receiveAhead)) {
+		c.log.Error("the store's promise gives a receive time later than its answer: the store may shift receive times to keep a record out of the window it arrived in; the promise is kept as evidence",
+			"seq", r.seq, "receive_time", recv.UTC(), "answered", answered.UTC(), "file", aheadFile)
+		return appendLine(filepath.Join(c.cfg.SpoolDir, aheadFile), line)
 	}
 	return nil
 }

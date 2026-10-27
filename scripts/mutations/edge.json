@@ -457,14 +457,14 @@
   {
    "name": "C79 ответ на приём не продлевает связь (P-05)",
    "file": "internal/collector/collector.go",
-   "old": "\tc.contactAt = c.now()\n\tvar out ingestResponse",
-   "new": "\tvar out ingestResponse"
+   "old": "\tc.contactAt = c.now()\n\tanswered := c.wall()\n\tvar out ingestResponse",
+   "new": "\tanswered := c.wall()\n\tvar out ingestResponse"
   },
   {
    "name": "C80 отказ в ответе на пульс проглатывается (P-05)",
    "file": "internal/collector/collector.go",
-   "old": "\t_, err := c.fetchState(ctx)\n\treturn err\n}",
-   "new": "\tc.fetchState(ctx)\n\treturn nil\n}"
+   "old": "\t_, err := c.fetchState(ctx, c.nextSeq-min(c.nextSeq, 1))\n\treturn err\n}",
+   "new": "\tc.fetchState(ctx, c.nextSeq-min(c.nextSeq, 1))\n\treturn nil\n}"
   },
   {
    "name": "C81 heartbeat_every по умолчанию не ставится",
@@ -477,6 +477,36 @@
    "file": "internal/collector/collector.go",
    "old": "\tif c.HeartbeatEvery < 0 {",
    "new": "\tif false && c.HeartbeatEvery < 0 {"
+  },
+  {
+   "name": "X17 сервер не передаёт номер пульса хранилищу (Q-44)",
+   "file": "internal/server/server.go",
+   "old": "\t\tif err := s.store.Issued(source, n); err != nil {",
+   "new": "\t\tif err := s.store.Issued(source, n*0); err != nil {"
+  },
+  {
+   "name": "X18 пульс сборщика без последнего выданного номера (Q-44)",
+   "file": "internal/collector/collector.go",
+   "old": "c.fetchState(ctx, c.nextSeq-min(c.nextSeq, 1))",
+   "new": "c.fetchState(ctx, 0*c.nextSeq)"
+  },
+  {
+   "name": "X19 заголовок с номером не ставится (Q-44)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif issued > 0 {\n\t\treq.Header.Set(issuedHeader",
+   "new": "\tif false && issued > 0 {\n\t\treq.Header.Set(issuedHeader"
+  },
+  {
+   "name": "X31 сборщик не сверяет время приёма в обещании (Q-56)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif recv := time.Unix(0, p.ReceivedAt); recv.After(answered.Add(receiveAhead)) {",
+   "new": "\tif recv := time.Unix(0, p.ReceivedAt); false && recv.After(answered.Add(receiveAhead)) {"
+  },
+  {
+   "name": "X32 допуск времени приёма в обещании — сто минут (Q-56)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif recv := time.Unix(0, p.ReceivedAt); recv.After(answered.Add(receiveAhead)) {",
+   "new": "\tif recv := time.Unix(0, p.ReceivedAt); recv.After(answered.Add(100 * receiveAhead)) {"
   }
  ],
  "note": "V3 (имя из сертификата не сверяется с реестром на входе) снят как равносильный: store.Ingest и store.LastSeq сами отказывают неизвестному источнику (ErrUnknownSource → 403)."

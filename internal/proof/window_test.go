@@ -394,8 +394,15 @@ func TestWindowKindAndVersion(t *testing.T) {
 	if kind, err := BundleKind(data); err != nil || kind != WindowKind {
 		t.Fatalf("вид пакета %q, %v", kind, err)
 	}
-	if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), "bundle version 2, supported 1") {
+	if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), `a bundle of kind "window", not a single-record bundle`) {
 		t.Fatalf("разбор пакета одной улики принял окно: %v", err)
+	}
+	// Пакет одной улики: версии 1 (хранилище v0.2.0) и 2 — да, другие — нет.
+	for v, ok := range map[int]bool{1: true, Version: true, 3: false, 0: false} {
+		data, _ := json.Marshal(Bundle{Version: v})
+		if _, err := Parse(data); (err == nil) != ok {
+			t.Fatalf("пакет одной улики версии %d: %v", v, err)
+		}
 	}
 	if _, err := ParseWindow(data); err != nil {
 		t.Fatal(err)

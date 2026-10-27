@@ -38,8 +38,12 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
-// Version — версия формата пакета.
-const Version = 1
+// Version — версия формата пакета одной улики. Версия 2 (27.10) — тот же
+// формат, но проверки ему нужны новые (звено токена T1 — tokenLinkTime,
+// сверка обещания от головы T1): esverify v0.2.0 и раньше такой пакет не
+// разбирает и говорит о версии, а не проверяет его без них. Пакеты
+// версии 1 (хранилище v0.2.0 и раньше) читаются по-прежнему.
+const Version = 2
 
 // HeadDomain — домен хэша головы, который уходит в TSA.
 const HeadDomain = "evidencestore/head/v1"
@@ -54,12 +58,19 @@ const (
 	ReceiveSkew  = time.Minute
 )
 
+// ReceiveLag — на сколько время приёма может отставать от настоящего:
+// хранилище зажимает часы хоста окном по якорю TSA не шире ReceiveLag
+// (store.recvWindow). Время звеньев при этом доходит до настоящего, и
+// честному хранилищу срок обещания нужен не короче ReceiveLag и двух тиков
+// цепи (config, chain.promise_mmd).
+const ReceiveLag = 55 * time.Second
+
 // Граница окна у пакетов за окно и по источнику (DECISIONS, п. 27, 28).
 // Метка заверяет звено, созданное перед запросом к TSA; что легло в цепь,
 // пока шёл запрос, — после этого звена, и метка его не заверяет. Такая
 // запись получает время приёма позже T2 − WindowEdge: ответа TSA дольше
 // StampLatency хранилище не ждёт (токен не ложится в цепь), часы приёма
-// отстают от настоящего времени не больше 55 с, остальное — запас на путь
+// отстают от настоящего времени не больше ReceiveLag, остальное — запас на путь
 // от приёма до листа в цепи. Поэтому окно, кончившееся раньше
 // T2 − WindowEdge, целиком лежит в заверенном.
 const (
@@ -210,8 +221,13 @@ func Parse(data []byte) (Bundle, error) {
 	if err := json.Unmarshal(data, &b); err != nil {
 		return b, fmt.Errorf("proof: %w", err)
 	}
-	if b.Version != Version {
-		return b, fmt.Errorf("proof: bundle version %d, supported %d", b.Version, Version)
+	// Версия у пакетов разных видов своя (пакет за окно — тоже 2): вид
+	// сверяется первым.
+	if kind, _ := BundleKind(data); kind != "" {
+		return b, fmt.Errorf("proof: a bundle of kind %q, not a single-record bundle", kind)
+	}
+	if b.Version != Version && b.Version != 1 {
+		return b, fmt.Errorf("proof: bundle version %d, supported 1 and %d", b.Version, Version)
 	}
 	return b, nil
 }
@@ -531,7 +547,27 @@ func checkLower(lw Lower, evidenceLink uint64, linkAt func(uint64) (auditchain.R
 	if err != nil {
 		return time.Time{}, err
 	}
+	link, _, _ := linkAt(inc.LinkSeq)
+	if err := tokenLinkTime(link, info.GenTime.UTC()); err != nil {
+		return time.Time{}, err
+	}
 	return info.GenTime.UTC(), nil
+}
+
+// tokenLinkTime — звено, в котором лежит токен метки, получило время не
+// раньше её времени минус ReceiveSkew. Время звена — время его последнего
+// листа; лист токена ложится сразу после ответа TSA со временем по якорю
+// этой же метки, и звено сворачивается тут же (store.stampOnce): в честной
+// цепи время звена с токеном отстаёт от времени метки меньше чем на 55 с.
+// Время звеньев пишет само хранилище, и обещание сверяется по нему
+// (CheckPromise): звено токена со временем задним числом пропустило бы
+// запись, придержанную за метку, «в срок» (Q-33). Проверяется у каждого
+// токена, который пакет показывает.
+func tokenLinkTime(link auditchain.Record, gen time.Time) error {
+	if at := time.Unix(0, link.UnixNano).UTC(); at.Before(gen.Add(-ReceiveSkew)) {
+		return fmt.Errorf("link %d holds the token of the time-stamp of %s, yet its time is %s, more than %s earlier: the store backdated the link", link.Seq, fmtTime(gen), fmtTime(at), ReceiveSkew)
+	}
+	return nil
 }
 
 func encodeHash(h [32]byte) string {

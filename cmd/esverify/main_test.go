@@ -43,6 +43,11 @@ func newWorldWith(t *testing.T, body []byte) world {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	// Метка до приёма, как в serve (приём ждёт якоря): у улики есть T1, и
+	// обещание сверяется (-promise требует T1).
+	if _, err := s.Stamp(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	res, err := s.Ingest("abs-core", []store.Incoming{{Seq: 1, Body: body}})
 	if err != nil {
 		t.Fatal(err)
@@ -154,6 +159,29 @@ func TestExitCodesAndPromiseVerdict(t *testing.T) {
 	code, out = w.run(t, "-json")
 	if code != exitInvalid || !strings.Contains(out, `"valid": false`) {
 		t.Fatalf("битый пакет: %d\n%s", code, out)
+	}
+}
+
+// Q-33: без метки T1 перед уликой время её звена — только слово
+// хранилища, и обещание не сверяется без явного -allow-no-tsa.
+func TestPromiseNeedsLowerStamp(t *testing.T) {
+	w := newWorld(t)
+	data, _ := os.ReadFile(w.bundle)
+	b, err := proof.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Lower = nil
+	stripped, _ := json.Marshal(b)
+	os.WriteFile(w.bundle, stripped, 0o600)
+	if code, out := w.run(t); code != exitValid {
+		t.Fatalf("без T1 и без обещания: %d\n%s", code, out)
+	}
+	if code, out := w.run(t, "-promise", w.promise); code != exitInvalid || !strings.Contains(out, "no TSA time-stamp in the chain before the record") {
+		t.Fatalf("обещание без T1: %d\n%s", code, out)
+	}
+	if code, out := w.run(t, "-promise", w.promise, "-allow-no-tsa"); code != exitValid {
+		t.Fatalf("обещание без T1 с -allow-no-tsa: %d\n%s", code, out)
 	}
 }
 

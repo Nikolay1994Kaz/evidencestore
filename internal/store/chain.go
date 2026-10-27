@@ -20,7 +20,7 @@ import (
 type chainScan struct {
 	keyEvents map[string]string // последнее событие каждого ключа
 	maxPos    uint64            // наибольшая позиция улики в цепи
-	maxSeq    map[string]uint64 // наибольший номер в цепи у каждого источника
+	maxSeq    map[string]uint64 // наибольший номер в цепи у каждого источника: улика или конец пропуска
 	silent    map[string]bool   // источники, чьё последнее событие в цепи — «молчит»
 }
 
@@ -62,6 +62,15 @@ func (s *Store) scanChain() (chainScan, error) {
 			}
 			s.srcTail[l.Scope] = srcTailRef{seq: seq, hash: auditchain.LeafHash(l)}
 			delete(cs.silent, l.Scope)
+		case auditchain.EventGap:
+			// Пропуск, объявленный пульсом сборщика, — без записи после него:
+			// после подъёма он не объявляется заново, и следующая запись его
+			// не повторит.
+			var g gap
+			if err := json.Unmarshal(l.Payload, &g); err != nil {
+				return fmt.Errorf("chain leaf %d: sequence gap: %w", num, err)
+			}
+			cs.maxSeq[l.Scope] = max(cs.maxSeq[l.Scope], g.To)
 		case auditchain.EventSilence:
 			cs.silent[l.Scope] = true
 		case auditchain.EventContact:
@@ -187,8 +196,7 @@ func (s *Store) appendLeafLocked(l auditchain.Leaf) uint64 {
 
 // appendEvent кладёт в цепь событие (ключи, пропуски, молчание, запуск).
 func (s *Store) appendEvent(typ auditchain.EventType, scope, subject string, payload []byte) uint64 {
-	at := s.leafTime()
-	s.chainMu.Lock()
+	at := s.lockChainAt()
 	defer s.chainMu.Unlock()
 	return s.appendLeafLocked(auditchain.Leaf{
 		UnixNano: at,
@@ -197,6 +205,23 @@ func (s *Store) appendEvent(typ auditchain.EventType, scope, subject string, pay
 		Subject:  subject,
 		Payload:  payload,
 	})
+}
+
+// lockChainAt берёт chainMu и отдаёт время листа события по якорю,
+// который действует сейчас. Время берётся до замка (часы — вне замков), и
+// если, пока событие ждало цепь, якорь сменился, — заново: иначе событие со
+// временем прежнего якоря (до первой метки — часы хоста как есть) легло бы
+// после листьев нового, в звенья, которые считает сверка обещания (Q-47).
+func (s *Store) lockChainAt() int64 {
+	for {
+		g := s.anchorGen.Load()
+		at := s.leafTime()
+		s.chainMu.Lock()
+		if s.anchorGen.Load() == g {
+			return at
+		}
+		s.chainMu.Unlock()
+	}
 }
 
 func (s *Store) appendJSONEvent(typ auditchain.EventType, scope, subject string, v any) {

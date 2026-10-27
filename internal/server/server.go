@@ -300,6 +300,19 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		s.writeIngestErr(w, source, err)
 		return
 	}
+	// Пульс несёт последний выданный номер: пропуск в конце нумерации
+	// хранилище записывает сейчас, а не со следующей записью.
+	if v := r.Header.Get(IssuedHeader); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("%s: %w", IssuedHeader, err))
+			return
+		}
+		if err := s.store.Issued(source, n); err != nil {
+			s.writeIngestErr(w, source, err)
+			return
+		}
+	}
 	last, err := s.store.LastSeq(source)
 	if err != nil {
 		writeErr(w, http.StatusForbidden, err)
@@ -609,6 +622,11 @@ const CodeEpochMismatch = "epoch_mismatch"
 // EpochHeader — заголовок запроса сборщика: эпоха его установки
 // (store.Admit). Без заголовка — сборщик прежней версии.
 const EpochHeader = "Collector-Epoch"
+
+// IssuedHeader — заголовок пульса сборщика (GET /v1/state): последний
+// выданный им номер, когда всё выданное доставлено (store.Issued). Без
+// заголовка — запуск сборщика или сборщик прежней версии.
+const IssuedHeader = "Collector-Issued"
 
 // BindRequest — оператор закрепляет за источником эпоху сборщика: так
 // принимается законная переустановка.

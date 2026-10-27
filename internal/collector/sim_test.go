@@ -251,13 +251,14 @@ type fakeStore struct {
 	promises map[uint64]proof.Promise
 	last     uint64
 	position uint64
+	recvAt   int64    // время приёма в обещаниях (unix-нс)
 	bad      []string // нарушения протокола со стороны сборщика
 }
 
 func newFakeStore(sk ed25519.PrivateKey) *fakeStore {
 	return &fakeStore{
 		sk: sk, pub: base64.RawStdEncoding.EncodeToString(sk.Public().(ed25519.PublicKey)),
-		bodies: map[uint64]string{}, promises: map[uint64]proof.Promise{},
+		bodies: map[uint64]string{}, promises: map[uint64]proof.Promise{}, recvAt: 1,
 	}
 }
 
@@ -272,6 +273,15 @@ func (s *fakeStore) RoundTrip(req *http.Request) (*http.Response, error) {
 	case s.down:
 		http.Error(rec, "down", http.StatusServiceUnavailable)
 	case req.Method == http.MethodGet && req.URL.Path == "/v1/state":
+		// Пульс с последним выданным номером: пропуск в конце нумерации
+		// хранилище записывает сразу (server.IssuedHeader).
+		if v := req.Header.Get(issuedHeader); v != "" {
+			n, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				s.bad = append(s.bad, "пульс: "+err.Error())
+			}
+			s.last = max(s.last, n)
+		}
 		json.NewEncoder(rec).Encode(stateResponse{LastSeq: s.last, PublicKey: s.pub})
 	case req.Method == http.MethodPost && req.URL.Path == "/v1/ingest":
 		s.ingest(rec, req)
@@ -327,7 +337,7 @@ func (s *fakeStore) ingest(w http.ResponseWriter, req *http.Request) {
 		if !ok {
 			s.position++
 			d := sha256.Sum256(r.Body)
-			p = proof.Promise{Source: "abs-core", Seq: r.Seq, Position: s.position, Digest: d[:], ReceivedAt: 1, Deadline: 2, PublicKey: s.pub}
+			p = proof.Promise{Source: "abs-core", Seq: r.Seq, Position: s.position, Digest: d[:], ReceivedAt: s.recvAt, Deadline: s.recvAt + 1, PublicKey: s.pub}
 			p.Signature = ed25519.Sign(s.sk, proof.PromiseBytes(p))
 			s.promises[r.Seq], s.bodies[r.Seq] = p, string(r.Body)
 			s.last = max(s.last, r.Seq)
@@ -1418,6 +1428,12 @@ func (s *sim) quiesce() {
 			return
 		}
 		if n == 0 && s.c.Pending() == 0 {
+			// Сборщик живёт и дальше: пульс в тишине сообщает пропуск в
+			// конце нумерации, если после него строк нет (Q-44).
+			s.now = s.now.Add(s.cfg.HeartbeatEvery.D())
+			if err := s.c.SendOnce(context.Background()); err != nil {
+				s.fail("пульс в тишине: %v", err)
+			}
 			return
 		}
 		s.now = s.now.Add(simFlush)

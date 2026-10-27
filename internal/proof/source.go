@@ -306,6 +306,10 @@ func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Rec
 	if err != nil {
 		return [32]byte{}, time.Time{}, fmt.Errorf("the time-stamp: %w", err)
 	}
+	tl, _, _ := linkAt(e.Token.LinkSeq)
+	if err := tokenLinkTime(tl, info.GenTime.UTC()); err != nil {
+		return [32]byte{}, time.Time{}, err
+	}
 	return last, info.GenTime.UTC(), nil
 }
 
@@ -332,6 +336,10 @@ func closingStamp(b SourceBundle, linkAt func(uint64) (auditchain.Record, [32]by
 	info, err := tsa.Verify(tok.Payload, HeadImprint(head, hash), trust)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("the time-stamp that closes the window: %w", err)
+	}
+	cl, _, _ := linkAt(c.LinkSeq)
+	if err := tokenLinkTime(cl, info.GenTime.UTC()); err != nil {
+		return time.Time{}, err
 	}
 	return info.GenTime.UTC(), nil
 }
@@ -437,7 +445,7 @@ func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Rec
 		l := rec.Leaf.Leaf.chain()
 		if rec.Verdict == nil {
 			if gw {
-				return fmt.Errorf("record %s/%s lacks the store's verdict, and the tails name %s a gateway journal", b.Source, l.Subject, b.Source)
+				return fmt.Errorf("record %s/%s lacks the store's verdict, and the tails name %s a gateway journal (if the source became one inside the window, ask for a window after the switch)", b.Source, l.Subject, b.Source)
 			}
 			continue
 		}

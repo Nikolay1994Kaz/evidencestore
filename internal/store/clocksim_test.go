@@ -18,10 +18,11 @@ import (
 // секунды), часы хоста смещены, прыгают и уходят, монотонные часы уходят
 // (без NTP — тем же ходом, что часы хоста), ответ TSA идёт до 25 с, TSA
 // пропадает, хранилище простаивает сутками и перезапускается, записи
-// приходят и в окно между токеном новой метки в цепи и новым якорем. После
+// приходят и в окно между ответом TSA и новым якорем. После
 // последней метки каждая принятая запись должна пройти проверку
-// (время приёма между T1 − 1 мин и T2 + 1 с); приём не закрыт, пока TSA
-// отвечает; верные часы хоста — не тревога.
+// (время приёма между T1 − 1 мин и T2 + 1 с) и сверку с обещанием, данным
+// при приёме (esverify -promise); приём не закрыт, пока TSA отвечает;
+// верные часы хоста — не тревога.
 //
 // CLOCKSIM_SEEDS — сценариев, CLOCKSIM_SEED — один сценарий.
 
@@ -73,10 +74,12 @@ type clockSim struct {
 
 	seq      uint64
 	accepted []uint64
+	promises map[uint64]proof.Promise
 	pending  []uint64 // отвергнутые до якоря: сборщик повторит
 	lastOK   time.Time
-	armed    bool // принять запись в окне между токеном и якорем
+	armed    bool // принять запись в окне между ответом TSA и новым якорем
 	signing  bool // идёт метка
+	signed   bool // TSA уже ответила на эту метку
 	trace    []string
 	fails    []string
 	alarms   uint64
@@ -101,7 +104,7 @@ func (c *clockSim) fail(format string, args ...any) {
 }
 
 func runClockSim(t *testing.T, seed uint64) string {
-	c := &clockSim{t: t, rng: mrand.New(mrand.NewPCG(seed, seed^0x9e3779b9))}
+	c := &clockSim{t: t, rng: mrand.New(mrand.NewPCG(seed, seed^0x9e3779b9)), promises: map[uint64]proof.Promise{}}
 	c.t0 = time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC).Add(time.Duration(c.rng.Int64N(int64(time.Second))))
 	c.now = c.t0
 	c.monoBase = time.Duration(c.rng.Int64N(int64(1000 * time.Hour)))
@@ -137,7 +140,7 @@ func runClockSim(t *testing.T, seed uint64) string {
 			c.ingest()
 		case r < 42:
 			c.armed = true // запись в окне следующей метки
-			c.note("следующая метка — с записью в окне")
+			c.note("следующая метка — с записью между ответом TSA и якорем")
 		case r < 47:
 			c.tsaDown = !c.tsaDown
 			c.note("TSA down=%v", c.tsaDown)
@@ -195,19 +198,21 @@ func (c *clockSim) tsaHook() time.Time {
 	c.now = c.now.Add(before)
 	gen := c.now
 	c.now = c.now.Add(c.lag - before)
+	c.signed = c.signing
 	if c.tsaDown {
 		return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
 	return gen
 }
 
-// monoHook — монотонные часы; armed — первый их вызов после подписи метки
-// (токен уже в цепи, якорь ещё прежний) принимает запись.
+// monoHook — монотонные часы; armed — первый их вызов после ответа TSA
+// (якорь ещё прежний, токена в цепи нет) принимает запись: она ложится в
+// звено токена, время звена — уже по новому якорю.
 func (c *clockSim) monoHook() time.Duration {
 	m := c.mono()
-	if c.armed && c.signing {
+	if c.armed && c.signing && c.signed {
 		c.armed, c.signing = false, false
-		c.note("запись в окне между токеном и якорем")
+		c.note("запись в окне между ответом TSA и якорем")
 		c.ingest()
 	}
 	return m
@@ -221,7 +226,7 @@ func (c *clockSim) ingest() {
 	}
 	for len(c.pending) > 0 {
 		q := c.pending[0]
-		_, err := c.s.Ingest("abs-core", []Incoming{{Seq: q, Body: []byte(fmt.Sprintf("record %d", q))}})
+		res, err := c.s.Ingest("abs-core", []Incoming{{Seq: q, Body: []byte(fmt.Sprintf("record %d", q))}})
 		if errors.Is(err, ErrNoAnchor) {
 			if !c.lastOK.IsZero() && c.now.Sub(c.lastOK) < time.Hour && !c.tsaDown && !c.restartedSince() {
 				c.fail("приём закрыт без причины: последняя метка %v назад, TSA отвечает", c.now.Sub(c.lastOK))
@@ -233,7 +238,17 @@ func (c *clockSim) ingest() {
 			return
 		}
 		c.accepted = append(c.accepted, q)
+		c.promises[q] = *res[0].Promise
 		c.pending = c.pending[1:]
+	}
+	// Тик цепи (фоновых циклов в симуляции нет): звено — за секунду после
+	// приёма, а не на следующей метке, иначе в звено записи ложились бы
+	// листья на минуты позже и обещание «нарушала» бы сама симуляция.
+	// Запись посреди метки звено не сворачивает: оно — звено токена.
+	if !c.signing {
+		if err := c.s.flush(); err != nil {
+			c.fail("сброс цепи: %v", err)
+		}
 	}
 	if n := c.s.clockCapped.Load(); n > c.alarms {
 		c.alarms = n
@@ -289,9 +304,9 @@ func (c *clockSim) stamp() {
 		return
 	}
 	c.lag = []time.Duration{0, 200 * time.Millisecond, 2 * time.Second, 12 * time.Second, 25 * time.Second}[c.rng.IntN(5)]
-	c.signing = true
+	c.signing, c.signed = true, false
 	head, err := c.s.Stamp(context.Background())
-	c.signing = false
+	c.signing, c.signed = false, false
 	switch {
 	case err != nil && !c.tsaDown:
 		c.fail("метка при живой TSA: %v", err)
@@ -322,6 +337,12 @@ func (c *clockSim) finish() {
 		}
 		r := proof.Verify(b, trust)
 		if r.Valid() {
+			if err := proof.CheckPromise(c.promises[q], r, b, false); err != nil {
+				bad++
+				if bad <= 2 {
+					c.fail("обещание по законной улике %d не выполнено: %v", q, err)
+				}
+			}
 			continue
 		}
 		bad++
@@ -350,6 +371,15 @@ func (c *clockSim) finish() {
 		c.fail("в пакете за окно %d улик, принято %d", len(seqs["abs-core"]), len(c.accepted))
 	}
 	// И пакетом по источнику: цепочка abs-core сходится, принятое — в ней.
+	// Окно закрывает предпоследняя метка, и её время должно быть позже всех
+	// прежних: после перезапуска метка якоря и метка, что открывает приём,
+	// ложатся в одну секунду, и закрывающей стала бы первая из них — запись,
+	// принятая после второй, честно лежала бы за краем (Q-45).
+	c.now = c.now.Add(2 * time.Second)
+	if _, err := c.s.stampNow(context.Background()); err != nil {
+		c.fail("метка перед пакетом по источнику: %v", err)
+		return
+	}
 	sr, err := wholeChainSource(c.s, "abs-core", trust)
 	switch {
 	case err != nil:
@@ -374,9 +404,9 @@ func clockSimBackground(c *clockSim) {
 		return
 	}
 	c.lag = []time.Duration{0, 200 * time.Millisecond, 2 * time.Second}[c.rng.IntN(3)]
-	c.signing = true
+	c.signing, c.signed = true, false
 	_, err := c.s.stampNow(context.Background())
-	c.signing = false
+	c.signing, c.signed = false, false
 	if err != nil {
 		c.fail("метка якоря при живой TSA: %v", err)
 		return

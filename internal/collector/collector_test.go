@@ -333,6 +333,37 @@ func TestLostRotatedTailLeavesGap(t *testing.T) {
 	}
 }
 
+// Q-44: журнал исчез с непрочитанным хвостом, пока сборщик стоял, и новых
+// строк нет. Пропуск номера хранилище записывает по пульсу, а не со
+// следующей строкой, которой может не быть.
+func TestPulseDeclaresTrailingGap(t *testing.T) {
+	r := newRig(t)
+	r.cfg.HeartbeatEvery = config.Duration(100 * time.Millisecond)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, "1\n")
+	cycle(t, c)
+	c.Close() // сборщик остановлен
+	appendLines(t, r.cfg.File, "lost\n")
+	os.Remove(r.cfg.File)
+	c = r.collector(t)
+	cycle(t, c)
+	if last, _ := r.st.LastSeq("abs-core"); last != 1 {
+		t.Fatalf("до пульса последний номер %d, ожидали 1", last)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := c.SendOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if last, _ := r.st.LastSeq("abs-core"); last != 2 {
+		t.Fatalf("после пульса последний номер %d, ожидали 2 (пропуск)", last)
+	}
+	appendLines(t, r.cfg.File, "3\n")
+	cycle(t, c)
+	if got := r.bodies(t); len(got) != 3 || got[0] != "1" || !strings.Contains(got[1], "нет 2") || got[2] != "3" {
+		t.Fatalf("принято: %q", got)
+	}
+}
+
 // Сборщик стоял, пока журнал ротировали, а ротированный файл остался рядом
 // (audit.log.1): после рестарта он находится по inode и дочитывается —
 // хвост не теряется, пропуска нет. (Работающий сборщик дочитывает через
@@ -567,6 +598,77 @@ func TestRegistryKnowsFileByBirth(t *testing.T) {
 	}
 	if e := c.files[ino]; e == nil || e.off != 7 {
 		t.Fatalf("свой файл забыт: %+v", e)
+	}
+}
+
+// Файл, открытый по inode записи реестра (после рестарта сборщика он ищется
+// по inode), — тот же, только если совпало время рождения: другое рождение
+// при той же первой строке — чужой файл, которому достался inode. Раньше это
+// ловила только симуляция — когда диск переиспользовал номера inode.
+func TestSameFileByBirth(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "a.log")
+	if err := os.WriteFile(p, []byte("header\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	birth := birthOf(f)
+	if birth == 0 {
+		t.Skip("файловая система не знает времени рождения")
+	}
+	if !sameFile(&tracked{off: 7, head: "header", birth: birth}, f) {
+		t.Fatal("свой файл не узнан")
+	}
+	if sameFile(&tracked{off: 7, head: "header", birth: birth + 1}, f) {
+		t.Fatal("чужой файл с той же первой строкой и другим рождением узнан своим")
+	}
+}
+
+// Q-56: время приёма в обещании — слово хранилища, и сдвиг его вперёд
+// выдаёт сборщик: позже ответа хранилища больше чем на receiveAhead — ошибка
+// в журнал и обещание в promises-ahead.jsonl. Запись доставлена: у хранилища
+// она есть, повтор вернул бы то же обещание.
+func TestPromiseReceiveTimeAhead(t *testing.T) {
+	certs := simCerts(t)
+	fs := newFakeStore(certs.storeSK)
+	logDir := t.TempDir()
+	cfg := &Config{
+		Server: "https://store.invalid", CA: filepath.Join(certs.dir, "ca.crt"),
+		Cert: filepath.Join(certs.dir, "abs-core.crt"), Key: filepath.Join(certs.dir, "abs-core.key"),
+		StoreKey: fs.pub, SpoolDir: filepath.Join(t.TempDir(), "spool"),
+		File: filepath.Join(logDir, "audit.log"), FromStart: true,
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(cfg, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fs.attach(c)
+	if err := c.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ahead := filepath.Join(cfg.SpoolDir, aheadFile)
+	fs.recvAt = time.Now().Add(receiveAhead / 2).UnixNano() // расхождение часов
+	appendLines(t, cfg.File, "1\n")
+	cycle(t, c)
+	if _, err := os.Stat(ahead); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("время приёма в пределах допуска сочтено сдвигом: %v", err)
+	}
+	fs.recvAt = time.Now().Add(10 * time.Minute).UnixNano()
+	appendLines(t, cfg.File, "2\n")
+	cycle(t, c)
+	data, err := os.ReadFile(ahead)
+	if err != nil || strings.Count(string(data), "\n") != 1 || !strings.Contains(string(data), `"seq":2,`) {
+		t.Fatalf("обещание со временем приёма на 10 минут позже ответа: %q, %v", data, err)
+	}
+	if c.Pending() != 0 || c.Acked() != 2 {
+		t.Fatalf("запись не доставлена: в буфере %d, подтверждено до %d", c.Pending(), c.Acked())
 	}
 }
 

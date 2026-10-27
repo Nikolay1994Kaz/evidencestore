@@ -3,6 +3,7 @@ package proof
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -287,7 +288,7 @@ func TestPromise(t *testing.T) {
 	if err := VerifyPromise(p, w.signer.PublicKey()); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckPromise(p, r, w.links[2].UnixNano); err != nil {
+	if err := CheckPromise(p, r, b, false); err != nil {
 		t.Fatal(err)
 	}
 	bad := p
@@ -295,13 +296,106 @@ func TestPromise(t *testing.T) {
 	if VerifyPromise(bad, w.signer.PublicKey()) == nil {
 		t.Fatal("изменённое обещание прошло")
 	}
-	if CheckPromise(p, r, p.Deadline+1) == nil {
-		t.Fatal("включение после срока прошло")
+	// Время звеньев: звено улики (3) или звено токена T1 (2) позже срока —
+	// улика вошла в цепь после срока; звено до токена T1 (1) и после улики
+	// (4) не в счёт.
+	for _, c := range []struct {
+		link int
+		late bool
+	}{{3, true}, {2, true}, {1, false}, {4, false}} {
+		lb := b
+		lb.Links = slices.Clone(b.Links)
+		lb.Links[c.link-1].UnixNano = p.Deadline + 1
+		if err := CheckPromise(p, r, lb, false); (err != nil) != c.late {
+			t.Fatalf("звено %d позже срока: %v", c.link, err)
+		}
+	}
+	// Без T1 время звена — только слово хранилища.
+	nr := r
+	nr.Lower = time.Time{}
+	if CheckPromise(p, nr, b, false) == nil {
+		t.Fatal("обещание сверено без метки перед уликой")
+	}
+	if err := CheckPromise(p, nr, b, true); err != nil {
+		t.Fatalf("-allow-no-tsa: %v", err)
 	}
 	other := p
 	other.Digest = make([]byte, 32)
-	if CheckPromise(other, r, w.links[2].UnixNano) == nil {
+	if CheckPromise(other, r, b, false) == nil {
 		t.Fatal("обещание про другие байты прошло")
+	}
+}
+
+// Q-33: запись, придержанная владельцем и положенная в цепь после метки,
+// закрывающей окно, со временем звена задним числом. Пакет за окно её не
+// видит (она за участком), T1 в её собственном пакете выбирает хранилище —
+// годится любая метка раньше звена. Опоздание выдаёт обещание: самое
+// позднее время звеньев от T1 до звена записи — у звена токена B, а его
+// время не раньше времени метки минус ReceiveSkew. Задним числом и звено
+// токена — тогда не проходит пакет за окно.
+//
+//	звено 1: [запуск]                         10:00, метка A над головой 1
+//	звено 2: [токен A, abs-core 1 (10:02)]    10:02
+//	звено 3: [событие]                        10:07 (задним числом — 10:05:30)
+//	                                          10:09, метка B над головой 3
+//	звено 4: [токен B]                        10:09 (задним числом — 10:05:30)
+//	звено 5: [abs-core 2 (принята 10:05)]     положено в 10:20, время звена — 10:05:30
+//	                                          10:20, метка C над головой 5
+//	звено 6: [токен C]                        10:20
+func TestPromiseHeldBackRecord(t *testing.T) {
+	for _, backdateB := range []bool{false, true} {
+		w := newWorld(t)
+		w.now = at(10, 0, 0)
+		w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+		hA, tA := w.stamp()
+		w.now = at(10, 2, 0)
+		w.wlink(tokenLeaf(hA, tA), rec(t, 1, at(10, 2, 0)))
+		w.now = at(10, 7, 0)
+		silence := auditchain.Leaf{UnixNano: w.now.UnixNano(), Type: auditchain.EventSilence, Scope: "other"}
+		if backdateB {
+			w.now = at(10, 5, 30)
+		}
+		w.wlink(silence)
+		w.now = at(10, 9, 0)
+		hB, tB := w.stamp()
+		if backdateB {
+			w.now = at(10, 5, 30)
+		}
+		w.wlink(tokenLeaf(hB, tB))
+		held := sealedBytes(t, 2, at(10, 5, 0), "held back")
+		w.now = at(10, 5, 30)
+		w.wlink(evLeaf(t, held, 2))
+		w.now = at(10, 20, 0)
+		hC, tC := w.stamp()
+		w.wlink(tokenLeaf(hC, tC))
+
+		from, to := at(10, 1, 0), at(10, 6, 0)
+		wr := VerifyWindow(w.window(1, 4, from, to), w.trust(), from, to)
+		b := w.bundle(held, 5, 0, hC, tC, 2)
+		r := Verify(b, w.trust())
+		if !r.Valid() {
+			t.Fatalf("задним числом %v: пакет записи с T1 = A:\n%s", backdateB, r.Text())
+		}
+		digest := evidence.Digest(held)
+		p := Promise{Source: "abs-core", Seq: 2, Position: 2, Digest: digest[:], ReceivedAt: at(10, 5, 0).UnixNano(),
+			Deadline: at(10, 6, 0).UnixNano(), PublicKey: base64.RawStdEncoding.EncodeToString(w.signer.PublicKey())}
+		perr := CheckPromise(p, r, b, false)
+		honest := Verify(w.bundle(held, 5, 0, hC, tC, 4), w.trust())
+		if !backdateB {
+			if !wr.Valid() || perr == nil || !strings.Contains(perr.Error(), "link 4") {
+				t.Fatalf("пакет за окно %s, обещание: %v", wr.Verdict(), perr)
+			}
+			continue
+		}
+		// Звено токена B задним числом: обещание «выполнено», но токен B
+		// виден в пакете за окно и в пакете записи с T1 = B — оба не проходят.
+		if perr != nil || wr.Valid() || honest.Valid() {
+			t.Fatalf("обещание: %v; пакет за окно %s; пакет записи с T1 = B %s", perr, wr.Verdict(), honest.Verdict())
+		}
+		checkFailed(t, wr, "every TSA time-stamp in the stretch verifies")
+		if !strings.Contains(honest.Text(), "backdated the link") {
+			t.Fatalf("пакет записи с T1 = B:\n%s", honest.Text())
+		}
 	}
 }
 

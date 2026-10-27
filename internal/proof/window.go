@@ -433,31 +433,41 @@ func windowStamps(leaves []auditchain.Leaf, stretch []stretchLink, linkAt func(u
 			if err != nil {
 				return nil, fmt.Errorf("the time-stamp in link %d over head %d: %w", sl.seq, head, err)
 			}
+			link, _, _ := linkAt(sl.seq)
+			if err := tokenLinkTime(link, info.GenTime.UTC()); err != nil {
+				return nil, err
+			}
 			out = append(out, windowStamp{link: sl.seq, head: head, gen: info.GenTime.UTC()})
 		}
 	}
 	return out, nil
 }
 
-// stampBefore — последняя метка, чью голову звено n уже прошло: запись в
-// звене n легла в цепь после того, как эта голова ушла в TSA. nil — такой
-// метки на участке нет.
+// stampBefore — самая поздняя по времени метка из тех, чью голову звено n
+// уже прошло: запись в звене n легла в цепь после того, как эта голова ушла
+// в TSA. Не последняя по месту: лист старого токена можно положить в цепь
+// ещё раз, за токеном верхней метки, и продлить до него участок — тогда
+// «последней» стала бы старая метка, и записи окна за головой верхней
+// сверялись бы с ней (Q-48). В честной цепи время меток растёт с их местом,
+// и выбор тот же. nil — такой метки на участке нет.
 func stampBefore(stamps []windowStamp, n uint64) *windowStamp {
 	var t0 *windowStamp
 	for i := range stamps {
-		if stamps[i].head < n {
+		if stamps[i].head < n && (t0 == nil || stamps[i].gen.After(t0.gen)) {
 			t0 = &stamps[i]
 		}
 	}
 	return t0
 }
 
-// stampsAround — метки вокруг звена n, как в пакете одной улики: последняя,
-// чей токен лёг в звено раньше n (T1), и первая над головой не раньше n (T2).
-// nil — такой метки на участке нет.
+// stampsAround — метки вокруг звена n, как в пакете одной улики: самая
+// поздняя по времени из тех, чей токен лёг в звено раньше n (T1; по той же
+// причине, что в stampBefore), и первая над головой не раньше n (T2: копия
+// старого токена над поздней головой не бывает). nil — такой метки на
+// участке нет.
 func stampsAround(stamps []windowStamp, n uint64) (t1, t2 *windowStamp) {
 	for i := range stamps {
-		if stamps[i].link < n {
+		if stamps[i].link < n && (t1 == nil || stamps[i].gen.After(t1.gen)) {
 			t1 = &stamps[i]
 		}
 		if t2 == nil && stamps[i].head >= n {

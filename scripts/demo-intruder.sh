@@ -52,7 +52,7 @@ cat >"$WORK/evidencestore.json" <<EOF
   "roots_dir": "roots",
   "listen": "127.0.0.1:$PORT",
   "tls": {"cert": "pki/server.crt", "key": "pki/server.key", "client_ca": "pki/ca.crt"},
-  "chain": {"tick": "200ms", "promise_mmd": "10s"},
+  "chain": {"tick": "200ms", "promise_mmd": "1m"},
   "tsa": {$TSA_JSON},
   "demo": true,
   "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // Config — настройки одного экземпляра хранилища.
@@ -88,7 +90,11 @@ type Chain struct {
 	// Tick — как часто листья сворачиваются в звено. По умолчанию 1s.
 	Tick Duration `json:"tick"`
 	// PromiseMMD — обещанная наибольшая задержка включения улики в цепь
-	// (подписанное обещание при приёме, по образцу RFC 6962). По умолчанию 1m.
+	// (подписанное обещание при приёме, по образцу RFC 6962). По умолчанию
+	// и не больше 1m (proof.MaxPromiseMMD): запись, придержанная за метку,
+	// которая закрывает окно, обязана пропустить срок. Не меньше 55s и двух
+	// тиков (proof.ReceiveLag): время приёма отстаёт от настоящего до 55 с,
+	// а время звена — нет, и меньший срок честное хранилище нарушало бы.
 	PromiseMMD Duration `json:"promise_mmd"`
 }
 
@@ -307,8 +313,13 @@ func (c *Config) Validate() error {
 	if c.Chain.Tick.D() < 10*time.Millisecond {
 		errs = append(errs, errors.New("chain.tick must be at least 10ms"))
 	}
-	if c.Chain.PromiseMMD.D() < 2*c.Chain.Tick.D() {
-		errs = append(errs, errors.New("chain.promise_mmd must be at least two ticks"))
+	switch least := proof.ReceiveLag + 2*c.Chain.Tick.D(); {
+	case least > proof.MaxPromiseMMD:
+		errs = append(errs, fmt.Errorf("chain.tick must be at most %v: chain.promise_mmd must be at least 55s plus two ticks and at most %v", (proof.MaxPromiseMMD-proof.ReceiveLag)/2, proof.MaxPromiseMMD))
+	case c.Chain.PromiseMMD.D() < least:
+		errs = append(errs, fmt.Errorf("chain.promise_mmd must be at least %v (55s plus two chain ticks): a receive time lags real time by up to 55 seconds, and the store must still link the record in time", least))
+	case c.Chain.PromiseMMD.D() > proof.MaxPromiseMMD:
+		errs = append(errs, fmt.Errorf("chain.promise_mmd must be at most %v: a record held back past the time-stamp that closes a window would still meet a longer deadline", proof.MaxPromiseMMD))
 	}
 	// Сроки: отрицательный тикер — паника посреди работы, отрицательное
 	// окно отмены — уничтожение ключа без окна.

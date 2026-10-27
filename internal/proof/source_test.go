@@ -20,13 +20,15 @@ import (
 
 // srcOpts — отступления синтетической цепи от честной.
 type srcOpts struct {
-	unlinked   bool   // записи abs-core 2–4 — листья прежнего формата, без ссылок
-	upperSeq   uint64 // номер abs-core в верхних хвостах (ноль — честный, 4)
-	lowerExtra bool   // в звене нижних хвостов ещё один лист
-	upperExtra bool   // в звене верхних хвостов ещё один лист
-	gap        bool   // abs-core 2 пришла под номером 7: в цепи номера 7, 3, 4, а 5–6 нет
-	late       bool   // abs-core 3 «принята» в 10:15, позже метки верхнего края
-	early      bool   // abs-core 2 «принята» в 9:57, раньше нижней метки на 3 минуты
+	unlinked   bool          // записи abs-core 2–4 — листья прежнего формата, без ссылок
+	upperSeq   uint64        // номер abs-core в верхних хвостах (ноль — честный, 4)
+	lowerExtra bool          // в звене нижних хвостов ещё один лист
+	upperExtra bool          // в звене верхних хвостов ещё один лист
+	gap        bool          // abs-core 2 пришла под номером 7: в цепи номера 7, 3, 4, а 5–6 нет
+	late       bool          // abs-core 3 «принята» в 10:15, позже метки верхнего края
+	early      bool          // abs-core 2 «принята» в 9:57, раньше нижней метки на 3 минуты
+	backdate   uint64        // звено с токеном (3, 6 или 8) — со временем раньше метки
+	backBy     time.Duration // насколько раньше (ноль — на 2 минуты)
 }
 
 // srcWorld — цепь хранилища с хвостами источников:
@@ -90,8 +92,22 @@ func newSrcWorld(t *testing.T, o srcOpts) *srcWorld {
 		lower = append(lower, auditchain.Leaf{Type: auditchain.EventStart})
 	}
 	w.wlink(lower...)
+	// Звено с токеном хранилище кладёт сразу после ответа TSA; backdate —
+	// время звена задним числом.
+	tokenLink := func(link uint64, leaves ...auditchain.Leaf) {
+		now := w.now
+		if o.backdate == link {
+			by := o.backBy
+			if by == 0 {
+				by = 2 * time.Minute
+			}
+			w.now = now.Add(-by)
+		}
+		w.wlink(leaves...)
+		w.now = now
+	}
 	hA, tA := w.stamp()
-	w.wlink(tokenLeaf(hA, tA))
+	tokenLink(3, tokenLeaf(hA, tA))
 	w.now = at(10, 5, 0)
 	t2, t3 := w.now, at(10, 5, 30)
 	if o.early {
@@ -104,7 +120,7 @@ func newSrcWorld(t *testing.T, o srcOpts) *srcWorld {
 	w.now = at(10, 10, 0)
 	w.wlink(tails(5, 3, 3, true))
 	hB, tB := w.stamp()
-	w.wlink(add(4, w.now), tokenLeaf(hB, tB))
+	tokenLink(6, add(4, w.now), tokenLeaf(hB, tB))
 	w.now = at(10, 11, 0)
 	upperSeq := uint64(4)
 	if o.upperSeq != 0 {
@@ -116,7 +132,7 @@ func newSrcWorld(t *testing.T, o srcOpts) *srcWorld {
 	}
 	w.wlink(upper...)
 	hC, tC := w.stamp()
-	w.wlink(tokenLeaf(hC, tC))
+	tokenLink(8, tokenLeaf(hC, tC))
 	w.now = at(10, 12, 0)
 	w.wlink(add(5, w.now))
 	w.toks = [3][]byte{tA, tB, tC}
@@ -167,6 +183,27 @@ func sourceCheckFailed(t *testing.T, r SourceReport, name, detail string) {
 		}
 	}
 	t.Fatalf("пункта %q нет в отчёте:\n%s", name, r.Text())
+}
+
+// Звено с токеном со временем задним числом (Q-33): у нижнего края, у
+// закрывающей метки и у верхнего края пакет не проходит. Граница —
+// ReceiveSkew: на минуту раньше метки — ещё честно.
+func TestSourceBackdatedTokenLink(t *testing.T) {
+	for _, c := range []struct {
+		link  uint64
+		check string
+	}{{3, "the lower tails"}, {6, "the upper tails"}, {8, "the upper tails"}} {
+		w := newSrcWorld(t, srcOpts{backdate: c.link})
+		r := VerifySource(w.bundle(at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{})
+		sourceCheckFailed(t, r, c.check, "backdated the link")
+		w = newSrcWorld(t, srcOpts{backdate: c.link, backBy: ReceiveSkew + time.Second})
+		r = VerifySource(w.bundle(at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{})
+		sourceCheckFailed(t, r, c.check, "backdated the link")
+		w = newSrcWorld(t, srcOpts{backdate: c.link, backBy: ReceiveSkew})
+		if r := VerifySource(w.bundle(at(10, 4, 0), at(10, 6, 0)), w.trust(), time.Time{}, time.Time{}); !r.Valid() {
+			t.Fatalf("звено %d на ReceiveSkew раньше метки:\n%s", c.link, r.Text())
+		}
+	}
 }
 
 func TestSourceVerifies(t *testing.T) {

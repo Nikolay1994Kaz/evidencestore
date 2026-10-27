@@ -2097,13 +2097,7 @@ func (m *storeSim) checkRecord(c *simClient, q uint64, trust proof.Trust) {
 		}
 	}
 	if acked {
-		var linkTime int64
-		for _, l := range b.Links {
-			if l.Seq == rep.LinkSeq {
-				linkTime = l.UnixNano
-			}
-		}
-		if err := proof.CheckPromise(p, rep, linkTime); err != nil {
+		if err := proof.CheckPromise(p, rep, b, false); err != nil {
 			// Улика доехала до копии, а её звено — нет: подъём из копии вплетает
 			// её в цепь позже срока; обещание нарушено видимо (README).
 			late := strings.Contains(err.Error(), "after the promised deadline") &&

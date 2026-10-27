@@ -154,7 +154,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if promise != nil {
 			// Обещание — часть вердикта: шапка отчёта не может говорить
 			// «пройдена», когда обещание нарушено.
-			perr := checkPromise(*promise, key, report, bundle)
+			perr := checkPromise(*promise, key, report, bundle, *allowNoTSA)
 			c := proof.Check{Name: "the promise given at intake is kept: the same record, in the chain in time", OK: perr == nil}
 			if perr != nil {
 				c.Detail = perr.Error()
@@ -205,17 +205,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return exitValid
 }
 
-func checkPromise(p proof.Promise, key ed25519.PublicKey, r proof.Report, b proof.Bundle) error {
+func checkPromise(p proof.Promise, key ed25519.PublicKey, r proof.Report, b proof.Bundle, allowNoTSA bool) error {
 	if err := proof.VerifyPromise(p, key); err != nil {
 		return err
 	}
-	var linkTime int64
-	for _, l := range b.Links {
-		if l.Seq == r.LinkSeq {
-			linkTime = l.UnixNano
-		}
-	}
-	return proof.CheckPromise(p, r, linkTime)
+	return proof.CheckPromise(p, r, b, allowNoTSA)
 }
 
 // readHeads читает головы, которые проверяющий сам взял у свидетеля: каждый

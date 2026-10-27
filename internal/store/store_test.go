@@ -185,13 +185,7 @@ func TestIngestProofVerify(t *testing.T) {
 	if err := proof.VerifyPromise(p, trustOf(t, s).StoreKey); err != nil {
 		t.Fatal(err)
 	}
-	var linkTime int64
-	for _, l := range b.Links {
-		if l.Seq == r.LinkSeq {
-			linkTime = l.UnixNano
-		}
-	}
-	if err := proof.CheckPromise(p, r, linkTime); err != nil {
+	if err := proof.CheckPromise(p, r, b, false); err != nil {
 		t.Fatal(err)
 	}
 	// Ключ записи — только по просьбе.
@@ -459,6 +453,45 @@ func TestCrashCatchUp(t *testing.T) {
 	}
 }
 
+// Q-53: подъём после падения догоняет запись, легшую в журнал улик, но не
+// в звено, а часы хоста после подъёма впереди на 5 минут (якоря ещё нет).
+// Звено догона сворачивается до событий подъёма: его время — время записи,
+// и сверка обещания честную запись не обвиняет.
+func TestCrashCatchUpKeepsPromise(t *testing.T) {
+	tsaClock := newClock()
+	host := newClock()
+	cfg := testConfig(t)
+	s, err := Open(cfg, Options{Logger: quiet, Now: host.now, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.tsaLocal.Now = tsaClock.now
+	mustStamp(t, s) // T1
+	ingest(t, s, "abs-core", 1, 1)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	res := ingest(t, s, "abs-core", 2, 2) // лист в памяти, звена нет
+	crashed := copyDirs(t, cfg)
+	host.add(5 * time.Minute)
+	s2, err := Open(crashed, Options{Logger: quiet, Now: host.now, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	s2.tsaLocal.Now = tsaClock.now
+	mustStamp(t, s2)
+	b, err := s2.Proof("abs-core", 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.Verify(b, trustOf(t, s2))
+	if err := proof.CheckPromise(*res[0].Promise, r, b, false); !r.Valid() || err != nil {
+		t.Fatalf("пакет %s; обещание: %v", r.Verdict(), err)
+	}
+}
+
 // Журнал потерял улики, которые цепь уже знает: запускаться нельзя.
 func TestLostEvidenceStopsStart(t *testing.T) {
 	c := newClock()
@@ -513,6 +546,53 @@ func TestGapsAndSilence(t *testing.T) {
 	silence := leavesOf(t, cfg, auditchain.EventSilence)
 	if len(silence) != 1 || silence[0].Scope != "abs-core" {
 		t.Fatalf("молчание: %+v", silence)
+	}
+}
+
+// Q-44: пропуск в конце нумерации объявляет пульс сборщика (Issued) —
+// сразу, без записи после него. Перезапуск его помнит, и следующая запись
+// его не повторяет; номера до известного и выключенный источник пропуска
+// не дают.
+func TestIssuedDeclaresTrailingGap(t *testing.T) {
+	c := newClock()
+	cfg := testConfig(t)
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 2)
+	for _, last := range []uint64{0, 1, 2, 4, 4} {
+		if err := s.Issued("abs-core", last); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if last, _ := s.LastSeq("abs-core"); last != 4 {
+		t.Fatalf("последний номер после пульса: %d", last)
+	}
+	if err := s.Issued("nope", 9); !errors.Is(err, ErrUnknownSource) {
+		t.Fatalf("чужой источник: %v", err)
+	}
+	s.Close()
+	s = openStore(t, cfg, c)
+	if last, _ := s.LastSeq("abs-core"); last != 4 {
+		t.Fatalf("последний номер после перезапуска: %d", last)
+	}
+	ingest(t, s, "abs-core", 5, 6)
+	if err := s.Issued("abs-core", 6); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	gaps := leavesOf(t, cfg, auditchain.EventGap)
+	if len(gaps) != 1 || !strings.Contains(string(gaps[0].Payload), `"from":3,"to":4`) {
+		t.Fatalf("пропуски: %+v", gaps)
+	}
+
+	off := testConfig(t)
+	off.Sources[0].Disabled = true
+	s = openStore(t, off, c)
+	if err := s.Issued("abs-core", 3); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if gaps := leavesOf(t, off, auditchain.EventGap); len(gaps) != 0 {
+		t.Fatalf("выключенный источник объявил пропуск: %+v", gaps)
 	}
 }
 

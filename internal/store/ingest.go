@@ -92,6 +92,11 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	case s.closed:
 		s.mu.Unlock()
 		return nil, ErrClosed
+	case s.reanchoring:
+		// Якорь переставляется (reanchor): время приёма сейчас — ни по
+		// прежнему якорю, ни по новому.
+		s.mu.Unlock()
+		return nil, ErrNoAnchor
 	case !ok || !st.known:
 		s.mu.Unlock()
 		return nil, fmt.Errorf("%w: %q", ErrUnknownSource, source)
@@ -370,8 +375,43 @@ func (st *sourceState) takeGaps() []gap {
 	return g
 }
 
-// LastSeq — наибольший принятый номер источника: сборщик после
-// переустановки продолжает отсюда, а не с единицы.
+// Issued — пульс сборщика: он выдал номера до last, и всё выданное
+// доставлено (пульс идёт, только когда буфер сборщика пуст). Номера после
+// наибольшего известного, которых нет, — пропуск, как при записи с прыжком
+// номера: сборщик оставляет его, когда файл исчез, а непрочитанный хвост
+// мог пропасть. Без пульса пропуск ждал бы следующей записи источника, и
+// источник, замолчавший после потери, её бы не показал (Q-44). Выключенный
+// источник пропусков не объявляет: приём от него закрыт.
+func (s *Store) Issued(source string, last uint64) error {
+	if err := s.Healthy(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	st, ok := s.sources[source]
+	switch {
+	case s.closed:
+		s.mu.Unlock()
+		return ErrClosed
+	case !ok || !st.known:
+		s.mu.Unlock()
+		return fmt.Errorf("%w: %q", ErrUnknownSource, source)
+	}
+	var gaps []gap
+	if last > st.maxSeq && !st.cfg.Disabled {
+		gaps = st.gapsIn(st.maxSeq+1, last)
+		st.maxSeq = last
+	}
+	s.mu.Unlock()
+	for _, g := range gaps {
+		s.appendJSONEvent(auditchain.EventGap, source, "", g)
+		s.log.Warn("sequence gap (collector heartbeat)", "source", source, "from", g.From, "to", g.To)
+	}
+	return nil
+}
+
+// LastSeq — наибольший принятый номер источника или конец пропуска,
+// объявленного пульсом: сборщик после переустановки продолжает отсюда, а
+// не с единицы.
 func (s *Store) LastSeq(source string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

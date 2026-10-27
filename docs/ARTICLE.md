@@ -328,7 +328,7 @@ The full list is in the README under [Known limitations](../README.md#known-limi
 
 The numbers are for commit `957345c`, 12 October 2026; the mutation count is for 27 October.
 
-GitHub Actions runs the tests (`go build ./... && go vet ./... && go test -race ./...`) on every push to master and every pull request. On top of that there's mutation testing: [`scripts/mutate.py`](../scripts/mutate.py) injects deliberate bugs into the code one at a time (flip a comparison, skip a check) and expects some test to fail. All 520 were caught.
+GitHub Actions runs the tests (`go build ./... && go vet ./... && go test -race ./...`) on every push to master and every pull request. On top of that there's mutation testing: [`scripts/mutate.py`](../scripts/mutate.py) injects deliberate bugs into the code one at a time (flip a comparison, skip a check) and expects some test to fail. All 557 were caught.
 
 The collector, the clock and the store itself are also checked by simulations against an oracle: random scenarios in virtual time with crashes in the middle of disk writes, three kinds of rotation, lost answers, wrong clocks and a disappearing TSA. The oracle demands that every line arrives exactly once, every loss shows up as a gap and every promise is kept. The store went through 2,000 scenarios of 300 steps without a failure, with 36,038 crashes, 6,649 restores from the copy, 1,368 disks that lied about fsync and 2,185 destroyed keys along the way.
 

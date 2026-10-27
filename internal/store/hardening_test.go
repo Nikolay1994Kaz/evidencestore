@@ -834,6 +834,44 @@ func TestFirstStampRetriedUntilAnchored(t *testing.T) {
 	}
 }
 
+// Q-43: TSA лежит — повторы метки реже с каждым отказом подряд (каждая
+// попытка с новыми листьями кладёт звено хвостов), а приём после её
+// возвращения открывается сам.
+func TestAnchorRetryBacksOff(t *testing.T) {
+	saved := anchorRetry
+	anchorRetry = 5 * time.Millisecond
+	defer func() { anchorRetry = saved }()
+	s, err := Open(testConfig(t), Options{Logger: quiet, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var up atomic.Bool
+	var asked atomic.Int64
+	s.tsaLocal.Now = func() time.Time {
+		if !up.Load() {
+			asked.Add(1)
+			return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		return time.Now()
+	}
+	s.needAnchor = true
+	s.wg.Add(1)
+	go s.keepAnchor()
+	time.Sleep(80 * anchorRetry)
+	if n := asked.Load(); n < 3 || n > 20 {
+		t.Fatalf("за 80 проверок %d попыток метки, ждали от 3 до 20", n)
+	}
+	up.Store(true)
+	deadline := time.Now().Add(5 * time.Second)
+	for s.anchored() != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("TSA ответила, а приём так и ждёт метки")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // ⭐ X-01, Y-01: запись пришла в окно между токеном новой метки в цепи и
 // новым якорем после долгого перерыва без метки: время приёма — по
 // прежнему якорю, а T1 — новая метка. Раньше время приёма ложилось раньше
@@ -1739,8 +1777,362 @@ func TestHostClockAheadKeepsPromise(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, "store.pub"), []byte(s.PublicKey()+"\n"), 0o600)
 		os.WriteFile(filepath.Join(dir, "tsa-root.crt"), s.TSARoot(), 0o600)
 	}
-	if err := proof.CheckPromise(p, r, linkTime); err != nil {
+	if err := proof.CheckPromise(p, r, b, false); err != nil {
 		t.Errorf("честное хранилище «нарушило» обещание: %v", err)
+	}
+}
+
+// Q-49 (заход 27.10, третий): запись, время приёма которой взято по
+// прежнему якорю (монотонные часы стояли 9 минут), а лист лёг в цепь после
+// хвостов ПОВТОРНОЙ метки (errClockLost). Так бывает с записью, которая на
+// fsync журнала улик в момент первого ответа TSA: повтор метки кладёт
+// хвосты сразу, а её лист — через миллисекунды. Здесь «миллисекунды»
+// растянуты замком scopeMu (Ingest берёт его после времени приёма и до
+// журнала улик; метке он не нужен). README: «a TSA answer whose time lies
+// beyond the receive-time window is not used: the store stamps again, so
+// whatever arrived during that request lies before the time-stamp».
+func TestClockLostRetryWaitsForRecordInFlight(t *testing.T) {
+	clk := newClock() // 10:00
+	var mono atomic.Int64
+	mono.Store(int64(1000 * time.Hour))
+	advance := func(real, monoD time.Duration) {
+		clk.add(real)
+		mono.Add(int64(monoD))
+	}
+	cfg := testConfig(t)
+	s, err := Open(cfg, Options{Logger: quiet, Now: clk.now, NoBackground: true, Mono: func() time.Duration { return time.Duration(mono.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.tsaLocal.Now = clk.now
+
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // A, 10:00 — якорь
+	s.needAnchor = true
+	advance(time.Minute, time.Minute)
+	ingest(t, s, "abs-core", 2, 2) // 10:01
+	advance(9*time.Minute, 0)      // машина стояла 9 минут: 10:10 по TSA и хосту
+
+	// Запись 3: время приёма взято (по прежнему якорю — около 10:01), до
+	// журнала улик она ещё не дошла.
+	s.scopeMu.Lock()
+	done := make(chan []Result, 1)
+	go func() {
+		res, err := s.Ingest("abs-core", []Incoming{{Seq: 3, Body: []byte("abs-core event 3")}})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- res
+	}()
+	for {
+		s.mu.Lock()
+		taken := s.sources["abs-core"].inflight[3]
+		s.mu.Unlock()
+		if taken {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Метка B: первый ответ (10:10) — позже окна по якорю, токен не ложится,
+	// якорь по нему, повтор кладёт новые хвосты. Пока идёт второй запрос,
+	// запись 3 доходит до цепи.
+	// fsync записи 3 кончается через 50 мс после первого запроса к TSA —
+	// уже после первого ответа; второй запрос ждёт, пока она ляжет в цепь
+	// (иначе исход зависел бы от того, кто раньше возьмёт chainMu).
+	asked := 0
+	var res []Result
+	s.tsaLocal.Now = func() time.Time {
+		asked++
+		switch asked {
+		case 1:
+			time.AfterFunc(50*time.Millisecond, s.scopeMu.Unlock)
+		case 2:
+			res = <-done
+		}
+		return clk.now()
+	}
+	if _, err := s.StampNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.tsaLocal.Now = clk.now
+	if asked != 2 {
+		t.Fatalf("запросов к TSA: %d, ждали 2 (повтор после потери хода часов)", asked)
+	}
+	if len(res) != 1 || res[0].Promise == nil {
+		t.Fatalf("запись 3 не принята: %+v", res)
+	}
+	p := *res[0].Promise
+	recv3 := time.Unix(0, p.ReceivedAt).UTC()
+	advance(10*time.Minute, 10*time.Minute)
+	ingest(t, s, "abs-core", 4, 4)
+	mustStamp(t, s) // C, 10:20
+
+	tr := trustOf(t, s)
+	// Обещание по записи 3.
+	b, err := s.Proof("abs-core", 3, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.Verify(b, tr)
+	perr := proof.CheckPromise(p, r, b, false)
+	var linkTimes []string
+	for _, l := range b.Links {
+		linkTimes = append(linkTimes, time.Unix(0, l.UnixNano).UTC().Format("15:04:05"))
+	}
+	t.Logf("запись 3: принята %s (срок %s), звено %d; пакет %s; звенья %d…: %v; обещание: %v",
+		recv3.Format("15:04:05"), time.Unix(0, p.Deadline).UTC().Format("15:04:05"), r.LinkSeq, r.Verdict(), b.Links[0].Seq, linkTimes, perr)
+
+	// Пакет за окно вокруг времени приёма записи 3.
+	from, to := recv3.Add(-30*time.Second), recv3.Add(30*time.Second)
+	w, err := s.ProofWindow(from, to, "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wr := proof.VerifyWindow(w, tr, from, to)
+	sb, err := s.ProofSource("abs-core", from, to, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := proof.VerifySource(sb, tr, from, to)
+	t.Logf("пакет за окно %s – %s: %s; пакет по источнику: %s", from.Format("15:04:05"), to.Format("15:04:05"), wr.Verdict(), sr.Verdict())
+	if !wr.Valid() {
+		for _, c := range wr.Checks {
+			if !c.OK {
+				t.Logf("  ✘ %s — %s", c.Name, c.Detail)
+			}
+		}
+	}
+	if perr != nil || !r.Valid() {
+		t.Errorf("честное хранилище: esverify -promise обвиняет запись 3: %v", perr)
+	}
+	if !wr.Valid() || !sr.Valid() {
+		t.Errorf("честное хранилище: пакет за окно (%s) или по источнику (%s) не проходит", wr.Verdict(), sr.Verdict())
+	}
+}
+
+// Q-49: пока якорь переставляется после потери хода монотонных часов,
+// приём на паузе: новая запись получает ErrNoAnchor (сборщик повторит), а
+// не время по прежнему, отставшему якорю. Пауза кончается, когда записи в
+// пути легли в цепь.
+func TestReanchorPausesIntake(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	mustStamp(t, s)
+	s.needAnchor = true
+	s.scopeMu.Lock() // запись 1 взяла время приёма, до журнала улик не дошла
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Ingest("abs-core", []Incoming{{Seq: 1, Body: []byte("in flight")}})
+		done <- err
+	}()
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal(what)
+			}
+		}
+	}
+	locked := func(f func() bool) func() bool {
+		return func() bool { s.mu.Lock(); defer s.mu.Unlock(); return f() }
+	}
+	waitFor("запись 1 не в пути", locked(func() bool { return s.sources["abs-core"].inflight[1] }))
+	reanchored := make(chan struct{})
+	go func() { s.reanchor(c.now(), s.mono(), 0); close(reanchored) }()
+	waitFor("перестановка якоря не началась", locked(func() bool { return s.reanchoring }))
+	during := make(chan error, 1)
+	go func() {
+		_, err := s.Ingest("abs-core", []Incoming{{Seq: 2, Body: []byte("during")}})
+		during <- err
+	}()
+	select {
+	case err := <-during:
+		if !errors.Is(err, ErrNoAnchor) {
+			t.Fatalf("приём во время перестановки якоря: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		// Запись взяла время приёма по прежнему якорю и ждёт журнал улик.
+		s.scopeMu.Unlock()
+		t.Fatal("приём во время перестановки якоря не на паузе")
+	}
+	s.scopeMu.Unlock()
+	<-reanchored
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 2, 2)
+}
+
+// Q-47: первая метка вышла, открывающая (вторая) — нет: TSA пропала между
+// ними. Якорь свежий, но приём закрыт, и keepAnchor повторяет открывающую
+// метку, пока TSA не ответит.
+func TestOpeningStampRetried(t *testing.T) {
+	saved := anchorRetry
+	anchorRetry = 5 * time.Millisecond
+	defer func() { anchorRetry = saved }()
+	s, err := Open(testConfig(t), Options{Logger: quiet, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.needAnchor = true
+	var calls atomic.Int32
+	var up atomic.Bool
+	s.tsaLocal.Now = func() time.Time {
+		if calls.Add(1) > 1 && !up.Load() {
+			return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) // TSA пропала
+		}
+		return time.Now()
+	}
+	if _, err := s.Stamp(context.Background()); err == nil {
+		t.Fatal("ПАРНЫЙ КОНТРОЛЬ: открывающая метка вышла при пропавшей TSA")
+	}
+	if err := s.anchored(); !errors.Is(err, ErrNoAnchor) {
+		t.Fatalf("приём открыт одной первой меткой: %v", err)
+	}
+	s.wg.Add(1)
+	go s.keepAnchor()
+	up.Store(true)
+	for deadline := time.Now().Add(5 * time.Second); s.anchored() != nil; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("TSA ответила, а приём так и закрыт")
+		}
+	}
+}
+
+// Q-47 (J-03): событие взяло время до якоря (часы хоста впереди на 5 минут,
+// как есть) и ждёт цепь, а якорь тем временем ставится. В цепь оно ложится
+// со временем по новому якорю: иначе лист с часами хоста лёг бы после
+// листьев нового якоря, в звенья, которые считает сверка обещания.
+func TestEventWaitingForChainTakesNewAnchor(t *testing.T) {
+	tsaClock := newClock()
+	host := newClock()
+	host.add(5 * time.Minute)
+	s, err := Open(testConfig(t), Options{Logger: quiet, Now: host.now, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.chainMu.Lock()
+	done := make(chan uint64, 1)
+	go func() { done <- s.appendEvent(auditchain.EventSilence, "abs-core", "", nil) }()
+	time.Sleep(20 * time.Millisecond) // событие взяло время и ждёт цепь
+	s.anchorClock(tsaClock.now(), s.mono(), 0)
+	s.chainMu.Unlock()
+	num := <-done
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	leaves, err := auditchain.ReadLeaves(s.chainDir, num, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if at := time.Unix(0, leaves[0].UnixNano); at.After(tsaClock.now().Add(time.Minute)) {
+		t.Fatalf("событие легло со временем %v — часы хоста как есть, а не по якорю %v", at.UTC(), tsaClock.now())
+	}
+}
+
+// Q-50: запись, принятая во время первых меток нового хранилища, не ложится
+// до токена той, что открыла приём (без T1 esverify -promise обещание не
+// сверяет). Приём пробуется на каждом обращении к монотонным часам после
+// ответа TSA, все принятые записи проходят сверку обещания.
+func TestIntakeOpensAfterFirstTokenLeaf(t *testing.T) {
+	clk := newClock()
+	var monoV atomic.Int64
+	monoV.Store(int64(1000 * time.Hour))
+	var signed, injecting atomic.Bool
+	var s *Store
+	var seq uint64
+	var promises []proof.Promise
+	mono := func() time.Duration {
+		// Обращения к часам после ответа TSA — вне замков хранилища; сам
+		// Ingest тоже зовёт часы (под s.mu) — туда не вкладываемся.
+		if signed.Load() && injecting.CompareAndSwap(false, true) {
+			seq++
+			if res, err := s.Ingest("abs-core", []Incoming{{Seq: seq, Body: []byte(fmt.Sprintf("abs-core event %d", seq))}}); err == nil {
+				promises = append(promises, *res[0].Promise)
+			} else {
+				seq--
+			}
+			injecting.Store(false)
+		}
+		return time.Duration(monoV.Load())
+	}
+	var err error
+	s, err = Open(testConfig(t), Options{Logger: quiet, Now: clk.now, NoBackground: true, Mono: mono})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.needAnchor = true // как в serve с TSA: приём только по якорю
+	s.tsaLocal.Now = func() time.Time { signed.Store(true); return clk.now() }
+	mustStamp(t, s) // первая метка нового хранилища
+	signed.Store(false)
+	s.tsaLocal.Now = clk.now
+	ingest(t, s, "abs-core", seq+1, seq+1)
+	for _, r := range ingest(t, s, "abs-core", seq+2, seq+2) {
+		promises = append(promises, *r.Promise)
+	}
+	clk.add(time.Minute)
+	monoV.Add(int64(time.Minute))
+	mustStamp(t, s)
+	tr := trustOf(t, s)
+	for _, p := range promises {
+		b, err := s.Proof("abs-core", p.Seq, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := proof.Verify(b, tr)
+		if err := proof.CheckPromise(p, r, b, false); !r.Valid() || err != nil {
+			t.Fatalf("запись %d: пакет %s, T1 %v, обещание: %v", p.Seq, r.Verdict(), r.Lower, err)
+		}
+	}
+}
+
+// Q-47: первая метка процесса при часах хоста впереди TSA на 5 минут. Пока
+// идёт её запрос, якоря нет, и событие в цепи (пропуск по пульсу, звено
+// свернул тик) получает часы хоста как есть. Приём открывает только
+// следующая метка, с хвостами при якоре: у записи T1 — она, и сверка
+// обещания от головы под ней этого звена не считает.
+func TestIntakeOpensAfterSecondStamp(t *testing.T) {
+	tsaClock := newClock()
+	host := newClock()
+	host.add(5 * time.Minute)
+	s, err := Open(testConfig(t), Options{Logger: quiet, Now: host.now, NoBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.needAnchor = true
+	s.tsaLocal.Now = func() time.Time {
+		if err := s.Issued("abs-core", 2); err != nil {
+			t.Error(err)
+		}
+		if err := s.flush(); err != nil {
+			t.Error(err)
+		}
+		return tsaClock.now()
+	}
+	if _, _, err := s.stampOnce(context.Background(), true); err != nil { // первая: только якорь
+		t.Fatal(err)
+	}
+	s.tsaLocal.Now = tsaClock.now
+	if _, err := s.Ingest("abs-core", []Incoming{{Seq: 3, Body: []byte("too early")}}); !errors.Is(err, ErrNoAnchor) {
+		t.Fatalf("приём после первой метки: %v", err)
+	}
+	mustStamp(t, s) // вторая — с хвостами при якоре
+	res := ingest(t, s, "abs-core", 3, 3)
+	tsaClock.add(time.Minute)
+	host.add(time.Minute)
+	mustStamp(t, s)
+	b, err := s.Proof("abs-core", 3, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.Verify(b, trustOf(t, s))
+	if err := proof.CheckPromise(*res[0].Promise, r, b, false); !r.Valid() || err != nil {
+		t.Fatalf("пакет %s; обещание: %v", r.Verdict(), err)
 	}
 }
 

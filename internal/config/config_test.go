@@ -85,7 +85,9 @@ func TestKeyDirsDoNotNest(t *testing.T) {
 // S-10, K-07, S-09, S-11: опасные значения — ошибка проверки, а не беда
 // посреди работы: корни внутри данных (или данные внутри корней, или «..roots»
 // внутри data_dir), отрицательные и нулевые сроки, слишком короткое окно
-// отмены уничтожения вне стенда, тип содержимого длиннее предела улики.
+// отмены уничтожения вне стенда, тип содержимого длиннее предела улики,
+// срок обещания длиннее proof.MaxPromiseMMD (Q-33) или короче 55 с и двух
+// тиков (Q-46).
 func TestValidateRejectsDangerousValues(t *testing.T) {
 	base := t.TempDir()
 	good := func() *Config {
@@ -120,6 +122,9 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 		"expect_contact 30s":    func(c *Config) { c.Sources[0].ExpectContact = Duration(30 * time.Second) },
 		"expect_contact -1m":    func(c *Config) { c.Sources[0].ExpectContact = Duration(-time.Minute) },
 		"content_type 256 байт": func(c *Config) { c.Sources[0].ContentType = strings.Repeat("x", 256) },
+		"promise_mmd 61s":       func(c *Config) { c.Chain.PromiseMMD = Duration(61 * time.Second) },
+		"promise_mmd 56s":       func(c *Config) { c.Chain.PromiseMMD = Duration(56 * time.Second) },
+		"tick 3s":               func(c *Config) { c.Chain.Tick = Duration(3 * time.Second) },
 	} {
 		c := good()
 		spoil(c)
@@ -131,5 +136,11 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 	c.Keys.MinWait, c.Demo = Duration(time.Second), true
 	if err := c.Validate(); err != nil {
 		t.Fatalf("min_wait 1s на стенде: %v", err)
+	}
+	// Тик, при котором срока обещания нет вовсе, назван тиком, а не сроком.
+	c = good()
+	c.Chain.Tick = Duration(3 * time.Second)
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "chain.tick must be at most 2.5s") {
+		t.Fatalf("tick 3s: %v", err)
 	}
 }

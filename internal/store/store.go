@@ -43,6 +43,7 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 
@@ -143,6 +144,19 @@ type Store struct {
 	// будущего», а монотонность — и всем следующим на всю длину скачка
 	// (W-13).
 	needAnchor bool
+	// reanchoring — якорь переставляется после потери хода монотонных часов
+	// (reanchor): приём на паузе.
+	reanchoring bool
+	// intakeOpen — легла в цепь метка, чьи хвосты легли уже при якоре этого
+	// процесса (вторая после старта): до неё приём закрыт и при свежем
+	// якоре. Пока шёл запрос первой метки, якоря не было, и события в цепи
+	// получали часы хоста как есть; сверка обещания считает звенья от головы
+	// под T1 (proof.CheckPromise), и с T1 — первой меткой часы хоста впереди
+	// обвинили бы честное хранилище (Q-47).
+	intakeOpen bool
+	// anchorGen — сколько раз ставился якорь: событие, ждавшее цепь, пока он
+	// менялся, берёт время заново (lockChainAt).
+	anchorGen atomic.Uint64
 
 	// mu — источники, индекс принятых, часы приёма.
 	mu       sync.Mutex
@@ -632,13 +646,30 @@ func (s *Store) open() error {
 		s.log.Error("the evidence log holds receive times ahead of the host clock (an earlier clock jump): new records keep receive times monotonic, so they are ahead too until the clock catches up",
 			"ahead", ahead)
 	}
+	// Наибольший номер — и по пропускам в цепи: пропуск, объявленный
+	// пульсом, кончается номером, которого в журнале улик нет.
+	s.mu.Lock()
+	for name, m := range cs.maxSeq {
+		if st := s.sources[name]; st != nil {
+			st.maxSeq = max(st.maxSeq, m)
+		}
+	}
+	s.mu.Unlock()
 	if len(tail) > 0 {
 		s.log.Info("chain catch-up", "records", len(tail))
 		s.chainMu.Lock()
 		for _, p := range tail {
 			s.appendEvidenceLocked(p.header, p.pos, p.digest)
 		}
+		// Звено догона — сразу, до событий подъёма (пропуски, вердикты,
+		// запуск): их время — часы хоста без якоря, и в одном звене с ними
+		// время звена догнанных записей стало бы часами хоста; сверка
+		// обещания обвинила бы запись, которую подъём догнал быстро (Q-53).
+		err := s.flushLocked()
 		s.chainMu.Unlock()
+		if err != nil {
+			return err
+		}
 		s.announceTailGaps(cs.maxSeq, tailSources)
 	}
 	// «Источник молчит» записан в цепь и с тех пор от него ничего нет: эпизод
@@ -920,7 +951,7 @@ func (s *Store) confirmSigner() error {
 // каждая постоянная вычета ухода хода рвала одну из границ (W-01, X-01,
 // Y-01); часы хоста, отставшие больше чем на минуту, рвали нижнюю.
 const (
-	recvWindow    = 55 * time.Second
+	recvWindow    = proof.ReceiveLag
 	anchorRefresh = time.Hour
 	// clockSlack — на сколько часы хоста могут выйти за окно по якорю,
 	// прежде чем это тревога, а не обычное отставание оценки.
@@ -943,11 +974,22 @@ func (s *Store) anchorWindowAt(mono time.Duration) (lo, hi int64, ok bool) {
 	if s.anchorTSA.IsZero() {
 		return 0, 0, false
 	}
-	el := mono - s.anchorMono
-	lo = s.anchorTSA.Add(el - el/driftPPM).UnixNano()
-	run := el + s.anchorLag
-	hi = s.anchorTSA.Add(time.Second + run + run/driftPPM).UnixNano()
+	lo, hi = anchorWindow(s.anchorTSA, s.anchorLag, mono-s.anchorMono)
 	return lo, hi, hi-lo <= int64(recvWindow)
+}
+
+// anchorWindow — lo и hi (unix-нс) по метке со временем gen, ответ на
+// которую шёл lag, через el монотонных часов после ответа.
+func anchorWindow(gen time.Time, lag, el time.Duration) (lo, hi int64) {
+	lo = gen.Add(el - el/driftPPM).UnixNano()
+	run := el + lag
+	hi = gen.Add(time.Second + run + run/driftPPM).UnixNano()
+	return lo, hi
+}
+
+// clampToWindow — часы хоста t, зажатые в [hi − recvWindow, lo].
+func clampToWindow(t, lo, hi int64) int64 {
+	return min(max(t, hi-int64(recvWindow)), lo)
 }
 
 // clockLocked — время приёма: часы хоста в окне по якорю и строго больше
@@ -991,7 +1033,7 @@ func (s *Store) leafTime() int64 {
 	lo, hi, _ := s.anchorWindowAt(mono)
 	s.mu.Unlock()
 	if hi != 0 {
-		t = min(max(t, hi-int64(recvWindow)), lo)
+		t = clampToWindow(t, lo, hi)
 	}
 	return t
 }
@@ -1014,14 +1056,15 @@ func (s *Store) anchored() error {
 	if !s.needAnchor {
 		return nil
 	}
-	if _, _, ok := s.anchorWindowLocked(); !ok {
+	if _, _, ok := s.anchorWindowLocked(); !ok || !s.intakeOpen {
 		return ErrNoAnchor
 	}
 	return nil
 }
 
-// anchorStale — якорь пора освежить: его нет, он старше anchorRefresh,
-// окно по нему разошлось больше чем на половину recvWindow или часы хоста
+// anchorStale — якорь пора освежить: его нет, приём по нему ещё не открыт
+// (intakeOpen), он старше anchorRefresh, окно по нему разошлось больше чем
+// на половину recvWindow или часы хоста
 // ушли вперёд оценки по якорю больше чем на clockSlack сверх того, где были
 // при якоре: монотонные часы стояли (сон хоста, пауза ВМ), и время приёма
 // отстаёт на всю паузу. Часы хоста, просто идущие впереди, метку не зовут:
@@ -1030,18 +1073,21 @@ func (s *Store) anchorStale() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lo, hi, ok := s.anchorWindowLocked()
-	if !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) {
+	if !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) || s.needAnchor && !s.intakeOpen {
 		return true
 	}
 	return time.Duration(s.nowTime().UnixNano()-lo)-s.anchorHost > clockSlack
 }
 
-// anchorClock ставит якорь часов по свежей метке TSA: её время и монотонные
-// часы в момент ответа. lag — сколько шёл ответ, от запроса до якоря.
-func (s *Store) anchorClock(gen time.Time, lag time.Duration) {
-	mono := s.mono() // вне s.mu: часы теста бывают с крючком
+// anchorClock ставит якорь часов по свежей метке TSA: её время, монотонные
+// часы в момент ответа и сколько шёл ответ. Якорь — на момент ответа, а не
+// на момент вызова: иначе нижняя оценка отставала бы ещё на проверку
+// токена и запись звена с ним.
+func (s *Store) anchorClock(gen time.Time, answered, took time.Duration) {
+	lo, _ := anchorWindow(gen, took, s.mono()-answered) // вне s.mu: часы теста бывают с крючком
 	s.mu.Lock()
-	s.anchorTSA, s.anchorMono, s.anchorLag = gen, mono, lag
-	s.anchorHost = s.nowTime().Sub(gen)
+	s.anchorTSA, s.anchorMono, s.anchorLag = gen, answered, took
+	s.anchorHost = time.Duration(s.nowTime().UnixNano() - lo)
 	s.mu.Unlock()
+	s.anchorGen.Add(1)
 }

@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 )
 
 // PromiseDomain — домен подписанного обещания при приёме.
@@ -59,9 +61,45 @@ func VerifyPromise(p Promise, pinned ed25519.PublicKey) error {
 	return nil
 }
 
+// MaxPromiseMMD — наибольший срок обещания (chain.promise_mmd), при котором
+// запись из окна, придержанная за метку, что закрывает окно, срок
+// пропускает: метка позже конца окна больше чем на WindowEdge, звено её
+// токена — не раньше её времени минус ReceiveSkew (tokenLinkTime), и всё,
+// что за ним, легло в цепь позже срока любой записи окна.
+const MaxPromiseMMD = WindowEdge - ReceiveSkew
+
 // CheckPromise сверяет обещание с проверенным пакетом: та же улика, та же
 // позиция, звено улики не позже срока по часам хранилища.
-func CheckPromise(p Promise, r Report, linkTime int64) error {
+//
+// Время звена пишет само хранилище, поэтому берётся самое позднее время
+// звеньев от звена после головы, которую заверила T1, до звена улики:
+// звено легло в цепь не раньше любого прежнего. Если улику придержали за
+// метку, что закрывает окно, звено её токена — в этом счёте: голова T1
+// раньше него, либо T1 взята после него, и тогда её собственное звено не
+// раньше её времени минус ReceiveSkew. Снизу время звена с токеном держит
+// tokenLinkTime: самое позднее время выйдет за срок (Q-33). Не от звена
+// токена T1: лист токена можно положить в цепь ещё раз или придержать
+// токен — в конец живой цепи, прямо перед придержанной записью, — и звено
+// закрывающего токена осталось бы до него (Q-47). Звено токена задним
+// числом выдаст любой пакет, где этот токен виден, — пакет за окно, по
+// источнику, пакет улики с этой меткой как T1. Сама голова T1 не в счёт:
+// это звено хвостов перед запросом, и у первой метки после старта его
+// время — часы хоста как есть; звенья между ней и токеном хранилище при
+// первой метке не сворачивает (store.stampOnce). allowNoTSA — принять
+// пакет без T1: тогда время звена — только слово хранилища.
+func CheckPromise(p Promise, r Report, b Bundle, allowNoTSA bool) error {
+	from := r.LinkSeq
+	if b.Lower != nil && !r.Lower.IsZero() {
+		// Голова уже сверена checkLower: она в пакете и раньше токена.
+		head, _ := strconv.ParseUint(b.Lower.Inclusion.Leaf.Subject, 10, 64)
+		from = head + 1
+	}
+	entered, at := int64(0), uint64(0)
+	for _, l := range b.Links {
+		if l.Seq >= from && l.Seq <= r.LinkSeq && (at == 0 || l.UnixNano > entered) {
+			entered, at = l.UnixNano, l.Seq
+		}
+	}
 	switch {
 	case p.Source != r.Header.Source || p.Seq != r.Header.Seq:
 		return fmt.Errorf("the promise is about %s/%d, the bundle about %s/%d", p.Source, p.Seq, r.Header.Source, r.Header.Seq)
@@ -71,8 +109,13 @@ func CheckPromise(p Promise, r Report, linkTime int64) error {
 		return fmt.Errorf("position %d was promised, the chain has %d", p.Position, r.Position)
 	case p.ReceivedAt != r.Header.ReceivedAt:
 		return errors.New("the receive time in the promise does not match the record")
-	case linkTime > p.Deadline:
-		return errors.New("the record entered the chain after the promised deadline")
+	case r.Lower.IsZero() && !allowNoTSA:
+		return errors.New("the bundle has no TSA time-stamp in the chain before the record: the time the record entered the chain is the store's word alone (esverify -allow-no-tsa accepts it)")
+	case at == 0:
+		return fmt.Errorf("link %d, which holds the record, is not in the bundle", r.LinkSeq)
+	case entered > p.Deadline:
+		return fmt.Errorf("the record entered the chain after the promised deadline %s: link %d, at or before the record's link %d, carries the time %s",
+			fmtTime(time.Unix(0, p.Deadline)), at, r.LinkSeq, fmtTime(time.Unix(0, entered)))
 	}
 	return nil
 }

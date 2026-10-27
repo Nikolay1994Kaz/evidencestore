@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -61,6 +62,12 @@ func (s *Store) startBackground() {
 // пока он не свеж. Переменная — чтобы тесты не ждали.
 var anchorRetry = 10 * time.Second
 
+// anchorBackoff — во сколько раз реже anchorRetry, самое большее, идут
+// повторы метки после отказов подряд: при лежащей TSA каждая попытка с
+// новыми листьями кладёт звено хвостов (Q-43), а приём после её
+// возвращения ждёт не дольше двух минут.
+const anchorBackoff = 12
+
 // stampTimeout — сколько ждать ответа TSA: ответ дольше proof.StampLatency
 // всё равно не берётся.
 const stampTimeout = proof.StampLatency + 5*time.Second
@@ -77,19 +84,25 @@ func (s *Store) stampLogged() {
 // keepAnchor держит якорь часов приёма свежим: якоря нет, он старше
 // anchorRefresh или окно по нему разошлось — метка ставится сейчас, даже
 // если в цепь ничего не легло (простой). Не вышла — повтор через
-// anchorRetry, а не через tsa.every: без свежего якоря приём закрыт.
-// Зовётся с s.wg.Add(1).
+// anchorRetry, а не через tsa.every: без свежего якоря приём закрыт; после
+// отказов подряд — реже, до anchorBackoff раз. Зовётся с s.wg.Add(1).
 func (s *Store) keepAnchor() {
 	defer s.wg.Done()
 	t := time.NewTicker(anchorRetry)
 	defer t.Stop()
+	var fails, skip int
 	for {
 		select {
 		case <-s.stop:
 			return
 		case <-t.C:
 		}
+		if skip > 0 {
+			skip--
+			continue
+		}
 		if !s.anchorStale() {
+			fails = 0
 			continue
 		}
 		if s.anchored() != nil {
@@ -98,6 +111,10 @@ func (s *Store) keepAnchor() {
 		ctx, cancel := context.WithTimeout(context.Background(), stampTimeout)
 		if _, err := s.stampNow(ctx); err != nil {
 			s.log.Error("tsa stamp", "err", err)
+			skip = min(1<<min(fails, 4), anchorBackoff) - 1
+			fails++
+		} else {
+			fails = 0
 		}
 		cancel()
 	}
@@ -251,10 +268,26 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	defer s.stampMu.Unlock()
 	head, gen, err := s.stampOnce(ctx, force)
 	if errors.Is(err, errClockLost) {
-		// Якорь уже взят по этой метке. Повтор кладёт новые хвосты — после
-		// того, что легло в цепь, пока шёл запрос, — и метка их заверяет.
+		// Якорь уже взят по этой метке (reanchor). Повтор кладёт новые
+		// хвосты — после того, что легло в цепь, пока шёл запрос, — и метка
+		// их заверяет. Срок у повтора свой: первая попытка могла съесть почти
+		// весь, а несвежим якорь уже не считается, и keepAnchor её не повторит.
 		s.log.Warn("the TSA time is ahead of the receive-time window: the monotonic clock lost time (host suspended or VM paused?); stamping again", "err", err)
-		head, gen, err = s.stampOnce(ctx, true)
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stampTimeout)
+		head, gen, err = s.stampOnce(rctx, true)
+		cancel()
+	}
+	s.mu.Lock()
+	closed := err == nil && s.needAnchor && !s.intakeOpen && !s.anchorTSA.IsZero()
+	s.mu.Unlock()
+	if closed {
+		// Якорь есть, а приём закрыт: хвосты последней метки легли без якоря
+		// (первая метка процесса). Приём открывает метка с хвостами при
+		// якоре — сразу, и без новых листьев; не вышла — keepAnchor
+		// повторит (anchorStale).
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stampTimeout)
+		head, gen, err = s.stampOnce(rctx, true)
+		cancel()
 	}
 	return head, gen, err
 }
@@ -271,6 +304,9 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	// источнику берёт вердикт своей записи до края.
 	unlockGW := s.lockGateways()
 	before := s.leafTime()
+	s.mu.Lock()
+	first := s.anchorTSA.IsZero()
+	s.mu.Unlock()
 	s.chainMu.Lock()
 	if err := s.flushLocked(); err != nil {
 		s.chainMu.Unlock()
@@ -335,13 +371,16 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	s.mu.Lock()
 	_, hi, _ := s.anchorWindowAt(answered)
 	s.mu.Unlock()
-	// Якорь — до времени листа токена: после старта якоря ещё нет, и лист
-	// токена получил бы часы хоста как есть.
-	s.anchorClock(info.GenTime, took)
 	if hi != 0 && info.GenTime.UnixNano() > hi+int64(clockLost) {
+		s.reanchor(info.GenTime, answered, took)
 		return 0, gen, fmt.Errorf("%w by %s", errClockLost, time.Duration(info.GenTime.UnixNano()-hi).Round(time.Second))
 	}
-	after := s.leafTime()
+	// Время листа токена — по окну этой же метки: после старта якоря ещё
+	// нет, и лист получил бы часы хоста как есть. Сам якорь — после того,
+	// как лист лёг в цепь: с якорем открывается приём, и запись, принятая
+	// раньше листа токена, легла бы до него — у первой метки без T1 (Q-50).
+	lo, hi := anchorWindow(info.GenTime, took, s.mono()-answered)
+	after := clampToWindow(s.nowTime().UnixNano(), lo, hi)
 	s.chainMu.Lock()
 	num := s.appendLeafLocked(auditchain.Leaf{
 		UnixNano: after,
@@ -358,6 +397,58 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 		s.queueWitnessLocked(s.chain.Head(), true)
 	}
 	s.chainMu.Unlock()
+	s.anchorClock(info.GenTime, answered, took)
+	s.mu.Lock()
+	if !first || !s.needAnchor {
+		s.intakeOpen = true
+	}
+	s.mu.Unlock()
 	s.log.Info("tsa stamp", "head", head.Seq, "gen_time", info.GenTime)
 	return head.Seq, info.GenTime, err
 }
+
+// reanchor ставит якорь по метке, время которой позже окна по якорю:
+// монотонные часы стояли, и время приёма отставало на всю паузу. Запись,
+// уже взявшая время по прежнему якорю, но ещё не легшая в цепь (fsync
+// журнала улик), обязана лечь в звено раньше листьев нового якоря: иначе
+// время её звена — по новому якорю, на всю паузу позже её срока, и
+// esverify -promise обвинит честную запись, а хвосты повторной метки лягут
+// раньше неё (Q-49). Поэтому приём на это время на паузе (новая запись
+// получает 503, сборщик повторит), записи в пути дожидаются, их листья
+// сворачиваются в звено, и только потом — якорь.
+func (s *Store) reanchor(gen time.Time, answered, took time.Duration) {
+	type inflight struct {
+		st  *sourceState
+		seq uint64
+	}
+	var wait []inflight
+	s.mu.Lock()
+	s.reanchoring = true
+	for _, st := range s.sources {
+		for q := range st.inflight {
+			wait = append(wait, inflight{st, q})
+		}
+	}
+	s.mu.Unlock()
+	for deadline := time.Now().Add(reanchorWait); len(wait) > 0; {
+		if time.Now().After(deadline) {
+			s.log.Error("records taken in before the monotonic clock was found stopped are still not in the chain; their promise check may fail", "records", len(wait))
+			break
+		}
+		time.Sleep(time.Millisecond)
+		s.mu.Lock()
+		wait = slices.DeleteFunc(wait, func(r inflight) bool { return !r.st.inflight[r.seq] })
+		s.mu.Unlock()
+	}
+	if err := s.flush(); err != nil {
+		s.log.Error("chain flush", "err", err)
+	}
+	s.anchorClock(gen, answered, took)
+	s.mu.Lock()
+	s.reanchoring = false
+	s.mu.Unlock()
+}
+
+// reanchorWait — сколько reanchor ждёт записи в пути: fsync журнала улик —
+// миллисекунды, зависший диск ждать незачем.
+const reanchorWait = 5 * time.Second
