@@ -2139,6 +2139,7 @@ func TestStampBarrierRecordOwnLink(t *testing.T) {
 	if serr != nil {
 		t.Fatalf("метка: %v", serr)
 	}
+	tokenLinksAlone(t, s) // Q-84
 	advance(time.Minute)
 	ingest(t, s, "abs-core", 3, 3)
 	mustStamp(t, s)
@@ -2304,6 +2305,11 @@ func TestHostClockStepKeepsPromise(t *testing.T) {
 	if err := s.flush(); err != nil {
 		t.Fatal(err)
 	}
+	// Q-84: событие после шага легло не дальше хода монотонных часов от
+	// времени приёма записи 2 (8 с × 1,01).
+	if d := time.Duration(leafAt(t, s, auditchain.EventSilence, "pipelock") - res[0].Promise.ReceivedAt); d > 9*time.Second {
+		t.Errorf("событие после шага часов хоста — на %v позже времени приёма записи 2, а монотонные часы прошли 8 с", d)
+	}
 	advance(time.Minute)
 	ingest(t, s, "abs-core", 3, 3)
 	mustStamp(t, s)
@@ -2351,6 +2357,7 @@ func TestRestoreCatchUpKeepsPromise(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
+	catchUpLinks(t, s2, "abs-core", 2, 3, 4, 5, 6, 7, 8, 9)
 	mustStampNow(t, s2)
 	c.add(time.Minute)
 	ingest(t, s2, "abs-core", 10, 10)

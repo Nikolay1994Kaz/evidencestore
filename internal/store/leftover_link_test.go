@@ -67,6 +67,7 @@ func TestLeftoverOwnLinkBeforeCatchUp(t *testing.T) {
 	}
 	defer s2.Close()
 	s2.tsaLocal.Now = truth.now
+	catchUpLinks(t, s2, "abs-core", 2, 3)
 	mustStamp(t, s2)
 	if _, err := s2.Proof("abs-core", 3, false); err != nil {
 		t.Fatalf("запись 3 не догнана: %v", err)
