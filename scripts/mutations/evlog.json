@@ -6,8 +6,8 @@
   {
    "name": "E1 ошибка fsync игнорируется",
    "file": "internal/evlog/evlog.go",
-   "old": "\tif err := l.syncFile(l.active); err != nil {",
-   "new": "\tif err := l.syncFile(l.active); err != nil && false {"
+   "old": "\tif err := l.syncFile(l.active); err != nil {\n\t\tl.fail(fmt.Errorf(\"evlog: fsync: %w\", err))",
+   "new": "\tif err := l.syncFile(l.active); err != nil && false {\n\t\tl.fail(fmt.Errorf(\"evlog: fsync: %w\", err))"
   },
   {
    "name": "E2 OnCommit до fsync",
