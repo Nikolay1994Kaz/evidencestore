@@ -2236,6 +2236,7 @@ func TestIntakeWaitsForAnchorChange(t *testing.T) {
 	if err := s.flush(); err != nil {
 		t.Fatal(err)
 	}
+	receivedAfterToken(t, s, "abs-core", 2) // Q-84
 	advance(time.Minute)
 	ingest(t, s, "abs-core", 3, 3)
 	mustStamp(t, s)

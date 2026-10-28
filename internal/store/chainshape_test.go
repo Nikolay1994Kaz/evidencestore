@@ -105,6 +105,33 @@ func tokenLinksAlone(t *testing.T, st *Store) {
 	}
 }
 
+// receivedAfterToken — README («Bundles over a window of time»): пока
+// хранилище ждёт записи, бывшие в пути при ответе TSA, новые ждут, прежде
+// чем взять время приёма; запись, легшая после токена, взяла его по окну
+// этой метки — не раньше листа токена, а не по прежнему якорю (мутация X42).
+func receivedAfterToken(t *testing.T, st *Store, source string, seq uint64) {
+	t.Helper()
+	at := func(ns int64) string { return time.Unix(0, ns).UTC().Format("15:04:05.000") }
+	subject := strconv.FormatUint(seq, 10)
+	var token int64
+	for _, link := range chainLinks(t, st) {
+		for _, l := range link.leaves {
+			switch {
+			case l.Type == auditchain.EventTimestamp:
+				token = l.UnixNano
+			case l.Type == auditchain.EventEvidence && l.Scope == source && l.Subject == subject:
+				if token == 0 {
+					t.Errorf("%s/%d: перед записью нет токена", source, seq)
+				} else if l.UnixNano < token {
+					t.Errorf("%s/%d: время приёма %s раньше листа токена перед ней (%s)", source, seq, at(l.UnixNano), at(token))
+				}
+				return
+			}
+		}
+	}
+	t.Errorf("%s/%d нет в цепи", source, seq)
+}
+
 // leafAt — время первого листа вида typ с предметом scope.
 func leafAt(t *testing.T, st *Store, typ auditchain.EventType, scope string) int64 {
 	t.Helper()
