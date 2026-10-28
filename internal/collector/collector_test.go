@@ -672,6 +672,55 @@ func TestPromiseReceiveTimeAhead(t *testing.T) {
 	}
 }
 
+// Q-57: срок обещания — тоже слово хранилища. Срок дальше
+// proof.MaxPromiseMMD от времени приёма пропускает запись, придержанную за
+// метку, что закрывает окно: ошибка в журнал и обещание в
+// promises-deadline.jsonl, запись доставлена. Срок ровно MaxPromiseMMD —
+// честный.
+func TestPromiseLongDeadline(t *testing.T) {
+	certs := simCerts(t)
+	fs := newFakeStore(certs.storeSK)
+	logDir := t.TempDir()
+	cfg := &Config{
+		Server: "https://store.invalid", CA: filepath.Join(certs.dir, "ca.crt"),
+		Cert: filepath.Join(certs.dir, "abs-core.crt"), Key: filepath.Join(certs.dir, "abs-core.key"),
+		StoreKey: fs.pub, SpoolDir: filepath.Join(t.TempDir(), "spool"),
+		File: filepath.Join(logDir, "audit.log"), FromStart: true,
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(cfg, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fs.attach(c)
+	if err := c.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	late := filepath.Join(cfg.SpoolDir, deadlineFile)
+	fs.recvAt, fs.mmd = time.Now().UnixNano(), int64(proof.MaxPromiseMMD)
+	appendLines(t, cfg.File, "1\n")
+	cycle(t, c)
+	if _, err := os.Stat(late); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("срок ровно MaxPromiseMMD сочтён слишком длинным: %v", err)
+	}
+	fs.recvAt, fs.mmd = time.Now().UnixNano(), int64(proof.MaxPromiseMMD+time.Second)
+	appendLines(t, cfg.File, "2\n")
+	cycle(t, c)
+	data, err := os.ReadFile(late)
+	if err != nil || strings.Count(string(data), "\n") != 1 || !strings.Contains(string(data), `"seq":2,`) {
+		t.Fatalf("обещание со сроком на секунду дальше предела: %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.SpoolDir, aheadFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("длинный срок сочтён сдвигом времени приёма: %v", err)
+	}
+	if c.Pending() != 0 || c.Acked() != 2 {
+		t.Fatalf("запись не доставлена: в буфере %d, подтверждено до %d", c.Pending(), c.Acked())
+	}
+}
+
 // Z-04: то же, когда файл не открыть (права): рождение сверяется по пути,
 // без открытия. Раньше «не открыть» значило «тот же файл»: чужой файл жил в
 // реестре под чужим местом, а ротированный — «пропадал» с пропуском, и его

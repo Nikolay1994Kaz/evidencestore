@@ -87,6 +87,15 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	var news []fresh
 	var dups []int // номер уже занят: тело сверяется вне замка
 	s.mu.Lock()
+	// Метка сняла записи в пути и ждёт их, чтобы положить токен и сменить
+	// якорь: время приёма по прежнему якорю сейчас не берётся — запись легла
+	// бы после листьев нового (Q-64). Пауза — до reanchorWait и fsync звена.
+	for s.stampPause != nil && !s.closed {
+		ch := s.stampPause
+		s.mu.Unlock()
+		<-ch
+		s.mu.Lock()
+	}
 	st, ok := s.sources[source]
 	switch {
 	case s.closed:

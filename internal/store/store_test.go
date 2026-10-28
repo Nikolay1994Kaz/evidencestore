@@ -453,42 +453,65 @@ func TestCrashCatchUp(t *testing.T) {
 	}
 }
 
-// Q-53: подъём после падения догоняет запись, легшую в журнал улик, но не
-// в звено, а часы хоста после подъёма впереди на 5 минут (якоря ещё нет).
-// Звено догона сворачивается до событий подъёма: его время — время записи,
-// и сверка обещания честную запись не обвиняет.
+// Q-53, Q-58: падение до звена записи. Запись легла в журнал улик, а её
+// лист — только в память (догон журнала при подъёме) или на диск без звена
+// (падение между fsync листьев и звена: лист поднимается с диска). Подъём —
+// при часах хоста впереди на 5 минут или просто через 5 минут (перезагрузка),
+// якоря ещё нет. Всё, что осталось от прошлого процесса, ложится своим
+// звеном до событий подъёма: время звена — время записи, и сверка обещания
+// честное хранилище не обвиняет.
 func TestCrashCatchUpKeepsPromise(t *testing.T) {
-	tsaClock := newClock()
-	host := newClock()
-	cfg := testConfig(t)
-	s, err := Open(cfg, Options{Logger: quiet, Now: host.now, NoBackground: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	s.tsaLocal.Now = tsaClock.now
-	mustStamp(t, s) // T1
-	ingest(t, s, "abs-core", 1, 1)
-	if err := s.flush(); err != nil {
-		t.Fatal(err)
-	}
-	res := ingest(t, s, "abs-core", 2, 2) // лист в памяти, звена нет
-	crashed := copyDirs(t, cfg)
-	host.add(5 * time.Minute)
-	s2, err := Open(crashed, Options{Logger: quiet, Now: host.now, NoBackground: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	s2.tsaLocal.Now = tsaClock.now
-	mustStamp(t, s2)
-	b, err := s2.Proof("abs-core", 2, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := proof.Verify(b, trustOf(t, s2))
-	if err := proof.CheckPromise(*res[0].Promise, r, b, false); !r.Valid() || err != nil {
-		t.Fatalf("пакет %s; обещание: %v", r.Verdict(), err)
+	for _, crash := range []string{"leaves", "link"} {
+		for _, restart := range []string{"host ahead", "late"} {
+			t.Run(crash+"/"+restart, func(t *testing.T) {
+				tsaClock := newClock()
+				host := newClock()
+				cfg := testConfig(t)
+				s, err := Open(cfg, Options{Logger: quiet, Now: host.now, NoBackground: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.Close()
+				s.tsaLocal.Now = tsaClock.now
+				mustStamp(t, s) // T1
+				ingest(t, s, "abs-core", 1, 1)
+				if err := s.flush(); err != nil {
+					t.Fatal(err)
+				}
+				res := ingest(t, s, "abs-core", 2, 2) // лист в памяти, звена нет
+				if crash == "link" {
+					s.chain.SetBeforeWrite(func(phase string) error {
+						if phase == "link" {
+							return errors.New("crash (test)")
+						}
+						return nil
+					})
+					if err := s.flush(); err == nil {
+						t.Fatal("звено записалось")
+					}
+				}
+				crashed := copyDirs(t, cfg)
+				host.add(5 * time.Minute)
+				if restart == "late" {
+					tsaClock.add(5 * time.Minute)
+				}
+				s2, err := Open(crashed, Options{Logger: quiet, Now: host.now, NoBackground: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s2.Close()
+				s2.tsaLocal.Now = tsaClock.now
+				mustStamp(t, s2)
+				b, err := s2.Proof("abs-core", 2, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := proof.Verify(b, trustOf(t, s2))
+				if err := proof.CheckPromise(*res[0].Promise, r, b, false); !r.Valid() || err != nil {
+					t.Fatalf("пакет %s; обещание: %v", r.Verdict(), err)
+				}
+			})
+		}
 	}
 }
 

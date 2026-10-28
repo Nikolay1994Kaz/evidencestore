@@ -252,6 +252,7 @@ type fakeStore struct {
 	last     uint64
 	position uint64
 	recvAt   int64    // время приёма в обещаниях (unix-нс)
+	mmd      int64    // срок обещания после времени приёма (нс); ноль — 1 нс
 	bad      []string // нарушения протокола со стороны сборщика
 }
 
@@ -337,7 +338,7 @@ func (s *fakeStore) ingest(w http.ResponseWriter, req *http.Request) {
 		if !ok {
 			s.position++
 			d := sha256.Sum256(r.Body)
-			p = proof.Promise{Source: "abs-core", Seq: r.Seq, Position: s.position, Digest: d[:], ReceivedAt: s.recvAt, Deadline: s.recvAt + 1, PublicKey: s.pub}
+			p = proof.Promise{Source: "abs-core", Seq: r.Seq, Position: s.position, Digest: d[:], ReceivedAt: s.recvAt, Deadline: s.recvAt + max(s.mmd, 1), PublicKey: s.pub}
 			p.Signature = ed25519.Sign(s.sk, proof.PromiseBytes(p))
 			s.promises[r.Seq], s.bodies[r.Seq] = p, string(r.Body)
 			s.last = max(s.last, r.Seq)

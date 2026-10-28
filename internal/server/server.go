@@ -395,7 +395,12 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("POST /admin/stamp", func(w http.ResponseWriter, r *http.Request) {
 		head, err := s.store.StampNow(r.Context())
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, err)
+			s.log.Error("tsa stamp asked by the operator", "err", err)
+			code := http.StatusBadGateway
+			if errors.Is(err, store.ErrStampDeferred) || errors.Is(err, store.ErrLogFailed) {
+				code = http.StatusServiceUnavailable // записи в пути или отказ журнала улик, не TSA
+			}
+			writeErr(w, code, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]uint64{"stamped_head": head})

@@ -208,21 +208,23 @@ func (a simStats) String() string {
 
 // storeSim — один сценарий.
 type storeSim struct {
-	t        *testing.T
-	root     string // каталоги сценария: удаляются в конце, снимки умерших — сразу
-	rng      *mrand.Rand
-	clk      *clock
-	cfg      *config.Config
-	s        *Store
-	pub      ed25519.PublicKey
-	logBuf   *bytes.Buffer
-	logger   *slog.Logger
-	clients  []*simClient
-	mu       sync.Mutex // trace и failures: в параллельной работе пишут все горутины
-	trace    []string
-	failures []string
-	stats    simStats
-	rushing  bool // идёт параллельная работа: падений нет, точки записи пусты
+	// evlogFail — fsync журнала улик отказывает (ход fsyncFail, Q-75).
+	evlogFail atomic.Bool
+	t         *testing.T
+	root      string // каталоги сценария: удаляются в конце, снимки умерших — сразу
+	rng       *mrand.Rand
+	clk       *clock
+	cfg       *config.Config
+	s         *Store
+	pub       ed25519.PublicKey
+	logBuf    *bytes.Buffer
+	logger    *slog.Logger
+	clients   []*simClient
+	mu        sync.Mutex // trace и failures: в параллельной работе пишут все горутины
+	trace     []string
+	failures  []string
+	stats     simStats
+	rushing   bool // идёт параллельная работа: падений нет, точки записи пусты
 	// rushDirty — после параллельной работы звено ещё не сбрасывалось: тик
 	// звена, шедший вместе с приёмом, мог сбросить улики пачки раньше, чем к
 	// ним легли события о пропуске, и падение уносит события (предел README).
@@ -702,6 +704,12 @@ func (m *storeSim) crash() {
 	m.countCrash(at)
 	dirty := m.rushDirty
 	m.rushDirty = false
+	// Подъём — сразу или после перезагрузки: у всего, что осталось от
+	// умершего процесса, время звена — своё, а не часов при подъёме (Q-58).
+	if d := []time.Duration{0, 0, time.Second, 2 * time.Minute, 10 * time.Minute}[m.rng.IntN(5)]; d > 0 {
+		m.clk.add(d)
+		m.note("подъём через %s", d)
+	}
 	m.open()
 	if m.s != nil && (dirty || strings.Contains(at, "посреди записи chain/leaves_")) {
 		m.markLostGaps()
@@ -816,7 +824,13 @@ func (m *storeSim) open() {
 // options — настройки подъёма хранилища в симуляции.
 func (m *storeSim) options(hook func(string)) Options {
 	opt := Options{Logger: m.logger, Now: m.clk.now, NoBackground: true, writeHook: hook,
-		evlogSegment: m.evSeg, chainSegment: m.chainSeg, replicaChunk: m.repChunk}
+		evlogSegment: m.evSeg, chainSegment: m.chainSeg, replicaChunk: m.repChunk,
+		evlogSync: func(f *os.File) error {
+			if m.evlogFail.Load() {
+				return errors.New("EIO (симуляция: отказ fsync журнала улик)")
+			}
+			return f.Sync()
+		}}
 	if hook != nil {
 		opt.wrapRoots = func(rs keyring.RootStore) keyring.RootStore { return simRoots{rs, m} }
 	}
@@ -1276,14 +1290,59 @@ func (m *storeSim) step() {
 		m.lockBackup()
 	case r < 93:
 		m.rogueContact(c)
-	case r < 95:
+	case r < 94:
 		m.keyOperator()
+	case r < 95:
+		m.fsyncFail(c)
 	case r < 96:
 		m.diskLost()
 	default:
 		ds := []time.Duration{5 * time.Minute, 20 * time.Minute, time.Hour}
 		m.advance(ds[m.rng.IntN(len(ds))])
 	}
+}
+
+// fsyncFail — fsync журнала улик отказывает после того, как байты пачки
+// легли в файл (Q-75): приём отвечает отказом, журнал защёлкнут,
+// хранилище живо. Метка за это время (обновление якоря, уничтожение ключа,
+// оператор) — по случаю; потом оператор перезапускает хранилище, и журнал
+// поднимает пачку как принятую. Записи пачки остаются у клиента
+// неподтверждёнными: повтор получит «duplicate» с обещанием, и эталон в
+// конце сверяет пакет и -promise каждой.
+func (m *storeSim) fsyncFail(c *simClient) {
+	if m.calm || m.armed >= 0 || m.snap != nil {
+		m.ingest(c, true)
+		return
+	}
+	recs := m.batch(c, true)
+	if len(recs) == 0 {
+		return
+	}
+	if err := m.s.Admit(c.source, c.epoch); err != nil {
+		return
+	}
+	c.bound = true
+	m.evlogFail.Store(true)
+	_, err := m.s.Ingest(c.source, recs)
+	m.evlogFail.Store(false)
+	switch {
+	case err == nil:
+		// Пачка из одних повторов принятого: до журнала не дошла.
+		return
+	case !strings.Contains(err.Error(), "fsync"):
+		m.note("%s: приём при отказе fsync: %v", c.source, err)
+	}
+	m.note("%s: fsync журнала улик отказал на пачке до %d", c.source, recs[len(recs)-1].Seq)
+	if m.rng.IntN(2) == 0 {
+		// Фоновые шаги здесь не идут (m.advance): метки и якорь при
+		// отказавшем журнале вправе отказывать, а background считает это
+		// провалом. Час без фона — как обновление якоря раз в час.
+		ds := []time.Duration{time.Minute, 10 * time.Minute, time.Hour}
+		m.clk.add(ds[m.rng.IntN(len(ds))])
+		_, err := m.s.StampNow(context.Background())
+		m.note("метка при отказавшем журнале улик: %v", err)
+	}
+	m.restart()
 }
 
 // rush — параллельная работа, как в serve: каждый клиент шлёт пачки из своей
@@ -2097,14 +2156,11 @@ func (m *storeSim) checkRecord(c *simClient, q uint64, trust proof.Trust) {
 		}
 	}
 	if acked {
+		// Улика доехала до копии, а её звено — нет: подъём из копии догоняет
+		// её звеньями по тику, время звена — время её последней записи, и
+		// обещание выполнено (README, «Copy and restore»; Q-65).
 		if err := proof.CheckPromise(p, rep, b, false); err != nil {
-			// Улика доехала до копии, а её звено — нет: подъём из копии вплетает
-			// её в цепь позже срока; обещание нарушено видимо (README).
-			late := strings.Contains(err.Error(), "after the promised deadline") &&
-				slices.ContainsFunc(m.restoredAt, func(t time.Time) bool { return t.UnixNano() >= p.ReceivedAt })
-			if !late {
-				m.fail("обещание %s/%d не выполнено: %v", c.source, q, err)
-			}
+			m.fail("обещание %s/%d не выполнено: %v", c.source, q, err)
 		}
 	}
 }

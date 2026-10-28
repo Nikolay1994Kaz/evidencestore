@@ -122,6 +122,12 @@
    "file": "internal/evlog/evlog.go",
    "old": "\t\t\tif aside, err = setAside(f, path, seg.size, st.Size()); err != nil {",
    "new": "\t\t\tif aside, err = \"\", nil; err != nil {"
+  },
+  {
+   "name": "E21 Resync с позиции в прежнем сегменте при пустом последнем (падение сразу после ротации) — паника на подъёме (Q-81)",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tfrom = max(from, seg.first)\n\tend, size, path := seg.end(), seg.size, seg.path\n\tvar off int64\n\tif from < end {\n\t\toff = int64(seg.offsets[from-seg.first])",
+   "new": "\tend, size, path := seg.end(), seg.size, seg.path\n\tvar off int64\n\tif from < end {\n\t\toff = int64(seg.offsets[max(from, seg.first)-seg.first])"
   }
  ]
 }

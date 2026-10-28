@@ -41,9 +41,11 @@ import (
 // Version — версия формата пакета одной улики. Версия 2 (27.10) — тот же
 // формат, но проверки ему нужны новые (звено токена T1 — tokenLinkTime,
 // сверка обещания от головы T1): esverify v0.2.0 и раньше такой пакет не
-// разбирает и говорит о версии, а не проверяет его без них. Пакеты
-// версии 1 (хранилище v0.2.0 и раньше) читаются по-прежнему.
-const Version = 2
+// разбирает и говорит о версии, а не проверяет его без них. Версия 3
+// (28.10) несёт участок — все листья от головы под T1 до звена записи:
+// обещание сверяется по меткам на нём, а не по времени звеньев. Пакеты
+// версий 1 и 2 читаются по-прежнему, но для -promise не принимаются.
+const Version = 3
 
 // HeadDomain — домен хэша головы, который уходит в TSA.
 const HeadDomain = "evidencestore/head/v1"
@@ -214,6 +216,10 @@ type Bundle struct {
 	DEK       []byte               `json:"dek,omitempty"` // ключ этой записи, если выдан
 	// Gateway — для улик из журнала гейтвея (content_type pipelock/recorder).
 	Gateway *GatewayProof `json:"gateway,omitempty"`
+	// Stretch — с версии 3: все листья звеньев от головы, которую заверила
+	// T1, до звена улики. По ним сверка обещания находит каждую метку перед
+	// уликой (CheckPromise: правило меток).
+	Stretch []Leaf `json:"stretch,omitempty"`
 }
 
 func Parse(data []byte) (Bundle, error) {
@@ -226,8 +232,8 @@ func Parse(data []byte) (Bundle, error) {
 	if kind, _ := BundleKind(data); kind != "" {
 		return b, fmt.Errorf("proof: a bundle of kind %q, not a single-record bundle", kind)
 	}
-	if b.Version != Version && b.Version != 1 {
-		return b, fmt.Errorf("proof: bundle version %d, supported 1 and %d", b.Version, Version)
+	if b.Version < 1 || b.Version > Version {
+		return b, fmt.Errorf("proof: bundle version %d, supported 1 to %d", b.Version, Version)
 	}
 	return b, nil
 }

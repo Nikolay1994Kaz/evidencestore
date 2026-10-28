@@ -507,6 +507,12 @@
    "file": "internal/collector/collector.go",
    "old": "\tif recv := time.Unix(0, p.ReceivedAt); recv.After(answered.Add(receiveAhead)) {",
    "new": "\tif recv := time.Unix(0, p.ReceivedAt); recv.After(answered.Add(100 * receiveAhead)) {"
+  },
+  {
+   "name": "X35 сборщик не сверяет срок в обещании (Q-57)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif mmd := time.Duration(p.Deadline - p.ReceivedAt); mmd > proof.MaxPromiseMMD {",
+   "new": "\tif mmd := time.Duration(p.Deadline - p.ReceivedAt); false && mmd > proof.MaxPromiseMMD {"
   }
  ],
  "note": "V3 (имя из сертификата не сверяется с реестром на входе) снят как равносильный: store.Ingest и store.LastSeq сами отказывают неизвестному источнику (ErrUnknownSource → 403)."

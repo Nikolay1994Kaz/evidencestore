@@ -316,8 +316,8 @@
   {
    "name": "S35 журнал улик открывается с правом Release",
    "file": "internal/store/store.go",
-   "old": "evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment}",
-   "new": "evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment, AllowRelease: true}"
+   "old": "evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment, SyncFile: s.evlogSync}",
+   "new": "evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment, SyncFile: s.evlogSync, AllowRelease: true}"
   },
   {
    "name": "S36 отказ цепи не останавливает приём",
@@ -340,14 +340,14 @@
   {
    "name": "S39 время приёма не держится под нижней оценкой времени TSA (W-01)",
    "file": "internal/store/store.go",
-   "old": "\t\tt = min(max(t, floor), lo)",
-   "new": "\t\t_ = lo\n\t\tt = max(t, floor)"
+   "old": "\t\tt = s.scaleLocked(min(max(t, floor), lo), floor, mono)",
+   "new": "\t\t_ = lo\n\t\tt = s.scaleLocked(max(t, floor), floor, mono)"
   },
   {
    "name": "S40 метка TSA не ставит якорь часов",
    "file": "internal/store/jobs.go",
-   "old": "\ts.anchorClock(info.GenTime, answered, took)\n\ts.mu.Lock()\n\tif !first",
-   "new": "\t_, _ = answered, took\n\ts.mu.Lock()\n\tif !first"
+   "old": "\ts.anchorClock(info.GenTime, answered, took)\n\t// Отложенная перестановка (reanchor) теперь лишняя",
+   "new": "\t_, _ = answered, took\n\t// Отложенная перестановка (reanchor) теперь лишняя"
   },
   {
    "name": "S41 метка ставится и без новых листьев",
@@ -580,8 +580,8 @@
   {
    "name": "S67 время приёма не поднимается до окна при отставших часах хоста (Y-01)",
    "file": "internal/store/store.go",
-   "old": "\t\tt = min(max(t, floor), lo)",
-   "new": "\t\tt = min(t, lo)"
+   "old": "\t\tt = s.scaleLocked(min(max(t, floor), lo), floor, mono)",
+   "new": "\t\tt = s.scaleLocked(min(t, lo), floor, mono)"
   },
   {
    "name": "S68 уход монотонных часов не вычитается из нижней оценки (W-01)",
@@ -622,8 +622,8 @@
   {
    "name": "S74 якорь не стареет: в простой метка не освежает его (Y-01)",
    "file": "internal/store/store.go",
-   "old": "\tif !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) || s.needAnchor && !s.intakeOpen {",
-   "new": "\tif _ = hi; !ok || s.needAnchor && !s.intakeOpen {"
+   "old": "\tif !ok || s.reanchoring || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) || s.needAnchor && !s.intakeOpen {",
+   "new": "\tif _ = hi; !ok || s.reanchoring || s.needAnchor && !s.intakeOpen {"
   },
   {
    "name": "S75 часы хоста позади окна — без тревоги",
@@ -1630,8 +1630,8 @@
   {
    "name": "Q12 время листа событий — сырые часы хоста",
    "file": "internal/store/store.go",
-   "old": "\tif hi != 0 {\n\t\tt = clampToWindow(t, lo, hi)\n\t}\n",
-   "new": "\t_, _ = lo, hi\n"
+   "old": "\tif lo, hi, _ := s.anchorWindowAt(mono); hi != 0 {\n\t\tt = s.scaleLocked(clampToWindow(t, lo, hi), hi-int64(recvWindow), mono)\n\t}\n",
+   "new": "\t_ = mono\n"
   },
   {
    "name": "Q14 хвосты без соли",
@@ -1832,28 +1832,16 @@
    "new": "\tif err := tokenLinkTime(cl, info.GenTime.UTC()); false && err != nil {"
   },
   {
-   "name": "X7 обещание сверяется только со звеном улики (Q-33)",
-   "file": "internal/proof/promise.go",
-   "old": "\t\tif l.Seq >= from && l.Seq <= r.LinkSeq && (at == 0 || l.UnixNano > entered) {",
-   "new": "\t\tif l.Seq == r.LinkSeq && from >= 0 && (at == 0 || l.UnixNano > entered) {"
-  },
-  {
-   "name": "X8 обещание считает и голову T1, и звенья до неё (Q-33)",
-   "file": "internal/proof/promise.go",
-   "old": "\t\tfrom = head + 1",
-   "new": "\t\tfrom = 0 * head"
-  },
-  {
    "name": "X9 обещание сверяется без T1 (Q-33)",
    "file": "internal/proof/promise.go",
-   "old": "\tcase r.Lower.IsZero() && !allowNoTSA:",
-   "new": "\tcase false && r.Lower.IsZero() && !allowNoTSA:"
+   "old": "\tcase r.Lower.IsZero():\n\t\tif !allowNoTSA {",
+   "new": "\tcase r.Lower.IsZero():\n\t\tif false && !allowNoTSA {"
   },
   {
    "name": "X10 срок обещания с минутой запаса",
    "file": "internal/proof/promise.go",
-   "old": "\tcase entered > p.Deadline:",
-   "new": "\tcase entered > p.Deadline+int64(time.Minute):"
+   "old": "\tcase worst.UnixNano() > limit:",
+   "new": "\tcase worst.UnixNano() > limit+int64(time.Minute):"
   },
   {
    "name": "X11 esverify сверяет обещание без T1 и без -allow-no-tsa (Q-33)",
@@ -1890,12 +1878,6 @@
    "file": "internal/store/jobs.go",
    "old": "\t\t\tskip = min(1<<min(fails, 4), anchorBackoff) - 1",
    "new": "\t\t\tskip = min(1<<min(fails, 4), anchorBackoff) * 0"
-  },
-  {
-   "name": "X20 обещание — от звена токена T1, а не от головы под ней (Q-47)",
-   "file": "internal/proof/promise.go",
-   "old": "\t\tfrom = head + 1",
-   "new": "\t\tfrom = b.Lower.Inclusion.LinkSeq + 0*head"
   },
   {
    "name": "X21 метка перед звеном в пакете за окно — последняя по месту (Q-48)",
@@ -1940,9 +1922,9 @@
    "new": "\tif kind, _ := BundleKind(data); false && kind != \"\" {"
   },
   {
-   "name": "X28 пакет одной улики версии 1 не разбирается (Q-51)",
+   "name": "X28 пакет одной улики старой версии (1 или 2) не разбирается (Q-51)",
    "file": "internal/proof/proof.go",
-   "old": "\tif b.Version != Version && b.Version != 1 {",
+   "old": "\tif b.Version < 1 || b.Version > Version {",
    "new": "\tif b.Version != Version {"
   },
   {
@@ -1954,9 +1936,141 @@
   {
    "name": "X30 звено догона после падения — вместе с событиями подъёма (Q-53)",
    "file": "internal/store/store.go",
-   "old": "\t\terr := s.flushLocked()\n\t\ts.chainMu.Unlock()\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\ts.announceTailGaps",
-   "new": "\t\terr := error(nil)\n\t\ts.chainMu.Unlock()\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\ts.announceTailGaps"
+   "old": "\tif err == nil {\n\t\terr = s.flushLocked()\n\t}\n\ts.chainMu.Unlock()",
+   "new": "\ts.chainMu.Unlock()"
+  },
+  {
+   "name": "X33 сверка обещания — со сроком из обещания, без предела MaxPromiseMMD (Q-57)",
+   "file": "internal/proof/promise.go",
+   "old": "\tlimit := p.ReceivedAt + int64(MaxPromiseMMD)\n",
+   "new": "\tlimit := max(p.Deadline, p.ReceivedAt+int64(MaxPromiseMMD))\n"
+  },
+  {
+   "name": "X34 предел срока обещания — две минуты (Q-57)",
+   "file": "internal/proof/promise.go",
+   "old": "const MaxPromiseMMD = WindowEdge - ReceiveSkew",
+   "new": "const MaxPromiseMMD = WindowEdge"
+  },
+  {
+   "name": "X36 срок раньше времени приёма не отвергается (Q-57)",
+   "file": "internal/proof/promise.go",
+   "old": "\tcase p.Deadline < p.ReceivedAt:",
+   "new": "\tcase false && p.Deadline < p.ReceivedAt:"
+  },
+  {
+   "name": "X37 перестановка якоря не ждёт записи в пути дольше reanchorWait (Q-59)",
+   "file": "internal/store/jobs.go",
+   "old": "\tif rest := s.landed(wait); len(rest) > 0 {\n\t\ts.log.Error(\"records taken in before the monotonic clock",
+   "new": "\tif rest := s.landed(wait); false && len(rest) > 0 {\n\t\ts.log.Error(\"records taken in before the monotonic clock"
+  },
+  {
+   "name": "X38 пауза перестановки не делает якорь несвежим — keepAnchor метку не повторит (Q-59)",
+   "file": "internal/store/store.go",
+   "old": "\tif !ok || s.reanchoring || s.mono()",
+   "new": "\tif !ok || s.mono()"
+  },
+  {
+   "name": "X39 метка без потери хода часов не снимает паузу перестановки (Q-59)",
+   "file": "internal/store/jobs.go",
+   "old": "\t// свежий, время приёма снова по нему.\n\ts.reanchoring = false",
+   "new": "\t// свежий, время приёма снова по нему."
+  },
+  {
+   "name": "X40 токен ложится, не дождавшись записей, взявших время до ответа TSA (Q-61)",
+   "file": "internal/store/jobs.go",
+   "old": "\tif rest := s.landed(wait); len(rest) > 0 {\n\t\treturn 0, gen, fmt.Errorf",
+   "new": "\tif rest := s.landed(wait); false && len(rest) > 0 {\n\t\treturn 0, gen, fmt.Errorf"
+  },
+  {
+   "name": "X41 листья, поднятые после падения без звена, ложатся вместе с событиями подъёма (Q-58)",
+   "file": "internal/store/store.go",
+   "old": "\terr = s.flushLocked()\n\tvar linkFrom int64",
+   "new": "\tvar linkFrom int64"
+  },
+  {
+   "name": "X42 приём не ждёт смены якоря: время по прежнему якорю после снимка барьера (Q-64)",
+   "file": "internal/store/ingest.go",
+   "old": "\tfor s.stampPause != nil && !s.closed {",
+   "new": "\tfor false && s.stampPause != nil && !s.closed {"
+  },
+  {
+   "name": "X43 лист токена — в одном звене с записями, дождавшимися барьера (Q-64)",
+   "file": "internal/store/jobs.go",
+   "old": "\tif err := s.flushLocked(); err != nil {\n\t\ts.chainMu.Unlock()\n\t\treturn 0, gen, err\n\t}\n\tnum := s.appendLeafLocked(",
+   "new": "\tnum := s.appendLeafLocked("
+  },
+  {
+   "name": "X44 догон после подъёма — одним звеном, а не по тику (Q-65)",
+   "file": "internal/store/store.go",
+   "old": "\t\tif i > 0 && p.header.ReceivedAt-linkFrom > int64(s.cfg.Chain.Tick.D()) {",
+   "new": "\t\tif false && i > 0 && p.header.ReceivedAt-linkFrom > int64(s.cfg.Chain.Tick.D()) {"
+  },
+  {
+   "name": "X45 шкала скачет за часами хоста быстрее монотонных часов (Q-66)",
+   "file": "internal/store/store.go",
+   "old": "\tif s.scaleSet {\n\t\tstep := max(mono-s.scaleMono, 0)",
+   "new": "\tif false && s.scaleSet {\n\t\tstep := max(mono-s.scaleMono, 0)"
+  },
+  {
+   "name": "X46 отложенная перестановка якоря не доводится по прежнему ответу TSA (Q-67)",
+   "file": "internal/store/jobs.go",
+   "old": "\tif rest > 0 {\n\t\treturn false\n\t}\n\tif err := s.flush(); err != nil {",
+   "new": "\tif true || rest > 0 {\n\t\treturn false\n\t}\n\tif err := s.flush(); err != nil {"
+  },
+  {
+   "name": "X47 сверка по меткам не сверяет листья с корнями звеньев (пересмотр 28.10)",
+   "file": "internal/proof/promise.go",
+   "old": "\t\tcase auditchain.MerkleRoot(leaves[at:at+n]) != p.Root:",
+   "new": "\t\tcase false && auditchain.MerkleRoot(leaves[at:at+n]) != p.Root:"
+  },
+  {
+   "name": "X48 сверка по меткам не видит токенов (пересмотр 28.10)",
+   "file": "internal/proof/promise.go",
+   "old": "\t\t\tif lf.Type != auditchain.EventTimestamp {\n\t\t\t\tcontinue\n\t\t\t}",
+   "new": "\t\t\tif true || lf.Type != auditchain.EventTimestamp {\n\t\t\t\tcontinue\n\t\t\t}"
+  },
+  {
+   "name": "X50 хранилище не кладёт в пакет листья от головы под T1 до звена улики (пересмотр 28.10)",
+   "file": "internal/store/proofs.go",
+   "old": "\t\tif b.Stretch, err = s.stretchLocked(t.head, n); err != nil {",
+   "new": "\t\tif b.Stretch, err = nil, nil; err != nil {"
+  },
+  {
+   "name": "X52 метка ложится, хотя журнал улик отказал, пока она ждала барьер (Q-75)",
+   "file": "internal/store/jobs.go",
+   "old": "\t// снятая отказом, видна здесь. Токен не ложится до перезапуска.\n\tif err := s.evlog.Failed(); err != nil {",
+   "new": "\t// снятая отказом, видна здесь. Токен не ложится до перезапуска.\n\tif err := s.evlog.Failed(); false && err != nil {"
+  },
+  {
+   "name": "X53 пакет версии 1 или 2 сверяется по времени звеньев (Q-76)",
+   "file": "internal/proof/promise.go",
+   "old": "\tcase b.Version < 3:",
+   "new": "\tcase false && b.Version < 3:"
+  },
+  {
+   "name": "X54 предел — срок из обещания, если он короче минуты (Q-77, Q-80: запись v0.2.0, догнанная этим выпуском)",
+   "file": "internal/proof/promise.go",
+   "old": "\tlimit := p.ReceivedAt + int64(MaxPromiseMMD)\n",
+   "new": "\tlimit := min(p.Deadline, p.ReceivedAt+int64(MaxPromiseMMD))\n"
+  },
+  {
+   "name": "X55 метка при отказе журнала улик идёт к TSA и кладёт звено хвостов (Q-82)",
+   "file": "internal/store/jobs.go",
+   "old": "\t// без запроса к TSA и без звена хвостов.\n\tif err := s.evlog.Failed(); err != nil {",
+   "new": "\t// без запроса к TSA и без звена хвостов.\n\tif err := s.evlog.Failed(); false && err != nil {"
+  },
+  {
+   "name": "X56 подъём кладёт в цепь хвост журнала улик, не переписав его на диск (Q-81)",
+   "file": "internal/store/store.go",
+   "old": "\t\tif err := s.evlog.Resync(tail[0].pos); err != nil {",
+   "new": "\t\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "X57 Resync только синхронизирует, не переписывая байты (Q-81: чистые страницы fsync не пишет)",
+   "file": "internal/evlog/evlog.go",
+   "old": "\tif _, err := l.active.WriteAt(buf, off); err != nil {",
+   "new": "\tif _, err := len(buf), error(nil); err != nil {"
   }
  ],
- "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет."
+ "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются."
 }

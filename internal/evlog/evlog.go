@@ -91,6 +91,9 @@ type Options struct {
 	// позиций и до того, как писатели получат ответ. Сюда движок вешает
 	// листья цепи: порядок листьев совпадает с порядком журнала.
 	OnCommit func(first uint64, records [][]byte)
+	// SyncFile (только тесты) — подмена fsync активного сегмента: отказ
+	// fsync после записи байтов. nil — (*os.File).Sync.
+	SyncFile func(*os.File) error
 	// AllowRelease — журнал может удалять доставленные сегменты (Release) и
 	// начинаться не с 1 (файл floor). Только для буфера сборщика.
 	AllowRelease bool
@@ -185,6 +188,9 @@ func Open(dir string, opt Options, visit func(pos uint64, data []byte) error) (*
 	}
 	if l.segBytes <= 0 {
 		l.segBytes = DefaultSegmentBytes
+	}
+	if opt.SyncFile != nil {
+		l.syncFile = opt.SyncFile
 	}
 	if err := l.recover(visit); err != nil {
 		return nil, err
@@ -417,6 +423,52 @@ func readFrame(r io.Reader) ([]byte, int, error) {
 
 // Recovery — что нашлось при открытии.
 func (l *Log) Recovery() Recovery { return l.recovery }
+
+// Resync переписывает записи с позиции from до конца журнала теми же
+// байтами и делает fsync. После отказа fsync Linux помечает страницы
+// чистыми, не записав их: новый процесс читает пачку из кэша страниц, а
+// следующий fsync её уже не пишет (fsyncgate); после падения процесса между
+// записью и fsync страницы грязные, и до обратной записи их тоже нет на
+// диске. Хранилище зовёт Resync на подъёме, до первого Append, для записей,
+// которых нет в цепи, прежде чем положить их в цепь и выдать на них
+// обещание (Q-81). Только последний сегмент: прежние закрыты после
+// успешного fsync — ротация бывает только между пачками.
+func (l *Log) Resync(from uint64) error {
+	if err := l.Failed(); err != nil {
+		return err
+	}
+	l.mu.RLock()
+	seg := l.segs[len(l.segs)-1]
+	from = max(from, seg.first)
+	end, size, path := seg.end(), seg.size, seg.path
+	var off int64
+	if from < end {
+		off = int64(seg.offsets[from-seg.first])
+	}
+	l.mu.RUnlock()
+	if from >= end {
+		return nil
+	}
+	buf := make([]byte, size-off)
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("evlog: resync: %w", err)
+	}
+	_, err = f.ReadAt(buf, off)
+	f.Close()
+	if err != nil {
+		return fmt.Errorf("evlog: resync: %w", err)
+	}
+	if _, err := l.active.WriteAt(buf, off); err != nil {
+		l.fail(fmt.Errorf("evlog: resync write: %w", err))
+		return l.Failed()
+	}
+	if err := l.syncFile(l.active); err != nil {
+		l.fail(fmt.Errorf("evlog: resync fsync: %w", err))
+		return l.Failed()
+	}
+	return nil
+}
 
 // Append записывает пачку записей и ждёт fsync. Отдаёт позицию первой:
 // записи пачки лежат подряд. Вернулся без ошибки — записи на диске.

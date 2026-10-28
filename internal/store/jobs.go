@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
@@ -97,6 +98,12 @@ func (s *Store) keepAnchor() {
 			return
 		case <-t.C:
 		}
+		s.stampMu.Lock()
+		finished := s.finishReanchor()
+		s.stampMu.Unlock()
+		if finished {
+			fails, skip = 0, 0
+		}
 		if skip > 0 {
 			skip--
 			continue
@@ -111,8 +118,12 @@ func (s *Store) keepAnchor() {
 		ctx, cancel := context.WithTimeout(context.Background(), stampTimeout)
 		if _, err := s.stampNow(ctx); err != nil {
 			s.log.Error("tsa stamp", "err", err)
-			skip = min(1<<min(fails, 4), anchorBackoff) - 1
-			fails++
+			// Отсрочка из-за записей в пути — не отказ TSA: повтор на
+			// следующем шаге, без растущей паузы.
+			if !errors.Is(err, ErrStampDeferred) {
+				skip = min(1<<min(fails, 4), anchorBackoff) - 1
+				fails++
+			}
 		} else {
 			fails = 0
 		}
@@ -266,6 +277,7 @@ func (s *Store) stamp(ctx context.Context, force bool) (_ uint64, gen time.Time,
 	}
 	s.stampMu.Lock()
 	defer s.stampMu.Unlock()
+	s.finishReanchor()
 	head, gen, err := s.stampOnce(ctx, force)
 	if errors.Is(err, errClockLost) {
 		// Якорь уже взят по этой метке (reanchor). Повтор кладёт новые
@@ -299,6 +311,11 @@ var errClockLost = errors.New("store: the TSA time is ahead of the receive-time 
 
 // stampOnce — одна метка под stampMu.
 func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.Time, err error) {
+	// Журнал улик отказал — токен всё равно не ляжет (ниже, после барьера):
+	// без запроса к TSA и без звена хвостов.
+	if err := s.evlog.Failed(); err != nil {
+		return 0, gen, fmt.Errorf("%w: %w", ErrLogFailed, err)
+	}
 	// Пачка журнала гейтвея кладёт в цепь улики и вердикты к ним не разом:
 	// хвосты перед запросом не встают между уликой и её вердиктом — пакет по
 	// источнику берёт вердикт своей записи до края.
@@ -372,8 +389,43 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	_, hi, _ := s.anchorWindowAt(answered)
 	s.mu.Unlock()
 	if hi != 0 && info.GenTime.UnixNano() > hi+int64(clockLost) {
-		s.reanchor(info.GenTime, answered, took)
+		if !s.reanchor(info.GenTime, answered, took) {
+			return 0, gen, errReanchorPending
+		}
 		return 0, gen, fmt.Errorf("%w by %s", errClockLost, time.Duration(info.GenTime.UnixNano()-hi).Round(time.Second))
+	}
+	// Записи, взявшие время приёма по прежнему якорю, ложатся раньше
+	// токена и листьев нового: за ними время приёма записи, чей fsync шёл
+	// дольше ответа, было бы раньше времени метки больше чем на ReceiveSkew
+	// (отставание до ReceiveLag и весь запрос), и её пакет не прошёл бы
+	// (Q-61), а скачок шкалы при смене якоря (до всего ответа TSA) вошёл бы
+	// в сверку её обещания (Q-64). Снимок записей в пути и пауза приёма —
+	// под одним замком: такая запись либо в снимке и ляжет до токена, либо
+	// возьмёт время уже по новому якорю. Пауза — до якоря (defer); приём на
+	// ней ждёт, а не получает отказ.
+	pause := make(chan struct{})
+	s.mu.Lock()
+	s.stampPause = pause
+	wait := s.inFlightLocked()
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.stampPause = nil
+		s.mu.Unlock()
+		close(pause)
+	}()
+	if rest := s.landed(wait); len(rest) > 0 {
+		return 0, gen, fmt.Errorf("%w (%s)", errRecordsInFlight, describeInFlight(rest))
+	}
+	// Журнал улик отказал: запись, которой Append вернул ошибку, снята с
+	// учёта в пути (release), но её байты могли лечь на диск (Write прошёл,
+	// fsync — нет), и после перезапуска она догонится в цепь — после этого
+	// токена, со временем приёма до его ответа: её пакет не пройдёт, а
+	// обещание на повтор будет нарушено при подписи (Q-75). Отказ
+	// защёлкивается в журнале до ответа писателю, так что запись из снимка,
+	// снятая отказом, видна здесь. Токен не ложится до перезапуска.
+	if err := s.evlog.Failed(); err != nil {
+		return 0, gen, fmt.Errorf("%w: %w", ErrLogFailed, err)
 	}
 	// Время листа токена — по окну этой же метки: после старта якоря ещё
 	// нет, и лист получил бы часы хоста как есть. Сам якорь — после того,
@@ -382,6 +434,16 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	lo, hi := anchorWindow(info.GenTime, took, s.mono()-answered)
 	after := clampToWindow(s.nowTime().UnixNano(), lo, hi)
 	s.chainMu.Lock()
+	// Записи, взявшие время приёма по прежнему якорю (и дождавшиеся барьера
+	// выше), — своим звеном до листа токена: время их звена — по прежнему
+	// якорю, как и время их приёма. В звене токена оно стало бы временем
+	// листа токена — по окну этой метки, чей нижний край выше прежнего на
+	// весь ответ TSA, — и срок обещания записи, бывшей в пути весь запрос,
+	// «нарушался» бы (Q-64). Лист токена — всегда один в своём звене.
+	if err := s.flushLocked(); err != nil {
+		s.chainMu.Unlock()
+		return 0, gen, err
+	}
 	num := s.appendLeafLocked(auditchain.Leaf{
 		UnixNano: after,
 		Type:     auditchain.EventTimestamp,
@@ -398,10 +460,18 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	}
 	s.chainMu.Unlock()
 	s.anchorClock(info.GenTime, answered, took)
+	// Отложенная перестановка (reanchor) теперь лишняя: якорь — по этой
+	// метке, свежее. Доведённая по прежнему ответу, она переставила бы якорь
+	// без паузы приёма и барьера (Q-70).
+	s.pending = nil
 	s.mu.Lock()
 	if !first || !s.needAnchor {
 		s.intakeOpen = true
 	}
+	// Пауза перестановки якоря, отложенной из-за записи в пути (reanchor),
+	// кончается и тогда, когда повтор уже не видит потери хода часов: якорь
+	// свежий, время приёма снова по нему.
+	s.reanchoring = false
 	s.mu.Unlock()
 	s.log.Info("tsa stamp", "head", head.Seq, "gen_time", info.GenTime)
 	return head.Seq, info.GenTime, err
@@ -416,29 +486,26 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 // раньше неё (Q-49). Поэтому приём на это время на паузе (новая запись
 // получает 503, сборщик повторит), записи в пути дожидаются, их листья
 // сворачиваются в звено, и только потом — якорь.
-func (s *Store) reanchor(gen time.Time, answered, took time.Duration) {
-	type inflight struct {
-		st  *sourceState
-		seq uint64
-	}
-	var wait []inflight
+//
+// Записи в пути, не легшие за reanchorWait (медленный диск после паузы ВМ,
+// копия ключа месяца), якорь не двигают: приём остаётся на паузе, якорь —
+// прежним, и keepAnchor повторяет метку (anchorStale), пока они не лягут.
+// Иначе такая запись легла бы после листьев нового якоря, и её пакет и
+// обещание не сошлись бы (Q-59). false — якорь не переставлен.
+func (s *Store) reanchor(gen time.Time, answered, took time.Duration) bool {
+	// Флаг и снимок — под одним замком: запись, взявшая время по прежнему
+	// якорю, либо в снимке, либо уже получила отказ.
 	s.mu.Lock()
 	s.reanchoring = true
-	for _, st := range s.sources {
-		for q := range st.inflight {
-			wait = append(wait, inflight{st, q})
-		}
-	}
+	wait := s.inFlightLocked()
 	s.mu.Unlock()
-	for deadline := time.Now().Add(reanchorWait); len(wait) > 0; {
-		if time.Now().After(deadline) {
-			s.log.Error("records taken in before the monotonic clock was found stopped are still not in the chain; their promise check may fail", "records", len(wait))
-			break
+	if rest := s.landed(wait); len(rest) > 0 {
+		s.log.Error("records taken in before the monotonic clock was found stopped are still not in the chain: the intake stays paused until they are", "records", describeInFlight(rest))
+		if err := s.flush(); err != nil {
+			s.log.Error("chain flush", "err", err)
 		}
-		time.Sleep(time.Millisecond)
-		s.mu.Lock()
-		wait = slices.DeleteFunc(wait, func(r inflight) bool { return !r.st.inflight[r.seq] })
-		s.mu.Unlock()
+		s.pending = &pendingAnchor{gen: gen, answered: answered, took: took, wait: rest}
+		return false
 	}
 	if err := s.flush(); err != nil {
 		s.log.Error("chain flush", "err", err)
@@ -447,8 +514,112 @@ func (s *Store) reanchor(gen time.Time, answered, took time.Duration) {
 	s.mu.Lock()
 	s.reanchoring = false
 	s.mu.Unlock()
+	s.pending = nil
+	return true
 }
 
-// reanchorWait — сколько reanchor ждёт записи в пути: fsync журнала улик —
-// миллисекунды, зависший диск ждать незачем.
-const reanchorWait = 5 * time.Second
+// pendingAnchor — ответ TSA, по которому якорь не переставлен, пока не легли
+// записи wait, взявшие время приёма по прежнему якорю (reanchor).
+type pendingAnchor struct {
+	gen            time.Time
+	answered, took time.Duration
+	wait           []inFlight
+}
+
+// finishReanchor доводит отложенную перестановку якоря, когда записи, которых
+// она ждала, легли в цепь: якорь — по тому же ответу TSA, без нового запроса,
+// и приём открывается, даже если TSA тем временем пропала (Q-67). Зовётся
+// под stampMu: в начале каждой метки и на каждом шаге keepAnchor.
+func (s *Store) finishReanchor() bool {
+	p := s.pending
+	if p == nil {
+		return false
+	}
+	s.mu.Lock()
+	p.wait = slices.DeleteFunc(p.wait, func(r inFlight) bool { return !r.st.inflight[r.seq] })
+	rest := len(p.wait)
+	s.mu.Unlock()
+	if rest > 0 {
+		return false
+	}
+	if err := s.flush(); err != nil {
+		s.log.Error("chain flush", "err", err)
+		return false
+	}
+	s.anchorClock(p.gen, p.answered, p.took)
+	s.mu.Lock()
+	s.reanchoring = false
+	s.mu.Unlock()
+	s.pending = nil
+	s.log.Info("the records in flight reached the chain: receive times follow the TSA time stamped while they were", "gen_time", p.gen)
+	return true
+}
+
+// ErrStampDeferred — метка не вышла, пока не легли в цепь записи, взявшие
+// время приёма раньше (errRecordsInFlight, errReanchorPending): это не
+// отказ TSA, хранилище повторит метку само.
+var ErrStampDeferred = errors.New("store: time-stamp deferred")
+
+// ErrLogFailed — журнал улик отказал (запись или fsync): метки не ложатся
+// до перезапуска, а перезапуск кладёт в цепь записи хвоста раньше любой
+// новой метки (Q-75).
+var ErrLogFailed = errors.New("store: the evidence log failed, no time-stamp until restart")
+
+// errReanchorPending — время TSA позже окна по якорю, а записи, взявшие
+// время приёма по прежнему якорю, ещё не в цепи: якорь не переставлен,
+// приём на паузе, пока они не лягут (reanchor, finishReanchor).
+var errReanchorPending = fmt.Errorf("%w: the TSA time is ahead of the receive-time window, and records taken in before are not in the chain yet; the intake stays paused until they are, then receive times follow that TSA time", ErrStampDeferred)
+
+// errRecordsInFlight — записи, взявшие время приёма до ответа TSA, ещё не в
+// журнале улик: токен не ложится, следующая метка — по расписанию.
+var errRecordsInFlight = fmt.Errorf("%w: records taken in before the TSA answered are not in the chain yet, so the answer is not used; the next time-stamp is taken on schedule", ErrStampDeferred)
+
+// reanchorWait — сколько метка ждёт записи в пути (stampOnce, reanchor):
+// fsync журнала улик — миллисекунды; не легли — метка повторится. Переменная
+// — чтобы тесты не ждали.
+var reanchorWait = 5 * time.Second
+
+// inFlight — запись, взявшая время приёма, но ещё не легшая в журнал улик.
+type inFlight struct {
+	st  *sourceState
+	seq uint64
+}
+
+// inFlightLocked — записи в пути сейчас (под s.mu).
+func (s *Store) inFlightLocked() []inFlight {
+	var wait []inFlight
+	for _, st := range s.sources {
+		for q := range st.inflight {
+			wait = append(wait, inFlight{st, q})
+		}
+	}
+	return wait
+}
+
+// landed ждёт, пока записи wait лягут в журнал улик (их листья — уже в
+// цепи), не дольше reanchorWait; возвращает те, что не легли.
+func (s *Store) landed(wait []inFlight) []inFlight {
+	for deadline := time.Now().Add(reanchorWait); len(wait) > 0; {
+		if time.Now().After(deadline) {
+			return wait
+		}
+		time.Sleep(time.Millisecond)
+		s.mu.Lock()
+		wait = slices.DeleteFunc(wait, func(r inFlight) bool { return !r.st.inflight[r.seq] })
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+// describeInFlight — записи в пути для журнала и ответа оператору: что
+// именно не легло (зависший keys.backup_dir держит запись нового месяца).
+func describeInFlight(wait []inFlight) string {
+	var names []string
+	for _, r := range wait[:min(len(wait), 3)] {
+		names = append(names, r.st.cfg.Name+"/"+strconv.FormatUint(r.seq, 10))
+	}
+	if len(wait) > 3 {
+		names = append(names, fmt.Sprintf("%d more", len(wait)-3))
+	}
+	return "in flight: " + strings.Join(names, ", ")
+}

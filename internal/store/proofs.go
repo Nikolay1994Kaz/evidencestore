@@ -86,6 +86,11 @@ func (s *Store) ProofTo(source string, seq uint64, withDEK bool, toHead uint64) 
 		}
 		b.Lower = &proof.Lower{Inclusion: inc}
 		from = min(from, t.head) // звено, которое заверяет T1, тоже нужно проверяющему
+		// Листья звеньев от головы под T1 до звена улики: по ним проверяющий
+		// находит каждую метку перед уликой (сверка обещания по меткам).
+		if b.Stretch, err = s.stretchLocked(t.head, n); err != nil {
+			return proof.Bundle{}, err
+		}
 		break
 	}
 
@@ -253,4 +258,29 @@ func (s *Store) Status() Status {
 		out.OrphanRoots = orphans
 	}
 	return out
+}
+
+// stretchLocked — листья звеньев после head до звена end включительно.
+func (s *Store) stretchLocked(head, end uint64) ([]proof.Leaf, error) {
+	find := func(seq uint64) (linkRef, bool) {
+		i := sort.Search(len(s.links), func(i int) bool { return s.links[i].seq >= seq })
+		if i == len(s.links) || s.links[i].seq != seq {
+			return linkRef{}, false
+		}
+		return s.links[i], true
+	}
+	h, ok1 := find(head)
+	e, ok2 := find(end)
+	if !ok1 || !ok2 {
+		return nil, fmt.Errorf("store: links %d and %d are not both in the chain", head, end)
+	}
+	leaves, err := auditchain.ReadLeafRange(s.chainDir, h.first+h.count, e.first+e.count)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]proof.Leaf, len(leaves))
+	for i, l := range leaves {
+		out[i] = proof.FromLeaf(l)
+	}
+	return out, nil
 }

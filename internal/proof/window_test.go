@@ -398,7 +398,7 @@ func TestWindowKindAndVersion(t *testing.T) {
 		t.Fatalf("разбор пакета одной улики принял окно: %v", err)
 	}
 	// Пакет одной улики: версии 1 (хранилище v0.2.0) и 2 — да, другие — нет.
-	for v, ok := range map[int]bool{1: true, Version: true, 3: false, 0: false} {
+	for v, ok := range map[int]bool{1: true, 2: true, Version: true, Version + 1: false, 0: false} {
 		data, _ := json.Marshal(Bundle{Version: v})
 		if _, err := Parse(data); (err == nil) != ok {
 			t.Fatalf("пакет одной улики версии %d: %v", v, err)

@@ -125,6 +125,14 @@ func (w *world) bundle(evidenceBytes []byte, evLink uint64, evIdx int, upperHead
 	}
 	if lowerLink != 0 {
 		b.Lower = &Lower{Inclusion: w.inclusion(lowerLink, 0)}
+		// Версия 3: листья звеньев от головы под T1 до звена улики.
+		if head, err := strconv.ParseUint(b.Lower.Inclusion.Leaf.Subject, 10, 64); err == nil && head < evLink {
+			for _, ls := range w.leaves[head:evLink] {
+				for _, l := range ls {
+					b.Stretch = append(b.Stretch, FromLeaf(l))
+				}
+			}
+		}
 	}
 	for _, l := range w.links {
 		b.Links = append(b.Links, FromLink(l))
@@ -140,20 +148,20 @@ func (w *world) trust() Trust {
 // standard строит мир по схеме в шапке; улика — вторая в звене 3.
 func standard(t *testing.T, e2 []byte) (*world, Bundle) {
 	w := newWorld(t)
-	w.link(auditchain.Leaf{Type: auditchain.EventStart})
+	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
 	h1, t1 := w.stamp()
 	w.now = w.now.Add(time.Second)
-	w.link(tokenLeaf(h1, t1))
+	w.wlink(tokenLeaf(h1, t1))
 	e1 := sealedBytes(t, 1, w.now.Add(time.Second), "first")
 	if e2 == nil {
 		e2 = sealedBytes(t, 2, w.now.Add(2*time.Second), "second")
 	}
 	w.now = w.now.Add(3 * time.Second)
-	w.link(evLeaf(t, e1, 1), evLeaf(t, e2, 2))
-	w.link(auditchain.Leaf{Type: auditchain.EventGap, Scope: "abs-core"})
+	w.wlink(evLeaf(t, e1, 1), evLeaf(t, e2, 2))
+	w.wlink(auditchain.Leaf{Type: auditchain.EventGap, Scope: "abs-core"})
 	w.now = w.now.Add(time.Second)
 	h4, t2 := w.stamp()
-	w.link(tokenLeaf(h4, t2))
+	w.wlink(tokenLeaf(h4, t2))
 	return w, w.bundle(e2, 3, 1, h4, t2, 2)
 }
 
@@ -296,20 +304,8 @@ func TestPromise(t *testing.T) {
 	if VerifyPromise(bad, w.signer.PublicKey()) == nil {
 		t.Fatal("изменённое обещание прошло")
 	}
-	// Время звеньев: звено улики (3) или звено токена T1 (2) позже срока —
-	// улика вошла в цепь после срока; звено до токена T1 (1) и после улики
-	// (4) не в счёт.
-	for _, c := range []struct {
-		link int
-		late bool
-	}{{3, true}, {2, true}, {1, false}, {4, false}} {
-		lb := b
-		lb.Links = slices.Clone(b.Links)
-		lb.Links[c.link-1].UnixNano = p.Deadline + 1
-		if err := CheckPromise(p, r, lb, false); (err != nil) != c.late {
-			t.Fatalf("звено %d позже срока: %v", c.link, err)
-		}
-	}
+	// Время звеньев в сверку обещания не входит (пакет версии 3 сверяется по
+	// меткам — TestPromiseStamps).
 	// Без T1 время звена — только слово хранилища.
 	nr := r
 	nr.Lower = time.Time{}
@@ -381,22 +377,140 @@ func TestPromiseHeldBackRecord(t *testing.T) {
 			Deadline: at(10, 6, 0).UnixNano(), PublicKey: base64.RawStdEncoding.EncodeToString(w.signer.PublicKey())}
 		perr := CheckPromise(p, r, b, false)
 		honest := Verify(w.bundle(held, 5, 0, hC, tC, 4), w.trust())
+		// Сверка по меткам: токен B лежит перед записью, время его метки
+		// позже срока — опоздание видно, задним числом звенья или нет.
+		if perr == nil || !strings.Contains(perr.Error(), "link 4") {
+			t.Fatalf("задним числом %v: обещание: %v", backdateB, perr)
+		}
 		if !backdateB {
-			if !wr.Valid() || perr == nil || !strings.Contains(perr.Error(), "link 4") {
-				t.Fatalf("пакет за окно %s, обещание: %v", wr.Verdict(), perr)
+			if !wr.Valid() {
+				t.Fatalf("пакет за окно %s", wr.Verdict())
 			}
 			continue
 		}
-		// Звено токена B задним числом: обещание «выполнено», но токен B
-		// виден в пакете за окно и в пакете записи с T1 = B — оба не проходят.
-		if perr != nil || wr.Valid() || honest.Valid() {
-			t.Fatalf("обещание: %v; пакет за окно %s; пакет записи с T1 = B %s", perr, wr.Verdict(), honest.Verdict())
+		// Звено токена B задним числом выдают и пакет за окно, и пакет записи
+		// с T1 = B.
+		if wr.Valid() || honest.Valid() {
+			t.Fatalf("пакет за окно %s; пакет записи с T1 = B %s", wr.Verdict(), honest.Verdict())
 		}
 		checkFailed(t, wr, "every TSA time-stamp in the stretch verifies")
 		if !strings.Contains(honest.Text(), "backdated the link") {
 			t.Fatalf("пакет записи с T1 = B:\n%s", honest.Text())
 		}
 	}
+}
+
+// Q-57: срок в обещании пишет само хранилище. Владелец, поменявший код,
+// подписывает срок в час и придерживает запись за метку, что закрывает окно,
+// — в цепь она ложится честно, без звеньев задним числом. Пакет за окно и
+// пакет по источнику проходят без неё, пакет записи — тоже; обещание её
+// выдаёт: время звена сверяется с ReceivedAt + MaxPromiseMMD, что бы ни
+// стояло в сроке.
+//
+// Пакет за окно — цепь честная:
+//
+//	звено 1: [запуск]                         10:00, метка A над головой 1
+//	звено 2: [токен A, abs-core 1 (10:02)]    10:02
+//	звено 3: [молчит: other]                  10:07
+//	                                          10:09, метка B над головой 3
+//	звено 4: [токен B]                        10:09 — закрывает окно 10:01–10:06
+//	звено 5: [abs-core 2 (принята 10:05)]     10:20 — придержана за B
+//	                                          10:21, метка C над головой 5
+//	звено 6: [токен C]                        10:21
+//
+// Пакет по источнику — мир srcWorld (окно 10:04–10:06), запись abs-core 6
+// принята в 10:05:45 и легла в 10:13, после верхнего края.
+func TestPromiseDeadlineCapped(t *testing.T) {
+	promise := func(w *world, data []byte, seq uint64, recv time.Time, mmd time.Duration) Promise {
+		digest := evidence.Digest(data)
+		p := Promise{Source: "abs-core", Seq: seq, Position: seq, Digest: digest[:], ReceivedAt: recv.UnixNano(),
+			Deadline: recv.Add(mmd).UnixNano(), PublicKey: base64.RawStdEncoding.EncodeToString(w.signer.PublicKey())}
+		p.Signature = w.signer.SignMessage(PromiseBytes(p))
+		return p
+	}
+	t.Run("window", func(t *testing.T) {
+		w := newWorld(t)
+		w.now = at(10, 0, 0)
+		w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+		hA, tA := w.stamp()
+		w.now = at(10, 2, 0)
+		w.wlink(tokenLeaf(hA, tA), rec(t, 1, at(10, 2, 0)))
+		w.now = at(10, 7, 0)
+		w.wlink(auditchain.Leaf{UnixNano: w.now.UnixNano(), Type: auditchain.EventSilence, Scope: "other"})
+		w.now = at(10, 9, 0)
+		hB, tB := w.stamp()
+		w.wlink(tokenLeaf(hB, tB))
+		held := sealedBytes(t, 2, at(10, 5, 0), "held back")
+		w.now = at(10, 20, 0)
+		w.wlink(evLeaf(t, held, 2))
+		w.now = at(10, 21, 0)
+		hC, tC := w.stamp()
+		w.wlink(tokenLeaf(hC, tC))
+
+		from, to := at(10, 1, 0), at(10, 6, 0)
+		wr := VerifyWindow(w.window(1, 4, from, to), w.trust(), from, to)
+		if !wr.Valid() {
+			t.Fatalf("пакет за окно:\n%s", wr.Text())
+		}
+		for _, s := range wr.Sources {
+			if s.Name == "abs-core" && s.LastSeq >= 2 {
+				t.Fatalf("пакет за окно показал придержанную запись: %+v", s)
+			}
+		}
+		b := w.bundle(held, 5, 0, hC, tC, 2)
+		r := Verify(b, w.trust())
+		if !r.Valid() {
+			t.Fatalf("пакет записи:\n%s", r.Text())
+		}
+		for _, mmd := range []time.Duration{MaxPromiseMMD, 20 * time.Minute, time.Hour} {
+			if err := CheckPromise(promise(w, held, 2, at(10, 5, 0), mmd), r, b, false); err == nil || !strings.Contains(err.Error(), "lies before the record") {
+				t.Errorf("срок %s: запись легла через 15 минут, обещание: %v", mmd, err)
+			}
+		}
+	})
+	t.Run("source", func(t *testing.T) {
+		w := newSrcWorld(t, srcOpts{})
+		recv := at(10, 5, 45)
+		data := sealedBytes(t, 6, recv, "held back")
+		sx, _ := evidence.Unmarshal(data)
+		w.now = at(10, 13, 0)
+		w.wlink(EvidenceLeafLinked(sx.Header, 6, evidence.Digest(data), auditchain.LeafHash(w.recs[5]))) // звено 10
+		hD, tD := w.stamp()
+		w.wlink(tokenLeaf(hD, tD)) // звено 11
+
+		from, to := at(10, 4, 0), at(10, 6, 0)
+		sr := VerifySource(w.bundle(from, to), w.trust(), from, to)
+		if !sr.Valid() || sr.LastSeq >= 6 {
+			t.Fatalf("пакет по источнику (записи %d–%d):\n%s", sr.FirstSeq, sr.LastSeq, sr.Text())
+		}
+		b := w.world.bundle(data, 10, 0, hD, tD, 3) // T1 — метка A
+		r := Verify(b, w.trust())
+		if !r.Valid() {
+			t.Fatalf("пакет записи:\n%s", r.Text())
+		}
+		if err := CheckPromise(promise(w.world, data, 6, recv, time.Hour), r, b, false); err == nil || !strings.Contains(err.Error(), "lies before the record") {
+			t.Fatalf("срок в час: запись легла через 7 минут, обещание: %v", err)
+		}
+	})
+	// Обещание хранилища v0.2.0 с promise_mmd в 5 минут: запись, легшая за
+	// минуту, проходит; легшая через две минуты — нет, хотя свой срок
+	// хранилище выдержало.
+	// Обещание хранилища v0.2.0 с promise_mmd в 5 минут: честная запись
+	// проходит (перед ней лишь метка T1); срок раньше времени приёма — отказ.
+	t.Run("long promise_mmd", func(t *testing.T) {
+		w, b := standard(t, nil)
+		r := Verify(b, w.trust())
+		recv := time.Unix(0, r.Header.ReceivedAt)
+		p := promise(w, b.Evidence, 2, recv, 5*time.Minute)
+		if err := CheckPromise(p, r, b, false); !r.Valid() || err != nil {
+			t.Fatalf("срок 5 минут: пакет %s; обещание: %v", r.Verdict(), err)
+		}
+		back := p
+		back.Deadline = p.ReceivedAt - 1
+		if err := CheckPromise(back, r, b, false); err == nil || !strings.Contains(err.Error(), "earlier than the receive time") {
+			t.Fatalf("срок раньше времени приёма: %v", err)
+		}
+	})
 }
 
 // Почему тело закрыто, отчёт называет верно. Ключ не выдан — одна причина
@@ -461,5 +575,108 @@ func TestReportTextEscapesControls(t *testing.T) {
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if lines[len(lines)-1] != "NOT VERIFIED" {
 		t.Fatalf("последняя строка: %q", lines[len(lines)-1])
+	}
+}
+
+// Сверка обещания по меткам (пакет версии 3): перед записью в цепи нет
+// метки со временем TSA позже min(срок, время приёма + MaxPromiseMMD). Время
+// звеньев не участвует — придержанную запись выдаёт токен закрывающей метки,
+// какое бы время ни стояло у звеньев.
+//
+//	звено 1: [запуск]                         10:00, метка A над головой 1
+//	звено 2: [токен A, abs-core 1 (10:02)]    10:02
+//	звено 3: [молчит: other]                  10:07 (у придержанной — 10:05:30)
+//	                                          10:09, метка B над головой 3
+//	звено 4: [токен B]                        задним числом — 10:05:30
+//	звено 5: [abs-core 2 (принята 10:05)]     задним числом — 10:05:30
+//	                                          10:21, метка C над головой 5
+//	звено 6: [токен C]
+func TestPromiseStamps(t *testing.T) {
+	stretch := func(w *world, head, link uint64) []Leaf {
+		var out []Leaf
+		for _, ls := range w.leaves[head:link] {
+			for _, l := range ls {
+				out = append(out, FromLeaf(l))
+			}
+		}
+		return out
+	}
+	promise := func(w *world, data []byte, recv time.Time) Promise {
+		digest := evidence.Digest(data)
+		return Promise{Source: "abs-core", Seq: 2, Position: 2, Digest: digest[:], ReceivedAt: recv.UnixNano(),
+			Deadline: recv.Add(MaxPromiseMMD).UnixNano(), PublicKey: base64.RawStdEncoding.EncodeToString(w.signer.PublicKey())}
+	}
+	build := func(held bool) (*world, []byte, uint64, []byte) {
+		w := newWorld(t)
+		w.now = at(10, 0, 0)
+		w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+		hA, tA := w.stamp()
+		w.now = at(10, 2, 0)
+		w.wlink(tokenLeaf(hA, tA), rec(t, 1, at(10, 2, 0)))
+		data := sealedBytes(t, 2, at(10, 5, 0), "line 2")
+		if !held {
+			w.now = at(10, 5, 1)
+			w.wlink(evLeaf(t, data, 2)) // звено 3: запись вовремя
+		}
+		w.now = at(10, 7, 0)
+		if held {
+			w.now = at(10, 5, 30) // владелец датирует задним числом все звенья
+		}
+		w.wlink(auditchain.Leaf{UnixNano: w.now.UnixNano(), Type: auditchain.EventSilence, Scope: "other"})
+		w.now = at(10, 9, 0)
+		hB, tB := w.stamp()
+		w.now = at(10, 5, 30) // задним числом — время звеньев сверке не мешает
+		w.wlink(tokenLeaf(hB, tB))
+		if held {
+			w.wlink(evLeaf(t, data, 2)) // звено 5: придержана за B
+		}
+		w.now = at(10, 21, 0)
+		hC, tC := w.stamp()
+		w.wlink(tokenLeaf(hC, tC))
+		return w, data, hC, tC
+	}
+
+	// Честно: запись в звене 3, до метки B.
+	w, data, hC, tC := build(false)
+	b := w.bundle(data, 3, 0, hC, tC, 2)
+	b.Version, b.Stretch = Version, stretch(w, 1, 3)
+	r := Verify(b, w.trust())
+	if err := CheckPromise(promise(w, data, at(10, 5, 0)), r, b, false); !r.Valid() || err != nil {
+		t.Fatalf("честная запись: пакет %s; обещание: %v", r.Verdict(), err)
+	}
+
+	// Придержана за метку B, все звенья задним числом: по времени звеньев
+	// (версия 2) — «выполнено», по меткам — нет.
+	w, data, hC, tC = build(true)
+	b = w.bundle(data, 5, 0, hC, tC, 2)
+	p := promise(w, data, at(10, 5, 0))
+	old := b
+	old.Version, old.Stretch = 2, nil
+	if err := CheckPromise(p, Verify(old, w.trust()), old, false); err == nil || !strings.Contains(err.Error(), "ask the store") {
+		t.Fatalf("пакет версии 2 (по времени звеньев придержанная запись не видна) сверен: %v", err)
+	}
+	b.Version, b.Stretch = Version, stretch(w, 1, 5)
+	r = Verify(b, w.trust())
+	if err := CheckPromise(p, r, b, false); !r.Valid() || err == nil || !strings.Contains(err.Error(), "link 4") {
+		t.Fatalf("придержанная запись: пакет %s; обещание: %v", r.Verdict(), err)
+	}
+	// Листья не убрать и не добавить: корни звеньев сверяются.
+	short := b
+	short.Stretch = slices.Clone(b.Stretch)
+	short.Stretch = slices.Delete(short.Stretch, 2, 3) // лист токена B
+	if err := CheckPromise(p, r, short, false); err == nil || !strings.Contains(err.Error(), "Merkle root") {
+		t.Fatalf("убран лист токена: %v", err)
+	}
+	long := b
+	long.Stretch = append(slices.Clone(b.Stretch), FromLeaf(auditchain.Leaf{Type: auditchain.EventStart}))
+	if err := CheckPromise(p, r, long, false); err == nil {
+		t.Fatal("лишний лист прошёл")
+	}
+	// Без T1 — только с -allow-no-tsa.
+	none := b
+	none.Lower, none.Stretch = nil, nil
+	nr := Verify(none, w.trust())
+	if CheckPromise(p, nr, none, false) == nil || CheckPromise(p, nr, none, true) != nil {
+		t.Fatal("пакет без T1")
 	}
 }

@@ -98,6 +98,8 @@ type Options struct {
 	// журнала улик и файлов листьев цепи: симуляция гоняет ротацию под
 	// падениями. 0 — как в проде.
 	evlogSegment, chainSegment int64
+	// evlogSync (только тесты) — подмена fsync журнала улик.
+	evlogSync func(*os.File) error
 	// replicaChunk (только тесты) — предел куска копии наружу.
 	replicaChunk int64
 	// wrapRoots (только тесты) оборачивает хранилище корней: симуляция
@@ -113,10 +115,11 @@ type Store struct {
 	mono   func() time.Duration
 	opened time.Time
 
-	writeHook    func(point string) // Options.writeHook
-	evlogSegment int64              // Options.evlogSegment
-	chainSegment int64              // Options.chainSegment
-	replicaChunk int64              // Options.replicaChunk, без него — replicaChunk
+	writeHook    func(point string)   // Options.writeHook
+	evlogSegment int64                // Options.evlogSegment
+	evlogSync    func(*os.File) error // Options.evlogSync
+	chainSegment int64                // Options.chainSegment
+	replicaChunk int64                // Options.replicaChunk, без него — replicaChunk
 	wrapRoots    func(keyring.RootStore) keyring.RootStore
 
 	keys     *keyring.Keyring
@@ -147,6 +150,13 @@ type Store struct {
 	// reanchoring — якорь переставляется после потери хода монотонных часов
 	// (reanchor): приём на паузе.
 	reanchoring bool
+	// stampPause — метка от снимка записей в пути (барьер stampOnce) до нового
+	// якоря: время приёма по прежнему якорю не берётся, Ingest ждёт закрытия
+	// канала (Q-64). nil — паузы нет.
+	stampPause chan struct{}
+	// pending — ответ TSA, по которому якорь не переставлен, пока не легли
+	// записи в пути (reanchor, finishReanchor); под stampMu.
+	pending *pendingAnchor
 	// intakeOpen — легла в цепь метка, чьи хвосты легли уже при якоре этого
 	// процесса (вторая после старта): до неё приём закрыт и при свежем
 	// якоре. Пока шёл запрос первой метки, якоря не было, и события в цепи
@@ -162,6 +172,11 @@ type Store struct {
 	mu       sync.Mutex
 	sources  map[string]*sourceState
 	lastRecv int64
+	// scaleAt, scaleMono — последнее время шкалы (приёма или листа события)
+	// и монотонные часы в тот момент (scaleLocked); scaleSet — оно есть.
+	scaleAt   int64
+	scaleMono time.Duration
+	scaleSet  bool
 
 	// scopeMu — известные скоупы ключей и последние записанные в цепь
 	// состояния. Порядок захвата: scopeMu раньше chainMu.
@@ -488,6 +503,7 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 		writeHook: opt.writeHook,
 
 		evlogSegment: opt.evlogSegment,
+		evlogSync:    opt.evlogSync,
 		chainSegment: opt.chainSegment,
 		replicaChunk: cmp.Or(opt.replicaChunk, replicaChunk),
 		wrapRoots:    opt.wrapRoots,
@@ -629,7 +645,7 @@ func (s *Store) open() error {
 		}
 		return nil
 	}
-	if s.evlog, err = evlog.Open(evDir, evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment}, visit); err != nil {
+	if s.evlog, err = evlog.Open(evDir, evlog.Options{OnCommit: s.onCommit, SegmentBytes: s.evlogSegment, SyncFile: s.evlogSync}, visit); err != nil {
 		return fmt.Errorf("evidence log: %w", err)
 	}
 	if r := s.evlog.Recovery(); r.TornTailBytes > 0 {
@@ -637,6 +653,16 @@ func (s *Store) open() error {
 	}
 	if maxChained >= s.evlog.Next() {
 		return fmt.Errorf("%w: chain covers position %d, log ends at %d", ErrEvidenceLost, maxChained, s.evlog.Next()-1)
+	}
+	if len(tail) > 0 {
+		// Записи, которых нет в цепи, могли остаться только в кэше страниц:
+		// fsync их пачки отказал (Q-75), и Linux пометил страницы чистыми.
+		// До того как лечь в цепь и получить обещание на повтор, они
+		// переписываются и синхронизируются; не вышло — старт отказывает
+		// (Q-81).
+		if err := s.evlog.Resync(tail[0].pos); err != nil {
+			return fmt.Errorf("evidence log: records not yet in the chain cannot be written to disk again: %w", err)
+		}
 	}
 	if err := s.checkKeyUse(keyUse); err != nil {
 		return err
@@ -657,19 +683,41 @@ func (s *Store) open() error {
 	s.mu.Unlock()
 	if len(tail) > 0 {
 		s.log.Info("chain catch-up", "records", len(tail))
-		s.chainMu.Lock()
-		for _, p := range tail {
-			s.appendEvidenceLocked(p.header, p.pos, p.digest)
-		}
-		// Звено догона — сразу, до событий подъёма (пропуски, вердикты,
-		// запуск): их время — часы хоста без якоря, и в одном звене с ними
-		// время звена догнанных записей стало бы часами хоста; сверка
-		// обещания обвинила бы запись, которую подъём догнал быстро (Q-53).
-		err := s.flushLocked()
-		s.chainMu.Unlock()
+	}
+	s.chainMu.Lock()
+	// Всё, что осталось от прошлого процесса, — листья, поднятые с диска без
+	// звена (падение между fsync листьев и звена), и догон журнала улик —
+	// ложится своими звеньями сразу, до событий подъёма (пропуски, вердикты,
+	// запуск): их время — часы хоста без якоря, и в одном звене с ними
+	// время звена записей стало бы часами хоста при подъёме; сверка
+	// обещания обвинила бы честное хранилище, поднятое позже срока (Q-53,
+	// Q-58). Догон — звеньями не длиннее тика по времени приёма, как их
+	// сворачивал прежний процесс: время звена — время его последней записи,
+	// и одно звено на догон длиннее promise_mmd (подъём из копии, чей проход
+	// довёз журнал улик без цепи и головы) «нарушало» обещание ранних (Q-65).
+	err = s.flushLocked()
+	var linkFrom int64
+	for i, p := range tail {
 		if err != nil {
-			return err
+			break
 		}
+		if i > 0 && p.header.ReceivedAt-linkFrom > int64(s.cfg.Chain.Tick.D()) {
+			err = s.flushLocked()
+			linkFrom = p.header.ReceivedAt
+		}
+		if i == 0 {
+			linkFrom = p.header.ReceivedAt
+		}
+		s.appendEvidenceLocked(p.header, p.pos, p.digest)
+	}
+	if err == nil {
+		err = s.flushLocked()
+	}
+	s.chainMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if len(tail) > 0 {
 		s.announceTailGaps(cs.maxSeq, tailSources)
 	}
 	// «Источник молчит» записан в цепь и с тех пор от него ничего нет: эпизод
@@ -992,14 +1040,16 @@ func clampToWindow(t, lo, hi int64) int64 {
 	return min(max(t, hi-int64(recvWindow)), lo)
 }
 
-// clockLocked — время приёма: часы хоста в окне по якорю и строго больше
-// прошлого. Часы, прыгнувшие назад, не уводят запись в прошлый (возможно,
-// уже стёртый) месяц; прыгнувшие вперёд не делают улики «из будущего».
+// clockLocked — время приёма: часы хоста в окне по якорю, вперёд не быстрее
+// монотонных часов (scaleLocked) и строго больше прошлого. Часы, прыгнувшие
+// назад, не уводят запись в прошлый (возможно, уже стёртый) месяц;
+// прыгнувшие вперёд не делают улики «из будущего».
 // Без якоря (TSA не настроена; в serve с TSA приём до якоря закрыт) —
 // часы хоста как есть.
 func (s *Store) clockLocked() int64 {
 	t := s.nowTime().UnixNano()
-	if lo, hi, _ := s.anchorWindowLocked(); hi != 0 {
+	mono := s.mono()
+	if lo, hi, _ := s.anchorWindowAt(mono); hi != 0 {
 		floor := hi - int64(recvWindow)
 		switch {
 		case t > hi+int64(clockSlack):
@@ -1011,7 +1061,7 @@ func (s *Store) clockLocked() int64 {
 		}
 		// Окно уже recvWindow — floor ≤ lo; шире (только без фоновых
 		// циклов: в serve приём тогда закрыт) — верхняя граница важнее.
-		t = min(max(t, floor), lo)
+		t = s.scaleLocked(min(max(t, floor), lo), floor, mono)
 	}
 	if t <= s.lastRecv {
 		t = s.lastRecv + 1
@@ -1030,11 +1080,34 @@ func (s *Store) leafTime() int64 {
 	t := s.nowTime().UnixNano()
 	mono := s.mono() // вне s.mu: часы теста бывают с крючком
 	s.mu.Lock()
-	lo, hi, _ := s.anchorWindowAt(mono)
-	s.mu.Unlock()
-	if hi != 0 {
-		t = clampToWindow(t, lo, hi)
+	defer s.mu.Unlock()
+	if lo, hi, _ := s.anchorWindowAt(mono); hi != 0 {
+		t = s.scaleLocked(clampToWindow(t, lo, hi), hi-int64(recvWindow), mono)
 	}
+	return t
+}
+
+// scaleLocked — время шкалы хранилища (приёма или листа события) по часам
+// хоста t, уже зажатым в окно по якорю: вперёд прошлого времени шкалы оно
+// уходит не больше, чем прошли монотонные часы (с запасом 1 % на их уход), —
+// кроме подъёма нижним краем окна floor при смене якоря (её закрывают пауза
+// приёма и барьер метки). Шаг часов хоста вперёд внутри окна (NTP) иначе
+// поднимал бы время звеньев после записи, бывшей в пути, и входил бы в
+// сверку её обещания (Q-66); такой шаг шкала догоняет постепенно. Под s.mu.
+func (s *Store) scaleLocked(t, floor int64, mono time.Duration) int64 {
+	if s.scaleSet {
+		step := max(mono-s.scaleMono, 0)
+		if lim := s.scaleAt + int64(step+step/100); t > lim {
+			t = max(lim, floor)
+		}
+	}
+	// Точка отсчёта — последнее выданное время, а не наибольшее: время ниже
+	// прежнего (часы хоста шагнули назад, окно новой метки ниже) — тоже
+	// отсчёт. Иначе запись со временем ниже шкалы ушла бы в путь, а шаг часов
+	// вперёд поднял бы листья сразу до прежней шкалы плюс весь ход от неё
+	// (Q-71). Монотонные часы отсчёта не идут назад: вызов с часами,
+	// снятыми раньше прошлого, не даёт следующему лишнего хода.
+	s.scaleAt, s.scaleMono, s.scaleSet = t, max(mono, s.scaleMono), true
 	return t
 }
 
@@ -1063,8 +1136,9 @@ func (s *Store) anchored() error {
 }
 
 // anchorStale — якорь пора освежить: его нет, приём по нему ещё не открыт
-// (intakeOpen), он старше anchorRefresh, окно по нему разошлось больше чем
-// на половину recvWindow или часы хоста
+// (intakeOpen) или на паузе перестановки (reanchoring: записи в пути не
+// успели в цепь, Q-59), он старше anchorRefresh, окно по нему разошлось
+// больше чем на половину recvWindow или часы хоста
 // ушли вперёд оценки по якорю больше чем на clockSlack сверх того, где были
 // при якоре: монотонные часы стояли (сон хоста, пауза ВМ), и время приёма
 // отстаёт на всю паузу. Часы хоста, просто идущие впереди, метку не зовут:
@@ -1073,7 +1147,7 @@ func (s *Store) anchorStale() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lo, hi, ok := s.anchorWindowLocked()
-	if !ok || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) || s.needAnchor && !s.intakeOpen {
+	if !ok || s.reanchoring || s.mono()-s.anchorMono > anchorRefresh || hi-lo > int64(recvWindow/2) || s.needAnchor && !s.intakeOpen {
 		return true
 	}
 	return time.Duration(s.nowTime().UnixNano()-lo)-s.anchorHost > clockSlack

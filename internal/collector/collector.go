@@ -352,6 +352,10 @@ const rejectedFile = "promises-rejected.jsonl"
 // против хранилища (keepPromise).
 const aheadFile = "promises-ahead.jsonl"
 
+// deadlineFile — обещания со сроком дальше proof.MaxPromiseMMD от времени
+// приёма: улика против хранилища (keepPromise).
+const deadlineFile = "promises-deadline.jsonl"
+
 // receiveAhead — насколько время приёма в обещании может быть позже ответа
 // хранилища по часам сборщика: расхождение часов сборщика и TSA. Честное
 // хранилище берёт время приёма не позже времени TSA (окно по якорю).
@@ -1633,6 +1637,10 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 // уложит (Q-56). Время приёма позже ответа (answered, часы сборщика) больше
 // чем на receiveAhead — ошибка в журнал и обещание в promises-ahead.jsonl;
 // запись доставлена: у хранилища она есть, повтор вернёт то же обещание.
+// Так же и срок: дальше proof.MaxPromiseMMD от времени приёма он пропускает
+// запись, придержанную за метку, что закрывает окно (Q-57), — ошибка в
+// журнал и обещание в promises-deadline.jsonl. esverify -promise такой срок
+// сам сужает до MaxPromiseMMD.
 func (c *Collector) keepPromise(p *proof.Promise, position uint64, r spoolRecord, answered time.Time) error {
 	if p == nil {
 		c.log.Error("store answered without a promise; the record stays in the spool", "seq", r.seq)
@@ -1663,12 +1671,18 @@ func (c *Collector) keepPromise(p *proof.Promise, position uint64, r spoolRecord
 	if _, err := c.promises.Write(line); err != nil {
 		return errors.Join(err, c.promises.Truncate(fi.Size()))
 	}
+	var keep error
 	if recv := time.Unix(0, p.ReceivedAt); recv.After(answered.Add(receiveAhead)) {
 		c.log.Error("the store's promise gives a receive time later than its answer: the store may shift receive times to keep a record out of the window it arrived in; the promise is kept as evidence",
 			"seq", r.seq, "receive_time", recv.UTC(), "answered", answered.UTC(), "file", aheadFile)
-		return appendLine(filepath.Join(c.cfg.SpoolDir, aheadFile), line)
+		keep = appendLine(filepath.Join(c.cfg.SpoolDir, aheadFile), line)
 	}
-	return nil
+	if mmd := time.Duration(p.Deadline - p.ReceivedAt); mmd > proof.MaxPromiseMMD {
+		c.log.Error("the store's promise gives a deadline further from the receive time than allowed: a record held back past the time-stamp that closes its window would still meet it; the promise is kept as evidence",
+			"seq", r.seq, "deadline_after", mmd, "allowed", proof.MaxPromiseMMD, "file", deadlineFile)
+		keep = errors.Join(keep, appendLine(filepath.Join(c.cfg.SpoolDir, deadlineFile), line))
+	}
+	return keep
 }
 
 func appendLine(path string, line []byte) error {

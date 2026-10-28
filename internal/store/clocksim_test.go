@@ -11,14 +11,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // Симуляция часов приёма: истинное время задаёт TSA (метка округлена до
 // секунды), часы хоста смещены, прыгают и уходят, монотонные часы уходят
 // (без NTP — тем же ходом, что часы хоста), ответ TSA идёт до 25 с, TSA
-// пропадает, хранилище простаивает сутками и перезапускается, записи
-// приходят и в окно между ответом TSA и новым якорем. После
+// пропадает, хранилище простаивает сутками и перезапускается, машина
+// засыпает (монотонные часы стоят, часы хоста догоняет NTP или стоят тоже),
+// записи приходят и в окно между ответом TSA и новым якорем, а запись бывает
+// в пути (до журнала улик) всю метку — дольше, чем её ждёт перестановка
+// якоря (Q-59). После
 // последней метки каждая принятая запись должна пройти проверку
 // (время приёма между T1 − 1 мин и T2 + 1 с) и сверку с обещанием, данным
 // при приёме (esverify -promise); приём не закрыт, пока TSA отвечает;
@@ -27,6 +31,9 @@ import (
 // CLOCKSIM_SEEDS — сценариев, CLOCKSIM_SEED — один сценарий.
 
 func TestClockSim(t *testing.T) {
+	saved := reanchorWait
+	reanchorWait = 200 * time.Millisecond // запись в пути ложится за миллисекунды — или держит замок всю метку
+	defer func() { reanchorWait = saved }()
 	seeds := 12 // в гейте; длинный прогон — CLOCKSIM_SEEDS=2000
 	if raceBuild {
 		seeds = 3
@@ -72,17 +79,22 @@ type clockSim struct {
 	tsaDown  bool
 	lag      time.Duration // задержка ответа TSA на следующей метке
 
-	seq      uint64
-	accepted []uint64
-	promises map[uint64]proof.Promise
-	pending  []uint64 // отвергнутые до якоря: сборщик повторит
-	lastOK   time.Time
-	armed    bool // принять запись в окне между ответом TSA и новым якорем
-	signing  bool // идёт метка
-	signed   bool // TSA уже ответила на эту метку
-	trace    []string
-	fails    []string
-	alarms   uint64
+	seq       uint64
+	accepted  []uint64
+	promises  map[uint64]proof.Promise
+	pending   []uint64 // отвергнутые до якоря: сборщик повторит
+	lastOK    time.Time
+	armed     bool      // принять запись в окне между ответом TSA и новым якорем
+	slow      bool      // следующая метка — с записью в пути, пока она идёт
+	onAnswer  func()    // крючок TSA после ответа: отпустить запись в пути
+	paused    bool      // монотонные часы стояли: до метки тревога о часах законна
+	pauseAt   time.Time // приём на паузе перестановки якоря с этого момента
+	signing   bool      // идёт метка
+	signed    bool      // TSA уже ответила на эту метку
+	excursion bool      // часы хоста шагнули назад на секунды: NTP вернёт их, пока запись в пути (Q-71)
+	trace     []string
+	fails     []string
+	alarms    uint64
 }
 
 func (c *clockSim) host() time.Time {
@@ -156,6 +168,33 @@ func runClockSim(t *testing.T, seed uint64) string {
 			c.s = nil
 			c.note("хранилище перезапущено")
 			open()
+		case r < 56:
+			// Сон хоста или пауза ВМ: монотонные часы стоят, истина идёт;
+			// часы хоста догоняет NTP или они стоят тоже. Запись, бывшая в
+			// пути, может застрять до первой метки.
+			d := []time.Duration{10 * time.Second, 9 * time.Minute, 2 * time.Hour}[c.rng.IntN(3)]
+			c.monoBase -= d + time.Duration(float64(d)*c.monoPPM/1e6) // за паузу — ни шага, и назад тоже
+			host := "догнаны"
+			if c.rng.IntN(2) == 0 {
+				c.hostOff -= d
+				host = "стояли"
+			}
+			c.now = c.now.Add(d)
+			c.paused = true
+			c.slow = c.slow || c.rng.IntN(2) == 0
+			c.note("пауза %v, часы хоста %s; запись в пути на метке: %v", d, host, c.slow)
+		case r < 58:
+			c.slow = true
+			c.note("следующая метка — с записью в пути")
+		case r < 60:
+			// Часы хоста шагнули назад на 2 минуты, и сразу — метка с
+			// записью в пути (NTP может шагнуть их обратно, пока она в
+			// пути): синхронизация гипервизора против NTP (Q-71).
+			c.advance(time.Minute) // метка по расписанию — шкала по часам хоста
+			c.hostOff -= 2 * time.Minute
+			c.slow, c.excursion = true, true
+			c.note("часы хоста шагнули назад на 2 мин; следующая метка — с записью в пути")
+			c.advance(time.Second)
 		default:
 			ds := []time.Duration{time.Second, 10 * time.Second, time.Minute, 10 * time.Minute, time.Hour, 6 * time.Hour, 26 * time.Hour, 3 * 24 * time.Hour}
 			w := []int{20, 20, 15, 15, 10, 8, 6, 6}
@@ -199,6 +238,10 @@ func (c *clockSim) tsaHook() time.Time {
 	gen := c.now
 	c.now = c.now.Add(c.lag - before)
 	c.signed = c.signing
+	if f := c.onAnswer; f != nil {
+		c.onAnswer = nil
+		f()
+	}
 	if c.tsaDown {
 		return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
@@ -228,11 +271,19 @@ func (c *clockSim) ingest() {
 		q := c.pending[0]
 		res, err := c.s.Ingest("abs-core", []Incoming{{Seq: q, Body: []byte(fmt.Sprintf("record %d", q))}})
 		if errors.Is(err, ErrNoAnchor) {
-			if !c.lastOK.IsZero() && c.now.Sub(c.lastOK) < time.Hour && !c.tsaDown && !c.restartedSince() {
+			paused := c.reanchoring()
+			if paused && c.pauseAt.IsZero() {
+				c.pauseAt = c.now
+			}
+			switch {
+			case paused && !c.tsaDown && c.now.Sub(c.pauseAt) > 2*time.Minute:
+				c.fail("приём на паузе перестановки якоря %v, TSA отвечает", c.now.Sub(c.pauseAt))
+			case !paused && !c.lastOK.IsZero() && c.now.Sub(c.lastOK) < time.Hour && !c.tsaDown && !c.restartedSince():
 				c.fail("приём закрыт без причины: последняя метка %v назад, TSA отвечает", c.now.Sub(c.lastOK))
 			}
 			return
 		}
+		c.pauseAt = time.Time{}
 		if err != nil {
 			c.fail("приём записи %d: %v", q, err)
 			return
@@ -250,12 +301,112 @@ func (c *clockSim) ingest() {
 			c.fail("сброс цепи: %v", err)
 		}
 	}
+	c.checkAlarms()
+}
+
+// checkAlarms — тревога о часах после приёма: при верных часах хоста и
+// идущих монотонных она ложная.
+func (c *clockSim) checkAlarms() {
 	if n := c.s.clockCapped.Load(); n > c.alarms {
 		c.alarms = n
-		if d := c.host().Sub(c.now); d < 5*time.Second && d > -5*time.Second && c.hostPPM == 0 {
+		if d := c.host().Sub(c.now); d < 5*time.Second && d > -5*time.Second && c.hostPPM == 0 && !c.paused {
 			c.fail("ложная тревога: часы хоста отличаются от истины на %v", d)
 		}
 	}
+}
+
+// reanchoring — приём на паузе перестановки якоря (Q-59): законный отказ.
+func (c *clockSim) reanchoring() bool {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	return c.s.reanchoring
+}
+
+// withSlow — метка (stamp) с записью в пути: запись взяла время приёма, а до
+// журнала улик не дойдёт (scopeMu), пока метка не кончится, — или ляжет в
+// момент ответа TSA, пока метка её ждёт (барьер stampOnce). Пока запись
+// держит замок, часов она не читает; отпускает её горутина, запущенная
+// после того, как метка подвинула часы (tsaHook), а метка видит, что она
+// легла, под s.mu — порядок есть в обе стороны. Пока она в пути, часы хоста,
+// отстающие от истины, могут шагнуть к ней (NTP).
+//
+// С записью между ответом TSA и якорем (armed) — не на одной метке: та идёт
+// из этой же горутины и ждала бы scopeMu, который держит сама симуляция.
+func (c *clockSim) withSlow(stamp func() error) error {
+	if !c.slow || c.armed {
+		return stamp()
+	}
+	c.slow = false
+	c.seq++
+	q := c.seq
+	type result struct {
+		res []Result
+		err error
+	}
+	done := make(chan result, 1)
+	c.s.scopeMu.Lock()
+	go func() {
+		res, err := c.s.Ingest("abs-core", []Incoming{{Seq: q, Body: []byte(fmt.Sprintf("record %d", q))}})
+		done <- result{res, err}
+	}()
+	var r result
+	inFlight := false
+	for !inFlight {
+		c.s.mu.Lock()
+		inFlight = c.s.sources["abs-core"].inflight[q]
+		c.s.mu.Unlock()
+		select {
+		case r = <-done: // приём закрыт: запись не в пути, сборщик повторит
+			c.s.scopeMu.Unlock()
+			c.pending = append(c.pending, q)
+			c.note("запись %d не принята: %v", q, r.err)
+			return stamp()
+		default:
+		}
+		time.Sleep(10 * time.Microsecond)
+	}
+	c.checkAlarms() // время приёма взято: тревога — по часам этого момента
+	early := c.rng.IntN(2) == 0
+	if early {
+		c.onAnswer = func() { go c.s.scopeMu.Unlock() }
+		c.note("запись %d в пути до ответа TSA", q)
+	} else {
+		c.note("запись %d в пути всю метку", q)
+	}
+	excursion := c.excursion
+	c.excursion = false
+	if c.hostOff < -5*time.Second && (excursion || c.rng.IntN(2) == 0) {
+		c.hostOff = 0
+		c.note("NTP шагнул часы хоста к истине, пока запись в пути")
+	}
+	if excursion || c.rng.IntN(2) == 0 {
+		// Пока запись в пути, проходят секунды и в цепь ложится событие
+		// (молчание, связь, ключ): его время — по шкале (Q-71).
+		d := time.Duration(1+c.rng.IntN(12)) * time.Second
+		if excursion {
+			d = time.Duration(7+c.rng.IntN(6)) * time.Second
+		}
+		c.now = c.now.Add(d)
+		c.s.appendJSONEvent(auditchain.EventSilence, "pipelock", "", map[string]any{"since": c.now.UTC(), "expect_every": "10s"})
+		c.note("через %v, пока запись в пути, — событие в цепи", d)
+	}
+	err := stamp()
+	if !early || c.onAnswer != nil {
+		c.onAnswer = nil
+		c.s.scopeMu.Unlock()
+	}
+	r = <-done
+	switch {
+	case r.err != nil:
+		c.fail("приём записи %d, бывшей в пути: %v", q, r.err)
+	default:
+		c.accepted = append(c.accepted, q)
+		c.promises[q] = *r.res[0].Promise
+		if ferr := c.s.flush(); ferr != nil {
+			c.fail("сброс цепи: %v", ferr)
+		}
+	}
+	return err
 }
 
 func (c *clockSim) restartedSince() bool {
@@ -303,15 +454,22 @@ func (c *clockSim) stamp() {
 		}
 		return
 	}
-	c.lag = []time.Duration{0, 200 * time.Millisecond, 2 * time.Second, 12 * time.Second, 25 * time.Second}[c.rng.IntN(5)]
-	c.signing, c.signed = true, false
-	head, err := c.s.Stamp(context.Background())
-	c.signing, c.signed = false, false
+	c.lag = []time.Duration{0, 200 * time.Millisecond, 2 * time.Second, 12 * time.Second, 25 * time.Second, 29 * time.Second}[c.rng.IntN(6)]
+	var head uint64
+	err := c.withSlow(func() error {
+		c.signing, c.signed = true, false
+		var err error
+		head, err = c.s.Stamp(context.Background())
+		c.signing, c.signed = false, false
+		return err
+	})
 	switch {
+	case errors.Is(err, errReanchorPending) || errors.Is(err, errRecordsInFlight):
+		c.note("метка не вышла — запись в пути: %v", err)
 	case err != nil && !c.tsaDown:
 		c.fail("метка при живой TSA: %v", err)
 	case err == nil && head > 0:
-		c.lastOK = c.now
+		c.lastOK, c.paused = c.now, false
 		c.note("метка поставлена (ответ %v)", c.lag)
 	}
 }
@@ -404,13 +562,20 @@ func clockSimBackground(c *clockSim) {
 		return
 	}
 	c.lag = []time.Duration{0, 200 * time.Millisecond, 2 * time.Second}[c.rng.IntN(3)]
-	c.signing, c.signed = true, false
-	_, err := c.s.stampNow(context.Background())
-	c.signing, c.signed = false, false
-	if err != nil {
+	err := c.withSlow(func() error {
+		c.signing, c.signed = true, false
+		_, err := c.s.stampNow(context.Background())
+		c.signing, c.signed = false, false
+		return err
+	})
+	switch {
+	case errors.Is(err, errReanchorPending) || errors.Is(err, errRecordsInFlight):
+		c.note("метка якоря не вышла — запись в пути: %v", err)
+		return
+	case err != nil:
 		c.fail("метка якоря при живой TSA: %v", err)
 		return
 	}
-	c.lastOK = c.now
+	c.lastOK, c.paused = c.now, false
 	c.note("метка якоря (ответ %v)", c.lag)
 }
