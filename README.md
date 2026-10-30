@@ -20,8 +20,6 @@ Every record is accepted over mutual TLS, encrypted with its own key, written to
 
 Retention is enforced by destroying keys (crypto-erasure). Every record of a source for a month is encrypted under that month's key. Destroying the key needs two approvers and a waiting period, and it makes those bodies unreadable in every copy (log segments, backups). The chain and the proofs stay intact: you can still prove that record #42 from `abs-core` existed, was received at a given time and was never altered. You can no longer read it.
 
-How it works and how it was tested, as one long read: [docs/ARTICLE.md](docs/ARTICLE.md) (на русском: [docs/ARTICLE.ru.md](docs/ARTICLE.ru.md)).
-
 ## Try it
 
 The demos run on Linux with bash and python3 (the Pipelock one also needs curl). They build the binaries with Go 1.25.4 or newer; with binaries installed from a release, `ES_BIN=/usr/local/bin` runs the demos on those instead ([Install](#install)); the whole-session step at the end of `demo-intruder.sh` needs binaries newer than v0.2.0.
