@@ -35,8 +35,7 @@ var ErrNotExist = fmt.Errorf("ship: object does not exist")
 //	file:///abs/path            — директория (NFS/rclone-mount/локальные тесты)
 //	s3://bucket/prefix?endpoint=https://minio:9000&region=us-east-1
 //	                            — S3-совместимый бакет; креды из env
-//	                              (KVSTORE_S3_ACCESS_KEY/SECRET_KEY или
-//	                              AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
+//	                              (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
 func OpenRemote(rawURL string) (Remote, error) { return openRemote(rawURL, defaultCreds) }
 
 // OpenRemoteEnv — то же, но ключи S3 берутся только из своих переменных

@@ -101,8 +101,8 @@ func newS3TestRemote(t *testing.T) (*s3Remote, *fakeS3) {
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
 
-	t.Setenv("KVSTORE_S3_ACCESS_KEY", "test-access")
-	t.Setenv("KVSTORE_S3_SECRET_KEY", "test-secret")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test-access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
 
 	u, err := url.Parse(fmt.Sprintf("s3://test-bucket/kv/prod?endpoint=%s&region=us-east-1", srv.URL))
 	if err != nil {
@@ -153,14 +153,16 @@ func TestS3Remote_RoundTrip(t *testing.T) {
 	}
 }
 
+// Ключи копии — только AWS_*: переменные старого проекта KVSTORE_S3_* их не
+// дают (Q-86).
 func TestS3Remote_CredentialsRequired(t *testing.T) {
-	t.Setenv("KVSTORE_S3_ACCESS_KEY", "")
-	t.Setenv("KVSTORE_S3_SECRET_KEY", "")
+	t.Setenv("KVSTORE_S3_ACCESS_KEY", "old-access")
+	t.Setenv("KVSTORE_S3_SECRET_KEY", "old-secret")
 	t.Setenv("AWS_ACCESS_KEY_ID", "")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
 	u, _ := url.Parse("s3://bucket/prefix")
 	if _, err := newS3Remote(u); err == nil {
-		t.Fatal("без кредов newS3Remote должен вернуть ошибку")
+		t.Fatal("без AWS_* newS3Remote должен вернуть ошибку")
 	}
 }
 

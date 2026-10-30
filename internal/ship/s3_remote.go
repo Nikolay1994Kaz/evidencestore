@@ -26,12 +26,11 @@ import (
 // работает с MinIO/Ceph/LocalStack и с региональными endpoint'ами AWS.
 //
 // Креды и настройки:
-//   - access/secret: env KVSTORE_S3_ACCESS_KEY / KVSTORE_S3_SECRET_KEY,
-//     fallback AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN);
-//     env, не флаги — секреты не светятся в ps/proc (та же политика, что
-//     KVSTORE_REQUIREPASS);
+//   - access/secret: env AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+//     (+ AWS_SESSION_TOKEN); env, не флаги — секреты не светятся в ps/proc;
 //   - endpoint/region: query-параметры URL (s3://bucket/prefix?endpoint=...&region=...),
-//     endpoint по умолчанию https://s3.<region>.amazonaws.com, region — us-east-1.
+//     endpoint по умолчанию https://s3.<region>.amazonaws.com; region без
+//     параметра — AWS_REGION, иначе us-east-1.
 type s3Remote struct {
 	client       *http.Client
 	endpoint     string // https://host[:port] — без завершающего /
@@ -45,18 +44,12 @@ type s3Remote struct {
 
 func newS3Remote(u *url.URL) (*s3Remote, error) { return newS3RemoteWith(u, defaultCreds) }
 
-// defaultCreds — ключи копии наружу: KVSTORE_S3_ACCESS_KEY/KVSTORE_S3_SECRET_KEY,
-// иначе AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN).
+// defaultCreds — ключи копии наружу: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+// (+ AWS_SESSION_TOKEN). KVSTORE_S3_* старого проекта не читаются (Q-86).
 func defaultCreds() (access, secret, token string, err error) {
-	access = os.Getenv("KVSTORE_S3_ACCESS_KEY")
-	secret = os.Getenv("KVSTORE_S3_SECRET_KEY")
-	if access == "" {
-		access = os.Getenv("AWS_ACCESS_KEY_ID")
-		secret = os.Getenv("AWS_SECRET_ACCESS_KEY")
-	}
+	access, secret = os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 	if access == "" || secret == "" {
-		return "", "", "", fmt.Errorf("ship: s3 credentials not set " +
-			"(KVSTORE_S3_ACCESS_KEY/KVSTORE_S3_SECRET_KEY or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)")
+		return "", "", "", fmt.Errorf("ship: s3 credentials not set (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)")
 	}
 	return access, secret, os.Getenv("AWS_SESSION_TOKEN"), nil
 }
