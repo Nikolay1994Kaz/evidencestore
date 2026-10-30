@@ -3,6 +3,7 @@
 //	evidencestore init     -config C           завести хранилище (кейринг, ключ подписи)
 //	evidencestore serve    -config C           принимать улики
 //	evidencestore dev-pki  -out DIR -source N…  учебный УЦ и сертификаты для стенда
+//	evidencestore dev-setup -dir DIR [-source N] [-log F] [-port P]  учебная установка в одном каталоге
 //	evidencestore status   -config C           сводка
 //	evidencestore stamp    -config C           заверить голову цепи у TSA сейчас
 //	evidencestore proof    -config C -source S -seq N [-dek] [-to-head H] [-out F]
@@ -58,6 +59,8 @@ func main() {
 		err = cmdServe(args)
 	case "dev-pki":
 		err = cmdDevPKI(args)
+	case "dev-setup":
+		err = cmdDevSetup(args)
 	case "status":
 		err = adminGet(args, "/admin/status", nil)
 	case "statement":
@@ -96,6 +99,9 @@ Server:
   init      -config FILE                       create keyring, signing key (once)
   serve     -config FILE                       accept evidence over mTLS
   dev-pki   -out DIR -source NAME [-source …]  demo CA, server and collector certificates
+  dev-setup -dir DIR [-source NAME] [-log FILE] [-port N]
+                                               a demo store in a new or empty directory: certificates,
+                                               store.json, init, store.pub, collector.json
   version                                      print the version and the commit it was built from
 
 Operator (talks to the running server via its admin socket):

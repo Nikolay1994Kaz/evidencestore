@@ -47,9 +47,18 @@ The demo runs these steps:
 
 ## Run it yourself
 
-The first three steps of the demo, by hand and on a log of your own. Everything runs on one machine. You need the three binaries on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone. Time-stamps come from a demo TSA built into the store (`"url": "local"`), so nothing leaves the machine; a real TSA is set in `tsa` ([Configuration](#configuration)).
+The first three steps of the demo, by hand and on a log of your own. Everything runs on one machine. You need the three binaries on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone. `dev-setup` is in binaries newer than v0.3.0; with v0.3.0, take the steps under "What `dev-setup` does" instead.
 
-Certificates and the store. `dev-pki` writes a demo CA, a server certificate and a client certificate for the source `app` into `pki/` (the store takes the source name from the certificate's CommonName). The last line `init` prints is the store's public key:
+`dev-setup` prepares a directory for a try: a demo CA with certificates for the store and for the source `app`, the store's config, `init`, and the collector's config with the store's public key pinned in it. Time-stamps come from a demo TSA built into the store (`"url": "local"`), so nothing leaves the machine; a real TSA is set in `tsa` ([Configuration](#configuration)). It writes only into a new or empty directory; `-log FILE` points the collector at a log of your own (any file your user can read), and `-port` moves the store off port 8443:
+
+```sh
+evidencestore dev-setup -dir ~/es-try -source app
+```
+
+<details>
+<summary>What <code>dev-setup</code> does</summary>
+
+`dev-pki` writes a demo CA, a server certificate and a client certificate for the source `app` into `pki/` (the store takes the source name from the certificate's CommonName). The last line `init` prints is the store's public key: the collector pins it as `store_key`, and an auditor passes it to `esverify`:
 
 ```sh
 mkdir -p ~/es-try && cd ~/es-try
@@ -66,17 +75,6 @@ cat > store.json <<'EOF'
 EOF
 evidencestore init -config store.json | tee init.txt
 tail -1 init.txt > store.pub
-```
-
-Start the store in a second terminal and leave it running. It warns that `keys.backup_dir` is not set, and two minutes after the collector's last contact it warns that the collector of `app` is lost: a collector run with `-once` sends no heartbeat. Both are fine for a try:
-
-```sh
-cd ~/es-try && evidencestore serve -config store.json
-```
-
-The collector pins the store's public key and reads `app.log`; `file` can name any log your user can read. With `-once` it sends what the file holds and exits; a collector running as a service leaves `-once` out and follows the file:
-
-```sh
 cat > collector.json <<EOF
 {
   "server": "https://127.0.0.1:8443",
@@ -86,6 +84,20 @@ cat > collector.json <<EOF
   "file": "app.log", "from_start": true
 }
 EOF
+```
+
+</details>
+
+Start the store in a second terminal and leave it running. It warns that `keys.backup_dir` is not set, and two minutes after the collector's last contact it warns that the collector of `app` is lost: a collector run with `-once` sends no heartbeat. Both are fine for a try:
+
+```sh
+cd ~/es-try && evidencestore serve -config store.json
+```
+
+Back in the first terminal, a line goes into `app.log` and the collector sends it; with `-log`, skip the `echo`: record 1 is the first line of your log. With `-once` the collector sends what the file holds and exits; a collector running as a service leaves `-once` out and follows the file:
+
+```sh
+cd ~/es-try
 echo "$(date -Is) user=alice action=login" >> app.log
 escollect -config collector.json -once
 ```
@@ -105,7 +117,7 @@ esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt
 
 | Binary | Role |
 |---|---|
-| `evidencestore` | the store: `init`, `serve`, `restore`, `dev-pki` (demo certificates), plus operator commands over a local admin socket (`status`, `statement`, `stamp`, `proof`, `tsa-root`, `keys …`, `sources bind`) |
+| `evidencestore` | the store: `init`, `serve`, `restore`, `dev-pki` (demo certificates), `dev-setup` (a demo store in one directory: certificates, both configs, `init`), plus operator commands over a local admin socket (`status`, `statement`, `stamp`, `proof`, `tsa-root`, `keys …`, `sources bind`) |
 | `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
 | `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; `-body FILE` writes the record body to a file byte for byte, only once the bundle verifies; a bundle over a window of time (`evidencestore proof -source S -from -to`, or `-window` for every source) is checked for completeness, and `-bodies DIR` writes out the bodies it carries; exit code 0 — verified, 1 — not verified (including an unparsable bundle or a broken promise), 2 — bad usage (including a flag meant for the other kind of bundle, or a bad `-from` or `-to`), an unreadable bundle, key, certificate or promise file or heads directory, `-body` for a bundle without the record key, or `-bodies` for a window without bodies |
 
