@@ -13,7 +13,7 @@ import (
 )
 
 // cmdDevSetup готовит учебную установку в одном каталоге — то, что README
-// («Run it yourself», шаги под «What dev-setup does») делает руками:
+// («Run it yourself», шаги под «Step by step by hand») делает руками:
 // учебный УЦ и сертификаты (dev-pki), store.json со встроенной демо-TSA,
 // init, store.pub и collector.json с закреплённым ключом хранилища.
 // Хранилище не запускает: serve, escollect, stamp, proof и esverify

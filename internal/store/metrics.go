@@ -9,7 +9,7 @@ import (
 
 // Metrics — показатели для /metrics. Счётчики — с запуска процесса
 // (Prometheus переживает их сброс), остальное читается из состояния в
-// момент запроса. На что ставить тревоги — README, раздел Monitoring.
+// момент запроса. На что ставить тревоги — docs/monitoring.md.
 func (s *Store) Metrics(now time.Time) []metrics.Family {
 	st := s.Status()
 	ev := s.evlog.Stats()

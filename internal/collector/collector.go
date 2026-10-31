@@ -318,7 +318,7 @@ func New(cfg *Config, log *slog.Logger) (_ *Collector, err error) {
 		Timeout: 2 * time.Minute,
 		Transport: &http.Transport{
 			// Прокси из окружения (HTTPS_PROXY) не берётся намеренно: улики
-			// идут прямо в хранилище (docs/DECISIONS.md).
+			// идут прямо в хранилище (docs/dev/DECISIONS.md).
 			DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 			TLSHandshakeTimeout: 10 * time.Second,
 			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, Certificates: []tls.Certificate{cert}},
