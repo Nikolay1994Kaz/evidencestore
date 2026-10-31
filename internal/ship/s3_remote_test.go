@@ -153,8 +153,7 @@ func TestS3Remote_RoundTrip(t *testing.T) {
 	}
 }
 
-// Ключи копии — только AWS_*: переменные старого проекта KVSTORE_S3_* их не
-// дают (Q-86).
+// Ключи копии — только AWS_*: прежние имена KVSTORE_S3_* их не дают (Q-86).
 func TestS3Remote_CredentialsRequired(t *testing.T) {
 	t.Setenv("KVSTORE_S3_ACCESS_KEY", "old-access")
 	t.Setenv("KVSTORE_S3_SECRET_KEY", "old-secret")

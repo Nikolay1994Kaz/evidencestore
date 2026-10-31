@@ -45,7 +45,7 @@ type s3Remote struct {
 func newS3Remote(u *url.URL) (*s3Remote, error) { return newS3RemoteWith(u, defaultCreds) }
 
 // defaultCreds — ключи копии наружу: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
-// (+ AWS_SESSION_TOKEN). KVSTORE_S3_* старого проекта не читаются (Q-86).
+// (+ AWS_SESSION_TOKEN). Прежние имена KVSTORE_S3_* не читаются (Q-86).
 func defaultCreds() (access, secret, token string, err error) {
 	access, secret = os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 	if access == "" || secret == "" {
