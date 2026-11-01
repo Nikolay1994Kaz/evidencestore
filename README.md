@@ -188,7 +188,7 @@ Root on the store host can delete or rewrite the store's files, and whoever hold
 
 ## How it was tested
 
-The test gate with the race detector runs on every push. 578 bugs were injected one at a time, and every one of them makes a test fail. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each; on the code of v0.3.0 none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on S3 with Object Lock. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
+The test gate with the race detector runs on every push. 578 bugs were injected one at a time, and every one of them makes a test fail. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each; on the code of v0.3.0 none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on MinIO with Object Lock, not yet on AWS. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
 
 ## Known limitations
 
