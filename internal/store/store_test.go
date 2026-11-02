@@ -247,9 +247,9 @@ func TestProofEndsAtUpperStamp(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, last := b.Links[0].Seq, b.Links[len(b.Links)-1].Seq
-	if first != stamped || last != b.Upper.HeadSeq || b.Statement.HeadSeq != last {
-		t.Fatalf("звенья %d…%d, T1 заверяет голову %d, T2 — %d, заявление о голове %d",
-			first, last, stamped, b.Upper.HeadSeq, b.Statement.HeadSeq)
+	if first != stamped || last != b.Upper.HeadSeq || b.Checkpoint.Size != last {
+		t.Fatalf("звенья %d…%d, T1 заверяет голову %d, T2 — %d, подписанная голова %d",
+			first, last, stamped, b.Upper.HeadSeq, b.Checkpoint.Size)
 	}
 	if head := s.chain.Head().Seq; len(b.Links) != len(before.Links) || head < last+50 {
 		t.Fatalf("звеньев в пакете %d, до новых звеньев было %d; голова %d", len(b.Links), len(before.Links), head)
@@ -299,7 +299,8 @@ func TestTamperingIsDetected(t *testing.T) {
 		"путь":            func(b *proof.Bundle) { b.Inclusion.Path[0].Hash[0] ^= 1 },
 		"звено":           func(b *proof.Bundle) { b.Links[0].UnixNano++ },
 		"выкинутое звено": func(b *proof.Bundle) { b.Links = append(b.Links[:1], b.Links[2:]...) },
-		"голова":          func(b *proof.Bundle) { b.Statement.HeadSeq-- },
+		"голова":          func(b *proof.Bundle) { b.Checkpoint.Size-- },
+		"граница дерева":  func(b *proof.Bundle) { b.Frontier[0][0] ^= 1 },
 		"токен T2":        func(b *proof.Bundle) { b.Upper.Token[len(b.Upper.Token)/2] ^= 1 },
 		"голова T2":       func(b *proof.Bundle) { b.Upper.HeadSeq = b.Inclusion.LinkSeq - 1 },
 		"токен T1":        func(b *proof.Bundle) { b.Lower.Inclusion.Leaf.Payload[100] ^= 1 },

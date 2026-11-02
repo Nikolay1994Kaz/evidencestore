@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
 )
 
@@ -48,7 +48,7 @@ func TestCopyChunksAreSealed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := auditchain.ParseStatement(data); err != nil {
+		if c, err := proof.ParseCheckpoint(data); err != nil || proof.VerifyCheckpoint(c, s.signer.PublicKey()) != nil {
 			t.Fatalf("голова %s не открыта: %v", h, err)
 		}
 	}

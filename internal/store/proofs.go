@@ -121,9 +121,11 @@ func (s *Store) ProofTo(source string, seq uint64, withDEK bool, toHead uint64) 
 	for _, l := range links {
 		b.Links = append(b.Links, proof.FromLink(l))
 	}
-	// Заявление — о голове, которой кончается пакет; подписано при выдаче.
-	last := links[len(links)-1]
-	b.Statement = s.signer.Sign(auditchain.Head{Seq: last.Seq, Hash: auditchain.Hash(last)}, int(last.Seq), s.nowTime().Unix())
+	// Голова — та, которой кончается пакет: граница дерева звеньев перед
+	// первым звеном и контрольная точка на последнем, подписанная при выдаче.
+	if b.Frontier, b.Checkpoint, err = s.bundleHeadLocked(links); err != nil {
+		return proof.Bundle{}, err
+	}
 
 	if withDEK {
 		sealed, err := evidence.Unmarshal(data)

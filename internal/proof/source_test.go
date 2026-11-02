@@ -164,8 +164,8 @@ func (w *srcWorld) sign(b *SourceBundle, end uint64) {
 	for _, l := range w.links[max(b.Lower.Head, 1)-1 : end] {
 		b.Links = append(b.Links, FromLink(l))
 	}
-	last := w.links[end-1]
-	b.Statement = w.signer.Sign(auditchain.Head{Seq: last.Seq, Hash: auditchain.Hash(last)}, int(last.Seq), w.now.Unix())
+	b.Frontier = w.frontier(max(b.Lower.Head, 1))
+	b.Checkpoint = w.checkpoint(end)
 }
 
 // sourceCheckFailed — пункт name провален, и в его объяснении есть detail.
@@ -295,7 +295,7 @@ func TestSourceRewrittenUpperEdge(t *testing.T) {
 	b.Records = b.Records[:1]
 	b.Links[len(b.Links)-2] = FromLink(link)
 	b.Links[len(b.Links)-1] = FromLink(link8)
-	b.Statement = w.signer.Sign(auditchain.Head{Seq: link8.Seq, Hash: auditchain.Hash(link8)}, int(link8.Seq), w.now.Unix())
+	b.Checkpoint = headOf(w.signer, b.Frontier, b.Links)
 	sourceCheckFailed(t, VerifySource(b, w.trust(), time.Time{}, time.Time{}),
 		"the upper tails are the only leaf of a link certified by a time-stamp", "the time-stamp")
 }
@@ -306,7 +306,7 @@ func TestSourceRewrittenUpperEdge(t *testing.T) {
 func TestSourceFreshTokenOverOldTails(t *testing.T) {
 	w := newSrcWorld(t, srcOpts{})
 	w.now = at(10, 20, 0)
-	imprint := HeadImprint(5, auditchain.Hash(w.links[4]))
+	imprint := HeadImprint(5, w.root(5))
 	fresh, err := w.tsa.Sign(imprint[:], nil)
 	if err != nil {
 		t.Fatal(err)
@@ -354,8 +354,17 @@ func TestSourceForgedSynthetic(t *testing.T) {
 			b.Links = append(b.Links[:1], b.Links[2:]...)
 		}, "the links are chained by hash with no gaps", ""},
 		{"голова — не последнее звено", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
-			b.Statement = w.signer.Sign(auditchain.Head{Seq: 4, Hash: auditchain.Hash(w.links[3])}, 4, w.now.Unix())
-		}, head, "does not match the last link"},
+			b.Checkpoint = w.checkpoint(4)
+		}, head, "the signed head is of 4 links"},
+		{"корень головы — не над звеньями пакета", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			b.Checkpoint = SignCheckpoint(w.signer, b.Checkpoint.Size, w.root(4))
+		}, head, "does not match the links in the bundle"},
+		{"граница дерева не та", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			b.Frontier = [][]byte{make([]byte, 32)}
+		}, head, "does not match the links in the bundle"},
+		{"в границе дерева лишний хеш", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
+			b.Frontier = append(b.Frontier, make([]byte, 32))
+		}, "the links are chained by hash with no gaps", ""},
 		{"«с начала цепи», а звенья со второго", srcOpts{}, func(w *srcWorld, b *SourceBundle) {
 			b.Lower.Head = 0
 		}, start, "starts at link 2"},

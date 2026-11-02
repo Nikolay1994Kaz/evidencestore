@@ -78,11 +78,13 @@ type SourceBundle struct {
 	Closing Inclusion `json:"closing"`
 	// Links — звенья подряд от нижнего края (или первого звена цепи) до
 	// звена токена верхней метки, а с -to-head и дальше; последнее — голова
-	// Statement.
+	// Checkpoint.
 	Links []Link `json:"links"`
+	// Frontier — граница дерева звеньев перед первым звеном пакета.
+	Frontier [][]byte `json:"frontier,omitempty"`
 	// Records — все записи источника между краями, в порядке цепи.
-	Records   []SourceRecord       `json:"records,omitempty"`
-	Statement auditchain.Statement `json:"statement"`
+	Records    []SourceRecord `json:"records,omitempty"`
+	Checkpoint Checkpoint     `json:"checkpoint"`
 }
 
 // ParseSource разбирает пакет по источнику.
@@ -169,29 +171,22 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 		return err == nil
 	}
 
-	// 1. Звенья подряд и связаны хэшами.
-	links, hashes, err := chainLinks(b.Links)
+	// 1. Звенья подряд и связаны хэшами; корни дерева звеньев на их номерах.
+	links, rootAt, err := chainLinks(b.Links, b.Frontier)
 	if !add("the links are chained by hash with no gaps", err, fmt.Sprintf("%d links", len(links))) {
 		return r
 	}
 	linkAt := func(seq uint64) (auditchain.Record, [32]byte, bool) {
-		if seq < links[0].Seq || seq > links[len(links)-1].Seq {
+		root, ok := rootAt(seq)
+		if !ok {
 			return auditchain.Record{}, [32]byte{}, false
 		}
-		i := seq - links[0].Seq
-		return links[i], hashes[i], true
+		return links[seq-links[0].Seq], root, true
 	}
 
-	// 2. Голова подписана закреплённым ключом и совпадает с последним звеном.
-	err = auditchain.VerifyStatement(b.Statement, trust.StoreKey)
-	if err == nil {
-		last := len(links) - 1
-		if b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {
-			err = errors.New("the signed head does not match the last link in the bundle")
-		}
-	}
-	r.HeadSeq = b.Statement.HeadSeq
-	add("the head is signed with the store key", err, fmt.Sprintf("head %d", b.Statement.HeadSeq))
+	// 2. Голова подписана закреплённым ключом и сходится со звеньями пакета.
+	r.HeadSeq = b.Checkpoint.Size
+	add("the head is signed with the store key", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt), fmt.Sprintf("head %d", b.Checkpoint.Size))
 
 	// 3. Нижний край: хвосты — единственный лист звена, которое заверила
 	// нижняя метка; с начала цепи — первое звено и нули.
@@ -261,7 +256,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	// 10. Свидетель голов — как у остальных пакетов.
 	if trust.Witness != nil {
 		var wr Report
-		checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, hashes, &wr, add)
+		checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork
 	}
 	return r
@@ -272,7 +267,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 // последнего листа источника к этому месту (нули — записей ещё не было) и
 // время метки.
 func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) ([32]byte, time.Time, error) {
-	link, hash, ok := linkAt(e.Head)
+	link, root, ok := linkAt(e.Head)
 	switch {
 	case !ok:
 		return [32]byte{}, time.Time{}, fmt.Errorf("link %d is not in the bundle", e.Head)
@@ -302,7 +297,7 @@ func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Rec
 	if tok := e.Token.Leaf.chain(); tok.Type != auditchain.EventTimestamp || tok.Subject != strconv.FormatUint(e.Head, 10) {
 		return [32]byte{}, time.Time{}, fmt.Errorf("the leaf in link %d is not a time-stamp token over link %d", e.Token.LinkSeq, e.Head)
 	}
-	info, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, hash), trust)
+	info, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, root), trust)
 	if err != nil {
 		return [32]byte{}, time.Time{}, fmt.Errorf("the time-stamp: %w", err)
 	}
@@ -329,11 +324,11 @@ func closingStamp(b SourceBundle, linkAt func(uint64) (auditchain.Record, [32]by
 	if tok.Type != auditchain.EventTimestamp || err != nil {
 		return time.Time{}, fmt.Errorf("the leaf in link %d is not a time-stamp token", c.LinkSeq)
 	}
-	_, hash, ok := linkAt(head)
+	_, root, ok := linkAt(head)
 	if !ok {
 		return time.Time{}, fmt.Errorf("link %d, which the time-stamp that closes the window certifies, is not in the bundle", head)
 	}
-	info, err := tsa.Verify(tok.Payload, HeadImprint(head, hash), trust)
+	info, err := tsa.Verify(tok.Payload, HeadImprint(head, root), trust)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("the time-stamp that closes the window: %w", err)
 	}

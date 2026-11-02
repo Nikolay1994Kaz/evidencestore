@@ -36,7 +36,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
@@ -226,9 +225,9 @@ func readHeads(dir string) (*proof.Witness, error) {
 		if err != nil {
 			return err
 		}
-		st, _ := auditchain.ParseStatement(data)
+		c, _ := proof.ParseCheckpoint(data)
 		name, _ := filepath.Rel(dir, path)
-		w.Heads = append(w.Heads, proof.PublishedHead{Name: name, Statement: st})
+		w.Heads = append(w.Heads, proof.PublishedHead{Name: name, Checkpoint: c})
 		return nil
 	})
 	return w, err

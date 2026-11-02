@@ -90,8 +90,8 @@ func TestPromiseReplayedLowerToken(t *testing.T) {
 	for _, l := range w.links[1:8] {
 		sb.Links = append(sb.Links, FromLink(l))
 	}
-	l8 := w.links[7]
-	sb.Statement = w.signer.Sign(auditchain.Head{Seq: l8.Seq, Hash: auditchain.Hash(l8)}, int(l8.Seq), w.now.Unix())
+	sb.Frontier = w.frontier(2)
+	sb.Checkpoint = w.checkpoint(8)
 	sr := VerifySource(sb, w.trust(), from, to)
 	if !sr.Valid() || sr.Records != 0 {
 		t.Fatalf("пакет по источнику:\n%s", sr.Text())
@@ -150,7 +150,7 @@ func TestWindowReplayedTokenAfterUpperStamp(t *testing.T) {
 	w.now = at(10, 8, 0)
 	w.wlink(rec(t, 2, at(10, 7, 0)), rec(t, 3, at(10, 8, 0)))
 	w.now = at(10, 15, 0)
-	imprint := HeadImprint(headB.Seq, headB.Hash)
+	imprint := HeadImprint(headB.Seq, w.root(headB.Seq))
 	tB, err := w.tsa.Sign(imprint[:], nil)
 	if err != nil {
 		t.Fatal(err)

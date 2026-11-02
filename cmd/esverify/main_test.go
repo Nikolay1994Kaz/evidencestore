@@ -73,7 +73,11 @@ func newWorldWith(t *testing.T, body []byte) world {
 	w.trust = write("tsa-root.crt", s.TSARoot())
 	pdata, _ := json.Marshal(res[0].Promise)
 	w.promise = write("promise.json", pdata)
-	later, _ := s.Statement().JSON() // токен T2 лёг звеном после головы пакета
+	head, err := s.Checkpoint() // токен T2 лёг звеном после головы пакета
+	if err != nil {
+		t.Fatal(err)
+	}
+	later, _ := head.JSON()
 	w.later = write("later-head.json", later)
 	return w
 }
@@ -96,7 +100,7 @@ func TestHeadsFlag(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "versions"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	head, _ := b.Statement.JSON()
+	head, _ := b.Checkpoint.JSON()
 	for name, content := range map[string][]byte{"versions/head.json": head, "README": []byte("not a head")} {
 		if err := os.WriteFile(filepath.Join(dir, name), content, 0o600); err != nil {
 			t.Fatal(err)
@@ -104,7 +108,7 @@ func TestHeadsFlag(t *testing.T) {
 	}
 	code, out := w.run(t, "-heads", dir, "-json")
 	var rep map[string]any
-	if err := json.Unmarshal([]byte(out), &rep); err != nil || code != 0 || rep["witness_head"] != float64(b.Statement.HeadSeq) {
+	if err := json.Unmarshal([]byte(out), &rep); err != nil || code != 0 || rep["witness_head"] != float64(b.Checkpoint.Size) {
 		t.Fatalf("голова пакета у свидетеля: код %d, %v\n%s", code, err, out)
 	}
 

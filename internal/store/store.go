@@ -125,6 +125,7 @@ type Store struct {
 	keys     *keyring.Keyring
 	evlog    *evlog.Log
 	chain    *auditchain.Carrier
+	tree     *linkTree // дерево звеньев (tree.go); открывает scanChain
 	signer   *auditchain.Signer
 	chainDir string
 
@@ -885,6 +886,9 @@ func (s *Store) closeFiles() error {
 	}
 	if s.chain != nil {
 		err = errors.Join(err, s.chain.Close())
+	}
+	if s.tree != nil {
+		err = errors.Join(err, s.tree.close())
 	}
 	if s.keys != nil {
 		err = errors.Join(err, s.keys.Close())

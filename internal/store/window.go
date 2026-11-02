@@ -140,9 +140,10 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 	for i, l := range leaves {
 		b.Leaves[i] = proof.FromLeaf(l)
 	}
-	// Заявление — о последнем звене пакета; подписано при выдаче.
-	tail := links[len(links)-1]
-	b.Statement = s.signer.Sign(auditchain.Head{Seq: tail.Seq, Hash: auditchain.Hash(tail)}, int(tail.Seq), s.nowTime().Unix())
+	// Голова — последнее звено пакета, подписана при выдаче.
+	if b.Frontier, b.Checkpoint, err = s.bundleHead(links); err != nil {
+		return proof.WindowBundle{}, err
+	}
 	if source != "" {
 		if b.Records, err = s.windowRecords(leaves[:certEnd-first], source); err != nil {
 			return proof.WindowBundle{}, err

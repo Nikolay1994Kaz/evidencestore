@@ -34,14 +34,14 @@
   {
    "name": "P5 подпись головы не проверяется",
    "file": "internal/proof/proof.go",
-   "old": "\terr = auditchain.VerifyStatement(b.Statement, trust.StoreKey)\n",
-   "new": "\terr = nil\n"
+   "old": "\tif err := VerifyCheckpoint(c, key); err != nil {\n\t\treturn err\n\t}\n\tlast := links[len(links)-1].Seq",
+   "new": "\tif err := VerifyCheckpoint(c, key); false {\n\t\treturn err\n\t}\n\tlast := links[len(links)-1].Seq"
   },
   {
    "name": "P6 голова не сверяется с последним звеном",
    "file": "internal/proof/proof.go",
-   "old": "\t\tif b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {",
-   "new": "\t\tif last < 0 {"
+   "old": "\tif c.Size != last {",
+   "new": "\tif false {"
   },
   {
    "name": "P7 путь Меркла не проверяется",
@@ -58,8 +58,8 @@
   {
    "name": "P9 токен T2 не проверяется",
    "file": "internal/proof/proof.go",
-   "old": "\tinfo, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, hash), trust)\n\tif err != nil {\n\t\treturn time.Time{}, err\n\t}",
-   "new": "\tinfo, _ := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, hash), trust)"
+   "old": "\tinfo, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, root), trust)\n\tif err != nil {\n\t\treturn time.Time{}, err\n\t}\n",
+   "new": "\tinfo, _ := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, root), trust)\n"
   },
   {
    "name": "P10 T1 может лежать после улики",
@@ -160,8 +160,8 @@
   {
    "name": "R1 восстановление не сверяет цепь с подписанной головой",
    "file": "internal/store/replica.go",
-   "old": "\tif auditchain.EncodeHash(head.Hash) != st.HeadHash {",
-   "new": "\tif auditchain.EncodeHash(head.Hash) != st.HeadHash && false {"
+   "old": "\tif proof.FrontierOfLinks(links[:head.Size]).Root() != head.RootHash() {",
+   "new": "\tif proof.FrontierOfLinks(links[:head.Size]).Root() != head.RootHash() && false {"
   },
   {
    "name": "R2 восстановление не замечает дыр в кусках",
@@ -406,8 +406,8 @@
   {
    "name": "R5 голова копии новее её звеньев",
    "file": "internal/store/replica.go",
-   "old": "err == nil && seq <= uint64(len(links)) {",
-   "new": "err == nil && seq > 0 {"
+   "old": "\t\tif err != nil || seq > uint64(len(links)) {",
+   "new": "\t\tif err != nil {"
   },
   {
    "name": "R6 кусок внахлёст не сверяется",
@@ -640,7 +640,7 @@
   {
    "name": "S77 подъём не обрезает цепь по подписанной голове (Z-07)",
    "file": "internal/store/replica.go",
-   "old": "\tif err := auditchain.TrimToHead(filepath.Join(dataDir, \"chain\"), st.HeadSeq); err != nil {",
+   "old": "\tif err := auditchain.TrimToHead(filepath.Join(dataDir, \"chain\"), head.Size); err != nil {",
    "new": "\tif err := error(nil); err != nil {"
   },
   {
@@ -658,8 +658,8 @@
   {
    "name": "S80 голова копии мимо поколения",
    "file": "internal/store/replica.go",
-   "old": "r.Put(ctx, s.replica.Prefix+fmt.Sprintf(\"heads/%020d.json\", st.HeadSeq), data)",
-   "new": "r.Put(ctx, fmt.Sprintf(\"heads/%020d.json\", st.HeadSeq), data)"
+   "old": "r.Put(ctx, s.replica.Prefix+fmt.Sprintf(\"heads/%020d.json\", c.Size), data)",
+   "new": "r.Put(ctx, fmt.Sprintf(\"heads/%020d.json\", c.Size), data)"
   },
   {
    "name": "S81 копию, которую data_dir не продолжает, дописывают (Z-09)",
@@ -742,19 +742,19 @@
   {
    "name": "W1 головы свидетеля не сверяются со звеньями пакета",
    "file": "internal/proof/heads.go",
-   "old": "\t\t\tif h.Statement.HeadHash == encodeHash(hashes[seq-first]) {\n\t\t\t\tcontinue\n\t\t\t}",
-   "new": "\t\t\tif true {\n\t\t\t\tcontinue\n\t\t\t}"
+   "old": "\t\t\tif root, _ := rootAt(seq); h.Checkpoint.RootHash() == root {",
+   "new": "\t\t\tif root, _ := rootAt(seq); h.Checkpoint.RootHash() == root || true {"
   },
   {
    "name": "W2 под одним номером у свидетеля остаётся одна голова: развилка не видна",
    "file": "internal/proof/heads.go",
-   "old": "known = known || v.Statement.HeadHash == h.Statement.HeadHash",
-   "new": "known = known || v.Statement.HeadSeq == h.Statement.HeadSeq"
+   "old": "known = known || bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root)",
+   "new": "known = known || bytes.Equal(v.Checkpoint.Root[:0], h.Checkpoint.Root[:0])"
   },
   {
    "name": "W3 головы под чужим ключом идут в счёт",
    "file": "internal/proof/heads.go",
-   "old": "\t\tif auditchain.VerifyStatement(h.Statement, key) != nil {",
+   "old": "\t\tif VerifyCheckpoint(h.Checkpoint, key) != nil {",
    "new": "\t\tif false {"
   },
   {
@@ -772,7 +772,7 @@
   {
    "name": "W6 голова под меткой не уходит свидетелю",
    "file": "internal/store/jobs.go",
-   "old": "\t\t// уже не попала. Метка не выйдет — свидетель получит лишнюю голову.\n\t\ts.queueWitnessLocked(head, true)\n",
+   "old": "\t\t// уже не попала. Метка не выйдет — свидетель получит лишнюю голову.\n\t\ts.queueWitnessLocked(true)\n",
    "new": "\t\t// уже не попала. Метка не выйдет — свидетель получит лишнюю голову.\n"
   },
   {
@@ -1012,8 +1012,8 @@
   {
    "name": "B7 окно: токен метки на участке не проверяется",
    "file": "internal/proof/window.go",
-   "old": "info, err := tsa.Verify(l.Payload, HeadImprint(head, hash), trust)\n\t\t\tif err != nil {",
-   "new": "info, err := tsa.Verify(l.Payload, HeadImprint(head, hash), trust)\n\t\t\tif false {"
+   "old": "info, err := tsa.Verify(l.Payload, HeadImprint(head, root), trust)\n\t\t\tif err != nil {",
+   "new": "info, err := tsa.Verify(l.Payload, HeadImprint(head, root), trust)\n\t\t\tif false {"
   },
   {
    "name": "B9 окно: нижняя метка — над более поздней головой",
@@ -1082,16 +1082,10 @@
    "new": "if false {\n\t\t\treturn fmt.Errorf(\"the body of"
   },
   {
-   "name": "B22 окно: подпись головы не проверяется",
+   "name": "B22 окно: голова не проверяется",
    "file": "internal/proof/window.go",
-   "old": "err = auditchain.VerifyStatement(b.Statement, trust.StoreKey)",
-   "new": "err = nil"
-  },
-  {
-   "name": "B23 окно: голова не сверяется с последним звеном",
-   "file": "internal/proof/window.go",
-   "old": "if b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {",
-   "new": "if false && (b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last])) {"
+   "old": "add(\"the head is signed with the store key\", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt),",
+   "new": "add(\"the head is signed with the store key\", nil,"
   },
   {
    "name": "B24 окно: свидетель не сверяется",
@@ -1280,10 +1274,10 @@
    "new": "\tif l.Type != auditchain.EventEvidence || len(l.Payload) < 8+32+32 {\n\t\treturn prev, false"
   },
   {
-   "name": "U12 источник: голова — не последнее звено",
+   "name": "U12 источник: голова не проверяется",
    "file": "internal/proof/source.go",
-   "old": "\t\tif b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {",
-   "new": "\t\tif false && (b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last])) {"
+   "old": "add(\"the head is signed with the store key\", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt),",
+   "new": "add(\"the head is signed with the store key\", nil,"
   },
   {
    "name": "U13 источник: «с начала цепи» не сверяется",
@@ -1306,8 +1300,8 @@
   {
    "name": "U17 источник: метка края не проверяется",
    "file": "internal/proof/source.go",
-   "old": "\tinfo, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, hash), trust)\n\tif err != nil {",
-   "new": "\tinfo, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, hash), trust)\n\tif false {"
+   "old": "\tinfo, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, root), trust)\n\tif err != nil {",
+   "new": "\tinfo, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, root), trust)\n\tif false {"
   },
   {
    "name": "U18 источник: T1 не запоминается",
@@ -1426,8 +1420,8 @@
   {
    "name": "U42 источник: свидетель — по нижней голове",
    "file": "internal/proof/source.go",
-   "old": "checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, hashes, &wr, add)",
-   "new": "checkWitness(trust.Witness, trust.StoreKey, max(b.Lower.Head, 1), links, hashes, &wr, add)"
+   "old": "checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt, &wr, add)",
+   "new": "checkWitness(trust.Witness, trust.StoreKey, max(b.Lower.Head, 1), links, rootAt, &wr, add)"
   },
   {
    "name": "U43 хранилище: лист ссылается на нули",
@@ -1678,8 +1672,8 @@
   {
    "name": "Q21 звено токена не уходит свидетелю",
    "file": "internal/store/jobs.go",
-   "old": "\t\ts.queueWitnessLocked(s.chain.Head(), true)\n",
-   "new": ""
+   "old": "\t\t// свидетелю головой под меткой, не ждать обхода.\n\t\ts.queueWitnessLocked(true)\n",
+   "new": "\t\t// свидетелю головой под меткой, не ждать обхода.\n"
   },
   {
    "name": "Q22 окно: верхняя метка — первая, а не над наибольшей головой",
@@ -2171,7 +2165,7 @@
    "name": "Y10 другой ключ копии в резерве принят за свой (P-24)",
    "file": "internal/store/copykey.go",
    "old": "\t\tif bytes.Equal(have, want) {\n\t\t\treturn nil\n\t\t}",
-   "new": "\t\tif len(have) == len(want) {\n\t\t\treturn nil\n\t\t}"
+   "new": "\t\tif bytes.Equal(have, want) || len(have) == len(want) {\n\t\t\treturn nil\n\t\t}"
   },
   {
    "name": "Y11 тревога ключа копии не взводится (P-24)",
@@ -2190,6 +2184,72 @@
    "file": "internal/store/store.go",
    "old": "[]string{keyring.FileName, auditchain.SignKeyFileName, CopyKeyFileName}",
    "new": "[]string{keyring.FileName, auditchain.SignKeyFileName}"
+  },
+  {
+   "name": "D1 корень головы не сверяется со звеньями пакета",
+   "file": "internal/proof/proof.go",
+   "old": "\tif root, _ := rootAt(last); c.RootHash() != root {",
+   "new": "\tif root, _ := rootAt(last); c.RootHash() != root && false {"
+  },
+  {
+   "name": "D2 одна улика: голова не проверяется",
+   "file": "internal/proof/proof.go",
+   "old": "add(\"the head is signed with the store key\", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt),",
+   "new": "add(\"the head is signed with the store key\", nil,"
+  },
+  {
+   "name": "D3 число хешей границы дерева не сверяется с её размером",
+   "file": "internal/proof/tree.go",
+   "old": "\tif len(nodes) != bits.OnesCount64(size) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "D4 переполнение номеров звеньев пакета не ловится",
+   "file": "internal/proof/tree.go",
+   "old": "\tif first == 0 || first+uint64(len(hashes)) < first {",
+   "new": "\tif first == 0 {"
+  },
+  {
+   "name": "D5 звено не ложится в дерево",
+   "file": "internal/store/chain.go",
+   "old": "\tif err := s.tree.add(head.Hash); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "D6 корень текущей головы из файла подписывается без сверки",
+   "file": "internal/store/tree.go",
+   "old": "\t\tif root != t.front.Root() {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "D7 корень прежней головы из файла подписывается без доказательства продолжения",
+   "file": "internal/store/tree.go",
+   "old": "\tif tlog.CheckTree(p, int64(n), t.front.Root(), int64(m), root) != nil {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "D8 испорченный tree.hashes не собирается заново",
+   "file": "internal/store/tree.go",
+   "old": "\t\t\tif err == nil && bytes.Equal(got, hashBytes(stored)) {",
+   "new": "\t\t\tif err == nil {"
+  },
+  {
+   "name": "D9 tree.hashes длиннее цепи не обрезается",
+   "file": "internal/store/tree.go",
+   "old": "\treturn t.f.Truncate(tlog.StoredHashCount(int64(len(links))) * 32)",
+   "new": "\treturn nil"
+  },
+  {
+   "name": "D10 свидетелю уходит голова без корня",
+   "file": "internal/store/witness.go",
+   "old": "\th := witnessHead{size: s.tree.size(), root: s.tree.root(), stamped: stamped}",
+   "new": "\th := witnessHead{size: s.tree.size(), stamped: stamped}"
+  },
+  {
+   "name": "D11 подъём берёт голову под чужим номером",
+   "file": "internal/store/replica.go",
+   "old": "\t\tif head.Size != seq {",
+   "new": "\t\tif false {"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются."

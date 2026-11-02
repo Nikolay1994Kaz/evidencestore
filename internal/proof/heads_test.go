@@ -3,18 +3,14 @@ package proof
 import (
 	"strings"
 	"testing"
-
-	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 )
 
 // Головы свидетеля над синтетической цепью из proof_test.go: звенья 1–5,
 // улика в звене 3, T2 над головой 4.
 
-func (w *world) published(name string, seq uint64, hash [32]byte) PublishedHead {
-	return PublishedHead{Name: name, Statement: w.signer.Sign(auditchain.Head{Seq: seq, Hash: hash}, int(seq), w.now.Unix())}
+func (w *world) published(name string, seq uint64, root [32]byte) PublishedHead {
+	return PublishedHead{Name: name, Checkpoint: SignCheckpoint(w.signer, seq, root)}
 }
-
-func (w *world) linkHash(seq uint64) [32]byte { return auditchain.Hash(w.links[seq-1]) }
 
 func failed(r Report, name string) bool {
 	for _, c := range r.Checks {
@@ -33,8 +29,8 @@ func TestWitnessHeadFixesRecord(t *testing.T) {
 	w, b := standard(t, nil)
 	tr := w.trust()
 	tr.Witness = &Witness{Heads: []PublishedHead{
-		w.published("heads/2.json", 2, w.linkHash(2)),
-		w.published("heads/4.json", 4, w.linkHash(4)),
+		w.published("heads/2.json", 2, w.root(2)),
+		w.published("heads/4.json", 4, w.root(4)),
 	}}
 	r := Verify(b, tr)
 	if !r.Valid() || r.WitnessHead != 4 || !strings.Contains(strings.Join(r.Notes(), "\n"), "the witness saw head 4") {
@@ -47,7 +43,7 @@ func TestWitnessHeadFixesRecord(t *testing.T) {
 func TestWitnessHeadOfAnotherChain(t *testing.T) {
 	w, b := standard(t, nil)
 	tr := w.trust()
-	tr.Witness = &Witness{Heads: []PublishedHead{w.published("heads/4.json", 4, w.linkHash(3))}}
+	tr.Witness = &Witness{Heads: []PublishedHead{w.published("heads/4.json", 4, w.root(3))}}
 	if r := Verify(b, tr); r.Valid() || !failed(r, checkAgrees) {
 		t.Fatalf("голова свидетеля из другой цепи:\n%s", r.Text())
 	}
@@ -60,9 +56,9 @@ func TestWitnessForkOutsideRecordIsNote(t *testing.T) {
 	w, b := standard(t, nil)
 	tr := w.trust()
 	tr.Witness = &Witness{Heads: []PublishedHead{
-		w.published("heads/4.json", 4, w.linkHash(4)),
-		w.published("heads/7.json", 7, w.linkHash(1)),
-		w.published("heads/7.json.v2", 7, w.linkHash(2)),
+		w.published("heads/4.json", 4, w.root(4)),
+		w.published("heads/7.json", 7, w.root(1)),
+		w.published("heads/7.json.v2", 7, w.root(2)),
 	}}
 	r := Verify(b, tr)
 	if !r.Valid() || r.WitnessHead != 4 || r.WitnessFork != 7 || !strings.Contains(strings.Join(r.Notes(), "\n"), "two versions of the chain") {
@@ -76,8 +72,8 @@ func TestWitnessForkInRecordPartFails(t *testing.T) {
 	w, b := standard(t, nil)
 	tr := w.trust()
 	tr.Witness = &Witness{Heads: []PublishedHead{
-		w.published("heads/4.json", 4, w.linkHash(4)),
-		w.published("heads/4.json.v2", 4, w.linkHash(3)),
+		w.published("heads/4.json", 4, w.root(4)),
+		w.published("heads/4.json.v2", 4, w.root(3)),
 	}}
 	if r := Verify(b, tr); r.Valid() || !failed(r, checkAgrees) || !strings.Contains(r.Text(), "two different heads number 4") {
 		t.Fatalf("развилка на участке записи:\n%s", r.Text())
@@ -89,7 +85,7 @@ func TestWitnessForkInRecordPartFails(t *testing.T) {
 func TestWitnessHeadBeyondBundle(t *testing.T) {
 	w, b := standard(t, nil)
 	tr := w.trust()
-	tr.Witness = &Witness{Heads: []PublishedHead{w.published("heads/9.json", 9, w.linkHash(1))}}
+	tr.Witness = &Witness{Heads: []PublishedHead{w.published("heads/9.json", 9, w.root(1))}}
 	r := Verify(b, tr)
 	if r.Valid() || !failed(r, checkAgrees) || !strings.Contains(r.Text(), "proof -to-head 9") {
 		t.Fatalf("голова свидетеля дальше пакета:\n%s", r.Text())
@@ -109,8 +105,8 @@ func TestWitnessHasNothingYet(t *testing.T) {
 	other := newWorld(t)
 	tr := w.trust()
 	tr.Witness = &Witness{Heads: []PublishedHead{
-		w.published("heads/2.json", 2, w.linkHash(2)),
-		other.published("heads/4.json", 4, w.linkHash(3)),
+		w.published("heads/2.json", 2, w.root(2)),
+		other.published("heads/4.json", 4, w.root(3)),
 		{Name: "README"},
 	}}
 	r := Verify(b, tr)

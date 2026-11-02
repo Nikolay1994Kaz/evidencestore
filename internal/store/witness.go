@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // Канал свидетеля голов (witness.url; решение 25.10, DECISIONS «Свидетель
-// голов»). Туда уходят только подписанные головы цепи — заявления о голове,
-// без журнала улик и тел. Держит его не тот, кто администрирует
+// голов»). Туда уходят только подписанные головы цепи — контрольные точки
+// (число звеньев и корень дерева над ними, п. 30), без журнала улик и тел. Держит его не тот, кто администрирует
 // хранилище: проверяющий или другая организация. Голова у свидетеля
 // закрепляет цепь до неё, и пакет из цепи, переписанной после этого, с ней не
 // сойдётся (esverify -heads).
@@ -28,21 +28,24 @@ import (
 // номерами поднятое хранилище написало бы другое — для свидетеля развилка
 // (P-11). Головы дальше копии ждут в очереди её следующего прохода.
 
-// witnessHead — голова в очереди к свидетелю; stamped — над ней метка TSA.
+// witnessHead — голова в очереди к свидетелю: число звеньев и корень дерева
+// над ними, снятые с границы в памяти; stamped — над ней метка TSA.
 type witnessHead struct {
-	head    auditchain.Head
+	size    uint64
+	root    [32]byte
 	stamped bool
 }
 
-// queueWitnessLocked ставит голову в очередь к свидетелю. Ещё не ушедшая
-// текущая голова из очереди уходит: новая голова её накрывает. Головы под
-// метками остаются все — ими кончаются пакеты, — так что, пока свидетель
-// недоступен, очередь растёт только ими. Зовётся под chainMu.
-func (s *Store) queueWitnessLocked(h auditchain.Head, stamped bool) {
-	if s.witnessRemote == nil || h.Seq == 0 {
+// queueWitnessLocked ставит текущую голову в очередь к свидетелю. Ещё не
+// ушедшая текущая голова из очереди уходит: новая голова её накрывает.
+// Головы под метками остаются все — ими кончаются пакеты, — так что, пока
+// свидетель недоступен, очередь растёт только ими. Зовётся под chainMu.
+func (s *Store) queueWitnessLocked(stamped bool) {
+	h := witnessHead{size: s.tree.size(), root: s.tree.root(), stamped: stamped}
+	if s.witnessRemote == nil || h.size == 0 {
 		return
 	}
-	if h.Seq <= s.witnessQueued {
+	if h.size <= s.witnessQueued {
 		// Голова уже в очереди или у свидетеля. Голова под меткой встаёт в
 		// очередь, когда создаётся (хвосты перед запросом, stamp), — раньше
 		// любой текущей новее неё.
@@ -51,8 +54,8 @@ func (s *Store) queueWitnessLocked(h auditchain.Head, stamped bool) {
 	if n := len(s.witnessQueue); n > 0 && !s.witnessQueue[n-1].stamped {
 		s.witnessQueue = s.witnessQueue[:n-1]
 	}
-	s.witnessQueue = append(s.witnessQueue, witnessHead{head: h, stamped: stamped})
-	s.witnessQueued = h.Seq
+	s.witnessQueue = append(s.witnessQueue, h)
+	s.witnessQueued = h.size
 }
 
 // WitnessOnce ставит в очередь текущую голову и отправляет свидетелю очередь
@@ -62,7 +65,7 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 		return nil
 	}
 	s.chainMu.Lock()
-	s.queueWitnessLocked(s.chain.Head(), false)
+	s.queueWitnessLocked(false)
 	queue := append([]witnessHead(nil), s.witnessQueue...)
 	s.chainMu.Unlock()
 	limit := ^uint64(0)
@@ -70,16 +73,16 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 		limit = s.replicaShipped.Load()
 	}
 	for _, h := range queue {
-		if h.head.Seq > limit {
+		if h.size > limit {
 			break // очередь по возрастанию: дальше — тоже за копией
 		}
-		data, err := s.signer.Sign(h.head, int(h.head.Seq), s.nowTime().Unix()).JSON()
+		data, err := proof.SignCheckpoint(s.signer, h.size, h.root).JSON()
 		if err != nil {
 			return err
 		}
-		if err := s.witnessRemote.Put(ctx, fmt.Sprintf("heads/%020d.json", h.head.Seq), data); err != nil {
+		if err := s.witnessRemote.Put(ctx, fmt.Sprintf("heads/%020d.json", h.size), data); err != nil {
 			s.witnessErrors.Add(1)
-			return fmt.Errorf("witness: head %d: %w", h.head.Seq, err)
+			return fmt.Errorf("witness: head %d: %w", h.size, err)
 		}
 		s.chainMu.Lock()
 		if len(s.witnessQueue) > 0 && s.witnessQueue[0] == h {

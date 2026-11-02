@@ -266,7 +266,7 @@ func (s *ownerSim) attack() *ownerRec {
 			s.tailsLink()
 		}
 		head := uint64(len(s.w.links))
-		imprint := HeadImprint(head, auditchain.Hash(s.w.links[head-1]))
+		imprint := HeadImprint(head, s.w.root(head))
 		payload, err := s.w.tsa.Sign(imprint[:], nil)
 		if err != nil {
 			s.w.t.Fatal(err)
@@ -318,7 +318,7 @@ func (s *ownerSim) attack() *ownerRec {
 		}
 	default:
 		head := 1 + uint64(s.rng.IntN(len(s.w.links)))
-		imprint := HeadImprint(head, auditchain.Hash(s.w.links[head-1]))
+		imprint := HeadImprint(head, s.w.root(head))
 		payload, err := s.w.tsa.Sign(imprint[:], nil)
 		if err != nil {
 			s.w.t.Fatal(err)
@@ -455,8 +455,7 @@ func (s *ownerSim) tailsLink() {
 // stamp берёт токен над головой head сейчас; токен ложится сразу или
 // придерживается (hold).
 func (s *ownerSim) stamp(head uint64, hold bool) {
-	l := s.w.links[head-1]
-	imprint := HeadImprint(head, auditchain.Hash(l))
+	imprint := HeadImprint(head, s.w.root(head))
 	payload, err := s.w.tsa.Sign(imprint[:], nil)
 	if err != nil {
 		s.w.t.Fatal(err)
@@ -506,7 +505,7 @@ func (s *ownerSim) checkWindow(target *ownerRec) (bad []string, hidden int) {
 	// Свежая метка над последней головой: верхняя граница пакета записи
 	// владельцу всегда доступна.
 	top := uint64(len(s.w.links))
-	topImprint := HeadImprint(top, auditchain.Hash(s.w.links[top-1]))
+	topImprint := HeadImprint(top, s.w.root(top))
 	topTok, err := s.w.tsa.Sign(topImprint[:], nil)
 	if err != nil {
 		s.w.t.Fatal(err)
@@ -657,8 +656,8 @@ func (s *ownerSim) sourceBundle(low, c, up placedTok, from, to time.Time) (Sourc
 	for _, l := range s.w.links[max(low.head, 1)-1 : end] {
 		b.Links = append(b.Links, FromLink(l))
 	}
-	last := s.w.links[end-1]
-	b.Statement = s.w.signer.Sign(auditchain.Head{Seq: last.Seq, Hash: auditchain.Hash(last)}, int(last.Seq), s.w.now.Unix())
+	b.Frontier = s.w.frontier(max(low.head, 1))
+	b.Checkpoint = s.w.checkpoint(end)
 	return b, true
 }
 
@@ -690,8 +689,8 @@ func (s *ownerSim) promiseHolds(r *ownerRec, top uint64, topTok []byte, trust Tr
 			for _, l := range s.w.links[p.head-1 : top] {
 				b.Links = append(b.Links, FromLink(l))
 			}
-			last := s.w.links[top-1]
-			b.Statement = s.w.signer.Sign(auditchain.Head{Seq: last.Seq, Hash: auditchain.Hash(last)}, int(last.Seq), s.w.now.Unix())
+			b.Frontier = s.w.frontier(p.head)
+			b.Checkpoint = s.w.checkpoint(top)
 			rep := Verify(b, trust)
 			if rep.Valid() && CheckPromise(r.promise, rep, b, false) == nil {
 				return true
@@ -708,7 +707,7 @@ func (s *ownerSim) promiseHolds(r *ownerRec, top uint64, topTok []byte, trust Tr
 func (s *ownerSim) checkLate() (bad []string) {
 	trust := s.w.trust()
 	top := uint64(len(s.w.links))
-	topImprint := HeadImprint(top, auditchain.Hash(s.w.links[top-1]))
+	topImprint := HeadImprint(top, s.w.root(top))
 	topTok, err := s.w.tsa.Sign(topImprint[:], nil)
 	if err != nil {
 		s.w.t.Fatal(err)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
 )
 
@@ -24,7 +25,7 @@ import (
 //	evidence/seg_….log/<начало>-<конец>   журнал улик (только подтверждённое fsync)
 //	chain/chain.log/<начало>-<конец>      звенья цепи
 //	chain/leaves_….log/<начало>-<конец>   листья цепи
-//	heads/<номер головы>.json             подписанная голова на момент копии
+//	heads/<номер головы>.json             подписанная голова (контрольная точка) на момент копии
 //
 // Объекты неизменяемы и не удаляются никогда: копия улик тоже улика.
 // keyring.dat, корни, ключ подписи и ключ копии не уезжают. Куски журнала и
@@ -58,10 +59,11 @@ type replicaState struct {
 }
 
 // replicaSnapshot — что можно копировать сейчас: размер каждого
-// дописываемого файла и подписанная голова, снятые согласованно.
+// дописываемого файла и подписанная голова, снятые согласованно. У пустой
+// цепи головы нет (head.Size == 0).
 type replicaSnapshot struct {
 	sizes map[string]int64
-	head  auditchain.Statement
+	head  proof.Checkpoint
 }
 
 // replicaFiles снимает размеры файлов: у цепи — под замком цепи (только целые
@@ -92,7 +94,7 @@ func (s *Store) replicaFiles() (replicaSnapshot, error) {
 		}
 		snap.sizes["chain/"+name] = fi.Size()
 	}
-	snap.head = s.signer.Sign(s.chain.Head(), len(s.links), s.nowTime().Unix())
+	snap.head, _ = s.checkpointLocked()
 	s.chainMu.Unlock()
 	for _, seg := range s.evlog.Segments() {
 		snap.sizes["evidence/"+filepath.Base(seg.Path)] = seg.Size
@@ -291,12 +293,15 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 			s.replica.Offsets[name] = from
 		}
 	}
-	if st := snap.head; st.HeadSeq > s.replica.Head {
-		data, _ := st.JSON()
-		if err := r.Put(ctx, s.replica.Prefix+fmt.Sprintf("heads/%020d.json", st.HeadSeq), data); err != nil {
+	if c := snap.head; c.Size > s.replica.Head {
+		data, err := c.JSON()
+		if err != nil {
 			return total, err
 		}
-		s.replica.Head = st.HeadSeq
+		if err := r.Put(ctx, s.replica.Prefix+fmt.Sprintf("heads/%020d.json", c.Size), data); err != nil {
+			return total, err
+		}
+		s.replica.Head = c.Size
 	}
 	// Проход удался: копия продолжает data_dir и держит цепь до этой головы.
 	// Дальше неё свидетелю голов не отдаём (witness.go).
@@ -457,36 +462,40 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 	// Голова — последняя из тех, чьё звено есть в копии: голова новее
 	// звеньев копии (кусок цепи не доехал) не повод отказывать, если есть
 	// подписанная голова пораньше.
-	var st auditchain.Statement
+	var head proof.Checkpoint
 	for i := len(heads) - 1; i >= 0; i-- {
-		if seq, err := headSeqOf(heads[i]); err == nil && seq <= uint64(len(links)) {
-			stData, err := r.Get(ctx, heads[i])
-			if err != nil {
-				return rep, err
-			}
-			if st, err = auditchain.ParseStatement(stData); err != nil {
-				return rep, err
-			}
-			break
+		seq, err := headSeqOf(heads[i])
+		if err != nil || seq > uint64(len(links)) {
+			continue
 		}
+		data, err := r.Get(ctx, heads[i])
+		if err != nil {
+			return rep, err
+		}
+		if head, err = proof.ParseCheckpoint(data); err != nil {
+			return rep, err
+		}
+		if head.Size != seq {
+			return rep, fmt.Errorf("replica restore: %s holds a head of %d links", heads[i], head.Size)
+		}
+		break
 	}
-	if st.HeadSeq == 0 {
+	if head.Size == 0 {
 		return rep, fmt.Errorf("replica restore: copy holds %d links, every signed head is newer — copy is incomplete", len(links))
 	}
-	if err := auditchain.VerifyStatement(st, pinned); err != nil {
-		return rep, fmt.Errorf("replica restore: head %d in the copy: %w", st.HeadSeq, err)
+	if err := proof.VerifyCheckpoint(head, pinned); err != nil {
+		return rep, fmt.Errorf("replica restore: head %d in the copy: %w", head.Size, err)
 	}
-	head, err := auditchain.Verify(links[:st.HeadSeq], nil)
-	if err != nil {
+	if _, err := auditchain.Verify(links[:head.Size], nil); err != nil {
 		return rep, fmt.Errorf("replica restore: %w", err)
 	}
-	if auditchain.EncodeHash(head.Hash) != st.HeadHash {
+	if proof.FrontierOfLinks(links[:head.Size]).Root() != head.RootHash() {
 		return rep, errors.New("replica restore: chain in the copy does not match its signed head — copy was altered")
 	}
 	// Цепь — ровно по подписанной голове: хвост прерванного прохода копии
 	// голова не заверяет (Z-07). Улики после неё подъём досчитает в цепь по
 	// журналу улик.
-	if err := auditchain.TrimToHead(filepath.Join(dataDir, "chain"), st.HeadSeq); err != nil {
+	if err := auditchain.TrimToHead(filepath.Join(dataDir, "chain"), head.Size); err != nil {
 		return rep, fmt.Errorf("replica restore: %w", err)
 	}
 	// Ключ копии — тот, что открыл куски: поднятое хранилище пишет им новое
@@ -498,7 +507,7 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 	if err := writeAtomic(filepath.Join(dataDir, generationFile), []byte(strconv.FormatUint(free, 10)+"\n")); err != nil {
 		return rep, err
 	}
-	rep.HeadSeq, rep.Generation, rep.NextGeneration = st.HeadSeq, gen, free
+	rep.HeadSeq, rep.Generation, rep.NextGeneration = head.Size, gen, free
 	return rep, nil
 }
 

@@ -286,9 +286,10 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 	if _, err := proof.OpenTail(b.Upper.Tails.Chain(), source, b.Upper.Open); err != nil {
 		return proof.SourceBundle{}, fmt.Errorf("store: upper tails of %s: %w", source, err)
 	}
-	// Заявление — о последнем звене пакета; подписано при выдаче.
-	tailLink := links[len(links)-1]
-	b.Statement = s.signer.Sign(auditchain.Head{Seq: tailLink.Seq, Hash: auditchain.Hash(tailLink)}, int(tailLink.Seq), s.nowTime().Unix())
+	// Голова — последнее звено пакета, подписана при выдаче.
+	if b.Frontier, b.Checkpoint, err = s.bundleHead(links); err != nil {
+		return proof.SourceBundle{}, err
+	}
 	return b, nil
 }
 

@@ -1,6 +1,7 @@
 package proof
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"fmt"
 	"sort"
@@ -16,9 +17,9 @@ import (
 // пакет из неё проверку пройдёт. Свидетель — тот, кто рано получил
 // подписанную голову и хранит её вне власти администратора хранилища: канал
 // свидетеля (witness.url), газета, копия наружу в чужом хранилище с
-// блокировкой. Каждое звено ссылается хэшем на прежнее, поэтому голова у
-// свидетеля закрепляет всю цепь до неё: переписать улику раньше этой головы
-// значит разойтись со свидетелем.
+// блокировкой. Голова — корень дерева над всеми звеньями до неё, поэтому
+// голова у свидетеля закрепляет всю цепь до неё: переписать улику раньше
+// этой головы значит разойтись со свидетелем.
 
 // Witness — головы, которые проверяющий сам взял у свидетеля: все, какие
 // есть, в том числе прежние версии объектов (поверх запертой версии можно
@@ -27,17 +28,17 @@ type Witness struct {
 	Heads []PublishedHead
 }
 
-// PublishedHead — подписанная голова у свидетеля. Name — откуда она взята
-// (имя файла): для отчёта.
+// PublishedHead — подписанная голова (контрольная точка) у свидетеля. Name — откуда она
+// взята (имя файла): для отчёта.
 type PublishedHead struct {
-	Name      string
-	Statement auditchain.Statement
+	Name       string
+	Checkpoint Checkpoint
 }
 
 // checkWitness сверяет пакет с головами свидетеля. evLink — звено улики,
-// links и hashes — звенья пакета подряд и их хэши. add — пункт отчёта, как в
-// Verify.
-func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []auditchain.Record, hashes [][32]byte,
+// links — звенья пакета подряд, rootAt — корень дерева звеньев на звене
+// пакета. add — пункт отчёта, как в Verify.
+func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []auditchain.Record, rootAt func(uint64) ([32]byte, bool),
 	r *Report, add func(string, error, string) bool) {
 	r.WitnessChecked = true
 
@@ -48,13 +49,13 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	versions := map[uint64][]PublishedHead{}
 	signed := 0
 	for _, h := range w.Heads {
-		if auditchain.VerifyStatement(h.Statement, key) != nil {
+		if VerifyCheckpoint(h.Checkpoint, key) != nil {
 			continue
 		}
 		signed++
-		seq, known := h.Statement.HeadSeq, false
+		seq, known := h.Checkpoint.Size, false
 		for _, v := range versions[seq] {
-			known = known || v.Statement.HeadHash == h.Statement.HeadHash
+			known = known || bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root)
 		}
 		if !known {
 			versions[seq] = append(versions[seq], h)
@@ -82,13 +83,13 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			continue
 		}
 		for _, h := range vs {
-			if h.Statement.HeadHash == encodeHash(hashes[seq-first]) {
+			if root, _ := rootAt(seq); h.Checkpoint.RootHash() == root {
 				continue
 			}
 			if len(vs) > 1 {
 				err = fmt.Errorf("the witness holds two different heads number %d (%s and %s), both signed with the store key: this part of the chain exists in two versions", seq, vs[0].Name, vs[1].Name)
 			} else {
-				err = fmt.Errorf("link %d in the bundle differs from head %d the witness saw (%s): the chain was rewritten after the witness saw it", seq, seq, h.Name)
+				err = fmt.Errorf("the chain in the bundle up to link %d differs from head %d the witness saw (%s): the chain was rewritten after the witness saw it", seq, seq, h.Name)
 			}
 			break
 		}

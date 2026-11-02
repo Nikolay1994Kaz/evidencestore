@@ -336,7 +336,12 @@ func (s *Server) AdminHandler() http.Handler {
 		writeJSON(w, http.StatusOK, s.store.Status())
 	})
 	mux.HandleFunc("GET /admin/statement", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.store.Statement())
+		c, err := s.store.Checkpoint()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, c)
 	})
 	mux.HandleFunc("GET /admin/proof", func(w http.ResponseWriter, r *http.Request) {
 		seq, err := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)

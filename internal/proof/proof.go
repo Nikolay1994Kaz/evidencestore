@@ -10,13 +10,17 @@
 //	лист        тип «улика принята», источник, номер, время приёма, позиция, отпечаток
 //	лист        → путь Меркла → корень в звене n
 //	звенья      от первого нужного до головы, каждое хэшем ссылается на прежнее
+//	граница     дерева звеньев перед первым звеном пакета (tree.go)
 //	T2 (сверху) токен TSA над головой m ≥ n: улика существовала не позже T2
 //	T1 (снизу)  токен TSA, лежащий листом в звене k < n: улика вошла в цепь после T1
-//	голова      подписана ключом хранилища (Ed25519)
+//	голова      контрольная точка: число звеньев и корень дерева над ними,
+//	            подписана ключом хранилища (Ed25519)
 //	тело        если выдан ключ записи (DEK) — вскрывается, тег GCM сходится
 //
-// Звенья подлинны потому, что голова m заверена TSA, а каждое звено до неё
-// входит в хэш следующего: подменить звено n значит сломать хэш головы.
+// Голова m — число звеньев m и корень дерева RFC 6962 над их хешами
+// (checkpoint.go). Звенья подлинны потому, что голова m заверена TSA, а
+// корень на ней считается по границе дерева из пакета и хешам звеньев:
+// подменить звено n значит сломать корень головы.
 package proof
 
 import (
@@ -48,11 +52,14 @@ import (
 // (auditchain.LeafNode), и в участке целиком лежат только метки, остальные
 // листья — хешем; пакет больше не показывает имён, номеров и времени чужих
 // записей. Пакеты версий 1–3 сделаны над цепью прежнего формата и этим
-// выпуском не читаются.
+// выпуском не читаются. С той же версии 4 голова — контрольная точка над
+// деревом звеньев (DECISIONS п. 30), пакет несёт границу дерева.
 const Version = 4
 
-// HeadDomain — домен хэша головы, который уходит в TSA.
-const HeadDomain = "evidencestore/head/v1"
+// HeadDomain — домен отпечатка головы, который уходит в TSA. v1 заверял
+// номер и хеш последнего звена, v2 — контрольную точку: число звеньев и
+// корень дерева звеньев.
+const HeadDomain = "evidencestore/head/v2"
 
 // Допуски времени приёма относительно меток TSA — одни для пакета одной
 // улики и для пакета за окно (window.go). Сверху — секунда: время в метке —
@@ -84,11 +91,12 @@ const (
 	WindowEdge   = 2 * time.Minute
 )
 
-// HeadImprint — что заверяет TSA: номер и хэш головы цепи.
-func HeadImprint(seq uint64, hash [32]byte) [32]byte {
+// HeadImprint — что заверяет TSA: голова из size звеньев с корнем дерева
+// звеньев root.
+func HeadImprint(size uint64, root [32]byte) [32]byte {
 	var b [8 + 32]byte
-	binary.BigEndian.PutUint64(b[:8], seq)
-	copy(b[8:], hash[:])
+	binary.BigEndian.PutUint64(b[:8], size)
+	copy(b[8:], root[:])
 	return tsa.Imprint(HeadDomain, b[:])
 }
 
@@ -210,14 +218,17 @@ type Upper struct {
 
 // Bundle — пакет доказательств по одной улике.
 type Bundle struct {
-	Version   int                  `json:"v"`
-	Evidence  []byte               `json:"evidence"` // байты улики, как на диске
-	Inclusion Inclusion            `json:"inclusion"`
-	Lower     *Lower               `json:"lower,omitempty"`
-	Upper     *Upper               `json:"upper,omitempty"`
-	Links     []Link               `json:"links"` // подряд, последнее — голова из Statement
-	Statement auditchain.Statement `json:"statement"`
-	DEK       []byte               `json:"dek,omitempty"` // ключ этой записи, если выдан
+	Version   int       `json:"v"`
+	Evidence  []byte    `json:"evidence"` // байты улики, как на диске
+	Inclusion Inclusion `json:"inclusion"`
+	Lower     *Lower    `json:"lower,omitempty"`
+	Upper     *Upper    `json:"upper,omitempty"`
+	Links     []Link    `json:"links"` // подряд, последнее — голова из Checkpoint
+	// Frontier — граница дерева звеньев перед первым звеном пакета (не
+	// больше log₂N хешей; у пакета с первого звена цепи — пусто).
+	Frontier   [][]byte   `json:"frontier,omitempty"`
+	Checkpoint Checkpoint `json:"checkpoint"`
+	DEK        []byte     `json:"dek,omitempty"` // ключ этой записи, если выдан
 	// Gateway — для улик из журнала гейтвея (content_type pipelock/recorder).
 	Gateway *GatewayProof `json:"gateway,omitempty"`
 	// Stretch — все листья звеньев от головы, которую заверила T1, до звена
@@ -426,29 +437,24 @@ func Verify(b Bundle, trust Trust) Report {
 	}
 	add("the chain leaf describes this very record", err, fmt.Sprintf("position %d", pos))
 
-	// 3. Звенья подряд и связаны хэшами.
-	links, hashes, err := chainLinks(b.Links)
+	// 3. Звенья подряд и связаны хэшами; корни дерева звеньев на их номерах.
+	// linkAt — звено пакета и корень дерева на нём: по корню сверяются
+	// метки TSA и головы свидетеля.
+	links, rootAt, err := chainLinks(b.Links, b.Frontier)
 	if !add("the links are chained by hash with no gaps", err, fmt.Sprintf("%d links", len(links))) {
 		return r
 	}
 	linkAt := func(seq uint64) (auditchain.Record, [32]byte, bool) {
-		if len(links) == 0 || seq < links[0].Seq || seq > links[len(links)-1].Seq {
+		root, ok := rootAt(seq)
+		if !ok {
 			return auditchain.Record{}, [32]byte{}, false
 		}
-		i := seq - links[0].Seq
-		return links[i], hashes[i], true
+		return links[seq-links[0].Seq], root, true
 	}
 
-	// 4. Голова подписана закреплённым ключом и совпадает с последним звеном.
-	err = auditchain.VerifyStatement(b.Statement, trust.StoreKey)
-	if err == nil {
-		last := len(links) - 1
-		if b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {
-			err = errors.New("the signed head does not match the last link in the bundle")
-		}
-	}
-	r.HeadSeq = b.Statement.HeadSeq
-	add("the head is signed with the store key", err, fmt.Sprintf("head %d", b.Statement.HeadSeq))
+	// 4. Голова подписана закреплённым ключом и сходится со звеньями пакета.
+	r.HeadSeq = b.Checkpoint.Size
+	add("the head is signed with the store key", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt), fmt.Sprintf("head %d", b.Checkpoint.Size))
 
 	// 5. Путь Меркла от листа улики до корня звена n.
 	r.LinkSeq = b.Inclusion.LinkSeq
@@ -507,12 +513,16 @@ func Verify(b Bundle, trust Trust) Report {
 	// 11. Свидетель голов: цепь пакета сходится с головами, которые
 	// проверяющий сам взял у свидетеля.
 	if trust.Witness != nil {
-		checkWitness(trust.Witness, trust.StoreKey, b.Inclusion.LinkSeq, links, hashes, &r, add)
+		checkWitness(trust.Witness, trust.StoreKey, b.Inclusion.LinkSeq, links, rootAt, &r, add)
 	}
 	return r
 }
 
-func chainLinks(in []Link) ([]auditchain.Record, [][32]byte, error) {
+// chainLinks — звенья пакета подряд, связанные хешами, и корни дерева
+// звеньев на их номерах: по границе дерева перед первым звеном (frontier) и
+// хешам звеньев. rootAt(seq) — корень дерева из seq звеньев, если звено seq
+// в пакете.
+func chainLinks(in []Link, frontier [][]byte) ([]auditchain.Record, func(uint64) ([32]byte, bool), error) {
 	if len(in) == 0 {
 		return nil, nil, errors.New("the bundle has no links")
 	}
@@ -533,7 +543,27 @@ func chainLinks(in []Link) ([]auditchain.Record, [][32]byte, error) {
 		}
 		links[i], hashes[i] = r, auditchain.Hash(r)
 	}
-	return links, hashes, nil
+	rootAt, err := linkRoots(frontier, links[0].Seq, hashes)
+	if err != nil {
+		return nil, nil, err
+	}
+	return links, rootAt, nil
+}
+
+// checkHead — подписанная голова пакета: ключ хранилища, число звеньев —
+// последнее звено пакета, корень — корень дерева на нём.
+func checkHead(c Checkpoint, key ed25519.PublicKey, links []auditchain.Record, rootAt func(uint64) ([32]byte, bool)) error {
+	if err := VerifyCheckpoint(c, key); err != nil {
+		return err
+	}
+	last := links[len(links)-1].Seq
+	if c.Size != last {
+		return fmt.Errorf("the signed head is of %d links, the bundle ends at link %d", c.Size, last)
+	}
+	if root, _ := rootAt(last); c.RootHash() != root {
+		return errors.New("the signed head does not match the links in the bundle: the root of their tree differs")
+	}
+	return nil
 }
 
 func checkInclusion(inc Inclusion, linkAt func(uint64) (auditchain.Record, [32]byte, bool)) error {
@@ -566,11 +596,11 @@ func checkUpper(u Upper, evidenceLink uint64, linkAt func(uint64) (auditchain.Re
 	if u.HeadSeq < evidenceLink {
 		return time.Time{}, fmt.Errorf("the time-stamp is over head %d, the record is in link %d: the time-stamp does not cover it", u.HeadSeq, evidenceLink)
 	}
-	_, hash, ok := linkAt(u.HeadSeq)
+	_, root, ok := linkAt(u.HeadSeq)
 	if !ok {
 		return time.Time{}, fmt.Errorf("link %d is not in the bundle", u.HeadSeq)
 	}
-	info, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, hash), trust)
+	info, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, root), trust)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -592,11 +622,11 @@ func checkLower(lw Lower, evidenceLink uint64, linkAt func(uint64) (auditchain.R
 	if err != nil {
 		return time.Time{}, errors.New("the time-stamp leaf has no head number")
 	}
-	_, hash, ok := linkAt(stamped)
+	_, root, ok := linkAt(stamped)
 	if !ok {
 		return time.Time{}, fmt.Errorf("link %d, certified by the time-stamp, is not in the bundle", stamped)
 	}
-	info, err := tsa.Verify(inc.Leaf.Payload, HeadImprint(stamped, hash), trust)
+	info, err := tsa.Verify(inc.Leaf.Payload, HeadImprint(stamped, root), trust)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -623,11 +653,6 @@ func tokenLinkTime(link auditchain.Record, gen time.Time) error {
 		return fmt.Errorf("link %d holds the token of the time-stamp of %s, yet its time is %s, more than %s earlier: the store backdated the link", link.Seq, fmtTime(gen), fmtTime(at), ReceiveSkew)
 	}
 	return nil
-}
-
-func encodeHash(h [32]byte) string {
-	// Тот же вид, что в auditchain.Statement.
-	return auditchain.EncodeHash(h)
 }
 
 func fmtTime(t time.Time) string {

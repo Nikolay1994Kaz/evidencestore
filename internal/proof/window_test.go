@@ -47,8 +47,8 @@ func (w *world) window(lowerHead, end uint64, from, to time.Time) WindowBundle {
 			b.Leaves = append(b.Leaves, FromLeaf(l))
 		}
 	}
-	last := w.links[end-1]
-	b.Statement = w.signer.Sign(auditchain.Head{Seq: last.Seq, Hash: auditchain.Hash(last)}, int(last.Seq), w.now.Unix())
+	b.Frontier = w.frontier(max(lowerHead, 1))
+	b.Checkpoint = w.checkpoint(end)
 	return b
 }
 
@@ -168,7 +168,7 @@ func TestWindowFromChainStart(t *testing.T) {
 	l2 := w2.links[1]
 	b = WindowBundle{Version: WindowVersion, Kind: WindowKind, From: at(9, 0, 0), To: at(9, 30, 0), StretchEnd: 2,
 		Links: []Link{FromLink(l2)}, Leaves: []Leaf{FromLeaf(w2.leaves[1][0])},
-		Statement: w2.signer.Sign(auditchain.Head{Seq: 2, Hash: auditchain.Hash(l2)}, 2, w2.now.Unix())}
+		Frontier: w2.frontier(2), Checkpoint: w2.checkpoint(2)}
 	checkFailed(t, VerifyWindow(b, w2.trust(), time.Time{}, time.Time{}), "the bundle holds every leaf")
 }
 
@@ -481,7 +481,7 @@ func TestWindowStalledUpperStamp(t *testing.T) {
 	w.now = at(10, 8, 0)
 	w.wlink(rec(t, 2, at(10, 7, 0)), rec(t, 3, at(10, 8, 0)))
 	w.now = at(10, 15, 0)
-	imprint := HeadImprint(headB.Seq, headB.Hash)
+	imprint := HeadImprint(headB.Seq, w.root(headB.Seq))
 	tB, err := w.tsa.Sign(imprint[:], nil)
 	if err != nil {
 		t.Fatal(err)

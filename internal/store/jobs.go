@@ -348,14 +348,16 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 		// идёт запрос к TSA, обход свидетеля может поставить в очередь и
 		// отправить голову новее, и эта, встав в очередь после неё, туда бы
 		// уже не попала. Метка не выйдет — свидетель получит лишнюю голову.
-		s.queueWitnessLocked(head, true)
+		s.queueWitnessLocked(true)
 	}
+	// Метка заверяет голову целиком: число звеньев и корень дерева над ними.
+	root := s.tree.root()
 	s.chainMu.Unlock()
 	unlockGW()
 	if already {
 		return 0, gen, nil
 	}
-	imprint := proof.HeadImprint(head.Seq, head.Hash)
+	imprint := proof.HeadImprint(head.Seq, root)
 	asked := s.mono()
 	var token []byte
 	if s.tsaLocal != nil {
@@ -458,7 +460,7 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	if err = s.flushLocked(); err == nil {
 		// Звеном токена кончаются пакеты за окно и по источнику: и оно к
 		// свидетелю головой под меткой, не ждать обхода.
-		s.queueWitnessLocked(s.chain.Head(), true)
+		s.queueWitnessLocked(true)
 	}
 	s.chainMu.Unlock()
 	s.anchorClock(info.GenTime, answered, took)

@@ -549,13 +549,13 @@ func TestRestoreSkipsHeadAheadOfLinks(t *testing.T) {
 	}
 	// Голова нового состояния — в копию, а куски цепи и журнала — нет.
 	s.chainMu.Lock()
-	st := s.signer.Sign(s.chain.Head(), len(s.links), s.nowTime().Unix())
+	head, _ := s.checkpointLocked()
 	s.chainMu.Unlock()
-	if st.HeadSeq <= shipped {
-		t.Fatalf("голова не сдвинулась: %d, в копии %d", st.HeadSeq, shipped)
+	if head.Size <= shipped {
+		t.Fatalf("голова не сдвинулась: %d, в копии %d", head.Size, shipped)
 	}
-	data, _ := st.JSON()
-	if err := remote.Put(ctx, fmt.Sprintf("heads/%020d.json", st.HeadSeq), data); err != nil {
+	data, _ := head.JSON()
+	if err := remote.Put(ctx, fmt.Sprintf("heads/%020d.json", head.Size), data); err != nil {
 		t.Fatal(err)
 	}
 	pub, _ := base64.RawStdEncoding.DecodeString(s.PublicKey())

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -115,6 +116,13 @@ func (s *Store) scanChain() (chainScan, error) {
 	}
 	if got, want := s.nextLeaf-s.linked, uint64(s.chain.Pending()); got != want {
 		return cs, fmt.Errorf("chain: %d leaves without a link on disk, carrier holds %d", got, want)
+	}
+	// Дерево звеньев — до первого звена этого запуска (п. 30).
+	if s.tree, err = openLinkTree(s.cfg.DataDir, links); err != nil {
+		return cs, err
+	}
+	if n, head := s.tree.size(), s.chain.Head().Seq; n != head {
+		return cs, fmt.Errorf("chain: %d links in chain.log, the head is %d", n, head)
 	}
 	return cs, nil
 }
@@ -252,6 +260,9 @@ func (s *Store) flushLocked() error {
 	}
 	s.links = append(s.links, linkRef{seq: head.Seq, first: s.linked, count: s.nextLeaf - s.linked})
 	s.linked = s.nextLeaf
+	if err := s.tree.add(head.Hash); err != nil {
+		s.log.Error("tree of links: writing "+treeFileName+" failed: bundles are refused until a restart rebuilds it", "err", err)
+	}
 	return nil
 }
 
@@ -264,10 +275,17 @@ func (s *Store) linkOfLocked(leaf uint64) (linkRef, bool) {
 	return s.links[i], true
 }
 
-// Statement — голова, подписанная ключом хранилища.
-func (s *Store) Statement() auditchain.Statement {
+// ErrEmptyChain — у пустой цепи нет головы, которую можно подписать.
+var ErrEmptyChain = errors.New("store: the chain is empty: no head to sign yet")
+
+// Checkpoint — текущая голова, подписанная ключом хранилища (контрольная
+// точка, п. 30).
+func (s *Store) Checkpoint() (proof.Checkpoint, error) {
 	s.chainMu.Lock()
 	defer s.chainMu.Unlock()
-	h := s.chain.Head()
-	return s.signer.Sign(h, len(s.links), s.nowTime().Unix())
+	c, ok := s.checkpointLocked()
+	if !ok {
+		return c, ErrEmptyChain
+	}
+	return c, nil
 }

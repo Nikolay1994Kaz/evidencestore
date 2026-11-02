@@ -194,8 +194,8 @@ func TestWindowProof(t *testing.T) {
 		}
 	}
 	// Заявление — о последнем звене пакета, оно же конец участка.
-	if last := b.Links[len(b.Links)-1].Seq; b.Statement.HeadSeq != last || last != b.StretchEnd {
-		t.Fatalf("заявление о голове %d, последнее звено %d, конец участка %d", b.Statement.HeadSeq, last, b.StretchEnd)
+	if last := b.Links[len(b.Links)-1].Seq; b.Checkpoint.Size != last || last != b.StretchEnd {
+		t.Fatalf("подписанная голова %d, последнее звено %d, конец участка %d", b.Checkpoint.Size, last, b.StretchEnd)
 	}
 	// Без -source пакет не несёт улик, только листья.
 	nb, err := s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 6, 0), "", false, 0)
@@ -320,7 +320,7 @@ func TestWindowProofForgedByStore(t *testing.T) {
 		return proof.VerifyWindow(b, trust, time.Time{}, time.Time{})
 	}
 	sign := func(b *proof.WindowBundle, last auditchain.Record) {
-		b.Statement = s.signer.Sign(auditchain.Head{Seq: last.Seq, Hash: auditchain.Hash(last)}, int(last.Seq), 0)
+		b.Checkpoint = headOver(t, s, b.Frontier, b.Links, last.Seq)
 	}
 	_, chainDir, _ := dirs(cfg)
 	links, err := auditchain.ReadLinks(chainDir, 1, good.StretchEnd)
@@ -358,6 +358,7 @@ func TestWindowProofForgedByStore(t *testing.T) {
 	// Начало сдвинуто за улики 4–6: участок после головы под B.
 	b = clone()
 	b.Links, b.Leaves, b.LowerHead = b.Links[3:], b.Leaves[5:], 6
+	b.Frontier = proof.FrontierOfLinks(links[:5]).Bytes()
 	failedCheck(t, verify(b), "the time-stamps bracket the window")
 
 	// Улика 5 выброшена из звена 5, звенья 5–7 пересчитаны и сцеплены
@@ -396,7 +397,7 @@ func TestWindowProofForgedByStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	b = clone()
-	b.Statement = other.Sign(auditchain.Head{Seq: 7, Hash: auditchain.Hash(link(7))}, 7, 0)
+	b.Checkpoint = proof.SignCheckpoint(other, 7, b.Checkpoint.RootHash())
 	failedCheck(t, verify(b), "the head is signed with the store key")
 
 	// Приложенные улики: испорченный байт, чужой ключ записи, улика не с участка.
@@ -513,9 +514,12 @@ func TestWindowProofWitness(t *testing.T) {
 	if err := s.flush(); err != nil { // токен C — в звено после участка
 		t.Fatal(err)
 	}
-	head := s.Statement()
+	head, err := s.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
 	trust := trustOf(t, s)
-	trust.Witness = &proof.Witness{Heads: []proof.PublishedHead{{Name: "head.json", Statement: head}}}
+	trust.Witness = &proof.Witness{Heads: []proof.PublishedHead{{Name: "head.json", Checkpoint: head}}}
 
 	b, err := s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 6, 0), "", false, 0)
 	if err != nil {
@@ -523,24 +527,19 @@ func TestWindowProofWitness(t *testing.T) {
 	}
 	failedCheck(t, proof.VerifyWindow(roundTrip(t, b), trust, time.Time{}, time.Time{}), "the chain in the bundle agrees with the heads the witness saw")
 
-	b, err = s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 6, 0), "", false, head.HeadSeq)
+	b, err = s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 6, 0), "", false, head.Size)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := proof.VerifyWindow(roundTrip(t, b), trust, time.Time{}, time.Time{})
-	if !r.Valid() || r.WitnessHead != head.HeadSeq || b.StretchEnd >= head.HeadSeq {
+	if !r.Valid() || r.WitnessHead != head.Size || b.StretchEnd >= head.Size {
 		t.Fatalf("голова свидетеля %d, конец участка %d:\n%s", r.WitnessHead, b.StretchEnd, r.Text())
 	}
 
 	// Свидетель видел голову посреди участка: с пакетом она сходится, но
 	// закрепляет не весь участок — закрепляющей головы у свидетеля ещё нет.
-	_, chainDir, _ := dirs(s.cfg)
-	links, err := auditchain.ReadLinks(chainDir, 4, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
 	trust.Witness = &proof.Witness{Heads: []proof.PublishedHead{{Name: "mid.json",
-		Statement: s.signer.Sign(auditchain.Head{Seq: 4, Hash: auditchain.Hash(links[0])}, 4, 0)}}}
+		Checkpoint: proof.SignCheckpoint(s.signer, 4, rootOf(t, s, 4))}}}
 	b, err = s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 6, 0), "", false, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -618,7 +617,7 @@ func TestWindowProofIgnoresUncertifiedTail(t *testing.T) {
 	}
 	b.Links[len(b.Links)-1] = proof.FromLink(forged)
 	b.Leaves = append(b.Leaves[:5:5], proof.FromLeaf(fake), b.Leaves[5])
-	b.Statement = s.signer.Sign(auditchain.Head{Seq: forged.Seq, Hash: auditchain.Hash(forged)}, int(forged.Seq), 0)
+	b.Checkpoint = headOver(t, s, b.Frontier, b.Links, forged.Seq)
 
 	// Звено 7 лежит после головы 6, которую заверила метка B: в нём ничто не
 	// заверено, и выдуманная запись не попадает ни в сводку, ни в окно.

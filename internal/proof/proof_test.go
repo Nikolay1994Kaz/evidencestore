@@ -67,10 +67,36 @@ func (w *world) link(leaves ...auditchain.Leaf) {
 	w.leaves = append(w.leaves, leaves)
 }
 
+// root — корень дерева над первыми size звеньями мира.
+func (w *world) root(size uint64) [32]byte { return FrontierOfLinks(w.links[:size]).Root() }
+
+// checkpoint — голова из size звеньев мира, подписанная ключом мира.
+func (w *world) checkpoint(size uint64) Checkpoint {
+	return SignCheckpoint(w.signer, size, w.root(size))
+}
+
+// frontier — граница дерева перед звеном first мира.
+func (w *world) frontier(first uint64) [][]byte { return FrontierOfLinks(w.links[:first-1]).Bytes() }
+
+// headOf — голова над звеньями пакета links после границы frontier,
+// подписанная ключом s: так подписывает хранилище, и так же — владелец ключа,
+// переписавший звенья.
+func headOf(s *auditchain.Signer, frontier [][]byte, links []Link) Checkpoint {
+	f := Frontier{Size: links[0].Seq - 1}
+	for _, n := range frontier {
+		f.Nodes = append(f.Nodes, [32]byte(n))
+	}
+	for _, l := range links {
+		r, _ := l.record()
+		f.Push(LinkLeaf(auditchain.Hash(r)))
+	}
+	return SignCheckpoint(s, f.Size, f.Root())
+}
+
 func (w *world) stamp() (uint64, []byte) {
 	w.t.Helper()
 	h := w.head()
-	imprint := HeadImprint(h.Seq, h.Hash)
+	imprint := HeadImprint(h.Seq, w.root(h.Seq))
 	token, err := w.tsa.Sign(imprint[:], nil)
 	if err != nil {
 		w.t.Fatal(err)
@@ -137,7 +163,7 @@ func (w *world) bundle(evidenceBytes []byte, evLink uint64, evIdx int, upperHead
 	for _, l := range w.links {
 		b.Links = append(b.Links, FromLink(l))
 	}
-	b.Statement = w.signer.Sign(w.head(), len(w.links), w.now.Unix())
+	b.Checkpoint = w.checkpoint(uint64(len(w.links)))
 	return b
 }
 
@@ -236,7 +262,7 @@ func TestForgedLinkBreaksHashChain(t *testing.T) {
 func TestStatementMustBeSignedByPinnedKey(t *testing.T) {
 	w, b := standard(t, nil)
 	other, _ := auditchain.LoadOrCreateSigner(t.TempDir())
-	b.Statement = other.Sign(w.head(), len(w.links), w.now.Unix())
+	b.Checkpoint = headOf(other, b.Frontier, b.Links)
 	mustFail(t, "чужой ключ", b, w.trust())
 	trust := w.trust()
 	trust.StoreKey = ed25519.PublicKey(other.PublicKey())
@@ -245,10 +271,13 @@ func TestStatementMustBeSignedByPinnedKey(t *testing.T) {
 	}
 }
 
-// Подпись верна, но голова — не последнее звено пакета.
+// Подпись верна, но голова — не последнее звено пакета: другой корень при
+// том же числе звеньев или другое число звеньев.
 func TestStatementMustMatchLastLink(t *testing.T) {
 	w, b := standard(t, nil)
-	b.Statement = w.signer.Sign(auditchain.Head{Seq: 5, Hash: auditchain.Hash(w.links[3])}, 5, w.now.Unix())
+	b.Checkpoint = SignCheckpoint(w.signer, 5, w.root(4))
+	mustFail(t, "корень не тот", b, w.trust())
+	b.Checkpoint = w.checkpoint(4)
 	mustFail(t, "голова не та", b, w.trust())
 }
 

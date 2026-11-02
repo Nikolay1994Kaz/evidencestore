@@ -344,33 +344,31 @@ func TestSourceProofAcrossRestart(t *testing.T) {
 // — проси пакет до неё (-to-head), с ней пакет проходит.
 func TestSourceProofWitness(t *testing.T) {
 	s, _ := sourceStore(t)
-	head := s.Statement()
+	head, err := s.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
 	trust := trustOf(t, s)
-	trust.Witness = &proof.Witness{Heads: []proof.PublishedHead{{Name: "head.json", Statement: head}}}
+	trust.Witness = &proof.Witness{Heads: []proof.PublishedHead{{Name: "head.json", Checkpoint: head}}}
 	b, err := s.ProofSource("abs-core", clockAt(10, 4, 0), clockAt(10, 6, 0), false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sourceFailed(t, proof.VerifySource(sourceRoundTrip(t, b), trust, time.Time{}, time.Time{}), "the chain in the bundle agrees with the heads the witness saw")
-	if b, err = s.ProofSource("abs-core", clockAt(10, 4, 0), clockAt(10, 6, 0), false, head.HeadSeq); err != nil {
+	if b, err = s.ProofSource("abs-core", clockAt(10, 4, 0), clockAt(10, 6, 0), false, head.Size); err != nil {
 		t.Fatal(err)
 	}
 	r := proof.VerifySource(sourceRoundTrip(t, b), trust, time.Time{}, time.Time{})
-	if !r.Valid() || !r.WitnessChecked || r.WitnessHead != head.HeadSeq || r.UpperHead >= head.HeadSeq {
-		t.Fatalf("голова свидетеля %d:\n%s", head.HeadSeq, r.Text())
+	if !r.Valid() || !r.WitnessChecked || r.WitnessHead != head.Size || r.UpperHead >= head.Size {
+		t.Fatalf("голова свидетеля %d:\n%s", head.Size, r.Text())
 	}
 
 	// Свидетель видел голову посреди пакета (звено улик 4–6): с пакетом она
 	// сходится, но верхние хвосты не закрепляет — такой головы у свидетеля
 	// ещё нет.
 	mid := b.Lower.Head + 2
-	_, chainDir, _ := dirs(s.cfg)
-	links, err := auditchain.ReadLinks(chainDir, mid, mid)
-	if err != nil {
-		t.Fatal(err)
-	}
 	trust.Witness = &proof.Witness{Heads: []proof.PublishedHead{{Name: "mid.json",
-		Statement: s.signer.Sign(auditchain.Head{Seq: mid, Hash: auditchain.Hash(links[0])}, int(mid), 0)}}}
+		Checkpoint: proof.SignCheckpoint(s.signer, mid, rootOf(t, s, mid))}}}
 	if b, err = s.ProofSource("abs-core", clockAt(10, 4, 0), clockAt(10, 6, 0), false, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +387,7 @@ func oldStamp(t *testing.T, s *Store) {
 		t.Fatal(err)
 	}
 	head := s.chain.Head()
-	imprint := proof.HeadImprint(head.Seq, head.Hash)
+	imprint := proof.HeadImprint(head.Seq, s.tree.root())
 	token, err := s.tsaLocal.Sign(imprint[:], nil)
 	if err != nil {
 		t.Fatal(err)
@@ -743,8 +741,8 @@ func TestStampedHeadReachesWitnessAfterNewerHead(t *testing.T) {
 	var seqs []uint64
 	has := false
 	for _, h := range tr.Witness.Heads {
-		seqs = append(seqs, h.Statement.HeadSeq)
-		has = has || h.Statement.HeadSeq == stamped
+		seqs = append(seqs, h.Checkpoint.Size)
+		has = has || h.Checkpoint.Size == stamped
 	}
 	t.Logf("голова под T2: %d; головы у свидетеля: %v", stamped, seqs)
 	b, err := s.Proof("abs-core", 5, false)
@@ -1001,8 +999,10 @@ func TestSourceProofFreshTokenNeedsRewrite(t *testing.T) {
 	c.add(3 * time.Minute) // 10:20
 	// Цепь после B переписана: закрывающий токен (над B), хвосты, где
 	// последняя запись abs-core — 4, токен над ними; голова переподписана.
-	sign := func(h auditchain.Record) []byte {
-		imprint := proof.HeadImprint(h.Seq, auditchain.Hash(h))
+	// sign — метка над головой переписанной цепи, которой кончается chain.
+	sign := func(chain ...auditchain.Record) []byte {
+		h := chain[len(chain)-1]
+		imprint := proof.HeadImprint(h.Seq, rootAfter(t, honest.Frontier, chain))
 		tok, err := s.tsaLocal.Sign(imprint[:], nil)
 		if err != nil {
 			t.Fatal(err)
@@ -1017,7 +1017,7 @@ func TestSourceProofFreshTokenNeedsRewrite(t *testing.T) {
 		}
 		return r
 	}
-	closeLeaf := auditchain.Leaf{UnixNano: at, Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(linkB.Seq, 10), Payload: sign(linkB)}
+	closeLeaf := auditchain.Leaf{UnixNano: at, Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(linkB.Seq, 10), Payload: sign(links...)}
 	l1 := link(linkB, bp.FirstLeaf+1, closeLeaf)
 	var lastRec auditchain.Leaf
 	forged := honest
@@ -1031,7 +1031,7 @@ func TestSourceProofFreshTokenNeedsRewrite(t *testing.T) {
 	tail := proof.Tail{Source: src, Seq: 4, Hash: auditchain.LeafHash(lastRec), Salt: s.tailSalt(bp.FirstLeaf+2, src)}
 	tailsLeaf := proof.TailsLeaf([]proof.Tail{tail}, at)
 	l2 := link(l1, bp.FirstLeaf+2, tailsLeaf)
-	edgeLeaf := auditchain.Leaf{UnixNano: at, Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(l2.Seq, 10), Payload: sign(l2)}
+	edgeLeaf := auditchain.Leaf{UnixNano: at, Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(l2.Seq, 10), Payload: sign(slices.Concat(links, []auditchain.Record{l1, l2})...)}
 	l3 := link(l2, bp.FirstLeaf+3, edgeLeaf)
 	forged.Links = nil
 	for _, l := range append(links, l1, l2, l3) {
@@ -1040,7 +1040,7 @@ func TestSourceProofFreshTokenNeedsRewrite(t *testing.T) {
 	tails := proof.FromLeaf(tailsLeaf)
 	forged.Upper = proof.SourceEdge{Head: l2.Seq, Tails: &tails, Token: proof.Inclusion{Leaf: proof.FromLeaf(edgeLeaf), LinkSeq: l3.Seq}, Open: proof.TailOf(tail)}
 	forged.Closing = proof.Inclusion{Leaf: proof.FromLeaf(closeLeaf), LinkSeq: l1.Seq}
-	forged.Statement = s.signer.Sign(auditchain.Head{Seq: l3.Seq, Hash: auditchain.Hash(l3)}, int(l3.Seq), 0)
+	forged.Checkpoint = proof.SignCheckpoint(s.signer, l3.Seq, rootAfter(t, honest.Frontier, slices.Concat(links, []auditchain.Record{l1, l2, l3})))
 
 	sourceFailed(t, proof.VerifySource(forged, trust, from, to), "the chain in the bundle agrees with the heads the witness saw")
 	// Без свидетеля переписанное со свежей меткой в пределах часа после окна
@@ -1115,8 +1115,8 @@ func TestSourceProofEndsAtWitnessHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := proof.VerifySource(b, tr, from, to); !r.Valid() || r.WitnessHead != b.Statement.HeadSeq {
-		t.Fatalf("пакет по источнику с -heads (кончается звеном %d):\n%s", b.Statement.HeadSeq, r.Text())
+	if r := proof.VerifySource(b, tr, from, to); !r.Valid() || r.WitnessHead != b.Checkpoint.Size {
+		t.Fatalf("пакет по источнику с -heads (кончается звеном %d):\n%s", b.Checkpoint.Size, r.Text())
 	}
 	w, err := s.ProofWindow(from, to, "", false, 0)
 	if err != nil {
@@ -1346,11 +1346,10 @@ func TestSourceProofSkipsAppendedOldTailsToken(t *testing.T) {
 			pb = tok.head
 		}
 	}
-	links, err := auditchain.ReadLinks(s.chainDir, pb, pb)
-	if err != nil || pb == 0 {
-		t.Fatalf("звено B %d: %v", pb, err)
+	if pb == 0 {
+		t.Fatal("нет звена B")
 	}
-	imprint := proof.HeadImprint(pb, auditchain.Hash(links[0]))
+	imprint := proof.HeadImprint(pb, rootOf(t, s, pb))
 	fresh, err := s.tsaLocal.Sign(imprint[:], nil)
 	if err != nil {
 		t.Fatal(err)

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/ship"
@@ -31,11 +30,11 @@ func witnessHeads(t *testing.T, dir string) *proof.Witness {
 		if err != nil {
 			t.Fatal(err)
 		}
-		st, err := auditchain.ParseStatement(data)
+		c, err := proof.ParseCheckpoint(data)
 		if err != nil {
 			t.Fatal(err)
 		}
-		w.Heads = append(w.Heads, proof.PublishedHead{Name: filepath.Base(p), Statement: st})
+		w.Heads = append(w.Heads, proof.PublishedHead{Name: filepath.Base(p), Checkpoint: c})
 	}
 	return w
 }
@@ -242,8 +241,8 @@ func TestProofToWitnessHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if last := b.Links[len(b.Links)-1].Seq; last != head || b.Statement.HeadSeq != head {
-		t.Fatalf("пакет до головы %d кончается звеном %d, заявление о голове %d", head, last, b.Statement.HeadSeq)
+	if last := b.Links[len(b.Links)-1].Seq; last != head || b.Checkpoint.Size != head {
+		t.Fatalf("пакет до головы %d кончается звеном %d, подписанная голова %d", head, last, b.Checkpoint.Size)
 	}
 	if r := proof.Verify(b, trustOf(t, s)); !r.Valid() {
 		t.Fatalf("пакет до головы свидетеля:\n%s", r.Text())
@@ -313,7 +312,7 @@ func TestStampedHeadReachesWitnessDuringTSA(t *testing.T) {
 	tr := trustOf(t, s)
 	tr.Witness = witnessHeads(t, wdir)
 	r := proof.Verify(b, tr)
-	t.Logf("пакет кончается головой %d (T2 над %d); у свидетеля голов %d", b.Statement.HeadSeq, b.Upper.HeadSeq, len(tr.Witness.Heads))
+	t.Logf("пакет кончается головой %d (T2 над %d); у свидетеля голов %d", b.Checkpoint.Size, b.Upper.HeadSeq, len(tr.Witness.Heads))
 	if !r.Valid() {
 		t.Errorf("пакет одной улики не проходит -heads, хотя хранилище честное:\n%s", r.Text())
 	}

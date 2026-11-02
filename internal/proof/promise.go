@@ -132,7 +132,7 @@ func CheckPromise(p Promise, r Report, b Bundle, allowNoTSA bool) error {
 // обвинил бы только того, кто его положил; спрятать настоящий нельзя —
 // листья сверены с корнями звеньев (Q-79).
 func checkStamps(r Report, b Bundle, limit int64) error {
-	links, _, err := chainLinks(b.Links)
+	links, _, err := chainLinks(b.Links, b.Frontier)
 	if err != nil {
 		return err
 	}

@@ -67,11 +67,13 @@ type WindowBundle struct {
 	// StretchEnd — последнее звено участка: в нём токен верхней метки.
 	StretchEnd uint64 `json:"stretch_end"`
 	// Links — звенья подряд: LowerHead (или первое звено цепи), участок и,
-	// по запросу (-to-head), звенья после него; последнее — голова Statement.
+	// по запросу (-to-head), звенья после него; последнее — голова Checkpoint.
 	Links []Link `json:"links"`
+	// Frontier — граница дерева звеньев перед первым звеном пакета.
+	Frontier [][]byte `json:"frontier,omitempty"`
 	// Leaves — все листья звеньев участка по порядку.
-	Leaves    []Leaf               `json:"leaves"`
-	Statement auditchain.Statement `json:"statement"`
+	Leaves     []Leaf     `json:"leaves"`
+	Checkpoint Checkpoint `json:"checkpoint"`
 	// Records — улики одного источника с участка и ключи их записей
 	// (proof -source S -dek).
 	Records []WindowRecord `json:"records,omitempty"`
@@ -218,29 +220,22 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 		return err == nil
 	}
 
-	// 1. Звенья подряд и связаны хэшами.
-	links, hashes, err := chainLinks(b.Links)
+	// 1. Звенья подряд и связаны хэшами; корни дерева звеньев на их номерах.
+	links, rootAt, err := chainLinks(b.Links, b.Frontier)
 	if !add("the links are chained by hash with no gaps", err, fmt.Sprintf("%d links", len(links))) {
 		return r
 	}
 	linkAt := func(seq uint64) (auditchain.Record, [32]byte, bool) {
-		if seq < links[0].Seq || seq > links[len(links)-1].Seq {
+		root, ok := rootAt(seq)
+		if !ok {
 			return auditchain.Record{}, [32]byte{}, false
 		}
-		i := seq - links[0].Seq
-		return links[i], hashes[i], true
+		return links[seq-links[0].Seq], root, true
 	}
 
-	// 2. Голова подписана закреплённым ключом и совпадает с последним звеном.
-	err = auditchain.VerifyStatement(b.Statement, trust.StoreKey)
-	if err == nil {
-		last := len(links) - 1
-		if b.Statement.HeadSeq != links[last].Seq || b.Statement.HeadHash != encodeHash(hashes[last]) {
-			err = errors.New("the signed head does not match the last link in the bundle")
-		}
-	}
-	r.HeadSeq = b.Statement.HeadSeq
-	add("the head is signed with the store key", err, fmt.Sprintf("head %d", b.Statement.HeadSeq))
+	// 2. Голова подписана закреплённым ключом и сходится со звеньями пакета.
+	r.HeadSeq = b.Checkpoint.Size
+	add("the head is signed with the store key", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt), fmt.Sprintf("head %d", b.Checkpoint.Size))
 
 	// 3. Участок: все листья звеньев после нижней головы, подряд, и они дают
 	// корни звеньев. Без этого пункта полноты нет — дальше не идём.
@@ -345,7 +340,7 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 	// пакета обязаны совпасть с его звеньями.
 	if trust.Witness != nil {
 		var wr Report
-		checkWitness(trust.Witness, trust.StoreKey, b.StretchEnd, links, hashes, &wr, add)
+		checkWitness(trust.Witness, trust.StoreKey, b.StretchEnd, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork
 	}
 	return r
@@ -427,11 +422,11 @@ func windowStamps(leaves []auditchain.Leaf, stretch []stretchLink, linkAt func(u
 			if head >= sl.seq {
 				return nil, fmt.Errorf("the time-stamp in link %d certifies head %d, which cannot hold it yet", sl.seq, head)
 			}
-			_, hash, ok := linkAt(head)
+			_, root, ok := linkAt(head)
 			if !ok {
 				return nil, fmt.Errorf("the time-stamp in link %d certifies head %d, which is not in the bundle", sl.seq, head)
 			}
-			info, err := tsa.Verify(l.Payload, HeadImprint(head, hash), trust)
+			info, err := tsa.Verify(l.Payload, HeadImprint(head, root), trust)
 			if err != nil {
 				return nil, fmt.Errorf("the time-stamp in link %d over head %d: %w", sl.seq, head, err)
 			}
