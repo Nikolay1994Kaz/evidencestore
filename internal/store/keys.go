@@ -281,7 +281,7 @@ func (s *Store) DestroyOrphanRoots() ([]string, error) {
 	return done, err
 }
 
-// confirmKeys повторяет копию keyring.dat и sign.key в резерв, если она не
+// confirmKeys повторяет копию keyring.dat, sign.key и copy.key в резерв, если она не
 // прошла, и дописывает в цепь квитанции, ждавшие копии.
 func (s *Store) confirmKeys() {
 	if err := s.keys.Confirm(); err != nil {
@@ -290,6 +290,11 @@ func (s *Store) confirmKeys() {
 	if s.signerBackupPending.Load() {
 		if err := s.confirmSigner(); err != nil {
 			s.log.Warn("signing key backup", "err", err)
+		}
+	}
+	if s.copyKeyBackupPending.Load() {
+		if err := s.confirmCopyKey(); err != nil {
+			s.log.Warn("copy key backup", "err", err)
 		}
 	}
 	s.syncKeys("", nil)

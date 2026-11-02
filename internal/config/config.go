@@ -330,6 +330,9 @@ func (c *Config) Validate() error {
 	}
 	// Свидетель — чужое хранилище, копия — своё: в одном месте головы
 	// свидетеля ничего бы не доказывали.
+	if c.Replica.URL != "" && c.Keys.BackupDir == "" {
+		errs = append(errs, errors.New("replica.url needs keys.backup_dir: the copy is encrypted with copy.key, and a copy whose key is lost with data_dir cannot be restored"))
+	}
 	if c.Witness.URL != "" && c.Witness.URL == c.Replica.URL {
 		errs = append(errs, errors.New("witness.url must not be replica.url: the witness keeps heads out of the store administrator's reach, the copy is the store's own"))
 	}

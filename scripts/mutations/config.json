@@ -98,6 +98,12 @@
    "file": "internal/config/config.go",
    "old": "\tcase least > proof.MaxPromiseMMD:",
    "new": "\tcase false && least > proof.MaxPromiseMMD:"
+  },
+  {
+   "name": "F17 копия наружу без резерва ключей (P-24)",
+   "file": "internal/config/config.go",
+   "old": "\tif c.Replica.URL != \"\" && c.Keys.BackupDir == \"\" {",
+   "new": "\tif false {"
   }
  ]
 }

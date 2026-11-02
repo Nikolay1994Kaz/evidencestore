@@ -800,7 +800,7 @@ func TestReplicaRestore(t *testing.T) {
 	restored.AdminSocket = ""
 	restored.Defaults()
 	pub, _ := base64.RawStdEncoding.DecodeString(s.PublicKey())
-	rep, err := RestoreReplica(context.Background(), remote, restored.DataDir, ed25519.PublicKey(pub))
+	rep, err := RestoreReplica(context.Background(), remote, restored.DataDir, ed25519.PublicKey(pub), copyKeyOf(t, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -845,13 +845,22 @@ func TestReplicaRestore(t *testing.T) {
 	os.CopyFS(holed, os.DirFS(remoteDir))
 	os.Remove(filepath.Join(holed, filepath.FromSlash(evKeys[0])))
 	holedRemote, _ := ship.OpenRemote("file://" + holed)
-	if _, err := RestoreReplica(context.Background(), holedRemote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub)); err == nil {
+	if _, err := RestoreReplica(context.Background(), holedRemote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub), copyKeyOf(t, cfg)); err == nil {
 		t.Fatal("копия с дырой восстановилась")
 	}
 
 	// Чужая, но внутренне правильная цепь в копии (CRC и хэши сходятся):
-	// ловит только сверка с подписанной головой.
-	other := testConfig(t, func(c *config.Config) { c.Replica.URL = "file://" + t.TempDir() })
+	// ловит только сверка с подписанной головой. Ключ копии у чужого
+	// хранилища тот же — иначе его куски не открылись бы раньше сверки.
+	other := testConfig(t, func(c *config.Config) {
+		c.Replica.URL = "file://" + t.TempDir()
+		c.Keys.BackupDir = t.TempDir()
+	})
+	for _, dir := range []string{other.DataDir, other.Keys.BackupDir} {
+		if err := os.WriteFile(filepath.Join(dir, CopyKeyFileName), copyKeyOf(t, cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	so := openStore(t, other, c)
 	otherRemote, _ := ship.OpenRemote(other.Replica.URL)
 	for i := uint64(1); i <= 12; i++ {
@@ -866,8 +875,8 @@ func TestReplicaRestore(t *testing.T) {
 	os.RemoveAll(filepath.Join(forged, "chain"))
 	os.CopyFS(filepath.Join(forged, "chain"), os.DirFS(filepath.Join(strings.TrimPrefix(other.Replica.URL, "file://"), "chain")))
 	forgedRemote, _ := ship.OpenRemote("file://" + forged)
-	if _, err := RestoreReplica(context.Background(), forgedRemote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub)); err == nil {
-		t.Fatal("копия с чужой цепью восстановилась")
+	if _, err := RestoreReplica(context.Background(), forgedRemote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub), copyKeyOf(t, cfg)); err == nil || !strings.Contains(err.Error(), "signed head") {
+		t.Fatalf("копия с чужой цепью восстановилась или отказ не по голове: %v", err)
 	}
 
 	// Подмена куска цепи в копии ловится.
@@ -875,7 +884,7 @@ func TestReplicaRestore(t *testing.T) {
 	data, _ := remote.Get(context.Background(), keys[0])
 	data[len(data)-3] ^= 1
 	remote.Put(context.Background(), keys[0], data)
-	if _, err := RestoreReplica(context.Background(), remote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub)); err == nil {
+	if _, err := RestoreReplica(context.Background(), remote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub), copyKeyOf(t, cfg)); err == nil {
 		t.Fatal("подменённая копия восстановилась")
 	}
 }
@@ -902,7 +911,7 @@ func restoreFromCopy(t *testing.T, cfg *config.Config, remote ship.Remote, pub s
 	restored.Replica.URL = ""
 	restored.Defaults()
 	key, _ := base64.RawStdEncoding.DecodeString(pub)
-	if _, err := RestoreReplica(context.Background(), remote, restored.DataDir, ed25519.PublicKey(key)); err != nil {
+	if _, err := RestoreReplica(context.Background(), remote, restored.DataDir, ed25519.PublicKey(key), copyKeyOf(t, cfg)); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{keyring.FileName, "sign.key"} {

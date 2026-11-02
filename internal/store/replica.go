@@ -27,8 +27,10 @@ import (
 //	heads/<номер головы>.json             подписанная голова на момент копии
 //
 // Объекты неизменяемы и не удаляются никогда: копия улик тоже улика.
-// keyring.dat, корни и ключ подписи не уезжают: в копии только шифротекст и
-// открытые доказательства, стирание по-прежнему сводится к одному ключу.
+// keyring.dat, корни, ключ подписи и ключ копии не уезжают. Куски журнала и
+// цепи зашифрованы ключом копии (copykey.go, P-24), головы открыты; тела
+// внутри кусков ещё и под ключами месяцев — стирание по-прежнему сводится к
+// одному ключу.
 // Отставание копии (RPO) — до replica.every.
 //
 // Докуда доехала копия, знает сама копия: первый проход после запуска берёт
@@ -155,9 +157,13 @@ func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[s
 				last = c
 			}
 		}
-		copied, err := r.Get(ctx, last.key)
+		sealed, err := r.Get(ctx, last.key)
 		if err != nil {
 			return err
+		}
+		copied, err := openCopy(s.copyKey, last.key, sealed)
+		if err != nil {
+			return fmt.Errorf("%w: %v; another installation wrote this copy, or copy.key is not this store's: point replica.url at a new location (the old copy stays as evidence), or put the right copy.key back from keys.backup_dir", ErrReplicaDiverged, err)
 		}
 		local, err := readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(name)), last.start, last.end)
 		if err != nil || !bytes.Equal(local, copied) {
@@ -233,6 +239,9 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 	}()
 	s.replicaMu.Lock()
 	defer s.replicaMu.Unlock()
+	if s.copyKeyBackupPending.Load() {
+		return 0, errCopyKeyPending
+	}
 	if err := s.loadReplicaState(ctx, r); err != nil {
 		return 0, err
 	}
@@ -269,7 +278,12 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 			if err != nil {
 				return total, err
 			}
-			if err := r.Put(ctx, s.replica.Prefix+chunkKey(name, from, end), data); err != nil {
+			key := s.replica.Prefix + chunkKey(name, from, end)
+			sealed, err := sealCopy(s.copyKey, key, data)
+			if err != nil {
+				return total, err
+			}
+			if err := r.Put(ctx, key, sealed); err != nil {
 				return total, err
 			}
 			total += end - from
@@ -372,9 +386,10 @@ type RestoreReport struct {
 
 // RestoreReplica собирает журнал улик и цепь из копии в пустой каталог
 // данных и сверяет цепь с последней подписанной головой копии (по
-// закреплённому ключу хранилища). keyring.dat, корни и sign.key в копии нет:
-// их кладут из резерва ключей отдельно.
-func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned ed25519.PublicKey) (RestoreReport, error) {
+// закреплённому ключу хранилища). Куски открывает copyKey — ключ копии из
+// резерва ключей; он же ложится в data_dir. keyring.dat, корни и sign.key в
+// копии нет: их кладут из резерва ключей отдельно.
+func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned ed25519.PublicKey, copyKey []byte) (RestoreReport, error) {
 	var rep RestoreReport
 	lock, err := lockDataDir(dataDir)
 	if err != nil {
@@ -408,9 +423,13 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 			if c.start > have {
 				return rep, fmt.Errorf("replica restore: %s: hole at %d", name, have)
 			}
-			b, err := r.Get(ctx, c.key)
+			sealed, err := r.Get(ctx, c.key)
 			if err != nil {
 				return rep, err
+			}
+			b, err := openCopy(copyKey, c.key, sealed)
+			if err != nil {
+				return rep, fmt.Errorf("replica restore: %w", err)
 			}
 			if int64(len(b)) != c.end-c.start {
 				return rep, fmt.Errorf("replica restore: %s is %d bytes, name says %d", c.key, len(b), c.end-c.start)
@@ -470,6 +489,11 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 	if err := auditchain.TrimToHead(filepath.Join(dataDir, "chain"), st.HeadSeq); err != nil {
 		return rep, fmt.Errorf("replica restore: %w", err)
 	}
+	// Ключ копии — тот, что открыл куски: поднятое хранилище пишет им новое
+	// поколение и сверяет его с резервом при запуске.
+	if err := placeCopyKey(dataDir, copyKey); err != nil {
+		return rep, err
+	}
 	// Дальше копию пишет новое поколение (Z-08).
 	if err := writeAtomic(filepath.Join(dataDir, generationFile), []byte(strconv.FormatUint(free, 10)+"\n")); err != nil {
 		return rep, err
@@ -486,4 +510,20 @@ func writeDurable(p string, data []byte) error {
 	_, werr := f.Write(data)
 	serr := f.Sync()
 	return errors.Join(werr, serr, f.Close())
+}
+
+// placeCopyKey кладёт ключ копии в поднимаемый data_dir. Там уже другой —
+// отказ: какой верный, решает человек.
+func placeCopyKey(dataDir string, key []byte) error {
+	path := filepath.Join(dataDir, CopyKeyFileName)
+	have, err := os.ReadFile(path)
+	switch {
+	case err == nil && bytes.Equal(have, key):
+		return nil
+	case err == nil:
+		return fmt.Errorf("replica restore: %s holds another copy key than the one that opened the copy", path)
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	return writeAtomic(path, key)
 }

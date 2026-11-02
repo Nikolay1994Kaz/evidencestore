@@ -903,7 +903,11 @@ func (m *storeSim) disasterRestore() {
 	nc := *old
 	nc.DataDir = m.newDir("data")
 	nc.AdminSocket = filepath.Join(nc.DataDir, "admin.sock")
-	if _, err := RestoreReplica(context.Background(), m.remoteRaw, nc.DataDir, m.pub); err != nil {
+	copyKey, err := readCopyKey(filepath.Join(old.Keys.BackupDir, CopyKeyFileName))
+	if err != nil {
+		m.fail("ключ копии из резерва: %v", err)
+	}
+	if _, err := RestoreReplica(context.Background(), m.remoteRaw, nc.DataDir, m.pub, copyKey); err != nil {
 		m.fail("подъём из копии наружу: %v", err)
 		return
 	}

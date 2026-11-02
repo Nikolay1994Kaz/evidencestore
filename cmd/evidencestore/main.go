@@ -10,7 +10,7 @@
 //	evidencestore statement -config C          подписанная голова цепи
 //	evidencestore tsa-root -config C -out F    корень встроенной демо-TSA
 //	evidencestore keys list|due|deactivate|schedule|cancel|complete|destroy-orphan-roots -config C …
-//	evidencestore restore  -config C -from URL -store-key KEY  журнал и цепь из копии
+//	evidencestore restore  -config C -from URL -store-key KEY [-copy-key F]  журнал и цепь из копии
 //
 // Команды оператора ходят в работающий сервер через unix-сокет админки:
 // у кейринга и цепи один писатель.
@@ -131,8 +131,11 @@ Operator (talks to the running server via its admin socket):
                                                the previous installation is refused from then on
 
 Disaster recovery:
-  restore   -config FILE -from URL -store-key KEY   rebuild evidence log and chain from the copy;
-            keyring.dat and sign.key come from keys.backup_dir, roots from keys.roots_mirror_dir
+  restore   -config FILE -from URL -store-key KEY [-copy-key FILE]
+                                               rebuild evidence log and chain from the copy (its chunks open
+                                               with copy.key from keys.backup_dir, or -copy-key);
+            keyring.dat and sign.key come from keys.backup_dir (copy.key restore puts in place),
+            roots from keys.roots_mirror_dir
 `)
 }
 
@@ -307,6 +310,7 @@ func cmdRestore(args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	from := fs.String("from", "", "replica URL (default: replica.url from the config)")
 	key := fs.String("store-key", "", "pinned store public key (base64): the copy's signed head is checked against it")
+	copyKeyPath := fs.String("copy-key", "", "the copy's key file (default: copy.key in keys.backup_dir)")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -318,11 +322,21 @@ func cmdRestore(args []string) error {
 	if err != nil || len(raw) != ed25519.PublicKeySize {
 		return errors.New("restore: -store-key must be the store's base64 Ed25519 public key")
 	}
+	if *copyKeyPath == "" {
+		if cfg.Keys.BackupDir == "" {
+			return errors.New("restore: the copy is encrypted: give -copy-key, or set keys.backup_dir where copy.key lies")
+		}
+		*copyKeyPath = filepath.Join(cfg.Keys.BackupDir, store.CopyKeyFileName)
+	}
+	copyKey, err := os.ReadFile(*copyKeyPath)
+	if err != nil {
+		return fmt.Errorf("restore: the copy key: %w", err)
+	}
 	remote, err := ship.OpenRemote(*from)
 	if err != nil {
 		return err
 	}
-	rep, err := store.RestoreReplica(context.Background(), remote, cfg.DataDir, ed25519.PublicKey(raw))
+	rep, err := store.RestoreReplica(context.Background(), remote, cfg.DataDir, ed25519.PublicKey(raw), copyKey)
 	if err != nil {
 		return err
 	}
@@ -332,6 +346,7 @@ func cmdRestore(args []string) error {
 	fmt.Printf("restored %d files, %d bytes; chain links verified up to signed head %d\n", rep.Files, rep.Bytes, rep.HeadSeq)
 	fmt.Printf("restored from copy generation %d; the store writes the copy on as generation %d, from scratch (gen/%020d/ in the copy; earlier generations stay as they are)\n", rep.Generation, rep.NextGeneration, rep.NextGeneration)
 	fmt.Println("the evidence log and the leaves are not checked against the chain here: a damaged chunk shows when the store starts (frame checksum) or when a proof of its records is built; do not discard another copy of data_dir on the strength of this check")
+	fmt.Printf("copy.key is in %s already (it opened the copy);\n", cfg.DataDir)
 	fmt.Printf("now put keyring.dat into %s and sign.key into %s (from keys.backup_dir),\n", cfg.DataDir, filepath.Join(cfg.DataDir, "chain"))
 	if cfg.Keys.RootsMirrorDir != "" {
 		fmt.Printf("make sure roots_dir %s exists (the store reads missing roots from the mirror %s),\n", cfg.RootsDir, cfg.Keys.RootsMirrorDir)

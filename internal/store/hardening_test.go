@@ -166,7 +166,7 @@ func restoreCopy(t *testing.T, cfg *config.Config, s *Store, remote ship.Remote,
 	restored.Replica.URL = ""
 	restored.Defaults()
 	pub, _ := base64.RawStdEncoding.DecodeString(s.PublicKey())
-	if _, err := RestoreReplica(context.Background(), remote, restored.DataDir, ed25519.PublicKey(pub)); err != nil {
+	if _, err := RestoreReplica(context.Background(), remote, restored.DataDir, ed25519.PublicKey(pub), copyKeyOf(t, cfg)); err != nil {
 		return nil, err
 	}
 	for name, dst := range map[string]string{
@@ -183,6 +183,17 @@ func restoreCopy(t *testing.T, cfg *config.Config, s *Store, remote ship.Remote,
 	_, _, tsaDir2 := dirs(&restored)
 	os.CopyFS(tsaDir2, os.DirFS(tsaDir))
 	return reopen(&restored, c)
+}
+
+// copyKeyOf — ключ копии хранилища с этим конфигом, как его берут при
+// подъёме: из резерва ключей.
+func copyKeyOf(t *testing.T, cfg *config.Config) []byte {
+	t.Helper()
+	key, err := readCopyKey(filepath.Join(cfg.Keys.BackupDir, CopyKeyFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
 }
 
 func replicaConfig(t *testing.T) (*config.Config, ship.Remote) {
@@ -494,7 +505,11 @@ func TestReplicaHeadNotAheadOfShippedChain(t *testing.T) {
 		}
 		var chainLog []byte
 		for _, ch := range files["chain/chain.log"] {
-			b, _ := remote.Get(ctx, ch.key)
+			sealed, _ := remote.Get(ctx, ch.key)
+			b, err := openCopy(copyKeyOf(t, cfg), ch.key, sealed)
+			if err != nil {
+				t.Fatal(err)
+			}
 			chainLog = append(chainLog[:ch.start], b...)
 		}
 		dir := t.TempDir()
@@ -544,7 +559,7 @@ func TestRestoreSkipsHeadAheadOfLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub, _ := base64.RawStdEncoding.DecodeString(s.PublicKey())
-	rep, err := RestoreReplica(ctx, remote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub))
+	rep, err := RestoreReplica(ctx, remote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub), copyKeyOf(t, cfg))
 	if err != nil {
 		t.Fatalf("голова новее звеньев копии: %v", err)
 	}
@@ -568,7 +583,15 @@ func TestReplicaRestoreToleratesOverlap(t *testing.T) {
 	}
 	_, chainDir, _ := dirs(cfg)
 	local, _ := os.ReadFile(filepath.Join(chainDir, "chain.log"))
-	if err := remote.Put(ctx, chunkKey("chain/chain.log", 10, int64(len(local))), local[10:]); err != nil {
+	// putChunk кладёт кусок так, как его кладёт хранилище: под ключом копии.
+	putChunk := func(name string, plain []byte) error {
+		sealed, err := sealCopy(copyKeyOf(t, cfg), name, plain)
+		if err != nil {
+			return err
+		}
+		return remote.Put(ctx, name, sealed)
+	}
+	if err := putChunk(chunkKey("chain/chain.log", 10, int64(len(local))), local[10:]); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -580,7 +603,7 @@ func TestReplicaRestoreToleratesOverlap(t *testing.T) {
 
 	bad := bytes.Clone(local[5:])
 	bad[0] ^= 1
-	if err := remote.Put(ctx, chunkKey("chain/chain.log", 5, int64(len(local))), bad); err != nil {
+	if err := putChunk(chunkKey("chain/chain.log", 5, int64(len(local))), bad); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := restoreCopy(t, cfg, s, remote, c); err == nil {
@@ -1030,8 +1053,8 @@ func TestSigningKeyGuarded(t *testing.T) {
 	}
 }
 
-// P-13: data_dir потерян, keyring.dat и sign.key положены из резерва в
-// корень data_dir. Цепь пуста, в data_dir/chain/ ключа нет — отказ
+// P-13: data_dir потерян, keyring.dat, sign.key и copy.key положены из
+// резерва в корень data_dir. Цепь пуста, в data_dir/chain/ ключа нет — отказ
 // стартовать: резерв не смонтирован — его не проверить, смонтирован —
 // подсказка, куда положить ключ. Раньше хранилище заводило новый ключ и
 // только предупреждало.
@@ -1050,7 +1073,7 @@ func TestSigningKeyPutBackWrong(t *testing.T) {
 	if err := os.Mkdir(lost.DataDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{keyring.FileName, auditchain.SignKeyFileName} {
+	for _, name := range []string{keyring.FileName, auditchain.SignKeyFileName, CopyKeyFileName} {
 		data, err := os.ReadFile(filepath.Join(cfg.Keys.BackupDir, name))
 		if err != nil {
 			t.Fatal(err)
@@ -1249,7 +1272,10 @@ func TestFileRemoteDirsNotCreated(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
 	copyDir, witnessDir := filepath.Join(base, "copy"), filepath.Join(base, "witness")
-	cfg := testConfig(t, withWitness(witnessDir), func(c *config.Config) { c.Replica.URL = "file://" + copyDir })
+	cfg := testConfig(t, withWitness(witnessDir), func(c *config.Config) {
+		c.Replica.URL = "file://" + copyDir
+		c.Keys.BackupDir = t.TempDir()
+	})
 	s := openStore(t, cfg, c)
 	ingest(t, s, "abs-core", 1, 3)
 	mustStamp(t, s)

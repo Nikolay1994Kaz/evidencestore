@@ -230,6 +230,11 @@ type Store struct {
 	// signerBackupPending — sign.key не подтверждён в keys.backup_dir
 	// (confirmSigner): копия не прошла или там другой ключ.
 	signerBackupPending atomic.Bool
+	// copyKey — ключ кусков копии наружу (copykey.go); copyKeyBackupPending
+	// — он не подтверждён в keys.backup_dir (confirmCopyKey), и копия не
+	// пишется.
+	copyKey              []byte
+	copyKeyBackupPending atomic.Bool
 
 	// Счётчики для /metrics с запуска (metrics.go).
 	ingestErrors  atomic.Uint64
@@ -420,7 +425,7 @@ func lockDataDir(dir string) (*os.File, error) {
 }
 
 // ErrBackupExists — в keys.backup_dir уже лежат ключи другого запуска init.
-var ErrBackupExists = errors.New("store: keys.backup_dir already holds keyring.dat or sign.key")
+var ErrBackupExists = errors.New("store: keys.backup_dir already holds keyring.dat, sign.key or copy.key")
 
 // Init заводит хранилище: каталоги, кейринг под новым корнем, ключ подписи.
 // Повторный Init на живом хранилище — ошибка (keyring.ErrExists). Init при
@@ -449,9 +454,9 @@ func Init(cfg *config.Config) (publicKey string, err error) {
 	}
 	defer lock.Close()
 	if dir := cfg.Keys.BackupDir; dir != "" {
-		for _, name := range []string{keyring.FileName, auditchain.SignKeyFileName} {
+		for _, name := range []string{keyring.FileName, auditchain.SignKeyFileName, CopyKeyFileName} {
 			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
-				return "", fmt.Errorf("%w: %s — this store lost data_dir? restore keyring.dat and sign.key from there instead of init",
+				return "", fmt.Errorf("%w: %s — this store lost data_dir? restore keyring.dat, sign.key and copy.key from there instead of init",
 					ErrBackupExists, filepath.Join(dir, name))
 			}
 		}
@@ -470,6 +475,12 @@ func Init(cfg *config.Config) (publicKey string, err error) {
 		return "", err
 	}
 	if err := backupSigner(cfg, chainDir); err != nil {
+		return "", err
+	}
+	if _, err := loadOrCreateCopyKey(cfg.DataDir); err != nil {
+		return "", err
+	}
+	if err := backupCopyKey(cfg); err != nil {
 		return "", err
 	}
 	if cfg.TSA.URL == "local" {
@@ -559,7 +570,7 @@ func (s *Store) open() error {
 	}
 	if s.keys, err = keyring.Open(cfg.DataDir, roots, keyringOptions(cfg, s.now, s.writeHook)); err != nil {
 		if errors.Is(err, keyring.ErrNotFound) {
-			return fmt.Errorf("%w (first run: `evidencestore init`; after losing data_dir: put keyring.dat and sign.key back from keys.backup_dir)", err)
+			return fmt.Errorf("%w (first run: `evidencestore init`; after losing data_dir: put keyring.dat, sign.key and copy.key back from keys.backup_dir)", err)
 		}
 		return err
 	}
@@ -613,6 +624,21 @@ func (s *Store) open() error {
 			return err
 		}
 		s.log.Warn("signing key backup", "err", err)
+	}
+	if err := checkLostCopyKey(cfg, s.chain.Head().Seq); err != nil {
+		return err
+	}
+	if s.copyKey, err = loadOrCreateCopyKey(cfg.DataDir); err != nil {
+		return err
+	}
+	if err := s.confirmCopyKey(); err != nil {
+		// Как с ключом подписи: на пустой цепи расхождение с резервом —
+		// остановка, с цепью — тревога, а копия наружу стоит, пока ключ не
+		// подтверждён.
+		if errors.Is(err, errCopyKeyDiffers) && s.chain.Head().Seq == 0 {
+			return err
+		}
+		s.log.Warn("copy key backup", "err", err)
 	}
 	cs, err := s.scanChain()
 	if err != nil {

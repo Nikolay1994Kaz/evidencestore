@@ -117,7 +117,9 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 		"witness.every -1m":     func(c *Config) { c.Witness.Every = Duration(-time.Minute) },
 		"свидетель — сама копия": func(c *Config) {
 			c.Replica.URL, c.Witness.URL = "file:///srv/copy", "file:///srv/copy"
+			c.Keys.BackupDir = "/srv/keys"
 		},
+		"копия без резерва ключей": func(c *Config) { c.Replica.URL = "file:///srv/copy" },
 		"expect_every -1s":      func(c *Config) { c.Sources[0].ExpectEvery = Duration(-time.Second) },
 		"expect_contact 30s":    func(c *Config) { c.Sources[0].ExpectContact = Duration(30 * time.Second) },
 		"expect_contact -1m":    func(c *Config) { c.Sources[0].ExpectContact = Duration(-time.Minute) },

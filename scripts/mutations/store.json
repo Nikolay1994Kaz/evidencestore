@@ -652,8 +652,8 @@
   {
    "name": "S79 куски копии мимо поколения",
    "file": "internal/store/replica.go",
-   "old": "r.Put(ctx, s.replica.Prefix+chunkKey(name, from, end), data)",
-   "new": "r.Put(ctx, chunkKey(name, from, end), data)"
+   "old": "\t\t\tkey := s.replica.Prefix + chunkKey(name, from, end)",
+   "new": "\t\t\tkey := chunkKey(name, from, end)"
   },
   {
    "name": "S80 голова копии мимо поколения",
@@ -2112,6 +2112,84 @@
    "file": "internal/store/proofs.go",
    "old": "\t\tout[i] = proof.StretchOf(l)",
    "new": "\t\tfull := proof.FromLeaf(l)\n\t\tout[i] = proof.StretchLeaf{Leaf: &full}"
+  },
+  {
+   "name": "Y1 копия пишется, пока ключ копии не в резерве (P-24)",
+   "file": "internal/store/replica.go",
+   "old": "\tif s.copyKeyBackupPending.Load() {\n\t\treturn 0, errCopyKeyPending\n\t}",
+   "new": "\tif false {\n\t\treturn 0, errCopyKeyPending\n\t}"
+  },
+  {
+   "name": "Y2 куски копии уходят открытым текстом (P-24)",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\tsealed, err := sealCopy(s.copyKey, key, data)",
+   "new": "\t\t\tsealed, err := data, error(nil)"
+  },
+  {
+   "name": "Y3 имя куска не в дополнительных данных (P-24)",
+   "file": "internal/store/copykey.go",
+   "old": "\treturn []byte(copyDomain + \"\\x00\" + name)",
+   "new": "\treturn []byte(copyDomain)"
+  },
+  {
+   "name": "Y4 хвост копии сверяется без расшифровки (P-24)",
+   "file": "internal/store/replica.go",
+   "old": "\t\tcopied, err := openCopy(s.copyKey, last.key, sealed)",
+   "new": "\t\tcopied, err := sealed, error(nil)"
+  },
+  {
+   "name": "Y5 подъём не расшифровывает куски (P-24)",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\tb, err := openCopy(copyKey, c.key, sealed)",
+   "new": "\t\t\tb, err := sealed, error(nil)"
+  },
+  {
+   "name": "Y6 подъём не кладёт ключ копии в data_dir (P-24)",
+   "file": "internal/store/replica.go",
+   "old": "\tif err := placeCopyKey(dataDir, copyKey); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "Y7 подъём принимает другой ключ копии в data_dir (P-24)",
+   "file": "internal/store/replica.go",
+   "old": "\tcase err == nil && bytes.Equal(have, key):",
+   "new": "\tcase err == nil && len(have) == len(key):"
+  },
+  {
+   "name": "Y8 новый ключ копии поверх цепи с копией наружу (P-24)",
+   "file": "internal/store/copykey.go",
+   "old": "\tcase links > 0:\n\t\treturn fmt.Errorf(\"store: %s is missing while the chain holds %d links and replica.url is set",
+   "new": "\tcase false:\n\t\treturn fmt.Errorf(\"store: %s is missing while the chain holds %d links and replica.url is set"
+  },
+  {
+   "name": "Y9 ключ копии в резерве не возвращается, заводится новый (P-24)",
+   "file": "internal/store/copykey.go",
+   "old": "\t\t_, err := os.Stat(backup)\n\t\tif err == nil {",
+   "new": "\t\t_, err := os.Stat(backup)\n\t\tif false {"
+  },
+  {
+   "name": "Y10 другой ключ копии в резерве принят за свой (P-24)",
+   "file": "internal/store/copykey.go",
+   "old": "\t\tif bytes.Equal(have, want) {\n\t\t\treturn nil\n\t\t}",
+   "new": "\t\tif len(have) == len(want) {\n\t\t\treturn nil\n\t\t}"
+  },
+  {
+   "name": "Y11 тревога ключа копии не взводится (P-24)",
+   "file": "internal/store/copykey.go",
+   "old": "\ts.copyKeyBackupPending.Store(err != nil)",
+   "new": "\ts.copyKeyBackupPending.Store(false)"
+  },
+  {
+   "name": "Y12 пустая цепь стартует при другом ключе копии в резерве (P-24)",
+   "file": "internal/store/store.go",
+   "old": "\t\tif errors.Is(err, errCopyKeyDiffers) && s.chain.Head().Seq == 0 {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "Y13 init не видит ключа копии в резерве (P-24)",
+   "file": "internal/store/store.go",
+   "old": "[]string{keyring.FileName, auditchain.SignKeyFileName, CopyKeyFileName}",
+   "new": "[]string{keyring.FileName, auditchain.SignKeyFileName}"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются."
