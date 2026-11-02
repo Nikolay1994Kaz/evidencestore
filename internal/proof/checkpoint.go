@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 
+	"golang.org/x/mod/sumdb/tlog"
+
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 )
 
@@ -87,6 +89,26 @@ func (c Checkpoint) RootHash() (root [32]byte) {
 
 // JSON — точка текстом: так она уходит свидетелю, в копию и оператору.
 func (c Checkpoint) JSON() ([]byte, error) { return json.MarshalIndent(c, "", "  ") }
+
+// CheckExtends — consistency доказывает (tlog.ProveTree), что голова newer
+// продолжает голову older: дерево звеньев newer начинается деревом older.
+// Подписи точек не проверяет.
+func CheckExtends(newer, older Checkpoint, consistency [][]byte) error {
+	p := make(tlog.TreeProof, len(consistency))
+	for i, h := range consistency {
+		if len(h) != 32 {
+			return fmt.Errorf("hash %d of the consistency proof is not 32 bytes", i)
+		}
+		copy(p[i][:], h)
+	}
+	if newer.Size > 1<<62 || len(newer.Root) != 32 || len(older.Root) != 32 {
+		return errors.New("the heads do not parse")
+	}
+	if err := tlog.CheckTree(p, int64(newer.Size), tlog.Hash(newer.RootHash()), int64(older.Size), tlog.Hash(older.RootHash())); err != nil {
+		return fmt.Errorf("head %d does not extend head %d: %w", newer.Size, older.Size, err)
+	}
+	return nil
+}
 
 // ParseCheckpoint разбирает точку. Подпись не проверяет: это дело
 // VerifyCheckpoint.

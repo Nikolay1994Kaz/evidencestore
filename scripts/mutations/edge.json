@@ -451,8 +451,8 @@
   {
    "name": "C78 ответ на state не продлевает связь (P-05)",
    "file": "internal/collector/collector.go",
-   "old": "\tc.contactAt = c.now()\n\treturn st, nil",
-   "new": "\treturn st, nil"
+   "old": "\tc.contactAt = c.now()\n\treturn st, c.witnessHead(st.headAnswer)",
+   "new": "\treturn st, c.witnessHead(st.headAnswer)"
   },
   {
    "name": "C79 ответ на приём не продлевает связь (P-05)",

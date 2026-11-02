@@ -212,9 +212,10 @@ func checkPromise(p proof.Promise, key ed25519.PublicKey, r proof.Report, b proo
 }
 
 // readHeads читает головы, которые проверяющий сам взял у свидетеля: каждый
-// файл каталога, в том числе во вложенных (версии объектов, поколения копии).
-// Файл, который не разбирается как голова, остаётся в списке пустой головой:
-// сверка его не засчитает, а отчёт назовёт, сколько таких.
+// файл каталога, в том числе во вложенных (версии объектов, поколения копии,
+// файлы голов сборщиков — proof.ParseHeads). Что не разбирается как голова,
+// остаётся в списке пустой головой: сверка его не засчитает, а отчёт
+// назовёт, сколько таких.
 func readHeads(dir string) (*proof.Witness, error) {
 	w := &proof.Witness{}
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
@@ -225,9 +226,8 @@ func readHeads(dir string) (*proof.Witness, error) {
 		if err != nil {
 			return err
 		}
-		c, _ := proof.ParseCheckpoint(data)
 		name, _ := filepath.Rel(dir, path)
-		w.Heads = append(w.Heads, proof.PublishedHead{Name: name, Checkpoint: c})
+		w.Heads = append(w.Heads, proof.ParseHeads(name, data)...)
 		return nil
 	})
 	return w, err

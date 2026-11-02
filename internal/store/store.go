@@ -220,6 +220,10 @@ type Store struct {
 	witnessRemote ship.Remote
 	witnessQueue  []witnessHead
 	witnessQueued uint64 // наибольшая голова, поставленная в очередь
+	// collectorHead — последняя голова, подписанная для сборщиков
+	// (CollectorCheckpoint), под chainMu: подпись не повторяется на каждый
+	// ответ.
+	collectorHead proof.Checkpoint
 
 	stampMu sync.Mutex // метки по одной: фон и оператор не заверяют одну голову дважды
 

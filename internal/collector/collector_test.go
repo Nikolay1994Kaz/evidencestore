@@ -34,10 +34,11 @@ import (
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 type rig struct {
-	st     *store.Store
-	srv    *httptest.Server
-	cfg    *Config
-	logDir string
+	st      *store.Store
+	srv     *httptest.Server
+	cfg     *Config
+	logDir  string
+	dataDir string // data_dir хранилища
 }
 
 // newRig — настоящие хранилище и сервер приёма; wrap, если задан,
@@ -93,7 +94,7 @@ func newRig(t *testing.T, wrap ...func(http.Handler) http.Handler) *rig {
 	if err := cfg.validate(); err != nil {
 		t.Fatal(err)
 	}
-	return &rig{st: st, srv: hs, cfg: cfg, logDir: logDir}
+	return &rig{st: st, srv: hs, cfg: cfg, logDir: logDir, dataDir: scfg.DataDir}
 }
 
 func (r *rig) collector(t *testing.T) *Collector {
@@ -789,7 +790,7 @@ var anyKey = base64.RawStdEncoding.EncodeToString(make([]byte, ed25519.PublicKey
 // кривой адрес ронял сборщик паникой, без закреплённого ключа подмену
 // хранилища не видно.
 func TestConfigRejectsDangerousValues(t *testing.T) {
-	if maxBatch != store.MaxBatch || codeSeqConflict != server.CodeSeqConflict {
+	if maxBatch != store.MaxBatch || codeSeqConflict != server.CodeSeqConflict || checkpointHeader != server.CheckpointHeader {
 		t.Fatal("сборщик и хранилище разошлись в протоколе")
 	}
 	good := func() Config {
@@ -799,7 +800,7 @@ func TestConfigRejectsDangerousValues(t *testing.T) {
 	if err := c.validate(); err != nil {
 		t.Fatal(err)
 	}
-	if c.Batch != defaultBatch || c.FlushEvery.D() != time.Second || c.HeartbeatEvery.D() != 30*time.Second || c.Server != "https://store:8443" {
+	if c.Batch != defaultBatch || c.FlushEvery.D() != time.Second || c.HeartbeatEvery.D() != 30*time.Second || c.CheckpointEvery.D() != 10*time.Minute || c.Server != "https://store:8443" {
 		t.Fatalf("умолчания: %+v", c)
 	}
 	for name, spoil := range map[string]func(*Config){
@@ -807,6 +808,7 @@ func TestConfigRejectsDangerousValues(t *testing.T) {
 		"batch -5":               func(c *Config) { c.Batch = -5 },
 		"flush_every -1s":        func(c *Config) { c.FlushEvery = config.Duration(-time.Second) },
 		"heartbeat_every -1s":    func(c *Config) { c.HeartbeatEvery = config.Duration(-time.Second) },
+		"checkpoint_every -1s":   func(c *Config) { c.CheckpointEvery = config.Duration(-time.Second) },
 		"http://":                func(c *Config) { c.Server = "http://store:8443" },
 		"кривой порт":            func(c *Config) { c.Server = "https://127.0.0.1:abc" },
 		"без хоста":              func(c *Config) { c.Server = "https://" },

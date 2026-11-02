@@ -9,5 +9,6 @@
   "from_start": false,
   "batch": 256,
   "flush_every": "1s",
-  "heartbeat_every": "30s"
+  "heartbeat_every": "30s",
+  "checkpoint_every": "10m"
 }

@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
@@ -44,6 +45,9 @@ type Server struct {
 	cfg   *config.Config
 	store *store.Store
 	log   *slog.Logger
+	// headErrAt — когда последний раз сказали, что голову для сборщика не
+	// собрать (unix-нс): не чаще раза в минуту, а не на каждый ответ.
+	headErrAt atomic.Int64
 }
 
 func New(cfg *config.Config, st *store.Store, log *slog.Logger) *Server {
@@ -174,9 +178,19 @@ type IngestRecord struct {
 	Body []byte `json:"body"` // base64
 }
 
-// IngestResponse — итог по каждой записи.
+// IngestResponse — итог по каждой записи и голова цепи для сборщика.
 type IngestResponse struct {
 	Results []IngestResult `json:"results"`
+	CollectorHead
+}
+
+// CollectorHead — подписанная голова цепи в ответе сборщику и
+// доказательство, что она продолжает голову, которую сборщик назвал в
+// CheckpointHeader (сборщики-свидетели, store.CollectorCheckpoint). Головы
+// нет, пока копия наружу не прошла с запуска хранилища.
+type CollectorHead struct {
+	Checkpoint  *proof.Checkpoint `json:"checkpoint,omitempty"`
+	Consistency [][]byte          `json:"consistency,omitempty"`
 }
 
 type IngestResult struct {
@@ -187,11 +201,13 @@ type IngestResult struct {
 	Promise  *proof.Promise `json:"promise,omitempty"`
 }
 
-// StateResponse — что хранилище знает об источнике.
+// StateResponse — что хранилище знает об источнике, и голова цепи для
+// сборщика.
 type StateResponse struct {
 	Source    string `json:"source"`
 	LastSeq   uint64 `json:"last_seq"`
 	PublicKey string `json:"public_key"`
+	CollectorHead
 }
 
 func (s *Server) IntakeHandler() http.Handler {
@@ -247,11 +263,27 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		s.writeIngestErr(w, source, err)
 		return
 	}
-	resp := IngestResponse{Results: make([]IngestResult, len(results))}
+	resp := IngestResponse{Results: make([]IngestResult, len(results)), CollectorHead: s.collectorHead(r)}
 	for i, res := range results {
 		resp.Results[i] = IngestResult{Seq: res.Seq, Status: res.Status, Position: res.Position, Digest: res.Digest[:], Promise: res.Promise}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// collectorHead — голова цепи для сборщика, продолжающая ту, что он назвал
+// в CheckpointHeader. Не вышло — ответ без головы, ошибка — в журнал
+// хранилища: записи важнее.
+func (s *Server) collectorHead(r *http.Request) CollectorHead {
+	from, _ := strconv.ParseUint(r.Header.Get(CheckpointHeader), 10, 64)
+	c, consistency, ok, err := s.store.CollectorCheckpoint(from)
+	if now := time.Now().UnixNano(); err != nil && now-s.headErrAt.Load() >= int64(time.Minute) {
+		s.headErrAt.Store(now)
+		s.log.Error("head for the collector", "err", err)
+	}
+	if !ok {
+		return CollectorHead{}
+	}
+	return CollectorHead{Checkpoint: &c, Consistency: consistency}
 }
 
 // writeIngestErr — ответ сборщику с ошибкой приёма; Code говорит
@@ -318,7 +350,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, StateResponse{Source: source, LastSeq: last, PublicKey: s.store.PublicKey()})
+	writeJSON(w, http.StatusOK, StateResponse{Source: source, LastSeq: last, PublicKey: s.store.PublicKey(), CollectorHead: s.collectorHead(r)})
 }
 
 // --- админка ---
@@ -637,6 +669,11 @@ const EpochHeader = "Collector-Epoch"
 // выданный им номер, когда всё выданное доставлено (store.Issued). Без
 // заголовка — запуск сборщика или сборщик прежней версии.
 const IssuedHeader = "Collector-Issued"
+
+// CheckpointHeader — заголовок запроса сборщика: число звеньев в последней
+// голове цепи, которую он принял. Ответ несёт доказательство, что новая
+// голова её продолжает. Без заголовка — сборщик голов ещё не принимал.
+const CheckpointHeader = "Collector-Checkpoint"
 
 // BindRequest — оператор закрепляет за источником эпоху сборщика: так
 // принимается законная переустановка.

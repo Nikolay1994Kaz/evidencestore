@@ -3,7 +3,9 @@ package proof
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
@@ -33,6 +35,54 @@ type Witness struct {
 type PublishedHead struct {
 	Name       string
 	Checkpoint Checkpoint
+}
+
+// ParseHeads — головы из файла свидетеля name: одна точка (свидетель, копия,
+// evidencestore statement) или значения JSON подряд — головы сборщика
+// (сборщики-свидетели, п. 31): его последняя (checkpoint.json,
+// {"checkpoint": …}), журнал (checkpoints.jsonl) и расхождения
+// (checkpoints-conflict.jsonl: {"previous": …, "checkpoint": …} — обе головы
+// подписаны хранилищем). Что не разбирается, остаётся пустой головой: сверка
+// её не засчитает, а отчёт назовёт, сколько таких.
+func ParseHeads(name string, data []byte) []PublishedHead {
+	var vals []json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			if err != io.EOF || len(vals) == 0 {
+				vals = append(vals, nil) // не разбирается: пустая голова
+			}
+			break
+		}
+		vals = append(vals, raw)
+	}
+	var out []PublishedHead
+	for i, raw := range vals {
+		at := name
+		if len(vals) > 1 {
+			at = fmt.Sprintf("%s:%d", name, i+1)
+		}
+		var v map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &v)
+		heads := []json.RawMessage{raw}
+		if _, ok := v["origin"]; !ok {
+			heads = nil
+			for _, k := range []string{"previous", "checkpoint"} {
+				if h, ok := v[k]; ok {
+					heads = append(heads, h)
+				}
+			}
+		}
+		if len(heads) == 0 {
+			out = append(out, PublishedHead{Name: at})
+		}
+		for _, h := range heads {
+			c, _ := ParseCheckpoint(h)
+			out = append(out, PublishedHead{Name: at, Checkpoint: c})
+		}
+	}
+	return out
 }
 
 // checkWitness сверяет пакет с головами свидетеля. evLink — звено улики,
@@ -109,7 +159,7 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	default:
 		r.WitnessHead = seqs[i]
 	}
-	counted := fmt.Sprintf("%d heads signed with the store key, %d of %d files are not such heads", len(seqs), len(w.Heads)-signed, len(w.Heads))
+	counted := fmt.Sprintf("%d heads signed with the store key, %d of %d entries are not such heads", len(seqs), len(w.Heads)-signed, len(w.Heads))
 	detail := "the witness has no head at or after the record's link yet; " + counted
 	if r.WitnessHead != 0 {
 		detail = fmt.Sprintf("head %d; %s", r.WitnessHead, counted)

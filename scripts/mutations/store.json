@@ -2250,6 +2250,108 @@
    "file": "internal/store/replica.go",
    "old": "\t\tif head.Size != seq {",
    "new": "\t\tif false {"
+  },
+  {
+   "name": "N1 сборщик принимает голову без подписи хранилища",
+   "file": "internal/collector/head.go",
+   "old": "\tif err := proof.VerifyCheckpoint(*cp, c.storeKey); err != nil {",
+   "new": "\tif err := proof.VerifyCheckpoint(*cp, c.storeKey); err != nil && false {"
+  },
+  {
+   "name": "N2 сборщик не видит, что цепь стала короче",
+   "file": "internal/collector/head.go",
+   "old": "\tcase cp.Size < last.Size:",
+   "new": "\tcase cp.Size < last.Size && false:"
+  },
+  {
+   "name": "N3 сборщик не видит двух голов одной длины",
+   "file": "internal/collector/head.go",
+   "old": "\tcase cp.Size == last.Size && !bytes.Equal(cp.Root, last.Root):",
+   "new": "\tcase cp.Size == last.Size && !bytes.Equal(cp.Root, last.Root) && false:"
+  },
+  {
+   "name": "N4 сборщик не проверяет доказательство продолжения",
+   "file": "internal/collector/head.go",
+   "old": "\t\tif err := proof.CheckExtends(*cp, *last, a.Consistency); err != nil {",
+   "new": "\t\tif err := proof.CheckExtends(*cp, *last, a.Consistency); err != nil && false {"
+  },
+  {
+   "name": "N5 голова без доказательства — расхождение, а не предупреждение",
+   "file": "internal/collector/head.go",
+   "old": "\tcase len(a.Consistency) == 0:",
+   "new": "\tcase len(a.Consistency) == 0 && false:"
+  },
+  {
+   "name": "N6 журнал голов пишется на каждый ответ",
+   "file": "internal/collector/head.go",
+   "old": "\tif !c.headSaved.IsZero() && now.Sub(c.headSaved) < c.cfg.CheckpointEvery.D() {",
+   "new": "\tif !c.headSaved.IsZero() && false {"
+  },
+  {
+   "name": "N7 расхождение пишется на каждый ответ",
+   "file": "internal/collector/head.go",
+   "old": "\tif !c.headAlarm.IsZero() && now.Sub(c.headAlarm) < c.cfg.CheckpointEvery.D() {",
+   "new": "\tif !c.headAlarm.IsZero() && false {"
+  },
+  {
+   "name": "N8 сборщик не называет свою голову",
+   "file": "internal/collector/head.go",
+   "old": "\t\treq.Header.Set(checkpointHeader, strconv.FormatUint(c.head.Size, 10))",
+   "new": "\t\treq.Header.Set(checkpointHeader+\"-x\", strconv.FormatUint(c.head.Size, 10))"
+  },
+  {
+   "name": "N9 расхождение не ложится в файл",
+   "file": "internal/collector/head.go",
+   "old": "\t\treturn appendLine(filepath.Join(c.cfg.SpoolDir, headConflictFile), append(line, '\\n'))",
+   "new": "\t\treturn nil"
+  },
+  {
+   "name": "N10 последняя голова не ложится в checkpoint.json",
+   "file": "internal/collector/head.go",
+   "old": "\t\treturn writeJSON(c.headPath(), r)",
+   "new": "\t\treturn nil"
+  },
+  {
+   "name": "N11 сборщик поднимает голову без подписи хранилища",
+   "file": "internal/collector/head.go",
+   "old": "\tif err := proof.VerifyCheckpoint(*r.Checkpoint, c.storeKey); err != nil {",
+   "new": "\tif err := proof.VerifyCheckpoint(*r.Checkpoint, c.storeKey); err != nil && false {"
+  },
+  {
+   "name": "N12 голова сборщику дальше копии",
+   "file": "internal/store/witness.go",
+   "old": "\t\tm = min(m, s.replicaShipped.Load())",
+   "new": "\t\t_ = s.replicaShipped.Load()"
+  },
+  {
+   "name": "N13 доказательство сборщику не сверяется до отдачи",
+   "file": "internal/store/witness.go",
+   "old": "\tif tlog.CheckTree(p, int64(m), tlog.Hash(c.RootHash()), int64(from), old) != nil {",
+   "new": "\tif tlog.CheckTree(p, int64(m), tlog.Hash(c.RootHash()), int64(from), old) != nil && false {"
+  },
+  {
+   "name": "N14 хранилище не слышит голову сборщика",
+   "file": "internal/server/server.go",
+   "old": "\tfrom, _ := strconv.ParseUint(r.Header.Get(CheckpointHeader), 10, 64)",
+   "new": "\tfrom := uint64(0)"
+  },
+  {
+   "name": "N15 -heads не читает прежнюю голову расхождения",
+   "file": "internal/proof/heads.go",
+   "old": "\t\t\tfor _, k := range []string{\"previous\", \"checkpoint\"} {",
+   "new": "\t\t\tfor _, k := range []string{\"checkpoint\"} {"
+  },
+  {
+   "name": "N16 доказательство продолжения не проверяется",
+   "file": "internal/proof/checkpoint.go",
+   "old": "\tif err := tlog.CheckTree(p, int64(newer.Size), tlog.Hash(newer.RootHash()), int64(older.Size), tlog.Hash(older.RootHash())); err != nil {",
+   "new": "\tif err := tlog.CheckTree(p, int64(newer.Size), tlog.Hash(newer.RootHash()), int64(older.Size), tlog.Hash(older.RootHash())); err != nil && false {"
+  },
+  {
+   "name": "N17 голова сборщика не уходит в ответ на приём",
+   "file": "internal/server/server.go",
+   "old": "\tresp := IngestResponse{Results: make([]IngestResult, len(results)), CollectorHead: s.collectorHead(r)}",
+   "new": "\tresp := IngestResponse{Results: make([]IngestResult, len(results))}"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются."

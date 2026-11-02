@@ -7,7 +7,7 @@
 //	evidencestore status   -config C           сводка
 //	evidencestore stamp    -config C           заверить голову цепи у TSA сейчас
 //	evidencestore proof    -config C -source S -seq N [-dek] [-to-head H] [-out F]
-//	evidencestore statement -config C          подписанная голова цепи
+//	evidencestore statement -config C          подписанная голова цепи (контрольная точка)
 //	evidencestore tsa-root -config C -out F    корень встроенной демо-TSA
 //	evidencestore keys list|due|deactivate|schedule|cancel|complete|destroy-orphan-roots -config C …
 //	evidencestore restore  -config C -from URL -store-key KEY [-copy-key F]  журнал и цепь из копии
@@ -106,7 +106,7 @@ Server:
 
 Operator (talks to the running server via its admin socket):
   status    -config FILE
-  statement -config FILE                       signed chain head
+  statement -config FILE                       signed chain head (checkpoint: links and tree root)
   stamp     -config FILE                       time-stamp the chain head now
   proof     -config FILE -source S -seq N [-dek] [-to-head H] [-out FILE]
                                                -to-head: the bundle reaches at least head H (one a witness saw)

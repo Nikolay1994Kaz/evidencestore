@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"golang.org/x/mod/sumdb/tlog"
+
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
@@ -92,4 +94,62 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 		s.witnessOK.Store(time.Now().UnixNano())
 	}
 	return nil
+}
+
+// CollectorCheckpoint — голова для сборщика (сборщики-свидетели, п. 31) и
+// доказательство, что она продолжает голову из from звеньев, которую
+// сборщик принял последней (from = 0 — ещё не принимал). С копией наружу —
+// голова, которую держит копия, как у свидетеля голов (P-11): подъём из
+// копии обрывает цепь не раньше её, и честный подъём сборщику не развилка.
+// ok = false — отдавать нечего: копия с запуска ещё не прошла или цепь
+// пуста. Сборщик, который принял голову новее отдаваемой (хранилище потеряло
+// хвост цепи без копии), получает её без доказательства — для него это
+// расхождение, и так и есть. Доказательство берётся из tree.hashes и до
+// отдачи сверяется с корнем, подписанным по границе в памяти: испорченный
+// файл дал бы сборщику ложную развилку — тогда голова идёт без
+// доказательства, а ошибка — хранилищу.
+func (s *Store) CollectorCheckpoint(from uint64) (_ proof.Checkpoint, consistency [][]byte, ok bool, _ error) {
+	s.chainMu.Lock()
+	defer s.chainMu.Unlock()
+	n := s.tree.size()
+	m := n
+	if s.replicaRemote != nil {
+		m = min(m, s.replicaShipped.Load())
+	}
+	if m == 0 {
+		return proof.Checkpoint{}, nil, false, nil
+	}
+	if s.collectorHead.Size != m {
+		root := s.tree.root()
+		if m < n {
+			h, err := tlog.TreeHash(int64(m), s.tree)
+			if err != nil {
+				return proof.Checkpoint{}, nil, false, err
+			}
+			if err := s.tree.agreesLocked(m, h); err != nil {
+				return proof.Checkpoint{}, nil, false, err
+			}
+			root = h
+		}
+		s.collectorHead = proof.SignCheckpoint(s.signer, m, root)
+	}
+	c := s.collectorHead
+	if from == 0 || from >= m {
+		return c, nil, true, nil
+	}
+	p, err := tlog.ProveTree(int64(m), int64(from), s.tree)
+	if err != nil {
+		return c, nil, true, err
+	}
+	old, err := tlog.TreeHash(int64(from), s.tree)
+	if err != nil {
+		return c, nil, true, err
+	}
+	if tlog.CheckTree(p, int64(m), tlog.Hash(c.RootHash()), int64(from), old) != nil {
+		return c, nil, true, errTreeFile
+	}
+	for _, h := range p {
+		consistency = append(consistency, h[:])
+	}
+	return c, consistency, true, nil
 }

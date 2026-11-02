@@ -1448,6 +1448,11 @@ func (s *sim) check() {
 	for _, b := range bad[:min(len(bad), 3)] {
 		s.fail("%s", b)
 	}
+	// Хранилище честное: расхождений голов цепи у сборщика нет — ни после
+	// падений, ни после перезапусков (сборщики-свидетели, п. 31).
+	if data, err := os.ReadFile(filepath.Join(s.cfg.SpoolDir, headConflictFile)); err == nil {
+		s.fail("у честного хранилища расхождение голов: %.300s", data)
+	}
 	var gaps []uint64
 	seen := map[string][]uint64{}
 	for q := uint64(1); q <= last; q++ {

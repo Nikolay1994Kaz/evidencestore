@@ -26,3 +26,5 @@ Set `metrics_listen` (for example `127.0.0.1:9464`) to expose `/metrics` in the 
 | `rate(evidencestore_ingest_errors_total[5m]) > 0` | ingest requests are failing |
 
 Also exported: records, duplicates and conflicts per source, evidence-log batches and their fsync time, the chain head.
+
+Not in the metrics, worth an alert on the logs: `tree of links: writing tree.hashes failed` in the store's log (bundles are refused until a restart rebuilds that file), and `the store's chain does not extend the head this collector holds` in a collector's log: the store signed a second history or lost the end of its chain (see [Collectors as witnesses](copy-and-witness.md#collectors-as-witnesses)).

@@ -33,6 +33,11 @@
 // по времени изменения, при равенстве — по имени, где числа сравниваются как
 // числа. Текущий файл дочитывается до конца, когда появился другой
 // непрочитанный: значит, писатель его закрыл. В каталоге — один писатель.
+//
+// СВИДЕТЕЛЬ ГОЛОВ (DECISIONS п. 31). Каждый ответ хранилища несёт
+// подписанную голову цепи; сборщик держит последнюю и принимает новую,
+// только если она её продолжает (head.go). Его журнал голов — свидетель для
+// esverify -heads, которого администратор хранилища не переписывает.
 package collector
 
 import (
@@ -94,6 +99,9 @@ type Config struct {
 	// журнал от остановленного сборщика (expect_contact источника, по
 	// умолчанию 2 мин). 0 — 30 с.
 	HeartbeatEvery config.Duration `json:"heartbeat_every"`
+	// CheckpointEvery — как часто последняя принятая голова цепи ложится в
+	// журнал голов (checkpoints.jsonl) и в checkpoint.json. 0 — 10 мин.
+	CheckpointEvery config.Duration `json:"checkpoint_every"`
 }
 
 const (
@@ -138,6 +146,9 @@ func (c *Config) validate() error {
 	if c.HeartbeatEvery == 0 {
 		c.HeartbeatEvery = config.Duration(30 * time.Second)
 	}
+	if c.CheckpointEvery == 0 {
+		c.CheckpointEvery = config.Duration(10 * time.Minute)
+	}
 	c.Server = strings.TrimRight(c.Server, "/")
 	var errs []error
 	for name, v := range map[string]string{"server": c.Server, "ca": c.CA, "cert": c.Cert, "key": c.Key, "store_key": c.StoreKey, "spool_dir": c.SpoolDir} {
@@ -165,6 +176,9 @@ func (c *Config) validate() error {
 	}
 	if c.HeartbeatEvery < 0 {
 		errs = append(errs, fmt.Errorf("heartbeat_every %v: must not be negative", c.HeartbeatEvery.D()))
+	}
+	if c.CheckpointEvery < 0 {
+		errs = append(errs, fmt.Errorf("checkpoint_every %v: must not be negative", c.CheckpointEvery.D()))
 	}
 	if (c.File == "") == (c.Glob == "") {
 		errs = append(errs, errors.New("exactly one of file and glob is required"))
@@ -216,6 +230,16 @@ type Collector struct {
 	// state): старше heartbeat_every — пульс (SendOnce). Ноль — ещё не
 	// отвечало; отсчёт тогда с первого прохода.
 	contactAt time.Time
+
+	// head — последняя принятая голова цепи (head.go); nil — ещё не
+	// принимал. headSaved — когда она последний раз легла на диск,
+	// headAlarm — когда последний раз записали расхождение, headWarned —
+	// когда предупредили о голове без доказательства или без подписи (то и
+	// другое не чаще checkpoint_every).
+	head       *proof.Checkpoint
+	headSaved  time.Time
+	headAlarm  time.Time
+	headWarned time.Time
 
 	warned map[string]time.Time // когда последний раз сказали «читать нечего (нельзя)» — по пути
 
@@ -465,6 +489,9 @@ func (c *Collector) load() error {
 	if err := c.loadEpoch(); err != nil {
 		return err
 	}
+	if err := c.loadHead(); err != nil {
+		return err
+	}
 	if err := c.repairPromises(); err != nil {
 		return err
 	}
@@ -588,6 +615,13 @@ var (
 type stateResponse struct {
 	LastSeq   uint64 `json:"last_seq"`
 	PublicKey string `json:"public_key"`
+	headAnswer
+}
+
+// headAnswer — голова цепи в ответе хранилища (server.CollectorHead).
+type headAnswer struct {
+	Checkpoint  *proof.Checkpoint `json:"checkpoint"`
+	Consistency [][]byte          `json:"consistency"`
 }
 
 // fetchState — GET /v1/state. issued — последний выданный номер, когда всё
@@ -600,6 +634,7 @@ func (c *Collector) fetchState(ctx context.Context, issued uint64) (stateRespons
 		return st, err
 	}
 	req.Header.Set(epochHeader, c.epoch)
+	c.askHead(req)
 	if issued > 0 {
 		req.Header.Set(issuedHeader, strconv.FormatUint(issued, 10))
 	}
@@ -622,7 +657,7 @@ func (c *Collector) fetchState(ctx context.Context, issued uint64) (stateRespons
 		return st, ErrStoreKey
 	}
 	c.contactAt = c.now()
-	return st, nil
+	return st, c.witnessHead(st.headAnswer)
 }
 
 // Bootstrap сверяется с хранилищем при запуске.
@@ -1521,6 +1556,9 @@ const (
 	// issuedHeader — заголовок пульса с последним выданным номером
 	// (server.IssuedHeader).
 	issuedHeader = "Collector-Issued"
+	// checkpointHeader — заголовок с размером последней принятой головы
+	// цепи (server.CheckpointHeader).
+	checkpointHeader = "Collector-Checkpoint"
 )
 
 // errorResponse — тело ответа хранилища с ошибкой (server.ErrorResponse).
@@ -1548,6 +1586,7 @@ type ingestResponse struct {
 		Position uint64         `json:"position"`
 		Promise  *proof.Promise `json:"promise"`
 	} `json:"results"`
+	headAnswer
 }
 
 // send отправляет пачку. Подтверждённой она становится, только если на
@@ -1574,6 +1613,7 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set(epochHeader, c.epoch)
+	c.askHead(hreq)
 	resp, err := c.http.Do(hreq)
 	if err != nil {
 		return err
@@ -1621,7 +1661,10 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 		return errors.Join(append([]error{ErrBadPromise}, bad...)...)
 	}
 	c.acked = batch[len(batch)-1].seq
-	return c.saveState()
+	if err := c.saveState(); err != nil {
+		return err
+	}
+	return c.witnessHead(out.headAnswer)
 }
 
 // keepPromise проверяет обещание хранилища и сохраняет его. Проверяется

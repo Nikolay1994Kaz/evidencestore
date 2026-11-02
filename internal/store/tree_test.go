@@ -340,3 +340,83 @@ func TestTreeFileWriteFails(t *testing.T) {
 		t.Fatal(r.Text())
 	}
 }
+
+// Голова для сборщика: без копии наружу — текущая, с копией — не дальше
+// головы, которую держит копия (P-11), и до первого прохода копии — никакой.
+// Доказательство продолжения сходится с любой прежней головой; сборщику,
+// который назвал голову новее отдаваемой, — без доказательства; испорченный
+// tree.hashes — голова без доказательства и ошибка хранилищу, не ложное
+// доказательство.
+func TestCollectorCheckpoint(t *testing.T) {
+	c := newClock()
+	cfg, remote := replicaConfig(t)
+	s := openStore(t, cfg, c)
+	for i := uint64(1); i <= 10; i++ {
+		ingest(t, s, "abs-core", i, i)
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, ok, err := s.CollectorCheckpoint(0); ok || err != nil {
+		t.Fatalf("голова до первого прохода копии: %v, %v", ok, err)
+	}
+	if _, err := s.ShipOnce(context.Background(), remote); err != nil {
+		t.Fatal(err)
+	}
+	shipped := s.replicaShipped.Load()
+	for i := uint64(11); i <= 15; i++ {
+		ingest(t, s, "abs-core", i, i)
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := trustOf(t, s).StoreKey
+	head, _, ok, err := s.CollectorCheckpoint(0)
+	if !ok || err != nil || head.Size != shipped || head.Size >= s.chain.Head().Seq || proof.VerifyCheckpoint(head, key) != nil {
+		t.Fatalf("голова %d, копия держит %d, цепь %d: %v", head.Size, shipped, s.chain.Head().Seq, err)
+	}
+	if head.RootHash() != rootOf(t, s, head.Size) {
+		t.Fatal("корень головы не над звеньями цепи")
+	}
+	for from := uint64(1); from < head.Size; from++ {
+		_, consistency, _, err := s.CollectorCheckpoint(from)
+		older := proof.SignCheckpoint(s.signer, from, rootOf(t, s, from))
+		if err != nil || proof.CheckExtends(head, older, consistency) != nil {
+			t.Fatalf("продолжение от %d: %v", from, err)
+		}
+		other := proof.SignCheckpoint(s.signer, from, [32]byte{1})
+		if proof.CheckExtends(head, other, consistency) == nil {
+			t.Fatalf("продолжение от чужой головы %d", from)
+		}
+	}
+	if _, consistency, ok, err := s.CollectorCheckpoint(head.Size + 3); !ok || err != nil || consistency != nil {
+		t.Fatalf("сборщик впереди: %v, %v, %d хешей", ok, err, len(consistency))
+	}
+
+	// tree.hashes испорчен: доказательство не отдаётся.
+	path := filepath.Join(cfg.DataDir, treeFileName)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, fi.Size()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, consistency, ok, err := s.CollectorCheckpoint(3); !ok || !errors.Is(err, errTreeFile) || consistency != nil {
+		t.Fatalf("испорченный файл: %v, %v, %d хешей", ok, err, len(consistency))
+	}
+}
+
+// Без копии наружу сборщик получает текущую голову.
+func TestCollectorCheckpointNoCopy(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	ingest(t, s, "abs-core", 1, 3)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	head, _, ok, err := s.CollectorCheckpoint(0)
+	if !ok || err != nil || head.Size != s.chain.Head().Seq || head.RootHash() != rootOf(t, s, head.Size) {
+		t.Fatalf("голова %d, цепь %d: %v", head.Size, s.chain.Head().Seq, err)
+	}
+}
