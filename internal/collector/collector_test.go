@@ -809,6 +809,7 @@ func TestConfigRejectsDangerousValues(t *testing.T) {
 		"flush_every -1s":        func(c *Config) { c.FlushEvery = config.Duration(-time.Second) },
 		"heartbeat_every -1s":    func(c *Config) { c.HeartbeatEvery = config.Duration(-time.Second) },
 		"checkpoint_every -1s":   func(c *Config) { c.CheckpointEvery = config.Duration(-time.Second) },
+		"checkpoint_every 1ms":   func(c *Config) { c.CheckpointEvery = config.Duration(time.Millisecond) },
 		"http://":                func(c *Config) { c.Server = "http://store:8443" },
 		"кривой порт":            func(c *Config) { c.Server = "https://127.0.0.1:abc" },
 		"без хоста":              func(c *Config) { c.Server = "https://" },

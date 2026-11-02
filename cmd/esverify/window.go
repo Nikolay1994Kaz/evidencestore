@@ -54,6 +54,7 @@ func verifyWindow(data []byte, trust proof.Trust, from, to time.Time) windowResu
 	if win.WitnessChecked {
 		out["witness_head"] = win.WitnessHead
 		out["witness_fork"] = win.WitnessFork
+		out["witness_refused"] = win.WitnessRefused
 	}
 	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies}
 }
@@ -77,6 +78,7 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 	if src.WitnessChecked {
 		out["witness_head"] = src.WitnessHead
 		out["witness_fork"] = src.WitnessFork
+		out["witness_refused"] = src.WitnessRefused
 	}
 	return windowResult{valid: src.Valid(), text: src.Text(), json: out, bodies: src.Bodies}
 }

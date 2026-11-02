@@ -103,7 +103,8 @@ func TestLinkRootsRejectWrap(t *testing.T) {
 	if _, err := linkRoots(nil, 0, make([][32]byte, 1)); err == nil {
 		t.Fatal("звенья с нулевого номера")
 	}
-	full := make([][]byte, 64)
+	// Граница размера 2⁶⁴−2 — 63 хеша; два звена после неё переполняют номер.
+	full := make([][]byte, 63)
 	for i := range full {
 		full[i] = make([]byte, 32)
 	}

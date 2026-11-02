@@ -46,17 +46,26 @@ func main() {
 	c, err := collector.New(cfg, log)
 	fail(err)
 	defer c.Close()
+	// fail выходит мимо defer: Close — и на выходе по ошибке (хранилище
+	// может вызвать её само, 409), иначе принятая, но ещё не записанная
+	// голова цепи пропала бы.
+	failClosing := func(err error) {
+		if err != nil {
+			c.Close()
+			fail(err)
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if *once {
-		fail(c.Bootstrap(ctx))
+		failClosing(c.Bootstrap(ctx))
 		n, err := c.ReadOnce()
-		fail(err)
-		fail(c.SendOnce(ctx))
+		failClosing(err)
+		failClosing(c.SendOnce(ctx))
 		fmt.Printf("read %d new records, delivered up to seq %d, pending %d\n", n, c.Acked(), c.Pending())
 		return
 	}
-	fail(c.Run(ctx))
+	failClosing(c.Run(ctx))
 }
 
 func fail(err error) {

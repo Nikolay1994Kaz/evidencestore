@@ -355,6 +355,10 @@ type Report struct {
 	// вне участка цепи этой записи: хранилище подписало вторую историю, но
 	// запись она не задевает. Ноль — таких нет.
 	WitnessFork uint64
+	// WitnessRefused — голов под ключом хранилища, которые сборщик отверг
+	// (файл расхождений): пакет с ними не сходится, но хранилище показывало
+	// сборщику вторую историю.
+	WitnessRefused int
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -385,6 +389,9 @@ func (r Report) Notes() []string {
 		n = append(n, "body not opened: the bundle carries no record key, or the month key was destroyed (retention)")
 	}
 	n = append(n, r.gatewayNotes()...)
+	if r.WitnessRefused != 0 {
+		n = append(n, fmt.Sprintf("a collector refused %d heads signed with the store key (in its checkpoints-conflict.jsonl): the store showed it a second history, or lost the end of its chain; ask its operator", r.WitnessRefused))
+	}
 	if r.WitnessFork != 0 {
 		n = append(n, fmt.Sprintf("the witness holds two versions of the chain, both signed with the store key (the first head it holds in two versions is %d): this record's part of the chain is not among them, but the store signed a second history — a rewrite, or a store that lost data without a copy; ask its operator", r.WitnessFork))
 	}

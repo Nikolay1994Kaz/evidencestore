@@ -275,17 +275,19 @@ func (s *Store) linkOfLocked(leaf uint64) (linkRef, bool) {
 	return s.links[i], true
 }
 
-// ErrEmptyChain — у пустой цепи нет головы, которую можно подписать.
-var ErrEmptyChain = errors.New("store: the chain is empty: no head to sign yet")
+// ErrNoHead — подписать нечего: цепь пуста или копия наружу с запуска ещё
+// не прошла.
+var ErrNoHead = errors.New("store: no head to give yet: the chain is empty, or the copy has not been written since the store started")
 
-// Checkpoint — текущая голова, подписанная ключом хранилища (контрольная
-// точка, п. 30).
+// Checkpoint — голова, подписанная ключом хранилища (контрольная точка,
+// п. 30), для evidencestore statement: с копией наружу — та, что держит копия
+// (servedHeadLocked), иначе — текущая.
 func (s *Store) Checkpoint() (proof.Checkpoint, error) {
 	s.chainMu.Lock()
 	defer s.chainMu.Unlock()
-	c, ok := s.checkpointLocked()
-	if !ok {
-		return c, ErrEmptyChain
+	c, ok, err := s.servedHeadLocked()
+	if err == nil && !ok {
+		err = ErrNoHead
 	}
-	return c, nil
+	return c, err
 }

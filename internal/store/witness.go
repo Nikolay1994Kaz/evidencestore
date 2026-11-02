@@ -96,13 +96,42 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 	return nil
 }
 
-// CollectorCheckpoint — голова для сборщика (сборщики-свидетели, п. 31) и
-// доказательство, что она продолжает голову из from звеньев, которую
-// сборщик принял последней (from = 0 — ещё не принимал). С копией наружу —
-// голова, которую держит копия, как у свидетеля голов (P-11): подъём из
-// копии обрывает цепь не раньше её, и честный подъём сборщику не развилка.
-// ok = false — отдавать нечего: копия с запуска ещё не прошла или цепь
-// пуста. Сборщик, который принял голову новее отдаваемой (хранилище потеряло
+// servedHeadLocked — голова, которую хранилище отдаёт наружу: сборщикам и
+// по evidencestore statement. С копией наружу — та, что держит копия, как у
+// свидетеля голов (P-11): подъём из копии обрывает цепь не раньше её, и
+// честный подъём не выглядит переписью тому, кто её хранит. Без копии —
+// текущая. ok = false — отдавать нечего: копия с запуска ещё не прошла или
+// цепь пуста. Подпись повторяется только при новой голове. Звать под chainMu.
+func (s *Store) servedHeadLocked() (proof.Checkpoint, bool, error) {
+	n := s.tree.size()
+	m := n
+	if s.replicaRemote != nil {
+		m = min(m, s.replicaShipped.Load())
+	}
+	if m == 0 {
+		return proof.Checkpoint{}, false, nil
+	}
+	if s.servedHead.Size != m {
+		root := s.tree.root()
+		if m < n {
+			h, err := tlog.TreeHash(int64(m), s.tree)
+			if err != nil {
+				return proof.Checkpoint{}, false, err
+			}
+			if err := s.tree.agreesLocked(m, h); err != nil {
+				return proof.Checkpoint{}, false, err
+			}
+			root = h
+		}
+		s.servedHead = proof.SignCheckpoint(s.signer, m, root)
+	}
+	return s.servedHead, true, nil
+}
+
+// CollectorCheckpoint — голова для сборщика (сборщики-свидетели, п. 31,
+// servedHeadLocked) и доказательство, что она продолжает голову из from
+// звеньев, которую сборщик принял последней (from = 0 — ещё не принимал).
+// ok = false — отдавать нечего. Сборщик, который принял голову новее отдаваемой (хранилище потеряло
 // хвост цепи без копии), получает её без доказательства — для него это
 // расхождение, и так и есть. Доказательство берётся из tree.hashes и до
 // отдачи сверяется с корнем, подписанным по границе в памяти: испорченный
@@ -111,29 +140,11 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 func (s *Store) CollectorCheckpoint(from uint64) (_ proof.Checkpoint, consistency [][]byte, ok bool, _ error) {
 	s.chainMu.Lock()
 	defer s.chainMu.Unlock()
-	n := s.tree.size()
-	m := n
-	if s.replicaRemote != nil {
-		m = min(m, s.replicaShipped.Load())
+	c, ok, err := s.servedHeadLocked()
+	if !ok || err != nil {
+		return c, nil, false, err
 	}
-	if m == 0 {
-		return proof.Checkpoint{}, nil, false, nil
-	}
-	if s.collectorHead.Size != m {
-		root := s.tree.root()
-		if m < n {
-			h, err := tlog.TreeHash(int64(m), s.tree)
-			if err != nil {
-				return proof.Checkpoint{}, nil, false, err
-			}
-			if err := s.tree.agreesLocked(m, h); err != nil {
-				return proof.Checkpoint{}, nil, false, err
-			}
-			root = h
-		}
-		s.collectorHead = proof.SignCheckpoint(s.signer, m, root)
-	}
-	c := s.collectorHead
+	m := c.Size
 	if from == 0 || from >= m {
 		return c, nil, true, nil
 	}

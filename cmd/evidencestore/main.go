@@ -345,7 +345,7 @@ func cmdRestore(args []string) error {
 	// копию data_dir, хотя испорченный кусок копии виден только позже.
 	fmt.Printf("restored %d files, %d bytes; chain links verified up to signed head %d\n", rep.Files, rep.Bytes, rep.HeadSeq)
 	fmt.Printf("restored from copy generation %d; the store writes the copy on as generation %d, from scratch (gen/%020d/ in the copy; earlier generations stay as they are)\n", rep.Generation, rep.NextGeneration, rep.NextGeneration)
-	fmt.Println("the evidence log and the leaves are not checked against the chain here: a damaged chunk shows when the store starts (frame checksum) or when a proof of its records is built; do not discard another copy of data_dir on the strength of this check")
+	fmt.Println("the evidence log and the leaves are not checked against the chain here: a chunk damaged in the copy does not decrypt and stops the restore, but a file already damaged in data_dir before it was copied shows only when the store starts (frame checksum) or when a proof of its records is built; do not discard another copy of data_dir on the strength of this check")
 	fmt.Printf("copy.key is in %s already (it opened the copy);\n", cfg.DataDir)
 	fmt.Printf("now put keyring.dat into %s and sign.key into %s (from keys.backup_dir),\n", cfg.DataDir, filepath.Join(cfg.DataDir, "chain"))
 	if cfg.Keys.RootsMirrorDir != "" {

@@ -420,3 +420,31 @@ func TestCollectorCheckpointNoCopy(t *testing.T) {
 		t.Fatalf("голова %d, цепь %d: %v", head.Size, s.chain.Head().Seq, err)
 	}
 }
+
+// evidencestore statement с копией наружу отдаёт голову, которую держит
+// копия: честный подъём из неё не выглядит переписью тому, кто разослал
+// «газету». До первого прохода копии подписывать нечего.
+func TestStatementIsCopyHead(t *testing.T) {
+	c := newClock()
+	cfg, remote := replicaConfig(t)
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 3)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Checkpoint(); !errors.Is(err, ErrNoHead) {
+		t.Fatalf("голова до прохода копии: %v", err)
+	}
+	if _, err := s.ShipOnce(context.Background(), remote); err != nil {
+		t.Fatal(err)
+	}
+	shipped := s.replicaShipped.Load()
+	ingest(t, s, "abs-core", 4, 6)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	head, err := s.Checkpoint()
+	if err != nil || head.Size != shipped || head.Size >= s.chain.Head().Seq || head.RootHash() != rootOf(t, s, shipped) {
+		t.Fatalf("голова %d, копия держит %d, цепь %d: %v", head.Size, shipped, s.chain.Head().Seq, err)
+	}
+}

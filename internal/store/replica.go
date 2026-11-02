@@ -406,6 +406,11 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 			return rep, fmt.Errorf("replica restore: %s is not empty — refusing to overwrite", filepath.Join(dataDir, sub))
 		}
 	}
+	// Другой ключ копии в data_dir — отказ сразу, пока каталог пуст: после
+	// кусков повторить подъём в тот же каталог было бы нельзя.
+	if err := copyKeyFits(dataDir, copyKey); err != nil {
+		return rep, err
+	}
 	keys, err := r.List(ctx, "")
 	if err != nil {
 		return rep, err
@@ -521,18 +526,30 @@ func writeDurable(p string, data []byte) error {
 	return errors.Join(werr, serr, f.Close())
 }
 
-// placeCopyKey кладёт ключ копии в поднимаемый data_dir. Там уже другой —
-// отказ: какой верный, решает человек.
-func placeCopyKey(dataDir string, key []byte) error {
+// copyKeyFits — в data_dir нет ключа копии или там тот же. Другой — отказ:
+// какой верный, решает человек.
+func copyKeyFits(dataDir string, key []byte) error {
 	path := filepath.Join(dataDir, CopyKeyFileName)
 	have, err := os.ReadFile(path)
 	switch {
-	case err == nil && bytes.Equal(have, key):
+	case errors.Is(err, os.ErrNotExist):
 		return nil
-	case err == nil:
-		return fmt.Errorf("replica restore: %s holds another copy key than the one that opened the copy", path)
-	case !errors.Is(err, os.ErrNotExist):
+	case err != nil:
 		return err
+	case !bytes.Equal(have, key):
+		return fmt.Errorf("replica restore: %s holds another copy key than the one that opens the copy", path)
+	}
+	return nil
+}
+
+// placeCopyKey кладёт ключ копии в поднимаемый data_dir, если его там нет.
+func placeCopyKey(dataDir string, key []byte) error {
+	if err := copyKeyFits(dataDir, key); err != nil {
+		return err
+	}
+	path := filepath.Join(dataDir, CopyKeyFileName)
+	if _, err := os.Stat(path); err == nil {
+		return nil
 	}
 	return writeAtomic(path, key)
 }

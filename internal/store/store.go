@@ -220,10 +220,10 @@ type Store struct {
 	witnessRemote ship.Remote
 	witnessQueue  []witnessHead
 	witnessQueued uint64 // наибольшая голова, поставленная в очередь
-	// collectorHead — последняя голова, подписанная для сборщиков
-	// (CollectorCheckpoint), под chainMu: подпись не повторяется на каждый
+	// servedHead — последняя голова, подписанная для сборщиков и statement
+	// (servedHeadLocked), под chainMu: подпись не повторяется на каждый
 	// ответ.
-	collectorHead proof.Checkpoint
+	servedHead proof.Checkpoint
 
 	stampMu sync.Mutex // метки по одной: фон и оператор не заверяют одну голову дважды
 
@@ -630,6 +630,12 @@ func (s *Store) open() error {
 		}
 		s.log.Warn("signing key backup", "err", err)
 	}
+	cs, err := s.scanChain()
+	if err != nil {
+		return err
+	}
+	// Ключ копии — после прохода по цепи: data_dir прежнего формата
+	// (ErrOldFormat) называется своей причиной, и ключ для него не заводится.
 	if err := checkLostCopyKey(cfg, s.chain.Head().Seq); err != nil {
 		return err
 	}
@@ -644,10 +650,6 @@ func (s *Store) open() error {
 			return err
 		}
 		s.log.Warn("copy key backup", "err", err)
-	}
-	cs, err := s.scanChain()
-	if err != nil {
-		return err
 	}
 	maxChained := cs.maxPos
 

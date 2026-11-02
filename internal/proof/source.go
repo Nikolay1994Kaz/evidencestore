@@ -135,6 +135,7 @@ type SourceReport struct {
 	WitnessHead    uint64
 	WitnessNone    bool
 	WitnessFork    uint64
+	WitnessRefused int
 }
 
 // Valid — все проверки прошли.
@@ -257,7 +258,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	if trust.Witness != nil {
 		var wr Report
 		checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt, &wr, add)
-		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork
+		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
 	}
 	return r
 }
@@ -543,6 +544,9 @@ func (r SourceReport) Notes() []string {
 	}
 	if r.GatewayRecords > 0 {
 		n = append(n, "gateway journal records: the store's verdict at intake is in the bundle; the gateway's checkpoint signature can be checked yourself in single-record bundles (evidencestore proof -source S -seq N, esverify -gateway-key)")
+	}
+	if r.WitnessRefused != 0 {
+		n = append(n, fmt.Sprintf("a collector refused %d heads signed with the store key (in its checkpoints-conflict.jsonl): the store showed it a second history, or lost the end of its chain; ask its operator", r.WitnessRefused))
 	}
 	if r.WitnessFork != 0 {
 		n = append(n, fmt.Sprintf("the witness holds two versions of the chain, both signed with the store key (the first head it holds in two versions is %d): this part of the chain is not among them, but the store signed a second history — a rewrite, or a store that lost data without a copy; ask its operator", r.WitnessFork))

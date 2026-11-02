@@ -122,6 +122,14 @@ func TestHeadsFlag(t *testing.T) {
 	if code, out := w.run(t, "-heads", later); code != 1 || !strings.Contains(out, "proof -to-head") {
 		t.Fatalf("голова свидетеля после пакета: код %d\n%s", code, out)
 	}
+	// Сам пакет в каталоге голов (в нём подписанная голова) свидетелем не
+	// становится (P-28).
+	if err := os.WriteFile(filepath.Join(later, "proof.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := w.run(t, "-heads", later); code != 1 || !strings.Contains(out, "proof -to-head") {
+		t.Fatalf("пакет в каталоге голов: код %d\n%s", code, out)
+	}
 	if code, out := w.run(t, "-heads", filepath.Join(w.dir, "nope")); code != 2 {
 		t.Fatalf("нет каталога голов: код %d\n%s", code, out)
 	}

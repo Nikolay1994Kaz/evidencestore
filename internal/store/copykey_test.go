@@ -195,6 +195,18 @@ func TestCopyKeyLost(t *testing.T) {
 	if got, err := readCopyKey(own); err != nil || bytes.Equal(got, key) {
 		t.Fatalf("новый ключ копии без копии наружу: %v", err)
 	}
+	// Путь из подсказки: новый ключ уже в резерве — копия наружу в новом
+	// месте пишется им.
+	moved := *cfg
+	moved.Replica.URL = "file://" + t.TempDir()
+	s2 := openStore(t, &moved, c)
+	newRemote, err := ship.OpenRemote(moved.Replica.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.ShipOnce(context.Background(), newRemote); err != nil {
+		t.Fatalf("копия в новом месте с новым ключом: %v", err)
+	}
 }
 
 // Копию в этом месте писала другая установка (другой ключ): хранилище её не
@@ -253,6 +265,15 @@ func TestRestorePlacesCopyKey(t *testing.T) {
 	os.WriteFile(filepath.Join(dir2, CopyKeyFileName), bytes.Repeat([]byte{9}, copyKeyLen), 0o600)
 	if _, err := RestoreReplica(context.Background(), remote, dir2, ed25519.PublicKey(pub), key); err == nil || !strings.Contains(err.Error(), "another copy key") {
 		t.Fatalf("подъём в data_dir с другим ключом копии: %v", err)
+	}
+	// Отказ — до кусков: каталог остаётся пустым, и подъём туда можно
+	// повторить, вернув верный ключ.
+	if entries, _ := os.ReadDir(filepath.Join(dir2, "evidence")); len(entries) > 0 {
+		t.Fatalf("после отказа в data_dir лежат куски: %d", len(entries))
+	}
+	os.WriteFile(filepath.Join(dir2, CopyKeyFileName), key, 0o600)
+	if _, err := RestoreReplica(context.Background(), remote, dir2, ed25519.PublicKey(pub), key); err != nil {
+		t.Fatalf("повторный подъём с верным ключом: %v", err)
 	}
 	if _, err := RestoreReplica(context.Background(), remote, filepath.Join(t.TempDir(), "data"), ed25519.PublicKey(pub), key[:16]); err == nil {
 		t.Fatal("подъём с ключом не той длины")

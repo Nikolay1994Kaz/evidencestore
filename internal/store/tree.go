@@ -56,7 +56,7 @@ func openLinkTree(dataDir string, links []auditchain.Record) (*linkTree, error) 
 	t := &linkTree{f: f}
 	if err := t.reconcile(links); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("tree of links: %w", err)
+		return nil, fmt.Errorf("tree of links: %w (%s is derived from the chain: removing it makes the store build it again)", err, treeFileName)
 	}
 	return t, nil
 }

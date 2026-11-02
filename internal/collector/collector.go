@@ -100,7 +100,8 @@ type Config struct {
 	// умолчанию 2 мин). 0 — 30 с.
 	HeartbeatEvery config.Duration `json:"heartbeat_every"`
 	// CheckpointEvery — как часто последняя принятая голова цепи ложится в
-	// журнал голов (checkpoints.jsonl) и в checkpoint.json. 0 — 10 мин.
+	// журнал голов (checkpoints.jsonl) и в checkpoint.json. 0 — 10 мин, не
+	// меньше секунды.
 	CheckpointEvery config.Duration `json:"checkpoint_every"`
 }
 
@@ -177,8 +178,8 @@ func (c *Config) validate() error {
 	if c.HeartbeatEvery < 0 {
 		errs = append(errs, fmt.Errorf("heartbeat_every %v: must not be negative", c.HeartbeatEvery.D()))
 	}
-	if c.CheckpointEvery < 0 {
-		errs = append(errs, fmt.Errorf("checkpoint_every %v: must not be negative", c.CheckpointEvery.D()))
+	if c.CheckpointEvery.D() < time.Second {
+		errs = append(errs, fmt.Errorf("checkpoint_every %v: must be at least a second (each saved head costs two fsyncs)", c.CheckpointEvery.D()))
 	}
 	if (c.File == "") == (c.Glob == "") {
 		errs = append(errs, errors.New("exactly one of file and glob is required"))
@@ -232,14 +233,26 @@ type Collector struct {
 	contactAt time.Time
 
 	// head — последняя принятая голова цепи (head.go); nil — ещё не
-	// принимал. headSaved — когда она последний раз легла на диск,
-	// headAlarm — когда последний раз записали расхождение, headWarned —
-	// когда предупредили о голове без доказательства или без подписи (то и
-	// другое не чаще checkpoint_every).
+	// принимал; headDirty — принята, но ещё не на диске. headSaved — когда
+	// последний раз пробовали её записать, headAlarm — записать расхождение,
+	// headWarned — предупредили о голове без доказательства или без подписи,
+	// headStale — сказали, что голов, продолжающих принятую, давно нет (всё —
+	// не чаще checkpoint_every); headSeen — когда хранилище последний раз
+	// показало голову, продолжающую принятую (или ту же).
 	head       *proof.Checkpoint
+	headDirty  bool
 	headSaved  time.Time
 	headAlarm  time.Time
 	headWarned time.Time
+	headStale  time.Time
+	headSeen   time.Time
+	// headAnswered — когда хранилище последний раз отвечало (время его
+	// молчания в отсчёт headSeen не идёт); sent — записей, доставленных этим
+	// процессом; headGrewSent — сколько их было, когда принятая голова
+	// последний раз выросла.
+	headAnswered time.Time
+	sent         uint64
+	headGrewSent uint64
 
 	warned map[string]time.Time // когда последний раз сказали «читать нечего (нельзя)» — по пути
 
@@ -489,9 +502,7 @@ func (c *Collector) load() error {
 	if err := c.loadEpoch(); err != nil {
 		return err
 	}
-	if err := c.loadHead(); err != nil {
-		return err
-	}
+	c.loadHead()
 	if err := c.repairPromises(); err != nil {
 		return err
 	}
@@ -570,6 +581,7 @@ func (c *Collector) repairPromises() error {
 
 // Close закрывает буфер и файлы.
 func (c *Collector) Close() error {
+	c.closeHead()
 	for _, t := range c.files {
 		if t.f != nil {
 			t.f.Close()
@@ -657,7 +669,8 @@ func (c *Collector) fetchState(ctx context.Context, issued uint64) (stateRespons
 		return st, ErrStoreKey
 	}
 	c.contactAt = c.now()
-	return st, c.witnessHead(st.headAnswer)
+	c.witness(st.headAnswer)
+	return st, nil
 }
 
 // Bootstrap сверяется с хранилищем при запуске.
@@ -1661,10 +1674,12 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 		return errors.Join(append([]error{ErrBadPromise}, bad...)...)
 	}
 	c.acked = batch[len(batch)-1].seq
+	c.sent += uint64(len(batch))
 	if err := c.saveState(); err != nil {
 		return err
 	}
-	return c.witnessHead(out.headAnswer)
+	c.witness(out.headAnswer)
+	return nil
 }
 
 // keepPromise проверяет обещание хранилища и сохраняет его. Проверяется

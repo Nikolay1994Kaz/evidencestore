@@ -766,7 +766,7 @@
   {
    "name": "W5 улику закрепляет голова свидетеля раньше её звена",
    "file": "internal/proof/heads.go",
-   "old": "return seqs[i] >= evLink",
+   "old": "return seqs[i] >= max(evLink, first)",
    "new": "return seqs[i] >= 1"
   },
   {
@@ -2146,8 +2146,8 @@
   {
    "name": "Y7 подъём принимает другой ключ копии в data_dir (P-24)",
    "file": "internal/store/replica.go",
-   "old": "\tcase err == nil && bytes.Equal(have, key):",
-   "new": "\tcase err == nil && len(have) == len(key):"
+   "old": "\tcase !bytes.Equal(have, key):",
+   "new": "\tcase len(have) != len(key):"
   },
   {
    "name": "Y8 новый ключ копии поверх цепи с копией наружу (P-24)",
@@ -2225,13 +2225,13 @@
    "name": "D7 корень прежней головы из файла подписывается без доказательства продолжения",
    "file": "internal/store/tree.go",
    "old": "\tif tlog.CheckTree(p, int64(n), t.front.Root(), int64(m), root) != nil {",
-   "new": "\tif false {"
+   "new": "\tif tlog.CheckTree(p, int64(n), t.front.Root(), int64(m), root) != nil && false {"
   },
   {
    "name": "D8 испорченный tree.hashes не собирается заново",
    "file": "internal/store/tree.go",
    "old": "\t\t\tif err == nil && bytes.Equal(got, hashBytes(stored)) {",
-   "new": "\t\t\tif err == nil {"
+   "new": "\t\t\tif err == nil && (bytes.Equal(got, hashBytes(stored)) || true) {"
   },
   {
    "name": "D9 tree.hashes длиннее цепи не обрезается",
@@ -2284,8 +2284,8 @@
   {
    "name": "N6 журнал голов пишется на каждый ответ",
    "file": "internal/collector/head.go",
-   "old": "\tif !c.headSaved.IsZero() && now.Sub(c.headSaved) < c.cfg.CheckpointEvery.D() {",
-   "new": "\tif !c.headSaved.IsZero() && false {"
+   "old": "\tif !c.headDirty || !c.headSaved.IsZero() && now.Sub(c.headSaved) < c.cfg.CheckpointEvery.D() {",
+   "new": "\tif !c.headDirty {"
   },
   {
    "name": "N7 расхождение пишется на каждый ответ",
@@ -2302,20 +2302,20 @@
   {
    "name": "N9 расхождение не ложится в файл",
    "file": "internal/collector/head.go",
-   "old": "\t\treturn appendLine(filepath.Join(c.cfg.SpoolDir, headConflictFile), append(line, '\\n'))",
-   "new": "\t\treturn nil"
+   "old": "\t\treturn appendHeadLine(filepath.Join(c.cfg.SpoolDir, headConflictFile), line)",
+   "new": "\t\treturn appendHeadLine(filepath.Join(c.cfg.SpoolDir, headConflictFile+\".x\"), line)"
   },
   {
    "name": "N10 последняя голова не ложится в checkpoint.json",
    "file": "internal/collector/head.go",
-   "old": "\t\treturn writeJSON(c.headPath(), r)",
-   "new": "\t\treturn nil"
+   "old": "\t\tif err := writeJSON(c.headPath(), r); err != nil {",
+   "new": "\t\tif err := writeJSON(c.headPath()+\".x\", r); err != nil {"
   },
   {
    "name": "N11 сборщик поднимает голову без подписи хранилища",
    "file": "internal/collector/head.go",
-   "old": "\tif err := proof.VerifyCheckpoint(*r.Checkpoint, c.storeKey); err != nil {",
-   "new": "\tif err := proof.VerifyCheckpoint(*r.Checkpoint, c.storeKey); err != nil && false {"
+   "old": "\t\t\terr = proof.VerifyCheckpoint(*r.Checkpoint, c.storeKey)",
+   "new": "\t\t\t_ = proof.VerifyCheckpoint(*r.Checkpoint, c.storeKey)"
   },
   {
    "name": "N12 голова сборщику дальше копии",
@@ -2338,8 +2338,8 @@
   {
    "name": "N15 -heads не читает прежнюю голову расхождения",
    "file": "internal/proof/heads.go",
-   "old": "\t\t\tfor _, k := range []string{\"previous\", \"checkpoint\"} {",
-   "new": "\t\t\tfor _, k := range []string{\"checkpoint\"} {"
+   "old": "parse(v[\"previous\"], false), parse(v[\"checkpoint\"], true))",
+   "new": "parse(v[\"checkpoint\"], true))"
   },
   {
    "name": "N16 доказательство продолжения не проверяется",
@@ -2352,6 +2352,108 @@
    "file": "internal/server/server.go",
    "old": "\tresp := IngestResponse{Results: make([]IngestResult, len(results)), CollectorHead: s.collectorHead(r)}",
    "new": "\tresp := IngestResponse{Results: make([]IngestResult, len(results))}"
+  },
+  {
+   "name": "N18 отвергнутая сборщиком голова — голова свидетеля (P-28)",
+   "file": "internal/proof/heads.go",
+   "old": "parse(v[\"previous\"], false), parse(v[\"checkpoint\"], true))",
+   "new": "parse(v[\"previous\"], false), parse(v[\"checkpoint\"], false))"
+  },
+  {
+   "name": "N19 пакет, сходящийся с отвергнутой головой, проходит (P-28)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\terr = fmt.Errorf(\"the chain in the bundle agrees with head %d that a collector refused",
+   "new": "\t\t_ = fmt.Errorf(\"the chain in the bundle agrees with head %d that a collector refused"
+  },
+  {
+   "name": "N20 пакет в каталоге голов — голова свидетеля (P-29)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tcase onlyKeys(v, \"checkpoint\", \"received_at\"):",
+   "new": "\t\tcase v[\"checkpoint\"] != nil && onlyKeys(v, \"previous\", \"checkpoint\") == false:"
+  },
+  {
+   "name": "N21 обрыв строки прячет следующие головы (P-30)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tvals = append(vals, nil) // не разбирается: пустая голова\n\t\ti := bytes.IndexByte(rest, '\\n')\n\t\tif i < 0 {\n\t\t\tbreak\n\t\t}\n\t\trest = rest[i+1:]",
+   "new": "\t\tvals = append(vals, nil) // не разбирается: пустая голова\n\t\tbreak"
+  },
+  {
+   "name": "N22 ошибка записи головы останавливает доставку (P-30)",
+   "file": "internal/collector/collector.go",
+   "old": "\tc.witness(out.headAnswer)\n\treturn nil",
+   "new": "\treturn c.witnessHead(out.headAnswer)"
+  },
+  {
+   "name": "N23 журнал голов раньше checkpoint.json (P-30)",
+   "file": "internal/collector/head.go",
+   "old": "\t\tif err := writeJSON(c.headPath(), r); err != nil {\n\t\t\treturn err\n\t\t}\n\t\treturn appendHeadLine(filepath.Join(c.cfg.SpoolDir, headsFile), line)",
+   "new": "\t\tif err := appendHeadLine(filepath.Join(c.cfg.SpoolDir, headsFile), line); err != nil {\n\t\t\treturn err\n\t\t}\n\t\treturn writeJSON(c.headPath(), r)"
+  },
+  {
+   "name": "N24 давнее отсутствие продолжающей головы — без ошибки (P-30)",
+   "file": "internal/collector/head.go",
+   "old": "\tif now.Sub(c.headSeen) <= 3*every || !c.headStale.IsZero() && now.Sub(c.headStale) < every {",
+   "new": "\tif true || now.Sub(c.headSeen) <= 3*every || !c.headStale.IsZero() && now.Sub(c.headStale) < every {"
+  },
+  {
+   "name": "N25 оборванная строка файла голов не отрезается при запуске (P-30)",
+   "file": "internal/collector/head.go",
+   "old": "\treturn os.Truncate(path, base+int64(bytes.LastIndexByte(tail, '\\n')+1))",
+   "new": "\treturn nil"
+  },
+  {
+   "name": "N26 голова не пишется при остановке (P-34)",
+   "file": "internal/collector/collector.go",
+   "old": "\tc.closeHead()\n",
+   "new": "\n"
+  },
+  {
+   "name": "N27 голова не пишется в тишине (P-34)",
+   "file": "internal/collector/head.go",
+   "old": "\t\t\tc.headMissing(now)\n\t\t}\n\t\treturn c.saveHeadDue(now)",
+   "new": "\t\t\tc.headMissing(now)\n\t\t}\n\t\treturn nil"
+  },
+  {
+   "name": "N28 statement — голова дальше копии (P-31)",
+   "file": "internal/store/chain.go",
+   "old": "\tc, ok, err := s.servedHeadLocked()\n\tif err == nil && !ok {\n\t\terr = ErrNoHead\n\t}",
+   "new": "\tc, ok := s.checkpointLocked()\n\tvar err error\n\tif err == nil && !ok {\n\t\terr = ErrNoHead\n\t}"
+  },
+  {
+   "name": "N29 подъём сверяет ключ копии только после кусков (P-33)",
+   "file": "internal/store/replica.go",
+   "old": "\t// кусков повторить подъём в тот же каталог было бы нельзя.\n\tif err := copyKeyFits(dataDir, copyKey); err != nil {\n\t\treturn rep, err\n\t}\n",
+   "new": "\t// кусков повторить подъём в тот же каталог было бы нельзя.\n"
+  },
+  {
+   "name": "N30 checkpoint_every меньше секунды (P-34)",
+   "file": "internal/collector/collector.go",
+   "old": "\tif c.CheckpointEvery.D() < time.Second {",
+   "new": "\tif c.CheckpointEvery.D() < 0 {"
+  },
+  {
+   "name": "N31 свидетеля замораживают прежней головой без тревоги (P-37)",
+   "file": "internal/collector/head.go",
+   "old": "\t\tif c.sent == c.headGrewSent {",
+   "new": "\t\tif true {"
+  },
+  {
+   "name": "N32 молчание хранилища копит тревогу «нет головы» (P-37)",
+   "file": "internal/collector/head.go",
+   "old": "\t\tc.headSeen = c.headSeen.Add(gap)",
+   "new": "\t\tc.headSeen = c.headSeen.Add(0)"
+  },
+  {
+   "name": "N33 при расхождении принятая голова не пишется (P-37)",
+   "file": "internal/collector/head.go",
+   "old": "\t\treturn errors.Join(c.headConflict(now, reason, last, cp, a.Consistency), c.saveHeadDue(now))",
+   "new": "\t\treturn c.headConflict(now, reason, last, cp, a.Consistency)"
+  },
+  {
+   "name": "N34 без checkpoint.json голова берётся на веру, а не из журнала (P-37)",
+   "file": "internal/collector/head.go",
+   "old": "\t\tif errors.Is(terr, os.ErrNotExist) || terr == nil && len(tail) == 0 {",
+   "new": "\t\tif true || errors.Is(terr, os.ErrNotExist) || terr == nil && len(tail) == 0 {"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются."

@@ -5,7 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
-	"io"
+	"slices"
 	"sort"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
@@ -30,32 +30,48 @@ type Witness struct {
 	Heads []PublishedHead
 }
 
-// PublishedHead — подписанная голова (контрольная точка) у свидетеля. Name — откуда она
-// взята (имя файла): для отчёта.
+// PublishedHead — подписанная голова (контрольная точка) у свидетеля. Name —
+// откуда она взята (имя файла): для отчёта. Refused — голову свидетель
+// отверг: сборщик положил её в файл расхождений, потому что она не продолжает
+// принятую им. Такая голова — улика второй истории, а не голова свидетеля:
+// запись она не закрепляет, а пакет, который с ней сходится, не проходит.
 type PublishedHead struct {
 	Name       string
 	Checkpoint Checkpoint
+	Refused    bool
 }
 
 // ParseHeads — головы из файла свидетеля name: одна точка (свидетель, копия,
 // evidencestore statement) или значения JSON подряд — головы сборщика
-// (сборщики-свидетели, п. 31): его последняя (checkpoint.json,
-// {"checkpoint": …}), журнал (checkpoints.jsonl) и расхождения
-// (checkpoints-conflict.jsonl: {"previous": …, "checkpoint": …} — обе головы
-// подписаны хранилищем). Что не разбирается, остаётся пустой головой: сверка
-// её не засчитает, а отчёт назовёт, сколько таких.
+// (сборщики-свидетели, п. 31): его последняя (checkpoint.json) и журнал
+// (checkpoints.jsonl) — {"received_at", "checkpoint"}, расхождения
+// (checkpoints-conflict.jsonl) — {"received_at", "reason", "previous",
+// "checkpoint", "consistency"}: «previous» сборщик держал, «checkpoint»
+// отверг. Принимаются только эти формы, ключ в ключ: пакет доказательств,
+// попавший в каталог, несёт свою подписанную голову, но свидетелем самому себе
+// не становится. Значения читаются подряд; с места, которое не разбирается
+// (строка, оборванная записью), чтение идёт со следующей строки, так что
+// обрывок не прячет следующих голов. Что не разбирается, остаётся пустой
+// головой: сверка её не засчитает, а отчёт назовёт, сколько таких.
 func ParseHeads(name string, data []byte) []PublishedHead {
 	var vals []json.RawMessage
-	dec := json.NewDecoder(bytes.NewReader(data))
-	for {
+	for rest := bytes.TrimLeft(data, " \t\r\n"); len(rest) > 0; rest = bytes.TrimLeft(rest, " \t\r\n") {
+		dec := json.NewDecoder(bytes.NewReader(rest))
 		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			if err != io.EOF || len(vals) == 0 {
-				vals = append(vals, nil) // не разбирается: пустая голова
-			}
+		if err := dec.Decode(&raw); err == nil {
+			vals = append(vals, raw)
+			rest = rest[dec.InputOffset():]
+			continue
+		}
+		vals = append(vals, nil) // не разбирается: пустая голова
+		i := bytes.IndexByte(rest, '\n')
+		if i < 0 {
 			break
 		}
-		vals = append(vals, raw)
+		rest = rest[i+1:]
+	}
+	if len(vals) == 0 {
+		vals = append(vals, nil) // пустой файл — тоже не голова
 	}
 	var out []PublishedHead
 	for i, raw := range vals {
@@ -65,24 +81,35 @@ func ParseHeads(name string, data []byte) []PublishedHead {
 		}
 		var v map[string]json.RawMessage
 		_ = json.Unmarshal(raw, &v)
-		heads := []json.RawMessage{raw}
-		if _, ok := v["origin"]; !ok {
-			heads = nil
-			for _, k := range []string{"previous", "checkpoint"} {
-				if h, ok := v[k]; ok {
-					heads = append(heads, h)
-				}
-			}
+		parse := func(raw json.RawMessage, refused bool) PublishedHead {
+			c, _ := ParseCheckpoint(raw)
+			return PublishedHead{Name: at, Checkpoint: c, Refused: refused}
 		}
-		if len(heads) == 0 {
+		switch {
+		case onlyKeys(v, "origin", "size", "root", "sig"):
+			out = append(out, parse(raw, false))
+		case onlyKeys(v, "checkpoint", "received_at"):
+			out = append(out, parse(v["checkpoint"], false))
+		case onlyKeys(v, "previous", "received_at", "reason", "checkpoint", "consistency"):
+			out = append(out, parse(v["previous"], false), parse(v["checkpoint"], true))
+		default:
 			out = append(out, PublishedHead{Name: at})
-		}
-		for _, h := range heads {
-			c, _ := ParseCheckpoint(h)
-			out = append(out, PublishedHead{Name: at, Checkpoint: c})
 		}
 	}
 	return out
+}
+
+// onlyKeys — у значения есть первый ключ из keys и нет ключей вне keys.
+func onlyKeys(v map[string]json.RawMessage, keys ...string) bool {
+	if v[keys[0]] == nil {
+		return false
+	}
+	for k := range v {
+		if !slices.Contains(keys, k) {
+			return false
+		}
+	}
+	return true
 }
 
 // checkWitness сверяет пакет с головами свидетеля. evLink — звено улики,
@@ -97,12 +124,17 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	// номером бывает больше одной головы: тогда хранилище подписало две версии
 	// цепи, и сохраняются все.
 	versions := map[uint64][]PublishedHead{}
+	var refused []PublishedHead
 	signed := 0
 	for _, h := range w.Heads {
 		if VerifyCheckpoint(h.Checkpoint, key) != nil {
 			continue
 		}
 		signed++
+		if h.Refused {
+			refused = append(refused, h)
+			continue
+		}
 		seq, known := h.Checkpoint.Size, false
 		for _, v := range versions[seq] {
 			known = known || bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root)
@@ -147,9 +179,24 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			break
 		}
 	}
-	// Улику закрепляет первая голова свидетеля не раньше её звена; пакет
-	// обязан до неё доходить.
-	i := sort.Search(len(seqs), func(i int) bool { return seqs[i] >= evLink })
+	// Голова, которую сборщик отверг, запись не закрепляет. Пакет, который с
+	// ней сходится, — из той истории, что сборщик отверг, и не проходит, даже
+	// если ту же голову принял другой сборщик: тот мог принять её на веру
+	// (первая голова) или держать голову старше переписанного места, а честное
+	// хранилище головы меньше отданной не отдаёт (P-28). Не сходится или лежит
+	// вне пакета — только замечание: хранилище показывало сборщику вторую
+	// историю.
+	for _, h := range refused {
+		root, in := rootAt(h.Checkpoint.Size)
+		if err != nil || !in || h.Checkpoint.RootHash() != root {
+			continue
+		}
+		err = fmt.Errorf("the chain in the bundle agrees with head %d that a collector refused (%s): the store showed that collector a second history, or lost the end of its chain", h.Checkpoint.Size, h.Name)
+	}
+	r.WitnessRefused = len(refused)
+	// Улику закрепляет первая голова свидетеля не раньше её звена (и не
+	// раньше первого звена пакета); пакет обязан до неё доходить.
+	i := sort.Search(len(seqs), func(i int) bool { return seqs[i] >= max(evLink, first) })
 	switch {
 	case err != nil:
 	case i == len(seqs):

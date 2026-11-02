@@ -111,7 +111,7 @@ func checkLostCopyKey(cfg *config.Config, links uint64) error {
 	case cfg.Replica.URL == "":
 		return nil
 	case links > 0:
-		return fmt.Errorf("store: %s is missing while the chain holds %d links and replica.url is set: put copy.key back from keys.backup_dir, or point replica.url at a new location (chunks already in the copy open only with the old key)", path, links)
+		return fmt.Errorf("store: %s is missing while the chain holds %d links and replica.url is set: put copy.key back from keys.backup_dir. If it is lost, the chunks already in the copy no longer open: start the store once without replica.url (it makes a new copy.key and backs it up), then point replica.url at a new location", path, links)
 	case unchecked != nil:
 		return fmt.Errorf("store: %s is missing, and the backup cannot be checked for it: %w", path, unchecked)
 	}

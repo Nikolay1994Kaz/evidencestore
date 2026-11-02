@@ -168,6 +168,7 @@ type WindowReport struct {
 	WitnessHead    uint64
 	WitnessNone    bool
 	WitnessFork    uint64
+	WitnessRefused int
 }
 
 // Valid — все проверки прошли.
@@ -341,7 +342,7 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 	if trust.Witness != nil {
 		var wr Report
 		checkWitness(trust.Witness, trust.StoreKey, b.StretchEnd, links, rootAt, &wr, add)
-		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork
+		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
 	}
 	return r
 }
@@ -690,6 +691,9 @@ func (r WindowReport) Notes() []string {
 	}
 	if r.GatewayRecords > 0 {
 		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint signature) are in single-record bundles (evidencestore proof -source S -seq N)")
+	}
+	if r.WitnessRefused != 0 {
+		n = append(n, fmt.Sprintf("a collector refused %d heads signed with the store key (in its checkpoints-conflict.jsonl): the store showed it a second history, or lost the end of its chain; ask its operator", r.WitnessRefused))
 	}
 	if r.WitnessFork != 0 {
 		n = append(n, fmt.Sprintf("the witness holds two versions of the chain, both signed with the store key (the first head it holds in two versions is %d): this stretch is not among them, but the store signed a second history — a rewrite, or a store that lost data without a copy; ask its operator", r.WitnessFork))
