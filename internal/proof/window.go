@@ -32,12 +32,14 @@ import (
 // что в пакете одной улики, только «первая метка над её звеном» здесь
 // проверяема: между ними видны все листья.
 
-// WindowKind, WindowVersion — вид и версия пакета за окно. Версия своя: старый
-// esverify отвечает «bundle version 2», а не разбирает пакет как пакет одной
-// улики.
+// WindowKind, WindowVersion — вид и версия пакета за окно (и пакета по
+// источнику). Версия своя: старый esverify отвечает «bundle version …», а не
+// разбирает пакет как пакет одной улики. Версия 3 (P-23, после v0.3.1) —
+// пакет над цепью, где узел листа несёт признак метки; пакеты версии 2 этим
+// выпуском не читаются.
 const (
 	WindowKind    = "window"
-	WindowVersion = 2
+	WindowVersion = 3
 )
 
 // BundleKind — вид пакета: WindowKind или "" (пакет одной улики).
@@ -89,7 +91,7 @@ func ParseWindow(data []byte) (WindowBundle, error) {
 		return b, fmt.Errorf("proof: %w", err)
 	}
 	if b.Kind != WindowKind || b.Version != WindowVersion {
-		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d", b.Kind, b.Version, WindowKind, WindowVersion)
+		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d%s", b.Kind, b.Version, WindowKind, WindowVersion, olderRelease(b.Version, WindowVersion))
 	}
 	return b, nil
 }

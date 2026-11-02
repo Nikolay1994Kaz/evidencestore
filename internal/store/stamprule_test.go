@@ -14,7 +14,7 @@ import (
 
 // stampRule — сверка обещания по меткам по всей цепи на диске (цепь
 // свёрнута): перед листом записи нет листа токена со временем TSA позже
-// времени приёма + MaxPromiseMMD, что бы ни стояло в сроке (Q-80). Сверка пакета версии 3
+// времени приёма + MaxPromiseMMD, что бы ни стояло в сроке (Q-80). Сверка пакета одной улики
 // (proof.CheckPromise) должна давать тот же ответ по одним листьям от головы
 // под T1 до звена записи.
 func stampRule(st *Store, p proof.Promise) error {
@@ -49,7 +49,7 @@ func stampRule(st *Store, p proof.Promise) error {
 	return nil
 }
 
-// checkBoth — сверка обещания по пакету версии 3 (её ответ) и та же сверка
+// checkBoth — сверка обещания по пакету одной улики (её ответ) и та же сверка
 // по всей цепи: ответы обязаны совпасть.
 func checkBoth(t *testing.T, st *Store, p proof.Promise, r proof.Report, b proof.Bundle) error {
 	t.Helper()

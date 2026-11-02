@@ -217,7 +217,7 @@ func TestWindowForged(t *testing.T) {
 		t.Fatalf("тела подделки записаны: %v", err)
 	}
 	broken := filepath.Join(w.dir, "broken.json")
-	if err := os.WriteFile(broken, []byte(`{"kind": "window", "v": 3}`), 0o600); err != nil {
+	if err := os.WriteFile(broken, []byte(`{"kind": "window", "v": 99}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if code, out, _ := w.run(t, broken, "-json"); code != exitInvalid || !strings.Contains(out, "the window bundle parses") {
@@ -278,7 +278,7 @@ func TestSourceBundle(t *testing.T) {
 		t.Fatalf("тела подделки записаны: %v", err)
 	}
 	broken := filepath.Join(w.dir, "broken.json")
-	if err := os.WriteFile(broken, []byte(`{"kind": "source", "v": 3}`), 0o600); err != nil {
+	if err := os.WriteFile(broken, []byte(`{"kind": "source", "v": 99}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if code, out, _ := w.run(t, broken, "-json"); code != exitInvalid || !strings.Contains(out, "the source bundle parses") {

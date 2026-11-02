@@ -125,11 +125,11 @@ func (w *world) bundle(evidenceBytes []byte, evLink uint64, evIdx int, upperHead
 	}
 	if lowerLink != 0 {
 		b.Lower = &Lower{Inclusion: w.inclusion(lowerLink, 0)}
-		// Версия 3: листья звеньев от головы под T1 до звена улики.
+		// Участок: листья звеньев от головы под T1 до звена улики.
 		if head, err := strconv.ParseUint(b.Lower.Inclusion.Leaf.Subject, 10, 64); err == nil && head < evLink {
 			for _, ls := range w.leaves[head:evLink] {
 				for _, l := range ls {
-					b.Stretch = append(b.Stretch, FromLeaf(l))
+					b.Stretch = append(b.Stretch, StretchOf(l))
 				}
 			}
 		}
@@ -304,8 +304,8 @@ func TestPromise(t *testing.T) {
 	if VerifyPromise(bad, w.signer.PublicKey()) == nil {
 		t.Fatal("изменённое обещание прошло")
 	}
-	// Время звеньев в сверку обещания не входит (пакет версии 3 сверяется по
-	// меткам — TestPromiseStamps).
+	// Время звеньев в сверку обещания не входит (пакет сверяется по меткам —
+	// TestPromiseStamps).
 	// Без T1 время звена — только слово хранилища.
 	nr := r
 	nr.Lower = time.Time{}
@@ -578,7 +578,7 @@ func TestReportTextEscapesControls(t *testing.T) {
 	}
 }
 
-// Сверка обещания по меткам (пакет версии 3): перед записью в цепи нет
+// Сверка обещания по меткам (по участку пакета): перед записью в цепи нет
 // метки со временем TSA позже min(срок, время приёма + MaxPromiseMMD). Время
 // звеньев не участвует — придержанную запись выдаёт токен закрывающей метки,
 // какое бы время ни стояло у звеньев.
@@ -592,11 +592,11 @@ func TestReportTextEscapesControls(t *testing.T) {
 //	                                          10:21, метка C над головой 5
 //	звено 6: [токен C]
 func TestPromiseStamps(t *testing.T) {
-	stretch := func(w *world, head, link uint64) []Leaf {
-		var out []Leaf
+	stretch := func(w *world, head, link uint64) []StretchLeaf {
+		var out []StretchLeaf
 		for _, ls := range w.leaves[head:link] {
 			for _, l := range ls {
-				out = append(out, FromLeaf(l))
+				out = append(out, StretchOf(l))
 			}
 		}
 		return out
@@ -644,6 +644,13 @@ func TestPromiseStamps(t *testing.T) {
 	if err := CheckPromise(promise(w, data, at(10, 5, 0)), r, b, false); !r.Valid() || err != nil {
 		t.Fatalf("честная запись: пакет %s; обещание: %v", r.Verdict(), err)
 	}
+	// Целиком в участке — только метки: чужие листья (молчание источника
+	// other, запись 1) — хешем, без имён, номеров и времени (P-23).
+	for i, s := range b.Stretch {
+		if s.Leaf != nil && auditchain.EventType(s.Leaf.Type) != auditchain.EventTimestamp {
+			t.Fatalf("лист %d участка целиком, а он не метка: %+v", i, *s.Leaf)
+		}
+	}
 
 	// Придержана за метку B, все звенья задним числом: по времени звеньев
 	// (версия 2) — «выполнено», по меткам — нет.
@@ -667,8 +674,38 @@ func TestPromiseStamps(t *testing.T) {
 	if err := CheckPromise(p, r, short, false); err == nil || !strings.Contains(err.Error(), "Merkle root") {
 		t.Fatalf("убран лист токена: %v", err)
 	}
+	// Метку не показать хешем: её узел в дереве звена считался с признаком
+	// «метка», а лист, показанный хешем, — с признаком «не метка», и корень
+	// не сходится (P-23). Без признака так пряталась бы метка B, и
+	// придержанная запись прошла бы.
+	hidden := b
+	hidden.Stretch = slices.Clone(b.Stretch)
+	last := -1
+	for i, s := range hidden.Stretch {
+		if s.Leaf != nil {
+			last = i
+		}
+	}
+	tokB := auditchain.LeafHash(hidden.Stretch[last].Leaf.Chain())
+	hidden.Stretch[last] = StretchLeaf{Hash: tokB[:]}
+	if err := CheckPromise(p, r, hidden, false); err == nil || !strings.Contains(err.Error(), "shown only by its hash") {
+		t.Fatalf("метка B показана хешем: %v", err)
+	}
+	// Лист участка — либо целиком, либо хешем.
+	both := b
+	both.Stretch = slices.Clone(b.Stretch)
+	both.Stretch[0].Hash = make([]byte, 32)
+	if err := CheckPromise(p, r, both, false); err == nil || !strings.Contains(err.Error(), "either the whole leaf") {
+		t.Fatalf("лист участка и целиком, и хешем: %v", err)
+	}
+	cut := b
+	cut.Stretch = slices.Clone(b.Stretch)
+	cut.Stretch[1] = StretchLeaf{Hash: make([]byte, 31)}
+	if err := CheckPromise(p, r, cut, false); err == nil || !strings.Contains(err.Error(), "either the whole leaf") {
+		t.Fatalf("лист участка хешем не в 32 байта: %v", err)
+	}
 	long := b
-	long.Stretch = append(slices.Clone(b.Stretch), FromLeaf(auditchain.Leaf{Type: auditchain.EventStart}))
+	long.Stretch = append(slices.Clone(b.Stretch), StretchOf(auditchain.Leaf{Type: auditchain.EventStart}))
 	if err := CheckPromise(p, r, long, false); err == nil {
 		t.Fatal("лишний лист прошёл")
 	}

@@ -30,14 +30,61 @@ import (
 //     последний узел» даёт двум РАЗНЫМ наборам листьев один корень
 //     (CVE-2012-2459 в биткойне). Здесь нечётный узел поднимается на уровень
 //     выше БЕЗ изменения — дублирования нет, значит нет и подмены.
+//
+// УЗЕЛ ЛИСТА НЕСЁТ ПРИЗНАК «МЕТКА TSA» (P-23, после v0.3.1). Внизу дерева лежит
+// не хеш листа, а хеш с префиксом 0x02 от признака (1 — лист метки, 0 — любой
+// другой) и хеша листа. Сверке обещания по меткам нужно видеть все листья
+// перед уликой, чтобы метку нельзя было спрятать, но о чужом листе ей нужно
+// знать одно — метка ли он. Теперь чужой лист показывается одним хешем: его
+// узел считается с признаком 0, и метку, показанную так, выдаёт корень звена.
+// Метка, вписанная в звено с признаком 0 с самого начала, не годится нигде:
+// там, где лист раскрыт целиком (края окна, T1), признак берётся из типа, и
+// корень не сходится. Хеш листа (LeafHash) остался прежним: на нём держатся
+// ссылки цепочки источника и хвосты.
 const (
-	domainLeaf byte = 0x00
-	domainNode byte = 0x01
+	domainLeaf     byte = 0x00
+	domainNode     byte = 0x01
+	domainLeafNode byte = 0x02
 )
 
 // LeafHash — хеш листа.
 func LeafHash(l Leaf) [32]byte {
 	return sha256.Sum256(encodeLeafForHash(l))
+}
+
+// LeafNode — узел листа в дереве звена: хеш листа вместе с признаком «это
+// метка TSA».
+func LeafNode(l Leaf) [32]byte {
+	_, node := leafNode(l)
+	return node
+}
+
+// HiddenLeafNode — узел листа, показанного одним хешем: такой лист — не
+// метка.
+func HiddenLeafNode(leafHash [32]byte) [32]byte {
+	return nodeOfLeaf(false, leafHash)
+}
+
+// MerkleRootOfNodes — корень над готовыми узлами листьев (LeafNode,
+// HiddenLeafNode) в порядке листьев.
+func MerkleRootOfNodes(nodes [][32]byte) [32]byte {
+	return merkleRootOf(nodes)
+}
+
+// leafNode — хеш листа и его узел в дереве звена.
+func leafNode(l Leaf) (leafHash, node [32]byte) {
+	leafHash = LeafHash(l)
+	return leafHash, nodeOfLeaf(l.Type == EventTimestamp, leafHash)
+}
+
+func nodeOfLeaf(stamp bool, leafHash [32]byte) [32]byte {
+	var buf [2 + hashSize]byte
+	buf[0] = domainLeafNode
+	if stamp {
+		buf[1] = 1
+	}
+	copy(buf[2:], leafHash[:])
+	return sha256.Sum256(buf[:])
 }
 
 // nodeHash — хеш внутреннего узла из двух детей.
@@ -56,7 +103,7 @@ func nodeHash(left, right [32]byte) [32]byte {
 func MerkleRoot(leaves []Leaf) [32]byte {
 	level := make([][32]byte, len(leaves))
 	for i, l := range leaves {
-		level[i] = LeafHash(l)
+		level[i] = LeafNode(l)
 	}
 	return merkleRootOf(level)
 }
@@ -104,7 +151,7 @@ func MerkleProof(leaves []Leaf, idx int) ([]ProofStep, error) {
 	}
 	level := make([][32]byte, len(leaves))
 	for i, l := range leaves {
-		level[i] = LeafHash(l)
+		level[i] = LeafNode(l)
 	}
 
 	var path []ProofStep
@@ -133,7 +180,7 @@ func MerkleProof(leaves []Leaf, idx int) ([]ProofStep, error) {
 // и корень, который он взял из звена. Это и есть «докажи свою улику, не
 // показывая чужих».
 func VerifyProof(l Leaf, path []ProofStep, root [32]byte) bool {
-	h := LeafHash(l)
+	h := LeafNode(l)
 	for _, step := range path {
 		if step.SiblingLeft {
 			h = nodeHash(step.Hash, h)

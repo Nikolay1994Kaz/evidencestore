@@ -1,8 +1,14 @@
 package auditchain
 
 import (
+	"errors"
 	"fmt"
 )
+
+// ErrOldFormat — цепь записана хранилищем v0.3.1 или раньше: узлом листа в
+// дереве звена там был сам хеш листа, без признака метки (P-23). Этот выпуск
+// такую цепь не читает: совместимость с прежним форматом не держится.
+var ErrOldFormat = errors.New("auditchain: the chain was written by evidencestore v0.3.1 or earlier, whose Merkle trees hash leaves differently: this release does not read it; start with a new data_dir (bundles from that chain verify with esverify of that release)")
 
 // ScanVerifiedLeaves — ScanLeaves с проверкой: листья каждого звена
 // пересчитываются в корень Меркла и сверяются с корнем в звене. Лист,
@@ -34,16 +40,21 @@ func ScanVerifiedLeaves(dir string, links []Record, fn func(num uint64, l Leaf) 
 		batches = append(batches, batch{seq: l.Seq, first: p.FirstLeaf, end: next, root: p.Root})
 	}
 	cur := 0
-	var hashes [][32]byte
+	var hashes, nodes [][32]byte
 	err := ScanLeaves(dir, func(num uint64, l Leaf) error {
 		if cur < len(batches) {
-			hashes = append(hashes, LeafHash(l))
+			h, n := leafNode(l)
+			hashes, nodes = append(hashes, h), append(nodes, n)
 			if num+1 == batches[cur].end {
-				if merkleRootOf(hashes) != batches[cur].root {
+				if merkleRootOf(nodes) != batches[cur].root {
+					// Корень прежнего формата — над самими хешами листьев.
+					if merkleRootOf(hashes) == batches[cur].root {
+						return fmt.Errorf("%w (link %d)", ErrOldFormat, batches[cur].seq)
+					}
 					return fmt.Errorf("auditchain: leaves %d…%d do not match the root of link %d: a leaf was replaced",
 						batches[cur].first, num, batches[cur].seq)
 				}
-				cur, hashes = cur+1, hashes[:0]
+				cur, hashes, nodes = cur+1, hashes[:0], nodes[:0]
 			}
 		}
 		return fn(num, l)

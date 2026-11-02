@@ -92,7 +92,7 @@ func ParseSource(data []byte) (SourceBundle, error) {
 		return b, fmt.Errorf("proof: %w", err)
 	}
 	if b.Kind != SourceKind || b.Version != WindowVersion {
-		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d", b.Kind, b.Version, SourceKind, WindowVersion)
+		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d%s", b.Kind, b.Version, SourceKind, WindowVersion, olderRelease(b.Version, WindowVersion))
 	}
 	return b, nil
 }

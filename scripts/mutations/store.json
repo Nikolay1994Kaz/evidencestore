@@ -1922,10 +1922,10 @@
    "new": "\tif kind, _ := BundleKind(data); false && kind != \"\" {"
   },
   {
-   "name": "X28 пакет одной улики старой версии (1 или 2) не разбирается (Q-51)",
+   "name": "X28 пакет одной улики прежней версии разбирается (P-23)",
    "file": "internal/proof/proof.go",
-   "old": "\tif b.Version < 1 || b.Version > Version {",
-   "new": "\tif b.Version != Version {"
+   "old": "\tif b.Version != Version {",
+   "new": "\tif b.Version < 1 || b.Version > Version {"
   },
   {
    "name": "X29 событие, ждавшее цепь, ложится со временем прежнего якоря (Q-47)",
@@ -2020,14 +2020,14 @@
   {
    "name": "X47 сверка по меткам не сверяет листья с корнями звеньев (пересмотр 28.10)",
    "file": "internal/proof/promise.go",
-   "old": "\t\tcase auditchain.MerkleRoot(leaves[at:at+n]) != p.Root:",
-   "new": "\t\tcase false && auditchain.MerkleRoot(leaves[at:at+n]) != p.Root:"
+   "old": "\t\tcase auditchain.MerkleRootOfNodes(nodes[at:at+n]) != p.Root:",
+   "new": "\t\tcase false && auditchain.MerkleRootOfNodes(nodes[at:at+n]) != p.Root:"
   },
   {
    "name": "X48 сверка по меткам не видит токенов (пересмотр 28.10)",
    "file": "internal/proof/promise.go",
-   "old": "\t\t\tif lf.Type != auditchain.EventTimestamp {\n\t\t\t\tcontinue\n\t\t\t}",
-   "new": "\t\t\tif true || lf.Type != auditchain.EventTimestamp {\n\t\t\t\tcontinue\n\t\t\t}"
+   "old": "\t\t\tif lf == nil || auditchain.EventType(lf.Type) != auditchain.EventTimestamp {\n\t\t\t\tcontinue\n\t\t\t}",
+   "new": "\t\t\tif true || lf == nil || auditchain.EventType(lf.Type) != auditchain.EventTimestamp {\n\t\t\t\tcontinue\n\t\t\t}"
   },
   {
    "name": "X50 хранилище не кладёт в пакет листья от головы под T1 до звена улики (пересмотр 28.10)",
@@ -2042,10 +2042,10 @@
    "new": "\t// снятая отказом, видна здесь. Токен не ложится до перезапуска.\n\tif err := s.evlog.Failed(); false && err != nil {"
   },
   {
-   "name": "X53 пакет версии 1 или 2 сверяется по времени звеньев (Q-76)",
+   "name": "X53 пакет другой версии сверяется по меткам (Q-76)",
    "file": "internal/proof/promise.go",
-   "old": "\tcase b.Version < 3:",
-   "new": "\tcase false && b.Version < 3:"
+   "old": "\tcase b.Version != Version:",
+   "new": "\tcase false && b.Version != Version:"
   },
   {
    "name": "X54 предел — срок из обещания, если он короче минуты (Q-77, Q-80: запись v0.2.0, догнанная этим выпуском)",
@@ -2070,6 +2070,48 @@
    "file": "internal/evlog/evlog.go",
    "old": "\tif _, err := l.active.WriteAt(buf, off); err != nil {",
    "new": "\tif _, err := len(buf), error(nil); err != nil {"
+  },
+  {
+   "name": "X58 участок прячет и метки — хешем (P-23)",
+   "file": "internal/proof/proof.go",
+   "old": "\tif l.Type == auditchain.EventTimestamp {\n\t\tfull := FromLeaf(l)",
+   "new": "\tif false {\n\t\tfull := FromLeaf(l)"
+  },
+  {
+   "name": "X59 участок показывает чужие листья целиком (P-23)",
+   "file": "internal/proof/proof.go",
+   "old": "\tif l.Type == auditchain.EventTimestamp {\n\t\tfull := FromLeaf(l)",
+   "new": "\tif true {\n\t\tfull := FromLeaf(l)"
+  },
+  {
+   "name": "X60 лист участка и целиком, и хешем — берётся целый (P-23)",
+   "file": "internal/proof/proof.go",
+   "old": "\tcase s.Leaf != nil && s.Hash == nil:",
+   "new": "\tcase s.Leaf != nil:"
+  },
+  {
+   "name": "X61 лист участка хешем любой длины (P-23)",
+   "file": "internal/proof/proof.go",
+   "old": "\tcase s.Leaf == nil && len(s.Hash) == 32:",
+   "new": "\tcase s.Leaf == nil:"
+  },
+  {
+   "name": "X62 запись в участке не узнаётся по хешу (P-23)",
+   "file": "internal/proof/promise.go",
+   "old": "\t\t\tif seq == r.LinkSeq && hashes[i] == rec {",
+   "new": "\t\t\tif seq == r.LinkSeq && b.Stretch[i].Leaf != nil && hashes[i] == rec {"
+  },
+  {
+   "name": "X63 отказ пакету прежней версии без пояснения (P-23)",
+   "file": "internal/proof/proof.go",
+   "old": "\tif v < 1 || v >= current {",
+   "new": "\tif true {"
+  },
+  {
+   "name": "X64 хранилище кладёт в участок чужие листья целиком (P-23)",
+   "file": "internal/store/proofs.go",
+   "old": "\t\tout[i] = proof.StretchOf(l)",
+   "new": "\t\tfull := proof.FromLeaf(l)\n\t\tout[i] = proof.StretchLeaf{Leaf: &full}"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются."

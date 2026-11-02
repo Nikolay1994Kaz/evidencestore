@@ -177,3 +177,36 @@ func TestMerkle_ProofRejectsOutOfRange(t *testing.T) {
 		}
 	}
 }
+
+// TestMerkle_LeafNodeByDescription — узел листа в дереве звена считается по
+// описанию, а не по нашему коду: SHA-256(0x02 ‖ признак ‖ хеш листа), признак
+// 1 — у метки TSA, 0 — у любого другого листа (P-23). Проверяющий на другом
+// языке должен уметь его воспроизвести; домен 0x02 не совпадает ни с листом
+// (0x00), ни с внутренним узлом (0x01).
+func TestMerkle_LeafNodeByDescription(t *testing.T) {
+	stamp := Leaf{UnixNano: 1, Type: EventTimestamp, Subject: "7", Payload: []byte("token")}
+	for _, c := range []struct {
+		l    Leaf
+		flag byte
+	}{{leafN(0), 0}, {stamp, 1}} {
+		h := LeafHash(c.l)
+		want := sha256.Sum256(append([]byte{0x02, c.flag}, h[:]...))
+		if got := LeafNode(c.l); got != want {
+			t.Fatalf("узел листа типа %d: %x, по описанию %x", c.l.Type, got, want)
+		}
+	}
+	// Лист, показанный хешем, — не метка: для любого другого листа узел тот
+	// же, для метки — другой, и корень звена её выдаёт.
+	if h := LeafHash(leafN(0)); HiddenLeafNode(h) != LeafNode(leafN(0)) {
+		t.Fatal("узел листа, показанного хешем, не совпал с узлом того же листа целиком")
+	}
+	leaves := []Leaf{leafN(0), stamp, leafN(1)}
+	nodes := [][32]byte{LeafNode(leaves[0]), HiddenLeafNode(LeafHash(stamp)), LeafNode(leaves[2])}
+	if MerkleRootOfNodes(nodes) == MerkleRoot(leaves) {
+		t.Fatal("метка, показанная хешем, дала тот же корень звена")
+	}
+	nodes[1] = LeafNode(stamp)
+	if MerkleRootOfNodes(nodes) != MerkleRoot(leaves) {
+		t.Fatal("корень над узлами не совпал с корнем над листьями")
+	}
+}

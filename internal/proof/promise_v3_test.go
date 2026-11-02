@@ -18,11 +18,11 @@ import (
 // любой своей записи).
 
 // j10stretch — листья звеньев после head до звена link включительно.
-func j10stretch(w *world, head, link uint64) []Leaf {
-	var out []Leaf
+func j10stretch(w *world, head, link uint64) []StretchLeaf {
+	var out []StretchLeaf
 	for _, ls := range w.leaves[head:link] {
 		for _, l := range ls {
-			out = append(out, FromLeaf(l))
+			out = append(out, StretchOf(l))
 		}
 	}
 	return out
@@ -60,7 +60,7 @@ func j10leaf(t *testing.T, data []byte, prevOf auditchain.Leaf, linked bool) aud
 //	звено 6: [токен C]                     метка C (10:21) над головой 5
 func TestPromiseHeldBackAnyVersion(t *testing.T) {
 	for _, linked := range []bool{true, false} {
-		for _, v := range []int{1, 2, 3} {
+		for _, v := range []int{1, 2, 3, Version} {
 			t.Run(fmt.Sprintf("linked=%v/v%d", linked, v), func(t *testing.T) {
 				w := newWorld(t)
 				w.now = at(10, 0, 0)
@@ -101,8 +101,8 @@ func TestPromiseHeldBackAnyVersion(t *testing.T) {
 }
 
 // Q-76 (кто угодно). Честная запись 2 шла до цепи 90 с (класс
-// Q-72: зависшая копия кейринга), метка B — после неё (барьер). Пакет версии
-// 3 — обещание выполнено. Тот же пакет, переписанный в версию 2 или 1, не
+// Q-72: зависшая копия кейринга), метка B — после неё (барьер). Пакет текущей
+// версии — обещание выполнено. Тот же пакет, переписанный в прежнюю версию, не
 // должен обвинять хранилище: отказ сверять — да, «нарушено» — нет.
 //
 //	звено 1: [запуск]                      10:00, метка A над головой 1
@@ -128,14 +128,14 @@ func TestPromiseRelabelledBundleRefused(t *testing.T) {
 	w.wlink(tokenLeaf(hB, tB))
 
 	p := j10promise(w, data, at(10, 5, 0), MaxPromiseMMD)
-	b3 := w.bundle(data, 4, 0, hB, tB, 2)
-	b3.Version, b3.Stretch = 3, j10stretch(w, 1, 4)
-	r3 := Verify(b3, w.trust())
-	if err := CheckPromise(p, r3, b3, false); !r3.Valid() || err != nil {
-		t.Fatalf("честный пакет версии 3: %s; -promise: %v", r3.Verdict(), err)
+	cur := w.bundle(data, 4, 0, hB, tB, 2)
+	cur.Version, cur.Stretch = Version, j10stretch(w, 1, 4)
+	rc := Verify(cur, w.trust())
+	if err := CheckPromise(p, rc, cur, false); !rc.Valid() || err != nil {
+		t.Fatalf("честный пакет версии %d: %s; -promise: %v", Version, rc.Verdict(), err)
 	}
-	for _, v := range []int{1, 2} {
-		b := b3
+	for _, v := range []int{1, 2, 3} {
+		b := cur
 		b.Version, b.Stretch = v, nil
 		r := Verify(b, w.trust())
 		err := CheckPromise(p, r, b, false)
@@ -149,8 +149,8 @@ func TestPromiseRelabelledBundleRefused(t *testing.T) {
 // Q-77. Запись v0.2.0 (лист без ссылки, барьера метки не было,
 // promise_mmd = 10 с — v0.2.0 позволял от двух тиков) на хосте, чьи часы
 // отстают от TSA на 30 с (v0.2.0 зажимал время приёма окном по якорю шириной
-// 55 с — тревоги нет). Обновлённое хранилище выдаёт на неё пакет версии 3;
-// обещание дано честно и не должно обвиняться.
+// 55 с — тревоги нет). Обновлённое хранилище выдаёт на неё пакет текущей
+// версии; обещание дано честно и не должно обвиняться.
 //
 //	звено 1: [запуск]                         хост 09:59:30, метка T над головой 1 (TSA 10:00:00)
 //	звено 2: [токен T]                        хост 09:59:30
@@ -174,10 +174,10 @@ func TestPromiseOldRecordMinute(t *testing.T) {
 
 	p := j10promise(w, data, recv, 10*time.Second)
 	b := w.bundle(data, 3, 0, h2, tok2, 2)
-	b.Version, b.Stretch = 3, j10stretch(w, 1, 3)
+	b.Version, b.Stretch = Version, j10stretch(w, 1, 3)
 	r := Verify(b, w.trust())
 	err := CheckPromise(p, r, b, false)
-	t.Logf("пакет версии 3 записи v0.2.0: %s; -promise: %v", r.Verdict(), err)
+	t.Logf("пакет версии %d записи v0.2.0: %s; -promise: %v", Version, r.Verdict(), err)
 	if !r.Valid() || err != nil {
 		t.Errorf("Q-77: честная запись v0.2.0 (срок 10 с, часы хоста позади на 30 с) обвинена правилом меток")
 	}

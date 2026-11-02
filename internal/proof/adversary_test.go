@@ -671,19 +671,19 @@ func (s *ownerSim) promiseHolds(r *ownerRec, top uint64, topTok []byte, trust Tr
 			continue
 		}
 		// E1: версия пакета — поле JSON без подписи; владелец выдаёт и
-		// пакет старой версии (2), который сверяется по времени звеньев.
-		versions := []int{Version, 2}
+		// пакет прежней версии, без участка.
+		versions := []int{Version, Version - 1}
 		if os.Getenv("E1_V3ONLY") != "" {
-			versions = []int{Version} // контроль: только пакеты версии 3
+			versions = []int{Version} // контроль: только пакеты текущей версии
 		}
 		for _, v := range versions {
 			b := Bundle{Version: v, Evidence: r.data, Inclusion: s.w.inclusion(r.link, r.idx),
 				Upper: &Upper{HeadSeq: top, Token: topTok}, Lower: &Lower{Inclusion: s.w.inclusion(p.link, p.idx)}}
-			// Версия 3: листья звеньев от головы под T1 до звена записи.
-			if v >= 3 {
+			// Участок: листья звеньев от головы под T1 до звена записи.
+			if v == Version {
 				for _, ls := range s.w.leaves[p.head:r.link] {
 					for _, l := range ls {
-						b.Stretch = append(b.Stretch, FromLeaf(l))
+						b.Stretch = append(b.Stretch, StretchOf(l))
 					}
 				}
 			}

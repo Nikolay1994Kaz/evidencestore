@@ -43,9 +43,13 @@ import (
 // сверка обещания от головы T1): esverify v0.2.0 и раньше такой пакет не
 // разбирает и говорит о версии, а не проверяет его без них. Версия 3
 // (28.10) несёт участок — все листья от головы под T1 до звена записи:
-// обещание сверяется по меткам на нём, а не по времени звеньев. Пакеты
-// версий 1 и 2 читаются по-прежнему, но для -promise не принимаются.
-const Version = 3
+// обещание сверяется по меткам на нём, а не по времени звеньев. Версия 4
+// (P-23, после v0.3.1): узел листа в дереве звена несёт признак метки
+// (auditchain.LeafNode), и в участке целиком лежат только метки, остальные
+// листья — хешем; пакет больше не показывает имён, номеров и времени чужих
+// записей. Пакеты версий 1–3 сделаны над цепью прежнего формата и этим
+// выпуском не читаются.
+const Version = 4
 
 // HeadDomain — домен хэша головы, который уходит в TSA.
 const HeadDomain = "evidencestore/head/v1"
@@ -216,10 +220,44 @@ type Bundle struct {
 	DEK       []byte               `json:"dek,omitempty"` // ключ этой записи, если выдан
 	// Gateway — для улик из журнала гейтвея (content_type pipelock/recorder).
 	Gateway *GatewayProof `json:"gateway,omitempty"`
-	// Stretch — с версии 3: все листья звеньев от головы, которую заверила
-	// T1, до звена улики. По ним сверка обещания находит каждую метку перед
-	// уликой (CheckPromise: правило меток).
-	Stretch []Leaf `json:"stretch,omitempty"`
+	// Stretch — все листья звеньев от головы, которую заверила T1, до звена
+	// улики: метки — целиком, остальные — хешем (StretchOf). По ним сверка
+	// обещания находит каждую метку перед уликой (CheckPromise: правило
+	// меток).
+	Stretch []StretchLeaf `json:"stretch,omitempty"`
+}
+
+// StretchLeaf — лист участка: целиком (Leaf) или только хешем листа (Hash,
+// auditchain.LeafHash). О чужом листе правилу меток нужно знать одно — метка
+// ли он, а этот признак входит в узел листа в дереве звена
+// (auditchain.LeafNode): лист, показанный хешем, считается не меткой, и
+// метку, показанную так, выдаёт корень звена (P-23).
+type StretchLeaf struct {
+	Leaf *Leaf  `json:"leaf,omitempty"`
+	Hash []byte `json:"hash,omitempty"`
+}
+
+// StretchOf — лист в участок: метка TSA — целиком, любой другой — хешем.
+func StretchOf(l auditchain.Leaf) StretchLeaf {
+	if l.Type == auditchain.EventTimestamp {
+		full := FromLeaf(l)
+		return StretchLeaf{Leaf: &full}
+	}
+	h := auditchain.LeafHash(l)
+	return StretchLeaf{Hash: h[:]}
+}
+
+// node — хеш листа участка и его узел в дереве звена.
+func (s StretchLeaf) node() (leafHash, node [32]byte, err error) {
+	switch {
+	case s.Leaf != nil && s.Hash == nil:
+		l := s.Leaf.chain()
+		return auditchain.LeafHash(l), auditchain.LeafNode(l), nil
+	case s.Leaf == nil && len(s.Hash) == 32:
+		copy(leafHash[:], s.Hash)
+		return leafHash, auditchain.HiddenLeafNode(leafHash), nil
+	}
+	return leafHash, node, errors.New("a stretch leaf must carry either the whole leaf or its 32-byte hash")
 }
 
 func Parse(data []byte) (Bundle, error) {
@@ -232,10 +270,19 @@ func Parse(data []byte) (Bundle, error) {
 	if kind, _ := BundleKind(data); kind != "" {
 		return b, fmt.Errorf("proof: a bundle of kind %q, not a single-record bundle", kind)
 	}
-	if b.Version < 1 || b.Version > Version {
-		return b, fmt.Errorf("proof: bundle version %d, supported 1 to %d", b.Version, Version)
+	if b.Version != Version {
+		return b, fmt.Errorf("proof: bundle version %d, supported %d%s", b.Version, Version, olderRelease(b.Version, Version))
 	}
 	return b, nil
+}
+
+// olderRelease — пояснение к отказу пакету прежней версии: он сделан над
+// цепью формата v0.3.1 и раньше (P-23).
+func olderRelease(v, current int) string {
+	if v < 1 || v >= current {
+		return ""
+	}
+	return " (bundles of older versions come from evidencestore v0.3.1 or earlier, whose chain hashes leaves differently: verify them with esverify of that release)"
 }
 
 // Trust — во что верит проверяющий.
@@ -570,7 +617,7 @@ func checkLower(lw Lower, evidenceLink uint64, linkAt func(uint64) (auditchain.R
 // метку, «в срок» (Q-33). Сверка по меткам (checkStamps) времени звеньев не
 // читает. Проверяется у каждого токена, который пакет предъявляет меткой:
 // T1 пакета одной улики, метки участка пакета за окно, края и закрывающая
-// метка пакета по источнику; токены участка пакета версии 3 — нет (Q-79).
+// метка пакета по источнику; токены участка пакета одной улики — нет (Q-79).
 func tokenLinkTime(link auditchain.Record, gen time.Time) error {
 	if at := time.Unix(0, link.UnixNano).UTC(); at.Before(gen.Add(-ReceiveSkew)) {
 		return fmt.Errorf("link %d holds the token of the time-stamp of %s, yet its time is %s, more than %s earlier: the store backdated the link", link.Seq, fmtTime(gen), fmtTime(at), ReceiveSkew)

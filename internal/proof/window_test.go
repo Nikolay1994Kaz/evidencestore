@@ -1,6 +1,7 @@
 package proof
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -397,12 +398,20 @@ func TestWindowKindAndVersion(t *testing.T) {
 	if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), `a bundle of kind "window", not a single-record bundle`) {
 		t.Fatalf("разбор пакета одной улики принял окно: %v", err)
 	}
-	// Пакет одной улики: версии 1 (хранилище v0.2.0) и 2 — да, другие — нет.
-	for v, ok := range map[int]bool{1: true, 2: true, Version: true, Version + 1: false, 0: false} {
+	// Пакет одной улики: только текущая версия. Прежние сделаны над цепью
+	// прежнего формата (P-23), и отказ это называет.
+	for v, ok := range map[int]bool{1: false, 2: false, 3: false, Version: true, Version + 1: false, 0: false} {
 		data, _ := json.Marshal(Bundle{Version: v})
-		if _, err := Parse(data); (err == nil) != ok {
+		_, err := Parse(data)
+		if (err == nil) != ok {
 			t.Fatalf("пакет одной улики версии %d: %v", v, err)
 		}
+		if old := v >= 1 && v < Version; old != (err != nil && strings.Contains(err.Error(), "esverify of that release")) {
+			t.Fatalf("пакет одной улики версии %d: отказ без пояснения о прежнем выпуске или пояснение не к месту: %v", v, err)
+		}
+	}
+	if _, err := ParseWindow(bytes.Replace(data, []byte(`"v":3`), []byte(`"v":2`), 1)); err == nil || !strings.Contains(err.Error(), "esverify of that release") {
+		t.Fatalf("пакет за окно версии 2: %v", err)
 	}
 	if _, err := ParseWindow(data); err != nil {
 		t.Fatal(err)

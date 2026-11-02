@@ -18,7 +18,7 @@
   {
    "name": "A3 листья звена не сверяются с его корнем",
    "file": "internal/auditchain/query.go",
-   "old": "\t\t\t\tif merkleRootOf(hashes) != batches[cur].root {",
+   "old": "\t\t\t\tif merkleRootOf(nodes) != batches[cur].root {",
    "new": "\t\t\t\tif false {"
   },
   {
@@ -92,6 +92,24 @@
    "file": "internal/auditchain/carrier.go",
    "old": "fmt.Errorf(\"%w: no leaf file holds number %d\", ErrLeavesMissing, next)",
    "new": "fmt.Errorf(\"%v: no leaf file holds number %d\", ErrLeavesMissing, next)"
+  },
+  {
+   "name": "A16 узел листа не несёт признака метки (P-23)",
+   "file": "internal/auditchain/merkle.go",
+   "old": "\treturn leafHash, nodeOfLeaf(l.Type == EventTimestamp, leafHash)",
+   "new": "\treturn leafHash, nodeOfLeaf(false, leafHash)"
+  },
+  {
+   "name": "A17 узел листа в домене листа, а не своём (P-23)",
+   "file": "internal/auditchain/merkle.go",
+   "old": "\tbuf[0] = domainLeafNode",
+   "new": "\tbuf[0] = domainLeaf"
+  },
+  {
+   "name": "A18 цепь прежнего формата названа подменой, а не прежним форматом (P-23)",
+   "file": "internal/auditchain/query.go",
+   "old": "\t\t\t\t\tif merkleRootOf(hashes) == batches[cur].root {",
+   "new": "\t\t\t\t\tif false {"
   }
  ]
 }

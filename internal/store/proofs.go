@@ -260,8 +260,10 @@ func (s *Store) Status() Status {
 	return out
 }
 
-// stretchLocked — листья звеньев после head до звена end включительно.
-func (s *Store) stretchLocked(head, end uint64) ([]proof.Leaf, error) {
+// stretchLocked — листья звеньев после head до звена end включительно: метки
+// целиком, остальные хешем (proof.StretchOf) — пакет не показывает чужих
+// записей (P-23).
+func (s *Store) stretchLocked(head, end uint64) ([]proof.StretchLeaf, error) {
 	find := func(seq uint64) (linkRef, bool) {
 		i := sort.Search(len(s.links), func(i int) bool { return s.links[i].seq >= seq })
 		if i == len(s.links) || s.links[i].seq != seq {
@@ -278,9 +280,9 @@ func (s *Store) stretchLocked(head, end uint64) ([]proof.Leaf, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]proof.Leaf, len(leaves))
+	out := make([]proof.StretchLeaf, len(leaves))
 	for i, l := range leaves {
-		out[i] = proof.FromLeaf(l)
+		out[i] = proof.StretchOf(l)
 	}
 	return out, nil
 }

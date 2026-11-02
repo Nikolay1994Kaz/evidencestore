@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// Размер пакета одной улики версии 3 (листья от головы под T1 до звена
-// записи) против версии 2 — запись раз в секунду, метка раз в 10 минут,
-// худший случай — запись перед самой меткой: не больше чем втрое.
-func TestBundleSizeV3(t *testing.T) {
+// Размер пакета одной улики с участком (листья от головы под T1 до звена
+// записи: метки целиком, остальное хешем) против пакета без участка — запись
+// раз в секунду, метка раз в 10 минут, худший случай — запись перед самой
+// меткой: не больше чем вдвое.
+func TestBundleSizeStretch(t *testing.T) {
 	c := newClock()
 	s := openStore(t, testConfig(t), c)
 	mustStamp(t, s)
@@ -26,12 +27,16 @@ func TestBundleSizeV3(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		v3, _ := json.Marshal(b)
-		b.Version, b.Stretch = 2, nil
-		v2, _ := json.Marshal(b)
-		t.Logf("запись %d: звеньев %d; версия 2 — %d КБ, версия 3 — %d КБ", q, len(b.Links), len(v2)/1024, len(v3)/1024)
-		if len(v3) > 3*len(v2) {
-			t.Errorf("запись %d: пакет версии 3 — %d байт, больше утроенного %d", q, len(v3), len(v2))
+		with, _ := json.Marshal(b)
+		served, _ := json.MarshalIndent(b, "", " ") // как отдаёт хранилище (server.go)
+		n := len(b.Stretch)
+		b.Stretch = nil
+		without, _ := json.Marshal(b)
+		servedWithout, _ := json.MarshalIndent(b, "", " ")
+		t.Logf("запись %d: звеньев %d, листьев в участке %d; без участка — %d КБ, с участком — %d КБ; как отдаёт хранилище — %d КБ, ~%d Б на лист участка",
+			q, len(b.Links), n, len(without)/1024, len(with)/1024, len(served)/1024, (len(served)-len(servedWithout))/max(n, 1))
+		if len(with) > 2*len(without) {
+			t.Errorf("запись %d: пакет с участком — %d байт, больше удвоенного %d", q, len(with), len(without))
 		}
 	}
 }

@@ -76,7 +76,7 @@ const MaxPromiseMMD = WindowEdge - ReceiveSkew
 
 // CheckPromise сверяет обещание с проверенным пакетом: та же улика, та же
 // позиция, время приёма, и перед уликой в цепи нет метки со временем TSA
-// позже времени приёма + MaxPromiseMMD (checkStamps; пакет версии 3).
+// позже времени приёма + MaxPromiseMMD (checkStamps).
 //
 // Предел — минута от времени приёма, что бы ни стояло в сроке. Длиннее
 // срок не пускает: на минуте держится пакет за окно, и со сроком в час
@@ -89,9 +89,10 @@ const MaxPromiseMMD = WindowEdge - ReceiveSkew
 // ссылкой, а лист без ссылки владелец выдаст и для своей записи (Q-80).
 // Хранилище этого выпуска подписывает срок от 55 с и двух тиков до минуты,
 // так что сверка мягче срока не больше чем на 5 с.
-// Пакеты версий 1 и 2 не принимаются: версия — неподписанное поле, и время
-// звеньев в них — слово хранилища (Q-76). allowNoTSA — принять пакет без
-// T1: тогда время, когда запись легла в цепь, — только слово хранилища.
+// Пакет другой версии не сверяется: версия — неподписанное поле, и правило
+// по ней не выбирается (Q-76); Parse такой пакет уже отверг, проверка здесь —
+// для вызова в обход Parse. allowNoTSA — принять пакет без T1: тогда время,
+// когда запись легла в цепь, — только слово хранилища.
 func CheckPromise(p Promise, r Report, b Bundle, allowNoTSA bool) error {
 	limit := p.ReceivedAt + int64(MaxPromiseMMD)
 	switch {
@@ -105,12 +106,8 @@ func CheckPromise(p Promise, r Report, b Bundle, allowNoTSA bool) error {
 		return errors.New("the receive time in the promise does not match the record")
 	case p.Deadline < p.ReceivedAt:
 		return fmt.Errorf("the promised deadline %s is earlier than the receive time %s", fmtTime(time.Unix(0, p.Deadline)), fmtTime(time.Unix(0, p.ReceivedAt)))
-	case b.Version < 3:
-		// Версия — поле JSON, его никто не подписывает: по нему правило не
-		// выбирается. Время звеньев пишет само хранилище — владелец выдал бы
-		// пакет версии 1 или 2 записи, придержанной за метку, а кто угодно
-		// переписал бы так честный пакет версии 3 (Q-76).
-		return fmt.Errorf("the bundle is version %d and carries no leaves before the record, so the promise cannot be checked against the time-stamps; ask the store for this record's bundle again (a store of this release builds version %d for any record, older ones included)", b.Version, Version)
+	case b.Version != Version:
+		return fmt.Errorf("the bundle is version %d, and the promise is checked only against a version %d bundle, which carries the leaves before the record; ask the store for this record's bundle again", b.Version, Version)
 	case r.Lower.IsZero():
 		if !allowNoTSA {
 			return errors.New("the bundle has no TSA time-stamp in the chain before the record: the time the record entered the chain is the store's word alone (esverify -allow-no-tsa accepts it)")
@@ -120,13 +117,15 @@ func CheckPromise(p Promise, r Report, b Bundle, allowNoTSA bool) error {
 	return checkStamps(r, b, limit)
 }
 
-// checkStamps — сверка обещания по меткам (пакет версии 3): перед уликой в
-// цепи нет метки со временем TSA позже limit — время приёма +
-// MaxPromiseMMD. Придержанная за метку, что закрывает окно, улика лежит
-// после её токена, а время той метки позже limit; честное хранилище не
-// кладёт токен мимо записи, взявшей время приёма до ответа TSA (барьер), и
-// время звеньев здесь не участвует. Листья звеньев от головы под T1 до звена
-// улики — в пакете, корни звеньев сверяются, так что метку не спрятать.
+// checkStamps — сверка обещания по меткам: перед уликой в цепи нет метки со
+// временем TSA позже limit — время приёма + MaxPromiseMMD. Придержанная за
+// метку, что закрывает окно, улика лежит после её токена, а время той метки
+// позже limit; честное хранилище не кладёт токен мимо записи, взявшей время
+// приёма до ответа TSA (барьер), и время звеньев здесь не участвует. Листья
+// звеньев от головы под T1 до звена улики — в пакете, корни звеньев
+// сверяются, так что метку не спрятать: метки лежат целиком, прочие листья —
+// хешем, а узел такого листа считается с признаком «не метка», и метку,
+// показанную хешем, выдаёт корень звена (P-23).
 //
 // Время метки берётся из токена без проверки подписи: токены в цепь кладёт
 // хранилище, проверив их до цепи, и ложный токен со временем позже limit
@@ -153,9 +152,12 @@ func checkStamps(r Report, b Bundle, limit int64) error {
 		return err
 	}
 	next := hp.FirstLeaf + uint64(hp.Count)
-	leaves := make([]auditchain.Leaf, len(b.Stretch))
-	for i, l := range b.Stretch {
-		leaves[i] = l.chain()
+	hashes := make([][32]byte, len(b.Stretch))
+	nodes := make([][32]byte, len(b.Stretch))
+	for i, s := range b.Stretch {
+		if hashes[i], nodes[i], err = s.node(); err != nil {
+			return fmt.Errorf("leaf %d of the stretch: %w", i, err)
+		}
 	}
 	rec := auditchain.LeafHash(b.Inclusion.Leaf.chain())
 	var worst time.Time
@@ -175,17 +177,18 @@ func checkStamps(r Report, b Bundle, limit int64) error {
 		switch {
 		case p.FirstLeaf != next:
 			return fmt.Errorf("link %d covers leaves from %d, the link before it ends at %d", seq, p.FirstLeaf, next)
-		case n > len(leaves)-at:
-			return fmt.Errorf("link %d holds %d leaves, the bundle has %d more: leaves are left out", seq, n, len(leaves)-at)
-		case auditchain.MerkleRoot(leaves[at:at+n]) != p.Root:
-			return fmt.Errorf("the leaves of link %d do not give its Merkle root: a leaf was left out, added, changed or moved", seq)
+		case n > len(nodes)-at:
+			return fmt.Errorf("link %d holds %d leaves, the bundle has %d more: leaves are left out", seq, n, len(nodes)-at)
+		case auditchain.MerkleRootOfNodes(nodes[at:at+n]) != p.Root:
+			return fmt.Errorf("the leaves of link %d do not give its Merkle root: a leaf was left out, added, changed or moved, or a time-stamp is shown only by its hash", seq)
 		}
-		for _, lf := range leaves[at : at+n] {
-			if seq == r.LinkSeq && auditchain.LeafHash(lf) == rec {
+		for i := at; i < at+n; i++ {
+			if seq == r.LinkSeq && hashes[i] == rec {
 				found = true
 				break
 			}
-			if lf.Type != auditchain.EventTimestamp {
+			lf := b.Stretch[i].Leaf
+			if lf == nil || auditchain.EventType(lf.Type) != auditchain.EventTimestamp {
 				continue
 			}
 			gen, err := tsa.GenTime(lf.Payload)
@@ -202,8 +205,8 @@ func checkStamps(r Report, b Bundle, limit int64) error {
 	switch {
 	case !found:
 		return fmt.Errorf("the record is not among the leaves of link %d", r.LinkSeq)
-	case at != len(leaves):
-		return fmt.Errorf("the bundle has %d leaves beyond the record's link", len(leaves)-at)
+	case at != len(nodes):
+		return fmt.Errorf("the bundle has %d leaves beyond the record's link", len(nodes)-at)
 	case worst.UnixNano() > limit:
 		return fmt.Errorf("the time-stamp in link %d was taken at %s, more than %s after the receive time %s, and lies before the record: the record entered the chain after the deadline that window bundles rely on, whatever deadline the promise names",
 			worstLink, fmtTime(worst), MaxPromiseMMD, fmtTime(time.Unix(0, r.Header.ReceivedAt)))

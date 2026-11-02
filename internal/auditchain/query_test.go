@@ -197,3 +197,47 @@ func TestChainCorruptionIsLoud(t *testing.T) {
 		})
 	}
 }
+
+// TestOldFormatIsNamed — цепь, записанная до P-23 (узел листа — сам хеш
+// листа), не выдаётся за подменённую: сверка листьев с корнями говорит, что
+// формат прежний и его этот выпуск не читает.
+func TestOldFormatIsNamed(t *testing.T) {
+	dir := t.TempDir()
+	chainOfLinks(t, dir, 3)
+	links, err := ReadChain(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Те же звенья с корнями прежнего формата.
+	old := make([]Record, len(links))
+	for i, l := range links {
+		p, err := DecodeBatchPayload(l.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaves, err := ReadLeaves(dir, p.FirstLeaf, int(p.Count))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashes := make([][32]byte, len(leaves))
+		for k, lf := range leaves {
+			hashes[k] = LeafHash(lf)
+		}
+		p.Root = merkleRootOf(hashes)
+		old[i] = l
+		old[i].Payload = encodeBatchPayload(p)
+	}
+	err = ScanVerifiedLeaves(dir, old, func(uint64, Leaf) error { return nil })
+	if !errors.Is(err, ErrOldFormat) {
+		t.Fatalf("цепь прежнего формата: %v", err)
+	}
+	// Честные звенья проходят, а чужой корень — подмена, а не прежний формат.
+	if err := ScanVerifiedLeaves(dir, links, func(uint64, Leaf) error { return nil }); err != nil {
+		t.Fatalf("честные звенья: %v", err)
+	}
+	bad := append([]Record(nil), links...)
+	bad[1].Payload = encodeBatchPayload(BatchPayload{Root: [32]byte{1}, Count: 1, FirstLeaf: 1})
+	if err := ScanVerifiedLeaves(dir, bad, func(uint64, Leaf) error { return nil }); err == nil || errors.Is(err, ErrOldFormat) {
+		t.Fatalf("чужой корень назван прежним форматом или пропущен: %v", err)
+	}
+}
