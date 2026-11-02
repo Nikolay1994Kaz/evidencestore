@@ -135,19 +135,28 @@ func (c *Collector) witness(a headAnswer) {
 	}
 }
 
+// markDown — запрос к хранилищу отказал (нет связи, ответ не 200): с первого
+// отказа до следующего ответа отсчёт «нет головы» стоит.
+func (c *Collector) markDown() {
+	if c.headDown.IsZero() {
+		c.headDown = c.now()
+	}
+}
+
 // witnessHead сверяет голову из ответа хранилища с последней принятой.
 // Ошибку отдаёт только запись на диск.
 func (c *Collector) witnessHead(a headAnswer) error {
 	now := c.now()
 	if c.headSeen.IsZero() {
 		c.headSeen, c.headGrewSent = now, c.sent // отсчёт «нет головы» — с первого ответа
+	} else if !c.headDown.IsZero() {
+		// Пока запросы к хранилищу отказывали, отсчёт стоял: после долгого
+		// простоя оно вправе ответить без головы, пока его копия не прошла.
+		// Промежуток между ответами простоем не считается — сборщик мог
+		// просто не спрашивать (P-42).
+		c.headSeen = c.headSeen.Add(now.Sub(c.headDown))
 	}
-	// Пока хранилище не отвечало, отсчёт стоит: после долгого простоя оно
-	// вправе ответить без головы, пока его копия не прошла.
-	if gap := now.Sub(c.headAnswered); !c.headAnswered.IsZero() && gap > c.cfg.CheckpointEvery.D() {
-		c.headSeen = c.headSeen.Add(gap)
-	}
-	c.headAnswered = now
+	c.headDown = time.Time{}
 	cp := a.Checkpoint
 	if cp == nil {
 		c.headMissing(now)

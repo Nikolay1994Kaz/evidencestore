@@ -241,21 +241,27 @@ func TestLeafMustDescribeEvidence(t *testing.T) {
 	}
 }
 
-// Подменённое звено со своим корнем: путь сходится, метки целы (T2 над
-// следующим звеном), но звено после него ссылается на хэш настоящего.
+// Подменённое звено со своим корнем, а звено после него ссылается на хэш
+// настоящего. Подменено до метки T2: дерево над звеньями, T2 и подписанная
+// голова — над подменённым, путь сходится. Ловит ровно сверка ссылок: дерево
+// её не заменяет, пакет, где звенья не цепь, честное хранилище не выдаст.
 func TestForgedLinkBreaksHashChain(t *testing.T) {
-	w, b := standard(t, nil)
+	w, _ := standard(t, nil)
 	forged := sealedBytes(t, 2, time.Date(2026, 10, 3, 10, 0, 3, 0, time.UTC), "forged")
 	leaves := []auditchain.Leaf{w.leaves[2][0], evLeaf(t, forged, 2)}
-	fake, err := auditchain.LinkBatch(auditchain.Head{Seq: 2, Hash: auditchain.Hash(w.links[1])}, w.links[2].UnixNano, 0, leaves)
+	first := uint64(len(w.leaves[0]) + len(w.leaves[1]))
+	fake, err := auditchain.LinkBatch(auditchain.Head{Seq: 2, Hash: auditchain.Hash(w.links[1])}, w.links[2].UnixNano, first, leaves)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.leaves[2] = leaves
-	b.Evidence = forged
-	b.Inclusion = w.inclusion(3, 1)
-	b.Links[2] = FromLink(fake)
-	mustFail(t, "подменённое звено", b, w.trust())
+	w.links[2], w.leaves[2] = fake, leaves
+	w.links, w.leaves = w.links[:4], w.leaves[:4]
+	h4, t2 := w.stamp()
+	w.wlink(tokenLeaf(h4, t2))
+	r := Verify(w.bundle(forged, 3, 1, h4, t2, 2), w.trust())
+	if r.Valid() || !strings.Contains(r.Text(), "link 4 does not refer to the hash of link 3") {
+		t.Fatalf("звенья не цепь — ждали отказ на сверке ссылок:\n%s", r.Text())
+	}
 }
 
 // Голова подписана чужим ключом, всё остальное верно.

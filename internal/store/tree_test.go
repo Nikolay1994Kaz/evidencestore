@@ -216,20 +216,25 @@ func TestCheckpointOfPastHead(t *testing.T) {
 			mustStamp(t, s)
 		}
 	}
-	s.chainMu.Lock()
-	n := s.tree.size()
-	for m := uint64(1); m <= n; m++ {
-		if err := s.tree.agreesLocked(m, rootOf(t, s, m)); err != nil {
-			t.Fatalf("корень на размере %d: %v", m, err)
+	var n uint64
+	func() {
+		s.chainMu.Lock()
+		// t.Fatal под замком без defer повесил бы закрытие хранилища в
+		// очистке теста — провал стал бы таймаутом.
+		defer s.chainMu.Unlock()
+		n = s.tree.size()
+		for m := uint64(1); m <= n; m++ {
+			if err := s.tree.agreesLocked(m, rootOf(t, s, m)); err != nil {
+				t.Fatalf("корень на размере %d: %v", m, err)
+			}
+			if m > 1 && s.tree.agreesLocked(m, rootOf(t, s, m-1)) == nil {
+				t.Fatalf("на размере %d принят чужой корень", m)
+			}
 		}
-		if m > 1 && s.tree.agreesLocked(m, rootOf(t, s, m-1)) == nil {
-			t.Fatalf("на размере %d принят чужой корень", m)
+		if s.tree.agreesLocked(n+1, rootOf(t, s, n)) == nil || s.tree.agreesLocked(0, [32]byte{}) == nil {
+			t.Fatal("голова за пределами цепи")
 		}
-	}
-	if s.tree.agreesLocked(n+1, rootOf(t, s, n)) == nil || s.tree.agreesLocked(0, [32]byte{}) == nil {
-		t.Fatal("голова за пределами цепи")
-	}
-	s.chainMu.Unlock()
+	}()
 
 	b, err := s.ProofTo("abs-core", 2, false, 0)
 	if err != nil {
@@ -270,8 +275,9 @@ func TestRestoreChecksCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	root := rootOf(t, s, n-1)
 	s.chainMu.Lock()
-	smaller := proof.SignCheckpoint(s.signer, n-1, rootOf(t, s, n-1))
+	smaller := proof.SignCheckpoint(s.signer, n-1, root)
 	s.chainMu.Unlock()
 	s.Close()
 	pub := trustOf(t, s).StoreKey

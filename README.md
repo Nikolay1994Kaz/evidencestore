@@ -45,7 +45,7 @@ The demo runs these steps:
 
 ## Run it yourself
 
-The first three steps of the demo, by hand and on a log of your own. Everything runs on one machine. You need the three binaries on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone. `dev-setup` is in binaries newer than v0.3.0; with v0.3.0, take the steps by hand under "Step by step by hand" instead.
+The first three steps of the demo, by hand and on a log of your own. Everything runs on one Linux machine. You need the three binaries on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone. `dev-setup` is in binaries newer than v0.3.0; with v0.3.0, take the steps by hand under "Step by step by hand" instead.
 
 `dev-setup` prepares a directory for a try: a demo CA with certificates for the store and for the source `app`, the store's config, `init`, and the collector's config with the store's public key pinned in it. Time-stamps come from a demo TSA built into the store (`"url": "local"`), so nothing leaves the machine; a real TSA is set in `tsa` ([Configuration](docs/configuration.md)). It writes only into a new or empty directory; `-log FILE` points the collector at a log of your own (any file your user can read), and `-port` moves the store off port 8443:
 
@@ -188,7 +188,7 @@ Root on the store host can delete or rewrite the store's files, and whoever hold
 
 ## How it was tested
 
-The test gate with the race detector runs on every push. 578 bugs were injected one at a time, and every one of them makes a test fail. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each; on the code of v0.3.0 none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on MinIO with Object Lock, not yet on AWS. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
+The test gate with the race detector runs on every push. 650 bugs were injected one at a time, and every one of them makes a test fail. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each; on the code of v0.4.0 none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on MinIO with Object Lock, not yet on AWS. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
 
 ## Known limitations
 

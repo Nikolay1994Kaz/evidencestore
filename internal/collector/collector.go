@@ -246,11 +246,14 @@ type Collector struct {
 	headWarned time.Time
 	headStale  time.Time
 	headSeen   time.Time
-	// headAnswered — когда хранилище последний раз отвечало (время его
-	// молчания в отсчёт headSeen не идёт); sent — записей, доставленных этим
-	// процессом; headGrewSent — сколько их было, когда принятая голова
-	// последний раз выросла.
-	headAnswered time.Time
+	// headDown — первый отказ запроса к хранилищу после его последнего ответа
+	// (это время в отсчёт headSeen не идёт); sent — записей, доставленных этим
+	// процессом, с номерами после bootSeq, последнего выданного до его запуска
+	// (прежние хранилище могло принять до остановки, и голова при запуске уже
+	// держит их: повтор — не доставка); headGrewSent — сколько их было, когда
+	// принятая голова последний раз выросла.
+	headDown     time.Time
+	bootSeq      uint64
 	sent         uint64
 	headGrewSent uint64
 
@@ -499,6 +502,7 @@ func (c *Collector) load() error {
 	default:
 		c.nextSeq = last.seq + 1
 	}
+	c.bootSeq = c.nextSeq - min(c.nextSeq, 1)
 	if err := c.loadEpoch(); err != nil {
 		return err
 	}
@@ -652,10 +656,12 @@ func (c *Collector) fetchState(ctx context.Context, issued uint64) (stateRespons
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		c.markDown()
 		return st, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		c.markDown()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		if err := epochRefused(resp, body); err != nil {
 			return st, err
@@ -1629,6 +1635,7 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 	c.askHead(hreq)
 	resp, err := c.http.Do(hreq)
 	if err != nil {
+		c.markDown()
 		return err
 	}
 	defer resp.Body.Close()
@@ -1637,6 +1644,7 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
+		c.markDown()
 		if err := epochRefused(resp, body); err != nil {
 			return err
 		}
@@ -1674,7 +1682,11 @@ func (c *Collector) send(ctx context.Context, batch []spoolRecord) error {
 		return errors.Join(append([]error{ErrBadPromise}, bad...)...)
 	}
 	c.acked = batch[len(batch)-1].seq
-	c.sent += uint64(len(batch))
+	for _, r := range batch {
+		if r.seq > c.bootSeq {
+			c.sent++
+		}
+	}
 	if err := c.saveState(); err != nil {
 		return err
 	}

@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -444,10 +445,28 @@ func growChain(t *testing.T, r *rig, c *Collector, n *int) {
 // Файлы голов не пишутся (на их месте каталоги: кончилось место, чужие
 // права) — сборщик стартует, записи доставляются, ошибка — в журнал; при
 // расхождении тоже. checkpoint.json пишется раньше журнала голов и держит
-// последнюю голову, хотя журнал отказал (P-28).
+// последнюю голову, хотя журнал отказал (P-28): журнал не впереди
+// checkpoint.json (P-30(г)). Журнал ломается после первого запуска: без
+// checkpoint.json нечитаемый журнал откладывается при запуске (P-37), и
+// отказа его записи тест бы не увидел.
 func TestHeadFilesFailDeliveryGoesOn(t *testing.T) {
 	r, tamper := tamperRig(t)
 	r.cfg.CheckpointEvery = config.Duration(time.Nanosecond)
+	first, err := New(r.cfg, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	saved := headsOf(t, filepath.Join(r.cfg.SpoolDir, headFile))
+	if len(saved) != 1 {
+		t.Fatalf("первый запуск не положил голову: %+v", saved)
+	}
+	if err := os.Remove(filepath.Join(r.cfg.SpoolDir, headsFile)); err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{headsFile, headConflictFile} {
 		if err := os.MkdirAll(filepath.Join(r.cfg.SpoolDir, name), 0o700); err != nil {
 			t.Fatal(err)
@@ -466,8 +485,11 @@ func TestHeadFilesFailDeliveryGoesOn(t *testing.T) {
 	for range 3 {
 		growChain(t, r, c, &n)
 	}
-	if c.Pending() != 0 || c.Acked() != uint64(n) || c.head == nil {
+	if c.Pending() != 0 || c.Acked() != uint64(n) || c.head == nil || c.head.Size <= saved[0].Checkpoint.Size {
 		t.Fatalf("доставка при отказе файлов голов: в буфере %d, подтверждено %d из %d", c.Pending(), c.Acked(), n)
+	}
+	if fi, err := os.Stat(filepath.Join(r.cfg.SpoolDir, headsFile)); err != nil || !fi.IsDir() {
+		t.Fatalf("журнал голов не отказывал: %v", err)
 	}
 	if last := headsOf(t, c.headPath()); len(last) != 1 || last[0].Checkpoint.Size != c.head.Size {
 		t.Fatalf("checkpoint.json не держит последнюю голову %d: %+v", c.head.Size, last)
@@ -631,8 +653,22 @@ func TestHeadFrozenIsAnError(t *testing.T) {
 	}
 }
 
-// Пока хранилище не отвечало, отсчёт «нет головы» стоит: после долгого
-// простоя первый ответ без головы (копия ещё не прошла) тревоги не даёт.
+// downTransport — запросы к хранилищу отказывают: без status — нет связи,
+// со status — хранилище отвечает этой ошибкой.
+type downTransport struct{ status int }
+
+func (d downTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	if d.status == 0 {
+		return nil, errors.New("connection refused")
+	}
+	return &http.Response{StatusCode: d.status, Status: http.StatusText(d.status), Header: http.Header{}, Body: io.NopCloser(strings.NewReader("down"))}, nil
+}
+
+// Пока запросы к хранилищу отказывают (нет связи, ответ не 200), отсчёт «нет
+// головы» стоит: после долгого простоя первый ответ без головы (копия ещё не
+// прошла) тревоги не даёт. Простой только останавливает отсчёт: хранилище,
+// которое и дальше отвечает без головы, получает тревогу через три
+// checkpoint_every, хотя сборщик спрашивает реже (P-42).
 func TestHeadOutageNotCounted(t *testing.T) {
 	r, tamper := tamperRig(t)
 	now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
@@ -648,12 +684,180 @@ func TestHeadOutageNotCounted(t *testing.T) {
 	}
 	noHead := func(out map[string]json.RawMessage) { delete(out, "checkpoint"); delete(out, "consistency") }
 	tamper.Store(&noHead)
-	now = now.Add(5 * r.cfg.CheckpointEvery.D()) // хранилище недоступно, ответов нет
-	if err := c.SendOnce(context.Background()); err != nil {
+	every := r.cfg.CheckpointEvery.D()
+	live := c.http
+	for i, down := range []downTransport{{}, {status: http.StatusServiceUnavailable}} {
+		appendLines(t, r.cfg.File, fmt.Sprintf("line %d\n", i))
+		if _, err := c.ReadOnce(); err != nil {
+			t.Fatal(err)
+		}
+		c.http = &http.Client{Transport: down}
+		now = now.Add(time.Second)
+		if err := c.SendOnce(context.Background()); err == nil {
+			t.Fatal("запрос к недоступному хранилищу прошёл")
+		}
+		now = now.Add(5 * every) // простой
+		c.http = live
+		if err := c.SendOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(logs.String(), "has not shown a head") {
+			t.Fatalf("тревога сразу после простоя (%+v):\n%s", down, logs.String())
+		}
+	}
+	for range 4 {
+		now = now.Add(every + time.Second)
+		if err := c.SendOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !strings.Contains(logs.String(), "has not shown a head") {
+		t.Fatalf("после простоя хранилище отвечает без головы — тревоги нет:\n%s", logs.String())
+	}
+}
+
+// Хранилище отвечает на каждый запрос, но без головы или прежней головой,
+// пока записи доставляются: тревога через три checkpoint_every, как бы редко
+// сборщик ни спрашивал — при checkpoint_every короче пульса тихого источника
+// (30 с), при секундных checkpoint_every и flush_every, при умолчаниях с
+// ответом раз в 10 минут 1 секунду. Промежуток между ответами простоем не
+// считается (P-42).
+func TestHeadCadenceKeepsAlarm(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		every time.Duration // checkpoint_every
+		step  time.Duration // промежуток между ответами хранилища
+		mode  string
+	}{
+		{"без головы, checkpoint_every 10s, пульс 30s", 10 * time.Second, 30 * time.Second, "nohead"},
+		{"та же голова при доставке, checkpoint_every 10s, ответ раз в 30s", 10 * time.Second, 30 * time.Second, "frozen"},
+		{"та же голова при доставке, checkpoint_every 1s, flush_every 1s", time.Second, time.Second + 50*time.Millisecond, "frozen"},
+		{"та же голова, умолчания, ответ раз в 10m1s", 10 * time.Minute, 10*time.Minute + time.Second, "frozen"},
+		{"без головы, умолчания, ответ раз в 10m1s", 10 * time.Minute, 10*time.Minute + time.Second, "nohead"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, tamper := tamperRig(t)
+			r.cfg.CheckpointEvery = config.Duration(tc.every)
+			now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+			var logs bytes.Buffer
+			c, err := New(r.cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Close() })
+			c.now = func() time.Time { return now }
+			if err := c.Bootstrap(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			held, err := json.Marshal(*c.head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := func(out map[string]json.RawMessage) {
+				switch tc.mode {
+				case "nohead":
+					delete(out, "checkpoint")
+					delete(out, "consistency")
+				case "frozen":
+					out["checkpoint"] = held
+					delete(out, "consistency")
+				}
+			}
+			tamper.Store(&f)
+			n := 0
+			for elapsed := time.Duration(0); elapsed < 12*tc.every; elapsed += tc.step {
+				now = now.Add(tc.step)
+				if tc.mode == "frozen" || n%2 == 0 {
+					appendLines(t, r.cfg.File, fmt.Sprintf("line %d\n", n))
+				}
+				n++
+				cycle(t, c) // доставка строки или пульс: ответ хранилища есть каждый шаг
+			}
+			if c.Pending() != 0 {
+				t.Fatalf("в буфере %d", c.Pending())
+			}
+			if !strings.Contains(logs.String(), "has not shown a head") {
+				t.Fatalf("хранилище отвечало каждые %v (%s) — тревоги нет:\n%s", tc.step, tc.mode, logs.String())
+			}
+		})
+	}
+}
+
+// Сборщик упал после того, как хранилище приняло пачку, но до state.json.
+// После перезапуска пачка уходит повтором (duplicate): голова при запуске уже
+// держит её, цепь от повтора не растёт — и та же голова в тишине источника не
+// тревога. Повтором считается номер, выданный до запуска процесса, а не
+// статус duplicate: им хранилище могло бы назвать и новую запись (P-43).
+func TestDuplicateResendNoFalseAlarm(t *testing.T) {
+	r, tamper := tamperRig(t)
+	var statuses []string // статусы ответов на приём — только смотрим
+	spy := func(out map[string]json.RawMessage) {
+		var res []struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(out["results"], &res) == nil {
+			for _, x := range res {
+				statuses = append(statuses, x.Status)
+			}
+		}
+	}
+	tamper.Store(&spy)
+	now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	c1, err := New(r.cfg, quiet)
+	if err != nil {
 		t.Fatal(err)
 	}
+	c1.now = func() time.Time { return now }
+	if err := c1.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	growChain(t, r, c1, &n)
+	appendLines(t, r.cfg.File, fmt.Sprintf("line %d\n", n))
+	if _, err := c1.ReadOnce(); err != nil {
+		t.Fatal(err)
+	}
+	crash := errors.New("crash")
+	c1.persistHook = func(what string) error {
+		if what == "state" {
+			return crash
+		}
+		return nil
+	}
+	if err := c1.SendOnce(context.Background()); !errors.Is(err, crash) {
+		t.Fatalf("падение до state.json: %v", err)
+	}
+	c1.persistHook = nil
+	c1.Close()
+	if _, err := r.st.Proof("abs-core", 1, false); err != nil { // принятая пачка — в звене
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	c2, err := New(r.cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c2.Close() })
+	c2.now = func() time.Time { return now }
+	if err := c2.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	statuses = nil
+	if err := c2.SendOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0] != "duplicate" {
+		t.Fatalf("раскладка: повтор пачки получил %v", statuses)
+	}
+	for range 80 { // источник молчит 40 минут, пульс раз в 30 с
+		now = now.Add(30 * time.Second)
+		if err := c2.SendOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if strings.Contains(logs.String(), "has not shown a head") {
-		t.Fatalf("тревога сразу после простоя:\n%s", logs.String())
+		t.Fatalf("ложная тревога у честного хранилища после повтора пачки:\n%s", logs.String())
 	}
 }
 
