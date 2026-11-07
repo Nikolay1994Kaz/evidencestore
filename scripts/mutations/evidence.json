@@ -1,0 +1,104 @@
+{
+ "packages": [
+  "./internal/evidence/"
+ ],
+ "note": "Z13 и Z17 сняты как равносильные: ошибка json.Decoder остаётся в нём, и следующий Token вернёт её же; отдельные проверки оставлены ради ясности разбора. Z4 (обрыв посреди метки), Z8 (вложенное значение) не заводились по той же причине: обрыв отказывает на следующем поле, вложенное значение оставляет разбор на открытой скобке.",
+ "mutations": [
+  {
+   "name": "Z1 метка не пишется в запись",
+   "file": "internal/evidence/record.go",
+   "old": "\t\tbuf = appendField(buf, []byte(s.SubjectField))\n\t\tbuf = append(buf, s.Subject[:]...)\n",
+   "new": "\t\tbuf = appendField(buf, []byte(s.SubjectField))\n"
+  },
+  {
+   "name": "Z2 все записи — версии 2",
+   "file": "internal/evidence/record.go",
+   "old": "\tif s.Subject.IsZero() {\n\t\tbuf = append(buf, Version)",
+   "new": "\tif false {\n\t\tbuf = append(buf, Version)"
+  },
+  {
+   "name": "Z3 нулевая метка в записи версии 2 принимается",
+   "file": "internal/evidence/record.go",
+   "old": "\t\tif s.Subject.IsZero() {\n\t\t\treturn Sealed{}, fmt.Errorf(\"%w: empty subject",
+   "new": "\t\tif false {\n\t\t\treturn Sealed{}, fmt.Errorf(\"%w: empty subject"
+  },
+  {
+   "name": "Z5 версия 2 не читается",
+   "file": "internal/evidence/record.go",
+   "old": "if b[0] != Version && b[0] != VersionSubject {",
+   "new": "if b[0] != Version {"
+  },
+  {
+   "name": "Z6 метка читается и у версии 1",
+   "file": "internal/evidence/record.go",
+   "old": "\tif b[0] == VersionSubject {\n\t\tvar field []byte",
+   "new": "\tif b[0] != 0 {\n\t\tvar field []byte"
+  },
+  {
+   "name": "Z7 поле субъекта дважды: берётся последнее",
+   "file": "internal/evidence/subject.go",
+   "old": "\t\tif found {\n\t\t\treturn \"\", false\n\t\t}\n",
+   "new": "\t\t_ = found\n"
+  },
+  {
+   "name": "Z9 хвост после объекта принимается",
+   "file": "internal/evidence/subject.go",
+   "old": "if _, err := dec.Token(); err != io.EOF {",
+   "new": "if _, err := dec.Token(); false && err != io.EOF {"
+  },
+  {
+   "name": "Z10 пустой субъект принимается",
+   "file": "internal/evidence/subject.go",
+   "old": "if value == \"\" || len(value) > MaxSubjectLen {",
+   "new": "if len(value) > MaxSubjectLen {"
+  },
+  {
+   "name": "Z11 субъект без предела длины",
+   "file": "internal/evidence/subject.go",
+   "old": "if value == \"\" || len(value) > MaxSubjectLen {",
+   "new": "if value == \"\" {"
+  },
+  {
+   "name": "Z12 числа теряют цифры",
+   "file": "internal/evidence/subject.go",
+   "old": "\tdec.UseNumber()\n",
+   "new": ""
+  },
+  {
+   "name": "Z14 источник не входит в метку",
+   "file": "internal/evidence/subject.go",
+   "old": "\tm.Write(appendField(nil, []byte(source)))\n",
+   "new": ""
+  },
+  {
+   "name": "Z16 субъект и не из объекта",
+   "file": "internal/evidence/subject.go",
+   "old": "\tif tok, err := dec.Token(); err != nil || tok != json.Delim('{') {",
+   "new": "\tif _, err := dec.Token(); err != nil {"
+  },
+  {
+   "name": "Z23 метка без поля записывается",
+   "file": "internal/evidence/record.go",
+   "old": "\tcase h.Subject.IsZero() != (h.SubjectField == \"\"):",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "Z24 поле без предела длины",
+   "file": "internal/evidence/record.go",
+   "old": "\tcase len(h.SubjectField) > MaxSubjectField:",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "Z25 поле не входит в метку",
+   "file": "internal/evidence/subject.go",
+   "old": "\tm.Write(appendField(nil, []byte(field)))\n",
+   "new": ""
+  },
+  {
+   "name": "Z26 поле не пишется в запись",
+   "file": "internal/evidence/record.go",
+   "old": "\t\tbuf = appendField(buf, []byte(s.SubjectField))\n",
+   "new": "\t\tbuf = appendField(buf, nil)\n"
+  }
+ ]
+}

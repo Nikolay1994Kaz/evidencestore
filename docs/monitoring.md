@@ -18,6 +18,7 @@ Set `metrics_listen` (for example `127.0.0.1:9464`) to expose `/metrics` in the 
 | `evidencestore_source_silent == 1` | a source has been quiet longer than its `expect_every` |
 | `evidencestore_source_contact_lost == 1` | a source's collector has not contacted the store (a batch or a heartbeat) for longer than its `expect_contact`: stopped, crashed or hung, its host down, or the network cut; the chain marks the window |
 | `increase(evidencestore_gateway_problems_total[1h]) > 0` | a gateway journal entry was broken, out of order or badly signed |
+| `increase(evidencestore_records_without_subject_total[1h]) > 0` | lines of a source with `subject_field` name no subject: they carry no label and stay closed in subject bundles; the field may be set to the wrong name |
 | `increase(evidencestore_epoch_refused_total[1h]) > 0` | another collector installation used the source certificate and was refused: an impostor, or a reinstall waiting for `sources bind` |
 | `increase(evidencestore_records_conflict_total[1h]) > 0` | a resend was refused: another body under a taken number (a spool restored from an old copy, or two collectors share one certificate), or a body that cannot be compared (month key pending destruction or destroyed); the reason is in the chain event and in the collector log |
 | `evidencestore_keys_due > 0` | months past retention wait for a destruction request (two approvals) |

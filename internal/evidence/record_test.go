@@ -169,6 +169,10 @@ func FuzzUnmarshal(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(b)
+	if b, err = subjectSealed().Marshal(); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(b)
 	f.Fuzz(func(t *testing.T, data []byte) {
 		s, err := Unmarshal(data)
 		if err != nil {

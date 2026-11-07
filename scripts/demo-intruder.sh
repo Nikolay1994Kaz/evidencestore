@@ -230,7 +230,7 @@ for line in deleted:
     print("in the window, gone from web-1:", line.decode(errors="replace"))
 if len(deleted) != 4:
     sys.exit(f"ERROR: expected the 4 deleted lines in the window, found {len(deleted)}")
-print(f"every line the store received from web-1 between the two time-stamps is in this one bundle ({len(bodies)} records),"
+print(f"every line the store received from web-1 in the window is in this one bundle ({len(bodies)} records),"
       " and none of them can be left out: the four deleted lines are among them")
 PY
 

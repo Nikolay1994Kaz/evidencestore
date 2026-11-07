@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -113,6 +114,48 @@ func sourceFailedChecks(r proof.SourceReport) string {
 		}
 	}
 	return strings.Join(out, "; ")
+}
+
+// Пакет строит одно дерево на звено: деревом на лист звено из k листьев стоит k²,
+// и при всплеске пакет не укладывается в таймаут клиента (P-58). Считается память,
+// а не время: на занятой машине время врёт, а дерево на лист выделяет k² узлов.
+func TestSourceBundleBigLink(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t), c)
+	var seq uint64
+	batch := func(n int) {
+		t.Helper()
+		recs := make([]Incoming, n)
+		for i := range recs {
+			seq++
+			recs[i] = Incoming{Seq: seq, Body: []byte("запись")}
+		}
+		if _, err := s.Ingest("abs-core", recs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch(1)
+	mustStamp(t, s)
+	c.add(5 * time.Minute)
+	batch(MaxBatch)
+	batch(MaxBatch)
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustStampNow(t, s)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	b, err := s.ProofSource("abs-core", clockAt(10, 4, 0), clockAt(10, 6, 0), false, 0)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Records) != 2*MaxBatch {
+		t.Fatalf("записей %d", len(b.Records))
+	}
+	// Одно дерево на звено — 5 МиБ, дерево на лист — 200 МиБ.
+	if got := after.TotalAlloc - before.TotalAlloc; got > 32<<20 {
+		t.Fatalf("пакет выделил %d МиБ: путь каждого листа строит дерево заново?", got>>20)
+	}
 }
 
 func sourceRoundTrip(t *testing.T, b proof.SourceBundle) proof.SourceBundle {
@@ -288,12 +331,10 @@ func TestSourceProofForged(t *testing.T) {
 	b.Records[0].DEK, b.Records[1].DEK = b.Records[1].DEK, b.Records[0].DEK
 	sourceFailed(t, verify(b), "the records attached")
 
-	// Тело одной записи не приложено: пакет проходит, отчёт это называет.
+	// Тело записи окна не приложено: так прячут неудобную запись (P-46).
 	b = clone()
 	b.Records[1].Evidence, b.Records[1].DEK = nil, nil
-	if r := verify(b); !r.Valid() || !strings.Contains(r.Text(), "1 of the 3 records come without their evidence") {
-		t.Fatalf("тело снято:\n%s", r.Text())
-	}
+	sourceFailed(t, verify(b), "the records attached")
 }
 
 // Окно без записей источника: пакет пуст, нижнее и верхнее раскрытия —

@@ -35,6 +35,14 @@ import (
 // времени. Края заверены метками (и свидетелем): сдвинуть их можно, только
 // переписав цепь. На слове хранилища — только то, что хвосты оно записало
 // честно, когда ставило метки.
+//
+// Участок между краями шире окна: края стоят на метках, а окно — где спросили.
+// Полноте хватает листьев, поэтому записи вне окна идут листом: номер, время,
+// отпечаток. Улики с ключами — только у записей окна (P-46).
+//
+// Пакет по субъекту (п. 32) — та же цепочка: улика приложена у всех записей
+// окна, ключ — только у записей с меткой субъекта. Проверка идёт по заголовкам
+// улик: в них видно, чья метка, а тела остальных закрыты.
 
 // SourceKind — вид пакета по источнику; версия та же, что у пакета за окно.
 const SourceKind = "source"
@@ -49,6 +57,17 @@ type SourceEdge struct {
 	Tails *Leaf     `json:"tails,omitempty"`
 	Token Inclusion `json:"token"`
 	Open  *TailOpen `json:"open,omitempty"`
+}
+
+// SubjectClaim — о ком пакет по субъекту: поле записи, его значение и метка,
+// которую хранилище за ними считает. Сам проверяющий метку не посчитает: ключ у
+// хранилища. Поле закреплено в заголовке каждой записи под меткой. Значение
+// привязывает открытое тело: поле в нём обязано назвать этого субъекта. Тела нет
+// — не привязывает ничто, и отчёт это говорит.
+type SubjectClaim struct {
+	Field string `json:"field"`
+	Value string `json:"value"`
+	Tag   []byte `json:"tag"`
 }
 
 // SourceRecord — запись источника: лист с путём Меркла, лист вердикта
@@ -83,8 +102,10 @@ type SourceBundle struct {
 	// Frontier — граница дерева звеньев перед первым звеном пакета.
 	Frontier [][]byte `json:"frontier,omitempty"`
 	// Records — все записи источника между краями, в порядке цепи.
-	Records    []SourceRecord `json:"records,omitempty"`
-	Checkpoint Checkpoint     `json:"checkpoint"`
+	Records []SourceRecord `json:"records,omitempty"`
+	// Subject — пакет открывает записи одного субъекта (п. 32); nil — нет.
+	Subject    *SubjectClaim `json:"subject,omitempty"`
+	Checkpoint Checkpoint    `json:"checkpoint"`
 }
 
 // ParseSource разбирает пакет по источнику.
@@ -123,6 +144,22 @@ type SourceReport struct {
 	Holes             []SeqRange
 	Attached          int
 	Bodies            []WindowBody
+	// SourceNamed — верхние хвосты называют источник. Нет — под этим именем
+	// хранилище записей не называло, и ничем другим имя в пакете не подтверждено.
+	SourceNamed bool
+	// Subject, SubjectField — о ком пакет по субъекту. SubjectRecords — записей
+	// окна под его меткой, SubjectOpened — из них открыто и названо телом: только
+	// они привязывают метку к субъекту; SubjectKeyless — без ключа (ключ месяца
+	// уничтожен), SubjectOthers — закрытых записей окна с чужой меткой,
+	// SubjectUnlabeled — без метки.
+	Subject          string
+	SubjectField     string
+	SubjectLabel     string // метка из заявления, hex: сравнить с пакетом, где тело открыто
+	SubjectRecords   int
+	SubjectOpened    int
+	SubjectKeyless   int
+	SubjectOthers    int
+	SubjectUnlabeled int
 	// GatewayRecords — записей журнала гейтвея (с вердиктом хранилища);
 	// GatewayBroken — номера тех, что хранилище при приёме признало
 	// поломанными.
@@ -130,13 +167,18 @@ type SourceReport struct {
 	GatewayBroken  []uint64
 	// withheld — тел поломанных записей гейтвея, не вскрытых нарочно: ключ
 	// у них есть, и «нет ключа записи» о них неверно.
-	withheld       int
+	withheld int
+	// outside — открытых тел вне окна аудитора: в отчёт и в файлы они не идут.
+	outside        int
 	WitnessChecked bool
 	WitnessHead    uint64
 	WitnessNone    bool
 	WitnessFork    uint64
 	WitnessRefused int
 }
+
+// Withheld — сколько тел поломанных записей гейтвея не вскрыто нарочно.
+func (r SourceReport) Withheld() int { return r.withheld }
 
 // Valid — все проверки прошли.
 func (r SourceReport) Valid() bool {
@@ -162,6 +204,9 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	r := SourceReport{Source: b.Source, From: from, To: to, LowerHead: b.Lower.Head, UpperHead: b.Upper.Head}
 	if from.IsZero() && to.IsZero() {
 		r.From, r.To, r.FromBundle = b.From, b.To, true
+	}
+	if b.Subject != nil {
+		r.Subject, r.SubjectField, r.SubjectLabel = b.Subject.Value, b.Subject.Field, fmt.Sprintf("%x", b.Subject.Tag)
 	}
 	add := func(name string, err error, detail string) bool {
 		c := Check{Name: name, OK: err == nil, Detail: detail}
@@ -214,6 +259,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 		r.Upper, err = closingStamp(b, linkAt, trust.TSA)
 	}
 	r.UpperEdge = edgeAt
+	r.SourceNamed = b.Upper.Open != nil
 	add("the upper tails are the only leaf of a link certified by a time-stamp, and lie after the token of the time-stamp that closes the window (T2)", err,
 		fmt.Sprintf("T2 = %s, token in link %d; tails in link %d", fmtTime(r.Upper), b.Closing.LinkSeq, b.Upper.Head))
 
@@ -248,13 +294,22 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	}
 
 	// 9. Приложенные улики сверяются со своими листами, тела вскрываются;
-	// улика журнала гейтвея — только с вердиктом.
-	if slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {
+	// улика журнала гейтвея — только с вердиктом. Пакет с уликами обязан
+	// приложить все записи окна; пакет по субъекту — и без единой улики: иначе
+	// снятые улики выглядели бы как «у него записей нет».
+	if b.Subject != nil || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {
 		add("the records attached match their leaves, and their bodies open with their record keys", sourceAttached(b, &r),
 			fmt.Sprintf("%d records, %d bodies opened", r.Attached, len(r.Bodies)))
 	}
 
-	// 10. Свидетель голов — как у остальных пакетов.
+	// 10. Пакет по субъекту: открыты записи с его меткой и только они, и в
+	// открытых телах назван он.
+	if b.Subject != nil {
+		add("record keys come only with the records under the label, and every open body names the subject", sourceSubject(b, &r),
+			fmt.Sprintf("%d records under the label, %d of them open, %d others closed", r.SubjectRecords, r.SubjectOpened, r.SubjectOthers+r.SubjectUnlabeled))
+	}
+
+	// 11. Свидетель голов — как у остальных пакетов.
 	if trust.Witness != nil {
 		var wr Report
 		checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt, &wr, add)
@@ -472,13 +527,21 @@ func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Rec
 // sourceAttached сверяет приложенные улики со своими листами и вскрывает
 // тела. Улика журнала гейтвея без вердикта не принимается: проверки гейтвея
 // у неё в пакете нет, а README обещает, что такой пакет не проходит.
+//
+// Запись окна без улики — отказ: на такой пакет полагаются как на все записи
+// окна, и снятая улика прятала бы тело неудобной записи. Записи вне окна идут
+// листом; окно здесь — аудитора: шире окна пакета — и улик не хватит.
 func sourceAttached(b SourceBundle, r *SourceReport) error {
 	var leaves []auditchain.Leaf
 	var attached []WindowRecord
+	missing := 0
 	for _, rec := range b.Records {
 		l := rec.Leaf.Leaf.chain()
 		leaves = append(leaves, l)
 		if len(rec.Evidence) == 0 {
+			if InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {
+				missing++
+			}
 			continue
 		}
 		sealed, err := evidence.Unmarshal(rec.Evidence)
@@ -501,14 +564,88 @@ func sourceAttached(b SourceBundle, r *SourceReport) error {
 	r.Attached = wr.Attached
 	// Тело записи гейтвея, которую хранилище при приёме признало поломанной,
 	// здесь не вскрывается: что с ней не так, показывает пакет одной улики.
+	// Тело вне окна аудитора в отчёт и в -bodies не идёт: спросили не о нём.
 	for _, body := range wr.Bodies {
-		if slices.Contains(r.GatewayBroken, body.Seq) {
+		switch {
+		case slices.Contains(r.GatewayBroken, body.Seq):
 			r.withheld++
-			continue
+		case !InWindow(time.Unix(0, body.ReceivedAt), r.From, r.To):
+			r.outside++
+		default:
+			r.Bodies = append(r.Bodies, body)
 		}
-		r.Bodies = append(r.Bodies, body)
+	}
+	if err == nil && missing > 0 {
+		err = fmt.Errorf("%d records received in the window come without their evidence: ask for a bundle over this window", missing)
 	}
 	return err
+}
+
+// sourceSubject проверяет пакет по субъекту: у записей окна с его меткой тело
+// называет его, а записи с другой меткой или без неё идут без ключа. Считает,
+// сколько каких записей в окне. Приложенность и сверку с листами делает
+// sourceAttached: сюда приходят те же улики.
+func sourceSubject(b SourceBundle, r *SourceReport) error {
+	c := b.Subject
+	var want evidence.SubjectTag
+	if len(c.Tag) != len(want) || c.Value == "" || c.Field == "" {
+		return errors.New("the bundle does not say whose records it opens")
+	}
+	copy(want[:], c.Tag)
+	if want.IsZero() {
+		return errors.New("the bundle names an empty subject label")
+	}
+	opened := map[uint64][]byte{}
+	for _, body := range r.Bodies {
+		opened[body.Seq] = body.Body
+	}
+	for _, rec := range b.Records {
+		if len(rec.Evidence) == 0 {
+			// Здесь такой ключ ничего не открывает, а улику этой записи из другого
+			// пакета откроет.
+			if len(rec.DEK) > 0 {
+				return fmt.Errorf("record %s/%s comes with a record key and without its evidence", b.Source, rec.Leaf.Leaf.chain().Subject)
+			}
+			continue
+		}
+		sealed, err := evidence.Unmarshal(rec.Evidence)
+		if err != nil {
+			return fmt.Errorf("the record attached to %s/%s does not parse: %w", b.Source, rec.Leaf.Leaf.chain().Subject, err)
+		}
+		mine := sealed.Subject == want
+		if !mine && len(rec.DEK) > 0 {
+			return fmt.Errorf("record %s/%d does not carry the label of this subject, and it comes with its record key", sealed.Source, sealed.Seq)
+		}
+		// Поле — из записи, под отпечатком: другое поле того же тела выдало бы
+		// чужую метку за этого субъекта, а его записи остались бы закрытыми.
+		if mine && sealed.SubjectField != c.Field {
+			return fmt.Errorf("record %s/%d was labelled by the field %q, and the bundle names the field %q", sealed.Source, sealed.Seq, sealed.SubjectField, c.Field)
+		}
+		if !InWindow(time.Unix(0, sealed.ReceivedAt), r.From, r.To) {
+			continue
+		}
+		switch {
+		case mine:
+			r.SubjectRecords++
+			if len(rec.DEK) == 0 {
+				r.SubjectKeyless++
+			}
+			// Тела нет в отчёте у записи без ключа и у поломанной записи гейтвея.
+			if body, ok := opened[sealed.Seq]; ok {
+				// Тела без субъекта это тоже касается: значение тогда пустое, а
+				// названное не пусто.
+				if v, _ := evidence.SubjectOf(body, c.Field); v != c.Value {
+					return fmt.Errorf("record %s/%d carries the label of this subject, but its body does not name %q as %q", sealed.Source, sealed.Seq, c.Value, c.Field)
+				}
+				r.SubjectOpened++
+			}
+		case sealed.Subject.IsZero():
+			r.SubjectUnlabeled++
+		default:
+			r.SubjectOthers++
+		}
+	}
+	return nil
 }
 
 // Notes — чего пакет по источнику не доказывает.
@@ -530,10 +667,22 @@ func (r SourceReport) Notes() []string {
 		n = append(n, "the window was taken from the bundle itself: check the bundle against your own window with esverify -from and -to")
 	}
 	if r.Attached > 0 && r.Attached < r.Records {
-		n = append(n, fmt.Sprintf("%d of the %d records come without their evidence: the bundle carries no body for them", r.Records-r.Attached, r.Records))
+		n = append(n, fmt.Sprintf("%d of the %d records come without their evidence: they were received outside the window, and the bundle shows only their number, receive time and digest", r.Records-r.Attached, r.Records))
 	}
-	if keyless := r.Attached - len(r.Bodies) - r.withheld; keyless > 0 {
-		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction", keyless, r.Attached))
+	if r.Subject != "" {
+		n = append(n, "which records are this subject's rests on the store's word at intake: it sets a label when it receives a record, from the subject field in its body, and the label cannot change after that; a record whose line named someone else, or no one, is not under this label, and neither is one a dishonest store labelled otherwise: such a record stays closed here, and only its body shows whose it is")
+		n = append(n, "of the other records received in the window the bundle shows the number, receive time, length and subject label, a pseudonym that only the store can compute; their bodies stay closed")
+		if r.SubjectOpened == 0 {
+			n = append(n, fmt.Sprintf("no body under this label is open in the window, and only an open body ties a label to a subject: nothing here says that this label is %q, or that the subject has no records; ask for a wider window that opens one of its records, or compare label %s with a bundle that does", r.Subject, r.SubjectLabel))
+		}
+		if r.SubjectUnlabeled > 0 {
+			n = append(n, fmt.Sprintf("%d records received in the window carry no subject label: their lines named no subject, or they came before the source had subject_field, and they could be anyone's", r.SubjectUnlabeled))
+		}
+		if r.SubjectKeyless > 0 {
+			n = append(n, fmt.Sprintf("%d of the %d records under this label come without a record key, so their bodies are not shown: the key was removed from this bundle, the month key was destroyed (retention) or awaits destruction, or the store held it back; ask its operator", r.SubjectKeyless, r.SubjectRecords))
+		}
+	} else if keyless := r.Attached - len(r.Bodies) - r.withheld - r.outside; keyless > 0 {
+		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction, or the store held the key back", keyless, r.Attached))
 	}
 	if len(r.GatewayBroken) > 0 {
 		var parts []string
@@ -572,7 +721,9 @@ func (r SourceReport) Text() string {
 	if r.FromBundle {
 		asked = "named in the bundle"
 	}
-	fmt.Fprintf(&b, "Source: %s\nWindow (receive time): %s – %s (%s)\n", r.Source, fmtTime(r.From), fmtTime(r.To), asked)
+	// %q: имя пришло из пакета, и аудитор сверяет его с тем, о ком спрашивал:
+	// пробел на конце должен быть виден, перевод строки не должен рисовать отчёт.
+	fmt.Fprintf(&b, "Source: %q\nWindow (receive time): %s – %s (%s)\n", r.Source, fmtTime(r.From), fmtTime(r.To), asked)
 	records := "no records"
 	if r.Records > 0 {
 		records = fmt.Sprintf("records %d–%d (%d, %d received in the window)", r.FirstSeq, r.LastSeq, r.Records, r.InWindow)
@@ -584,9 +735,26 @@ func (r SourceReport) Text() string {
 		if !r.FromStart {
 			span = fmt.Sprintf("from the source tails laid right before the time-stamp of %s to the first source tails laid after the time-stamp of %s", fmtTime(r.Lower), fmtTime(r.Upper))
 		}
-		fmt.Fprintf(&b, "Every record %s put into the store's chain %s is in this bundle: %s\n", r.Source, span, records)
+		if r.SourceNamed {
+			fmt.Fprintf(&b, "Every record %q put into the store's chain %s is in this bundle: %s\n", r.Source, span, records)
+		} else {
+			// Не «записей нет»: имя можно заменить похожим и снять записи, и такой
+			// пакет сойдётся, потому что хвосты его не называют (P-59).
+			fmt.Fprintf(&b, "The source tails name no source %q up to the first tails laid after the time-stamp of %s, so this bundle holds no records and shows nothing about any other name: compare the name with the source you expect, letter by letter\n", r.Source, fmtTime(r.Upper))
+		}
 	} else {
 		fmt.Fprintf(&b, "Records in the bundle: %s\n", records)
+	}
+	switch {
+	case r.Subject == "":
+	case r.SubjectOpened > 0:
+		// %q: значение пришло из пакета и из тела, перевод строки в нём нарисовал
+		// бы чужие строки отчёта.
+		fmt.Fprintf(&b, "Subject: %q (field %q, label %s): %d of the %d records received in the window, %d of them open, the other %d stay closed\n",
+			r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.InWindow, r.SubjectOpened, r.SubjectOthers+r.SubjectUnlabeled)
+	default:
+		fmt.Fprintf(&b, "Subject: %q (field %q, label %s) is named by the bundle, and no open body ties the label to it: %d records under the label, the other %d of the %d in the window stay closed\n",
+			r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.SubjectOthers+r.SubjectUnlabeled, r.InWindow)
 	}
 	b.WriteString("\nChecks:\n")
 	for _, c := range r.Checks {
@@ -596,7 +764,9 @@ func (r SourceReport) Text() string {
 		}
 		fmt.Fprintf(&b, "  %s %s", mark, c.Name)
 		if c.Detail != "" {
-			b.WriteString(" — " + c.Detail)
+			// В тексте отказа есть имя из пакета: Printable оставляет перевод
+			// строки, и оно нарисовало бы в отчёте свои строки.
+			b.WriteString(" — " + strings.ReplaceAll(c.Detail, "\n", `\n`))
 		}
 		b.WriteString("\n")
 	}

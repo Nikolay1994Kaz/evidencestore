@@ -70,6 +70,9 @@ var (
 	// ErrEvidenceLost — цепь знает улики, которых нет в журнале: журнал
 	// потерял подтверждённые записи. Запускаться в таком состоянии нельзя.
 	ErrEvidenceLost = errors.New("store: chain covers evidence missing from the log")
+	// ErrEvidenceChanged — запись журнала улик не та, что под листом цепи:
+	// цепь верна, запись на диске изменили или подменили (P-47).
+	ErrEvidenceChanged = errors.New("store: an evidence record is not the one its chain leaf holds")
 	// ErrKeyringMismatch — кейринг не сходится с квитанциями в цепи (откат
 	// или подмена keyring.dat). Нужен разбор человеком.
 	ErrKeyringMismatch = errors.New("store: keyring does not match key events in the chain")
@@ -128,6 +131,9 @@ type Store struct {
 	tree     *linkTree // дерево звеньев (tree.go); открывает scanChain
 	signer   *auditchain.Signer
 	chainDir string
+	// subjectKey — ключ меток субъектов (evidence.NewSubjectTag), выведен из
+	// ключа подписи: у цепи он один, иначе записи клиента разошлись бы по меткам.
+	subjectKey [32]byte
 
 	tsaURL   string
 	tsaTrust tsa.Trust
@@ -301,6 +307,7 @@ type sourceState struct {
 	gwProblems atomic.Uint64 // записи с поломкой с момента запуска
 	dups       atomic.Uint64 // повторно присланные записи с момента запуска
 	conflicts  atomic.Uint64 // номер занят другим телом, с момента запуска
+	noSubject  atomic.Uint64 // записи без субъекта при subject_field, с момента запуска
 
 	// Эпоха сборщика (epoch.go): закреплённая за источником, "" — не
 	// закреплена; эпохи, отказ которым уже лёг в цепь; отказы с запуска.
@@ -620,6 +627,7 @@ func (s *Store) open() error {
 	if s.signer, err = auditchain.LoadOrCreateSigner(chainDir); err != nil {
 		return err
 	}
+	s.subjectKey = s.signer.DeriveKey(subjectKeyDomain)
 	if err := s.confirmSigner(); err != nil {
 		// Цепь пуста: этим ключом хранилище ещё ничего не подписало, и
 		// остановка ничего не стоит — какой из двух ключей верный, решает
@@ -658,10 +666,18 @@ func (s *Store) open() error {
 	var gwTail []pending            // улики гейтвея без вердикта в цепи
 	keyUse := map[[16]byte]uint64{} // ключ → первая улика под ним
 	tailSources := map[string]bool{}
+	checkChained, stopCheck := s.chainedEvidence()
+	defer stopCheck()
 	visit := func(pos uint64, data []byte) error {
 		sealed, err := evidence.Unmarshal(data)
 		if err != nil {
 			return fmt.Errorf("evidence log position %d: %w", pos, err)
+		}
+		digest := evidence.Digest(data)
+		if pos <= maxChained {
+			if err := checkChained(pos, digest, sealed.Header); err != nil {
+				return err
+			}
 		}
 		if id, ok := keyring.KEKIDOf(sealed.Envelope); ok {
 			if _, seen := keyUse[id]; !seen {
@@ -671,7 +687,7 @@ func (s *Store) open() error {
 		s.indexRecord(sealed.Header, pos)
 		maxRecv = max(maxRecv, sealed.ReceivedAt)
 		if pos > maxChained {
-			tail = append(tail, pending{pos: pos, header: sealed.Header, digest: evidence.Digest(data)})
+			tail = append(tail, pending{pos: pos, header: sealed.Header, digest: digest})
 			tailSources[sealed.Source] = true
 		}
 		if st := s.sources[sealed.Source]; st != nil && st.gw != nil && pos > st.gwVerified {

@@ -44,6 +44,7 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 	dups := metrics.Family{Name: "evidencestore_records_duplicate_total", Help: "records resent by the source that had already been accepted", Type: metrics.Counter}
 	conflicts := metrics.Family{Name: "evidencestore_records_conflict_total", Help: "records resent under a taken seq with another body: a collector rolled back to an old copy, or two collectors with one certificate", Type: metrics.Counter}
 	epochs := metrics.Family{Name: "evidencestore_epoch_refused_total", Help: "requests refused because another collector installation (another epoch) uses the source certificate", Type: metrics.Counter}
+	noSubject := metrics.Family{Name: "evidencestore_records_without_subject_total", Help: "records of a source with subject_field that name no subject, since the store started: they carry no label and stay closed in subject bundles", Type: metrics.Counter}
 	gw := metrics.Family{Name: "evidencestore_gateway_problems_total", Help: "gateway journal entries that were not intact at intake: hash, linkage or checkpoint signature", Type: metrics.Counter}
 	s.mu.Lock()
 	names := make([]string, 0, len(s.sources))
@@ -62,12 +63,15 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		dups.Samples = append(dups.Samples, metrics.Sample{Labels: l, Value: float64(src.dups.Load())})
 		conflicts.Samples = append(conflicts.Samples, metrics.Sample{Labels: l, Value: float64(src.conflicts.Load())})
 		epochs.Samples = append(epochs.Samples, metrics.Sample{Labels: l, Value: float64(src.epochRefused.Load())})
+		if src.cfg.SubjectField != "" {
+			noSubject.Samples = append(noSubject.Samples, metrics.Sample{Labels: l, Value: float64(src.noSubject.Load())})
+		}
 		if src.gw != nil {
 			gw.Samples = append(gw.Samples, metrics.Sample{Labels: l, Value: float64(src.gwProblems.Load())})
 		}
 	}
 	s.mu.Unlock()
-	return append(fams, records, last, silent, lost, contact, dups, conflicts, epochs, gw)
+	return append(fams, records, last, silent, lost, contact, dups, conflicts, noSubject, epochs, gw)
 }
 
 // receiveAhead — насколько последнее время приёма впереди часов хоста.

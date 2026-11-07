@@ -136,6 +136,10 @@ type Source struct {
 	// ContentType — что в телах: "syslog", "pipelock/receipt" и т. п.
 	// Берётся отсюда, а не со слов сборщика.
 	ContentType string `json:"content_type"`
+	// SubjectField — поле верхнего уровня JSON-записи с субъектом (клиентом):
+	// хранилище ставит записи обезличенную метку, и пакет по субъекту открывает
+	// только его записи (DECISIONS, п. 32). Пусто — метки не ставятся.
+	SubjectField string `json:"subject_field"`
 	// RetentionMonths — срок хранения в месяцах; после него месяц источника
 	// предлагается к уничтожению ключа. 0 — бессрочно.
 	RetentionMonths int `json:"retention_months"`
@@ -167,6 +171,10 @@ const MaxSourceName = 255
 // MaxContentType совпадает с evidence.MaxContentTypeLen: длиннее улику не
 // запечатать, и приём отвечал бы 503 на каждую запись.
 const MaxContentType = 255
+
+// MaxSubjectField совпадает с evidence.MaxSubjectField: длиннее улику не
+// записать.
+const MaxSubjectField = 64
 
 // MaxSocketPath — предел пути unix-сокета в Linux (sun_path, 108 байт с
 // завершающим нулём). Длиннее bind отвечает невнятным «invalid argument».
@@ -355,6 +363,14 @@ func (c *Config) Validate() error {
 		seen[s.Name] = true
 		if s.ContentType == "" || len(s.ContentType) > MaxContentType {
 			errs = append(errs, fmt.Errorf("sources[%d] %s: content_type is required, at most %d bytes", i, s.Name, MaxContentType))
+		}
+		if len(s.SubjectField) > MaxSubjectField || !utf8.ValidString(s.SubjectField) {
+			errs = append(errs, fmt.Errorf("sources[%d] %s: subject_field must be valid UTF-8, at most %d bytes", i, s.Name, MaxSubjectField))
+		}
+		// Вердикт гейтвея лежит в цепи открыто и называет сессию записи: чужие
+		// записи окна не остались бы обезличенными.
+		if s.SubjectField != "" && s.ContentType == GatewayContentType {
+			errs = append(errs, fmt.Errorf("sources[%d] %s: subject_field is not for content_type %q: the store's verdicts show the session of every record in the open, so subjects would not stay closed", i, s.Name, GatewayContentType))
 		}
 		if s.ExpectEvery < 0 {
 			errs = append(errs, fmt.Errorf("sources[%d] %s: expect_every must not be negative (0 — off)", i, s.Name))

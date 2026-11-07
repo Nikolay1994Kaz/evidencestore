@@ -287,13 +287,13 @@ func Parse(data []byte) (Bundle, error) {
 	return b, nil
 }
 
-// olderRelease — пояснение к отказу пакету прежней версии: он сделан над
-// цепью формата v0.3.1 и раньше (P-23).
+// olderRelease — пояснение к отказу пакету прежней версии: его проверяет
+// esverify того выпуска, который его выдал.
 func olderRelease(v, current int) string {
 	if v < 1 || v >= current {
 		return ""
 	}
-	return " (bundles of older versions come from evidencestore v0.3.1 or earlier, whose chain hashes its leaves and signs its heads differently: verify them with esverify of that release)"
+	return " (bundles of older versions come from an earlier release of evidencestore: verify them with esverify of that release)"
 }
 
 // Trust — во что верит проверяющий.

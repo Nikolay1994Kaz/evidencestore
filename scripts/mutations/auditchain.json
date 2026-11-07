@@ -110,6 +110,54 @@
    "file": "internal/auditchain/query.go",
    "old": "\t\t\t\t\tif merkleRootOf(hashes) == batches[cur].root {",
    "new": "\t\t\t\t\tif false {"
+  },
+  {
+   "name": "Z20 домен не входит в выведенный ключ",
+   "file": "internal/auditchain/export.go",
+   "old": "\tm.Write([]byte(domain))\n",
+   "new": ""
+  },
+  {
+   "name": "Z110 шаг без соседа не пропускается",
+   "file": "internal/auditchain/merkle.go",
+   "old": "if pos != len(level)-1 || len(level)%2 != 1 {",
+   "new": "if true {"
+  },
+  {
+   "name": "Z111 сторона соседа перепутана",
+   "file": "internal/auditchain/merkle.go",
+   "old": "\t\t\tif pos%2 == 0 {\n\t\t\t\tpath = append(path, ProofStep{Hash: level[pos+1], SiblingLeft: false})",
+   "new": "\t\t\tif pos%2 == 1 {\n\t\t\t\tpath = append(path, ProofStep{Hash: level[pos+1], SiblingLeft: false})"
+  },
+  {
+   "name": "Z112 левый сосед назван правым",
+   "file": "internal/auditchain/merkle.go",
+   "old": "path = append(path, ProofStep{Hash: level[pos-1], SiblingLeft: true})",
+   "new": "path = append(path, ProofStep{Hash: level[pos-1], SiblingLeft: false})"
+  },
+  {
+   "name": "Z113 номер за пределами звена принят",
+   "file": "internal/auditchain/merkle.go",
+   "old": "if idx < 0 || idx >= len(t.levels[0]) {",
+   "new": "if idx < 0 || idx > len(t.levels[0]) {"
+  },
+  {
+   "name": "Z114 отрицательный номер принят",
+   "file": "internal/auditchain/merkle.go",
+   "old": "if idx < 0 || idx >= len(t.levels[0]) {",
+   "new": "if idx >= len(t.levels[0]) {"
+  },
+  {
+   "name": "Z115 номер на уровень не делится",
+   "file": "internal/auditchain/merkle.go",
+   "old": "\t\tpos /= 2\n\t}\n\treturn path, nil",
+   "new": "\t}\n\treturn path, nil"
+  },
+  {
+   "name": "Z116 уровни не сохраняются",
+   "file": "internal/auditchain/merkle.go",
+   "old": "\t\tt.levels = append(t.levels, level)\n",
+   "new": "\t\t_ = level\n"
   }
  ]
 }

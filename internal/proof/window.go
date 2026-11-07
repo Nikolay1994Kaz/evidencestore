@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,12 +36,18 @@ import (
 // WindowKind, WindowVersion — вид и версия пакета за окно (и пакета по
 // источнику). Версия своя: старый esverify отвечает «bundle version …», а не
 // разбирает пакет как пакет одной улики. Версия 3 (P-23, после v0.3.1) —
-// пакет над цепью, где узел листа несёт признак метки; пакеты версии 2 этим
-// выпуском не читаются.
+// пакет над цепью, где узел листа несёт признак метки. Версия 4 (P-46, после
+// v0.4.0) — улики с ключами только у записей окна, в пакете по источнику
+// каждая запись окна обязана быть приложена, и есть пакет по субъекту; прежние
+// версии этим выпуском не читаются.
 const (
 	WindowKind    = "window"
-	WindowVersion = 3
+	WindowVersion = 4
 )
+
+// InWindow — время приёма t в окне [from, to], оба края включены. Одно на
+// выдачу и проверку: запись на краю либо открыта, либо нет, у обеих сторон.
+func InWindow(t, from, to time.Time) bool { return !t.Before(from) && !t.After(to) }
 
 // BundleKind — вид пакета: WindowKind или "" (пакет одной улики).
 func BundleKind(data []byte) (string, error) {
@@ -157,9 +164,11 @@ type WindowReport struct {
 	HeadSeq      uint64
 	Leaves       int
 	Sources      []SourceSummary
-	// Attached — приложенных улик; Bodies — вскрытые из них.
+	// Attached — приложенных улик; Bodies — вскрытые из них, в окне аудитора;
+	// outside — вскрытых вне его окна: в отчёт и в файлы они не идут.
 	Attached int
 	Bodies   []WindowBody
+	outside  int
 	// GatewayRecords — приложенных улик из журнала гейтвея: их собственные
 	// проверки — в пакете одной улики.
 	GatewayRecords int
@@ -333,6 +342,16 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 	// ключами записей.
 	if len(b.Records) > 0 {
 		err := windowRecords(b.Records, certLeaves, &r)
+		if err == nil {
+			err = windowAttached(b.Records, certLeaves, r.From, r.To)
+		}
+		r.Bodies = slices.DeleteFunc(r.Bodies, func(body WindowBody) bool {
+			out := !InWindow(time.Unix(0, body.ReceivedAt), r.From, r.To)
+			if out {
+				r.outside++
+			}
+			return out
+		})
 		add("the records attached are in the stretch, and their bodies open with their record keys", err,
 			fmt.Sprintf("%d records, %d bodies opened", r.Attached, len(r.Bodies)))
 	}
@@ -530,7 +549,7 @@ func summarize(leaves []auditchain.Leaf, stretch []stretchLink, certified int, s
 				s.Records++
 				seqs[l.Scope] = append(seqs[l.Scope], seq)
 				recv := time.Unix(0, l.UnixNano).UTC()
-				if !recv.Before(r.From) && !recv.After(r.To) {
+				if InWindow(recv, r.From, r.To) {
 					s.InWindow++
 				}
 				switch {
@@ -622,6 +641,32 @@ func unexplained(seqs []uint64, gaps []SeqRange) []SeqRange {
 	return out
 }
 
+// windowAttached: у источника с приложенными уликами приложены все его записи
+// окна (P-46), как в пакете по источнику: снятая улика прятала бы тело неудобной
+// записи. Окно — аудитора: шире окна пакета — и улик не хватит.
+func windowAttached(records []WindowRecord, leaves []auditchain.Leaf, from, to time.Time) error {
+	attached := map[string]bool{}
+	sources := map[string]bool{}
+	for _, rec := range records {
+		sealed, err := evidence.Unmarshal(rec.Evidence)
+		if err != nil {
+			return err
+		}
+		sources[sealed.Source] = true
+		attached[sealed.Source+"\x00"+strconv.FormatUint(sealed.Seq, 10)] = true
+	}
+	missing := 0
+	for _, l := range leaves {
+		if l.Type == auditchain.EventEvidence && sources[l.Scope] && !attached[l.Scope+"\x00"+l.Subject] && InWindow(time.Unix(0, l.UnixNano), from, to) {
+			missing++
+		}
+	}
+	if missing > 0 {
+		return fmt.Errorf("%d records received in the window come without their evidence: ask for a bundle over this window", missing)
+	}
+	return nil
+}
+
 // windowRecords сверяет приложенные улики с их листьями на участке и
 // вскрывает тела ключами записей.
 func windowRecords(records []WindowRecord, leaves []auditchain.Leaf, r *WindowReport) error {
@@ -686,8 +731,8 @@ func (r WindowReport) Notes() []string {
 			n = append(n, fmt.Sprintf("%s: numbers %s are not in the stretch, and no gap is recorded for them in it: they entered the chain outside the window, or the store lost them — ask for their own bundles", s.Name, u))
 		}
 	}
-	if r.Attached > len(r.Bodies) {
-		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction", r.Attached-len(r.Bodies), r.Attached))
+	if keyless := r.Attached - len(r.Bodies) - r.outside; keyless > 0 {
+		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction, or the store held the key back", keyless, r.Attached))
 	}
 	if r.GatewayRecords > 0 {
 		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint signature) are in single-record bundles (evidencestore proof -source S -seq N)")

@@ -43,6 +43,33 @@ func TestMerkle_ProofVerifiesForEveryLeaf(t *testing.T) {
 	}
 }
 
+// Пути всех листьев берутся из одного дерева и сходятся с корнем, посчитанным
+// отдельно; лист за пределами звена — ошибка, а не паника.
+func TestMerkleTree_PathsOfOneTree(t *testing.T) {
+	for _, n := range []int{1, 2, 3, 4, 5, 7, 8, 9, 100, 532} {
+		leaves := leavesN(n)
+		root := MerkleRoot(leaves)
+		tree := NewMerkleTree(leaves)
+		for i := 0; i < n; i++ {
+			path, err := tree.Proof(i)
+			if err != nil {
+				t.Fatalf("n=%d лист %d: %v", n, i, err)
+			}
+			if !VerifyProof(leaves[i], path, root) {
+				t.Fatalf("n=%d: путь для листа %d не сошёлся с корнем", n, i)
+			}
+		}
+		for _, idx := range []int{-1, n} {
+			if _, err := tree.Proof(idx); err == nil {
+				t.Fatalf("n=%d: лист %d вне звена принят", n, idx)
+			}
+		}
+	}
+	if _, err := NewMerkleTree(nil).Proof(0); err == nil {
+		t.Fatal("путь в пустом дереве")
+	}
+}
+
 // TestMerkle_ProofRejectsForeignLeaf — доказательство обязано быть про
 // КОНКРЕТНЫЙ лист, иначе оно доказывает лишь «батч существовал».
 func TestMerkle_ProofRejectsForeignLeaf(t *testing.T) {

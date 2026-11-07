@@ -65,8 +65,9 @@ func TestAdminProofWindow(t *testing.T) {
 	trust := proof.Trust{StoreKey: ed25519.PublicKey(pub)}
 	trust.TSA.Roots = x509.NewCertPool()
 	trust.TSA.Roots.AddCert(root)
+	// Записи легли позже окна: на участке они есть, но ключи — только окну (P-46).
 	r := proof.VerifyWindow(b, trust, time.Time{}, time.Time{})
-	if !r.Valid() || !r.FromStart || len(r.Bodies) != 2 || string(r.Bodies[1].Body) != "event 2" {
+	if !r.Valid() || !r.FromStart || r.Sources[0].Records != 2 || r.Attached != 0 || len(r.Bodies) != 0 {
 		t.Fatalf("пакет за окно:\n%s", r.Text())
 	}
 
@@ -158,8 +159,8 @@ func TestAdminProofSource(t *testing.T) {
 	trust.TSA.Roots.AddCert(root)
 	r := proof.VerifySource(b, trust, time.Time{}, time.Time{})
 	// Запись 3 легла после закрывающей метки, до хвостов второй: она тоже в
-	// пакете.
-	if !r.Valid() || !r.FromStart || r.Records != 3 || len(r.Bodies) != 3 || string(r.Bodies[1].Body) != "event 2" {
+	// пакете. Все записи легли позже окна: они идут листами, без улик (P-46).
+	if !r.Valid() || !r.FromStart || r.Records != 3 || r.InWindow != 0 || r.Attached != 0 || len(r.Bodies) != 0 {
 		t.Fatalf("пакет по источнику:\n%s", r.Text())
 	}
 
@@ -207,5 +208,48 @@ func TestAdminStampForced(t *testing.T) {
 			t.Fatalf("метка %d: голова %d после %d", i+1, out["stamped_head"], last)
 		}
 		last = out["stamped_head"]
+	}
+}
+
+// Пакет по субъекту через админку (п. 32): значение уходит параметром, источник
+// без subject_field — 400, чужой источник — 404. Журнал значений не видит.
+func TestAdminProofSubject(t *testing.T) {
+	e := setup(t)
+	c := e.collector(t, "agent")
+	post(t, c, e.url+"/v1/ingest", IngestRequest{Records: []IngestRecord{{Seq: 1, Body: []byte(`{"client":"c-1"}`)}}})
+	for range 2 {
+		if resp, body := post(t, e.admin, "http://admin/admin/stamp", nil); resp == nil || resp.StatusCode != 200 {
+			t.Fatalf("stamp: %v %s", resp, body)
+		}
+	}
+	now := time.Now().UTC()
+	get := func(source, subject string) (int, []byte) {
+		t.Helper()
+		q := url.Values{"source": {source}, "subject": {subject},
+			"from": {now.Add(-4 * time.Minute).Format(time.RFC3339Nano)}, "to": {now.Add(-3 * time.Minute).Format(time.RFC3339Nano)}}
+		resp, err := e.admin.Get("http://admin/admin/proof-source?" + q.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, data
+	}
+	code, data := get("agent", "c-1")
+	if code != 200 {
+		t.Fatalf("пакет по субъекту: %d %s", code, data)
+	}
+	b, err := proof.ParseSource(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Subject == nil || b.Subject.Value != "c-1" || b.Subject.Field != "client" {
+		t.Fatalf("субъект в пакете: %+v", b.Subject)
+	}
+	if code, data := get("abs-core", "c-1"); code != 400 || !bytes.Contains(data, []byte("subject_field")) {
+		t.Fatalf("источник без subject_field: %d %s", code, data)
+	}
+	if code, data := get("nobody", "c-1"); code != 404 {
+		t.Fatalf("чужой источник: %d %s", code, data)
 	}
 }

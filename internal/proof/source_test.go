@@ -217,7 +217,7 @@ func TestSourceVerifies(t *testing.T) {
 		t.Fatalf("отчёт: %+v", r)
 	}
 	text := r.Text()
-	if !strings.Contains(text, "Every record abs-core put into the store's chain from the source tails laid right before the time-stamp of 2026-10-03 10:00:00 UTC to the first source tails laid after the time-stamp of 2026-10-03 10:10:00 UTC is in this bundle: records 2–4 (3, 2 received in the window)") ||
+	if !strings.Contains(text, "Every record \"abs-core\" put into the store's chain from the source tails laid right before the time-stamp of 2026-10-03 10:00:00 UTC to the first source tails laid after the time-stamp of 2026-10-03 10:10:00 UTC is in this bundle: records 2–4 (3, 2 received in the window)") ||
 		!strings.HasSuffix(text, "VERIFIED\n") {
 		t.Fatalf("отчёт:\n%s", text)
 	}

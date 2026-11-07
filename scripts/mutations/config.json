@@ -104,6 +104,24 @@
    "file": "internal/config/config.go",
    "old": "\tif c.Replica.URL != \"\" && c.Keys.BackupDir == \"\" {",
    "new": "\tif false {"
+  },
+  {
+   "name": "Z21 subject_field без предела длины",
+   "file": "internal/config/config.go",
+   "old": "if len(s.SubjectField) > MaxSubjectField || !utf8.ValidString(s.SubjectField) {",
+   "new": "if !utf8.ValidString(s.SubjectField) {"
+  },
+  {
+   "name": "Z22 subject_field не UTF-8",
+   "file": "internal/config/config.go",
+   "old": "if len(s.SubjectField) > MaxSubjectField || !utf8.ValidString(s.SubjectField) {",
+   "new": "if len(s.SubjectField) > MaxSubjectField {"
+  },
+  {
+   "name": "Z27 subject_field у журнала гейтвея принимается",
+   "file": "internal/config/config.go",
+   "old": "if s.SubjectField != \"\" && s.ContentType == GatewayContentType {",
+   "new": "if false {"
   }
  ]
 }

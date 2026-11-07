@@ -34,6 +34,20 @@ type windowResult struct {
 	text   string
 	json   map[string]any
 	bodies []proof.WindowBody
+	// noBodies — почему -bodies нечего писать, когда записи окна закрыты: код 2.
+	noBodies string
+	// nothing — в окне нет того, о чём просили: это ответ, а не ошибка (код 0),
+	// и скрипт, идущий окно за окном, не встаёт. Пусто — такого не доказано.
+	nothing string
+}
+
+// noRecords — в окне нет записей. Говорит только о том, что показывает пакет: окно
+// из пакета ничем не подписано, а номера, потерянные на окне, выглядят так же.
+func noRecords(fromBundle bool) string {
+	if fromBundle {
+		return "no bodies to write: the bundle shows no record received in the window it names"
+	}
+	return "no bodies to write: the bundle shows no record received in your window"
 }
 
 // verifyWindow — пакет за окно по всем источникам. Пакет, который не
@@ -56,7 +70,18 @@ func verifyWindow(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		out["witness_fork"] = win.WitnessFork
 		out["witness_refused"] = win.WitnessRefused
 	}
-	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies}
+	// Пакет -window не называет источник, тела которого несёт: что окно пусто,
+	// видно, только если в нём нет записей ни одного источника.
+	inWindow := 0
+	for _, s := range win.Sources {
+		inWindow += s.InWindow
+	}
+	var nothing string
+	if inWindow == 0 {
+		nothing = noRecords(win.FromBundle)
+	}
+	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies, nothing: nothing,
+		noBodies: "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), the source it was taken for has no records in the window, or the month keys were destroyed: there are no bodies to write"}
 }
 
 // verifySource — пакет по одному источнику.
@@ -69,18 +94,38 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		src = proof.VerifySource(b, trust, from, to)
 	}
 	out := map[string]any{"valid": src.Valid(), "kind": proof.SourceKind, "checks": src.Checks, "notes": src.Notes(),
-		"source": src.Source, "from": src.From, "to": src.To, "window_from_bundle": src.FromBundle,
+		"source": src.Source, "source_named": src.SourceNamed, "from": src.From, "to": src.To, "window_from_bundle": src.FromBundle,
 		"lower": src.Lower, "upper": src.Upper, "from_start": src.FromStart,
 		"lower_head": src.LowerHead, "upper_head": src.UpperHead, "head": src.HeadSeq,
 		"records": src.Records, "records_in_window": src.InWindow, "first_seq": src.FirstSeq, "last_seq": src.LastSeq,
 		"holes": src.Holes, "records_attached": src.Attached, "bodies_opened": len(src.Bodies),
 		"gateway_records": src.GatewayRecords, "gateway_broken": src.GatewayBroken}
+	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), or the month keys were destroyed: there are no bodies to write"
+	if src.Withheld() > 0 {
+		noBodies = "the bundle opens no bodies in the window: the store found its records broken at intake, and their bodies are not opened here: single-record bundles show what is wrong"
+	}
+	var nothing string
+	if src.InWindow == 0 {
+		nothing = noRecords(src.FromBundle)
+	}
+	if src.Subject != "" {
+		// Не «попросите -dek»: это открыло бы всех клиентов окна. Сюда доходят
+		// записи под меткой без ключей: записей нет — это nothing.
+		noBodies = "the records under this label in the window come without record keys: the keys were removed from this bundle, the month key was destroyed (retention) or awaits destruction, or the store held it back; ask its operator"
+		// Не «записей нет»: без открытого тела метка ни к кому не привязана, а
+		// записи клиента могут лежать без метки.
+		if src.SubjectRecords == 0 && src.InWindow > 0 {
+			nothing = "no bodies to write: no record of the window is under this label, which does not show that the subject has none: the report says why"
+		}
+		out["subject"] = map[string]any{"field": src.SubjectField, "value": src.Subject, "label": src.SubjectLabel, "records": src.SubjectRecords,
+			"opened": src.SubjectOpened, "keyless": src.SubjectKeyless, "others": src.SubjectOthers, "unlabeled": src.SubjectUnlabeled}
+	}
 	if src.WitnessChecked {
 		out["witness_head"] = src.WitnessHead
 		out["witness_fork"] = src.WitnessFork
 		out["witness_refused"] = src.WitnessRefused
 	}
-	return windowResult{valid: src.Valid(), text: src.Text(), json: out, bodies: src.Bodies}
+	return windowResult{valid: src.Valid(), text: src.Text(), json: out, bodies: src.Bodies, noBodies: noBodies, nothing: nothing}
 }
 
 func runWindow(data []byte, kind string, a windowArgs, stdout, stderr io.Writer) int {
@@ -124,8 +169,12 @@ func runWindow(data []byte, kind string, a windowArgs, stdout, stderr io.Writer)
 		return exitInvalid
 	}
 	if a.bodies != "" {
+		if len(res.bodies) == 0 && res.nothing != "" {
+			fmt.Fprintln(stderr, res.nothing)
+			return exitValid
+		}
 		if len(res.bodies) == 0 {
-			fmt.Fprintln(stderr, "error: -bodies: the bundle carries no record keys (request them with evidencestore proof -source S -dek), or the month keys were destroyed: there are no bodies to write")
+			fmt.Fprintln(stderr, "error: -bodies:", res.noBodies)
 			return exitUsage
 		}
 		if err := writeBodies(a.bodies, res.bodies); err != nil {

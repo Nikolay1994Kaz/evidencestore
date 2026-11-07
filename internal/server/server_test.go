@@ -60,6 +60,7 @@ func setup(t *testing.T) *env {
 		Demo:        true,
 		Sources: []config.Source{
 			{Name: "abs-core", ContentType: "syslog"},
+			{Name: "agent", ContentType: "application/json", SubjectField: "client"},
 			{Name: "pinned-src", ContentType: "syslog", CertSHA256: config.CertFingerprint(pinned.Cert.Raw)},
 			{Name: "off", ContentType: "syslog", Disabled: true},
 		},

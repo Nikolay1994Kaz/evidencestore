@@ -114,6 +114,10 @@ Operator (talks to the running server via its admin socket):
                                                every record of S received in the window (RFC 3339 times),
                                                complete between two time-stamps, other sources unseen:
                                                for an auditor from outside
+  proof     -config FILE -source S -subject V -from T -to T [-to-head H] [-out FILE]
+                                               the same bundle, opening only the records of one subject
+                                               (V: the value of the source's subject_field); the other
+                                               records of the window stay closed
   proof     -config FILE -window -from T -to T [-source S -dek] [-to-head H] [-out FILE]
                                                every record of every source in the window: for an
                                                investigation inside the organization; -source S -dek
@@ -248,13 +252,30 @@ func cmdProof(args []string) error {
 	from := fs.String("from", "", "a window of time: every record received from this time (RFC 3339, with -to)")
 	to := fs.String("to", "", "a window of time: up to this time (RFC 3339)")
 	window := fs.Bool("window", false, "with -from and -to: every source in the window, not one (for an investigation inside the organization)")
+	subject := fs.String("subject", "", "with -source, -from and -to: open the records of this subject only (the value of the source's subject_field); the other records of the window stay closed")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
 		return err
 	}
-	if *from != "" || *to != "" || *window {
+	// Пустое значение из скрипта не должно молча стать обычным пакетом: с -dek
+	// он открыл бы всех.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "subject" && *subject == "" {
+			err = errors.New("proof: -subject is empty")
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if *from != "" || *to != "" || *window || *subject != "" {
 		if *from == "" || *to == "" || *seq != 0 {
 			return errors.New("proof: a window takes both -from and -to, and no -seq")
+		}
+		if *subject != "" && (*window || *source == "") {
+			return errors.New("proof: -subject takes one source: -source S, without -window")
+		}
+		if *subject != "" && *dek {
+			return errors.New("proof: -subject attaches the record keys of that subject, and -dek would ask for all of them: drop -dek")
 		}
 		// Без -window — пакет по источнику (п. 28): чужих источников
 		// аудитор не видит. Все источники — только явно.
@@ -268,6 +289,9 @@ func cmdProof(args []string) error {
 		q := url.Values{"from": {*from}, "to": {*to}, "source": {*source}}
 		if *dek {
 			q.Set("dek", "1")
+		}
+		if *subject != "" {
+			q.Set("subject", *subject)
 		}
 		if *toHead > 0 {
 			q.Set("to_head", fmt.Sprint(*toHead))
@@ -340,12 +364,12 @@ func cmdRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Сверены только звенья цепи: журнал улик и листья с цепью здесь не
-	// сверяются (W-07). «verified» без оговорки толкал выбросить другую
-	// копию data_dir, хотя испорченный кусок копии виден только позже.
+	// Сверены только звенья цепи: журнал улик и листья сверяет первый запуск
+	// (W-07, P-47). «verified» без оговорки толкал выбросить другую копию
+	// data_dir, хотя испорченный кусок копии виден только позже.
 	fmt.Printf("restored %d files, %d bytes; chain links verified up to signed head %d\n", rep.Files, rep.Bytes, rep.HeadSeq)
 	fmt.Printf("restored from copy generation %d; the store writes the copy on as generation %d, from scratch (gen/%020d/ in the copy; earlier generations stay as they are)\n", rep.Generation, rep.NextGeneration, rep.NextGeneration)
-	fmt.Println("the evidence log and the leaves are not checked against the chain here: a chunk damaged in the copy does not decrypt and stops the restore, but a file already damaged in data_dir before it was copied shows only when the store starts (frame checksum) or when a proof of its records is built; do not discard another copy of data_dir on the strength of this check")
+	fmt.Println("the evidence log and the leaves are not checked against the chain here: a chunk damaged in the copy does not decrypt and stops the restore, but a file already damaged in data_dir before it was copied shows only at the first start, which checks every record already in the chain and refuses one that differs (records past the last signed head have no leaf to check against); do not discard another copy of data_dir before that start passes")
 	fmt.Printf("copy.key is in %s already (it opened the copy);\n", cfg.DataDir)
 	fmt.Printf("now put keyring.dat into %s and sign.key into %s (from keys.backup_dir),\n", cfg.DataDir, filepath.Join(cfg.DataDir, "chain"))
 	if cfg.Keys.RootsMirrorDir != "" {

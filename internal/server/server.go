@@ -422,7 +422,12 @@ func (s *Server) AdminHandler() http.Handler {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		b, err := s.store.ProofSource(q.Get("source"), from, to, q.Get("dek") == "1", head)
+		var b proof.SourceBundle
+		if subject := q.Get("subject"); subject != "" {
+			b, err = s.store.ProofSubject(q.Get("source"), subject, from, to, head)
+		} else {
+			b, err = s.store.ProofSource(q.Get("source"), from, to, q.Get("dek") == "1", head)
+		}
 		if err != nil {
 			windowError(w, err)
 			return

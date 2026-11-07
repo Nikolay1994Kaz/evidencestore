@@ -26,7 +26,26 @@ import (
 // Окно, край которого приходится на метку без хвостов источников
 // (хранилище обновилось позже), или записи в нём без ссылок — отказ: такое
 // окно отвечает только пакет за окно.
+//
+// Участок между краями шире окна: края стоят на метках. Полноте нужны листья,
+// тела — нет, поэтому улики с ключами идут только у записей окна (P-46); записи
+// вне окна — листом: номер, время, отпечаток.
 func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toHead uint64) (proof.SourceBundle, error) {
+	return s.proofSource(source, "", from, to, withDEK, toHead)
+}
+
+// ProofSubject — пакет по источнику, открывающий записи одного субъекта
+// (DECISIONS, п. 32): subject — значение поля subject_field. Остальные записи
+// окна идут уликой без ключа: по заголовку видно, что метка у них другая, а
+// тела закрыты. Цепочка источника та же, поэтому полнота та же.
+func (s *Store) ProofSubject(source, subject string, from, to time.Time, toHead uint64) (proof.SourceBundle, error) {
+	if subject == "" {
+		return proof.SourceBundle{}, fmt.Errorf("%w: name the subject", ErrWindow)
+	}
+	return s.proofSource(source, subject, from, to, true, toHead)
+}
+
+func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK bool, toHead uint64) (proof.SourceBundle, error) {
 	switch {
 	case source == "":
 		return proof.SourceBundle{}, fmt.Errorf("%w: name the source", ErrWindow)
@@ -38,10 +57,24 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 		return proof.SourceBundle{}, fmt.Errorf("%w: the store has no TSA, and a window is bounded by time-stamps", ErrWindow)
 	}
 	s.mu.Lock()
-	_, known := s.sources[source]
+	st, known := s.sources[source]
+	var subjectField string
+	if known {
+		subjectField = st.cfg.SubjectField
+	}
 	s.mu.Unlock()
 	if !known {
 		return proof.SourceBundle{}, fmt.Errorf("%w: source %s", ErrNotFound, source)
+	}
+	var claim *proof.SubjectClaim
+	var only *evidence.SubjectTag
+	if subject != "" {
+		if subjectField == "" {
+			return proof.SourceBundle{}, fmt.Errorf("%w: source %s has no subject_field in the configuration: a source that is retired keeps it, with \"disabled\": true", ErrWindow, source)
+		}
+		tag := evidence.NewSubjectTag(s.subjectKey[:], source, subjectField, subject)
+		only = &tag
+		claim = &proof.SubjectClaim{Field: subjectField, Value: subject, Tag: tag[:]}
 	}
 
 	s.chainMu.Lock()
@@ -172,7 +205,7 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 	}
 
 	b := proof.SourceBundle{Version: proof.WindowVersion, Kind: proof.SourceKind, Source: source,
-		From: from.UTC(), To: to.UTC()}
+		From: from.UTC(), To: to.UTC(), Subject: claim}
 	for _, l := range links {
 		b.Links = append(b.Links, proof.FromLink(l))
 	}
@@ -200,6 +233,7 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 		if err != nil {
 			return proof.SourceBundle{}, err
 		}
+		tree := auditchain.NewMerkleTree(ls)
 		for idx, leaf := range ls {
 			if leaf.Scope != source {
 				continue
@@ -210,11 +244,11 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 					return proof.SourceBundle{}, fmt.Errorf("%w: records of %s in this window were written before the store linked them: ask for a window bundle (proof -window)", ErrWindow, source)
 				}
 				rec := proof.SourceRecord{}
-				if rec.Leaf, err = inclusionAt(l.Seq, ls, idx); err != nil {
+				if rec.Leaf, err = inclusionIn(tree, l.Seq, ls, idx); err != nil {
 					return proof.SourceBundle{}, err
 				}
-				if withDEK {
-					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf); err != nil {
+				if withDEK && proof.InWindow(time.Unix(0, leaf.UnixNano), from, to) {
+					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf, only); err != nil {
 						return proof.SourceBundle{}, err
 					}
 				}
@@ -224,7 +258,7 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 				if err != nil {
 					return proof.SourceBundle{}, fmt.Errorf("store: %w", err)
 				}
-				if verdicts[pos], err = inclusionAt(l.Seq, ls, idx); err != nil {
+				if verdicts[pos], err = inclusionIn(tree, l.Seq, ls, idx); err != nil {
 					return proof.SourceBundle{}, err
 				}
 			}
@@ -318,7 +352,12 @@ func (s *Store) lastLeafBefore(source string, limit uint64) (seq, leaf uint64, o
 
 // inclusionAt — лист idx звена seq с путём Меркла.
 func inclusionAt(seq uint64, leaves []auditchain.Leaf, idx int) (proof.Inclusion, error) {
-	path, err := auditchain.MerkleProof(leaves, idx)
+	return inclusionIn(auditchain.NewMerkleTree(leaves), seq, leaves, idx)
+}
+
+// inclusionIn — то же из готового дерева звена.
+func inclusionIn(tree *auditchain.MerkleTree, seq uint64, leaves []auditchain.Leaf, idx int) (proof.Inclusion, error) {
+	path, err := tree.Proof(idx)
 	if err != nil {
 		return proof.Inclusion{}, err
 	}
@@ -330,8 +369,9 @@ func inclusionAt(seq uint64, leaves []auditchain.Leaf, idx int) (proof.Inclusion
 }
 
 // sealedWithKey — улика под листом и ключ её записи. Ключ месяца уничтожен
-// или ждёт уничтожения — без ключа: улика доказывается, тело — нет.
-func (s *Store) sealedWithKey(leaf auditchain.Leaf) ([]byte, []byte, error) {
+// или ждёт уничтожения — без ключа: улика доказывается, тело — нет. only — ключ
+// только записи с этой меткой субъекта, у остальных улика без ключа.
+func (s *Store) sealedWithKey(leaf auditchain.Leaf, only *evidence.SubjectTag) ([]byte, []byte, error) {
 	pos, _, err := proof.ParseEvidenceLeaf(leaf)
 	if err != nil {
 		return nil, nil, err
@@ -343,6 +383,9 @@ func (s *Store) sealedWithKey(leaf auditchain.Leaf) ([]byte, []byte, error) {
 	sealed, err := evidence.Unmarshal(data)
 	if err != nil {
 		return nil, nil, err
+	}
+	if only != nil && sealed.Subject != *only {
+		return data, nil, nil
 	}
 	dek, err := s.keys.UnwrapDEK(sealed.Envelope)
 	switch {

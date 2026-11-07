@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -49,5 +50,35 @@ func TestDevPKIKeepsCA(t *testing.T) {
 	}
 	if err := cmdDevPKI([]string{"-out", dir, "-source", "abs-core"}); err == nil {
 		t.Fatal("существующий сертификат перезаписан")
+	}
+}
+
+// -subject — только для пакета по одному источнику за окно: отказ до обращения
+// к хранилищу, живого сервера тесту не нужно.
+func TestProofSubjectFlags(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "store.json")
+	data := `{"data_dir": "data", "roots_dir": "roots", "tsa": {"url": "local"}, "demo": true,
+		"tls": {"cert": "s.crt", "key": "s.key", "client_ca": "ca.crt"},
+		"keys": {"min_wait": "1s"}, "sources": [{"name": "agent", "content_type": "application/json", "subject_field": "client"}]}`
+	if err := os.WriteFile(cfg, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	window := []string{"-from", "2026-11-07T10:00:00Z", "-to", "2026-11-07T10:01:00Z"}
+	for name, tc := range map[string]struct {
+		args []string
+		want string
+	}{
+		"без источника":   {append([]string{"-subject", "c-1"}, window...), "-subject takes one source"},
+		"пустое значение": {append([]string{"-subject", "", "-source", "agent", "-dek"}, window...), "-subject is empty"},
+		"с -window":       {append([]string{"-subject", "c-1", "-source", "agent", "-window"}, window...), "-subject takes one source"},
+		"с -dek":          {append([]string{"-subject", "c-1", "-source", "agent", "-dek"}, window...), "drop -dek"},
+		"без окна":        {[]string{"-subject", "c-1", "-source", "agent"}, "a window takes both -from and -to"},
+		"с -seq":          {append([]string{"-subject", "c-1", "-source", "agent", "-seq", "1"}, window...), "a window takes both -from and -to"},
+	} {
+		err := cmdProof(append([]string{"-config", cfg}, tc.args...))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }

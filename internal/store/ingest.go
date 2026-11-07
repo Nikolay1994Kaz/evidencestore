@@ -144,6 +144,7 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	for _, n := range news {
 		st.inflight[n.header.Seq] = true
 	}
+	subjectField := st.cfg.SubjectField
 	s.mu.Unlock()
 
 	release := func() {
@@ -181,7 +182,11 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 			release()
 			return nil, err
 		}
-		sealed, err := evidence.Record{Header: n.header, Body: n.body}.Seal(s.keys)
+		h := n.header
+		if subjectField != "" {
+			s.labelRecord(&h, st, subjectField, n.body)
+		}
+		sealed, err := evidence.Record{Header: h, Body: n.body}.Seal(s.keys)
 		if err != nil {
 			release()
 			return nil, err
@@ -226,6 +231,23 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 		s.log.Warn("sequence gap", "source", source, "from", g.From, "to", g.To)
 	}
 	return results, nil
+}
+
+// subjectKeyDomain — домен ключа меток субъектов.
+const subjectKeyDomain = "evidencestore/subject-key/v1"
+
+// labelRecord ставит записи метку субъекта. Тело здесь ещё открыто, дальше
+// хранилище его не видит. Запись без субъекта — без метки: принять её важнее,
+// чем отметить; счётчик и журнал показывают, что поле настроено не на то (само
+// значение в журнал не идёт: это персональные данные).
+func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, body []byte) {
+	if v, ok := evidence.SubjectOf(body, field); ok {
+		h.Subject, h.SubjectField = evidence.NewSubjectTag(s.subjectKey[:], h.Source, field, v), field
+		return
+	}
+	if st.noSubject.Add(1) == 1 {
+		s.log.Warn("a record names no subject: it carries no label and stays closed in subject bundles", "source", h.Source, "subject_field", field)
+	}
 }
 
 // promise — подписанное обещание по принятой улике. Ed25519 детерминирован:

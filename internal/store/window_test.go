@@ -480,7 +480,7 @@ func TestWindowProofAcrossLeafFiles(t *testing.T) {
 	if !reflect.DeepEqual(b.Leaves, stretchOf(t, s, cfg, b)) {
 		t.Fatal("листья пакета — не участок цепи")
 	}
-	if src := r.Sources[0]; src.FirstSeq != 4 || src.LastSeq != 40 || len(r.Bodies) != 37 {
+	if src := r.Sources[0]; src.FirstSeq != 4 || src.LastSeq != 40 || src.InWindow == 0 || len(r.Bodies) != src.InWindow {
 		t.Fatalf("сводка %+v, тел %d", src, len(r.Bodies))
 	}
 	// Файл листьев посреди участка пропал — пакет не собирается. Файл берётся

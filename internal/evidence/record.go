@@ -24,13 +24,19 @@ import (
 )
 
 // Version — версия формата. Меняется при любом изменении состава полей.
-const Version byte = 1
+// VersionSubject — та же запись с меткой субъекта (subject.go): запись без
+// метки остаётся байт в байт версией 1, и журналы прежних выпусков читаются.
+const (
+	Version        byte = 1
+	VersionSubject byte = 2
+)
 
 // Пределы полей. Проверяются и при кодировании, и при разборе.
 const (
 	MaxSourceLen      = 255
 	MaxContentTypeLen = 255
 	MaxEnvelopeLen    = 1 << 20 // 1 МиБ: запись журнала, а не файл
+	MaxSubjectField   = 64      // имя поля с субъектом
 )
 
 // domainSealed отделяет отпечаток улики от других хэшей проекта:
@@ -46,6 +52,12 @@ type Header struct {
 	Seq         uint64 // номер записи у источника; пара (Source, Seq) уникальна
 	ReceivedAt  int64  // когда принята, UnixNano по часам хранилища
 	ContentType string // что в теле: "syslog", "pipelock/receipt" и т. п.
+	// Subject — метка субъекта записи (subject.go), SubjectField — поле тела,
+	// из которого она взята. Поле лежит здесь, под отпечатком: иначе пакет мог бы
+	// назвать другое поле того же тела и выдать чужую метку за чью-то ещё.
+	// Метки нет — оба пусты.
+	Subject      SubjectTag
+	SubjectField string
 }
 
 // Validate проверяет, что заголовок можно хранить.
@@ -63,6 +75,10 @@ func (h Header) Validate() error {
 		return errors.New("evidence: received_at must be > 0")
 	case len(h.ContentType) > MaxContentTypeLen:
 		return fmt.Errorf("evidence: content type longer than %d bytes", MaxContentTypeLen)
+	case len(h.SubjectField) > MaxSubjectField:
+		return fmt.Errorf("evidence: subject field longer than %d bytes", MaxSubjectField)
+	case h.Subject.IsZero() != (h.SubjectField == ""):
+		return errors.New("evidence: a subject label goes with its field")
 	}
 	return nil
 }
@@ -87,16 +103,28 @@ func (s Sealed) Validate() error {
 // Marshal кодирует улику:
 //
 //	version(1) | seq(8) | received_at(8) | len(4)+source | len(4)+content_type | len(4)+envelope
+//
+// С меткой субъекта — версия 2, метка перед конвертом:
+//
+//	version(1) | seq(8) | received_at(8) | len(4)+source | len(4)+content_type | len(4)+subject_field | subject(16) | len(4)+envelope
 func (s Sealed) Marshal() ([]byte, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 0, 1+8+8+3*4+len(s.Source)+len(s.ContentType)+len(s.Envelope))
-	buf = append(buf, Version)
+	buf := make([]byte, 0, 1+8+8+4*4+len(s.Source)+len(s.ContentType)+len(s.SubjectField)+SubjectTagLen+len(s.Envelope))
+	if s.Subject.IsZero() {
+		buf = append(buf, Version)
+	} else {
+		buf = append(buf, VersionSubject)
+	}
 	buf = binary.BigEndian.AppendUint64(buf, s.Seq)
 	buf = binary.BigEndian.AppendUint64(buf, uint64(s.ReceivedAt))
 	buf = appendField(buf, []byte(s.Source))
 	buf = appendField(buf, []byte(s.ContentType))
+	if !s.Subject.IsZero() {
+		buf = appendField(buf, []byte(s.SubjectField))
+		buf = append(buf, s.Subject[:]...)
+	}
 	buf = appendField(buf, s.Envelope)
 	return buf, nil
 }
@@ -108,7 +136,7 @@ func Unmarshal(b []byte) (Sealed, error) {
 	if len(b) < 1+8+8 {
 		return Sealed{}, fmt.Errorf("%w: too short", ErrMalformed)
 	}
-	if b[0] != Version {
+	if b[0] != Version && b[0] != VersionSubject {
 		return Sealed{}, fmt.Errorf("%w: unknown version %d", ErrMalformed, b[0])
 	}
 	s.Seq = binary.BigEndian.Uint64(b[1:9])
@@ -122,6 +150,21 @@ func Unmarshal(b []byte) (Sealed, error) {
 	}
 	if ctype, rest, err = readField(rest, MaxContentTypeLen); err != nil {
 		return Sealed{}, err
+	}
+	if b[0] == VersionSubject {
+		var field []byte
+		if field, rest, err = readField(rest, MaxSubjectField); err != nil {
+			return Sealed{}, err
+		}
+		s.SubjectField = string(field)
+		if len(rest) < SubjectTagLen {
+			return Sealed{}, fmt.Errorf("%w: truncated subject", ErrMalformed)
+		}
+		rest = rest[copy(s.Subject[:], rest):]
+		// Нулевая метка — это запись версии 1: у записи одно представление.
+		if s.Subject.IsZero() {
+			return Sealed{}, fmt.Errorf("%w: empty subject in a record of version %d", ErrMalformed, VersionSubject)
+		}
 	}
 	if env, rest, err = readField(rest, MaxEnvelopeLen); err != nil {
 		return Sealed{}, err

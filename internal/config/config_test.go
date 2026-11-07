@@ -107,14 +107,19 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 		t.Fatalf("expect_contact по умолчанию: %v", c.Sources[0].ExpectContact.D())
 	}
 	for name, spoil := range map[string]func(*Config){
-		"корни внутри данных":   func(c *Config) { c.RootsDir = filepath.Join(c.DataDir, "roots") },
-		"данные внутри корней":  func(c *Config) { c.DataDir = filepath.Join(c.RootsDir, "data") },
-		"..roots внутри данных": func(c *Config) { c.RootsDir = filepath.Join(c.DataDir, "..roots") },
-		"min_wait -24h":         func(c *Config) { c.Keys.MinWait = Duration(-24 * time.Hour) },
-		"min_wait 1s":           func(c *Config) { c.Keys.MinWait = Duration(time.Second) },
-		"tsa.every -1m":         func(c *Config) { c.TSA.Every = Duration(-time.Minute) },
-		"replica.every -1m":     func(c *Config) { c.Replica.Every = Duration(-time.Minute) },
-		"witness.every -1m":     func(c *Config) { c.Witness.Every = Duration(-time.Minute) },
+		"корни внутри данных": func(c *Config) { c.RootsDir = filepath.Join(c.DataDir, "roots") },
+		"subject_field у журнала гейтвея": func(c *Config) {
+			c.Sources[0].ContentType, c.Sources[0].SubjectField = GatewayContentType, "session_id"
+		},
+		"длинное subject_field":  func(c *Config) { c.Sources[0].SubjectField = strings.Repeat("x", MaxSubjectField+1) },
+		"subject_field не UTF-8": func(c *Config) { c.Sources[0].SubjectField = "\xff" },
+		"данные внутри корней":   func(c *Config) { c.DataDir = filepath.Join(c.RootsDir, "data") },
+		"..roots внутри данных":  func(c *Config) { c.RootsDir = filepath.Join(c.DataDir, "..roots") },
+		"min_wait -24h":          func(c *Config) { c.Keys.MinWait = Duration(-24 * time.Hour) },
+		"min_wait 1s":            func(c *Config) { c.Keys.MinWait = Duration(time.Second) },
+		"tsa.every -1m":          func(c *Config) { c.TSA.Every = Duration(-time.Minute) },
+		"replica.every -1m":      func(c *Config) { c.Replica.Every = Duration(-time.Minute) },
+		"witness.every -1m":      func(c *Config) { c.Witness.Every = Duration(-time.Minute) },
 		"свидетель — сама копия": func(c *Config) {
 			c.Replica.URL, c.Witness.URL = "file:///srv/copy", "file:///srv/copy"
 			c.Keys.BackupDir = "/srv/keys"

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"sort"
 	"strconv"
 
@@ -23,6 +24,50 @@ type chainScan struct {
 	maxPos    uint64            // наибольшая позиция улики в цепи
 	maxSeq    map[string]uint64 // наибольший номер в цепи у каждого источника: улика или конец пропуска
 	silent    map[string]bool   // источники, чьё последнее событие в цепи — «молчит»
+}
+
+// chainedEvidence — сверка журнала улик с цепью при подъёме (P-47): check
+// получает записи журнала по порядку и сравнивает каждую с листом цепи. Запись,
+// изменённую на диске вместе с CRC кадра, иначе показал бы только esverify,
+// да и то если кто-то проверит пакет именно этой записи.
+//
+// Листья улик лежат в порядке журнала (onCommit, догон при подъёме), поэтому
+// сверке хватает прохода рядом с разбором журнала: память не растёт с числом
+// записей. Листья под звеньями уже сверены с корнями в scanChain.
+func (s *Store) chainedEvidence() (check func(pos uint64, digest [32]byte, h evidence.Header) error, stop func()) {
+	var scanErr error
+	leaves := func(yield func(auditchain.Leaf, error) bool) {
+		errStop := errors.New("stop")
+		err := auditchain.ScanLeaves(s.chainDir, func(_ uint64, l auditchain.Leaf) error {
+			if l.Type == auditchain.EventEvidence && !yield(l, nil) {
+				return errStop
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, errStop) {
+			scanErr = err
+		}
+	}
+	next, stop := iter.Pull2(leaves)
+	return func(pos uint64, digest [32]byte, h evidence.Header) error {
+		l, _, ok := next()
+		if !ok {
+			if scanErr != nil {
+				return scanErr
+			}
+			return fmt.Errorf("%w: no chain leaf for position %d (%s/%d)", ErrEvidenceChanged, pos, h.Source, h.Seq)
+		}
+		_, want, err := proof.ParseEvidenceLeaf(l)
+		if err != nil {
+			return err
+		}
+		// Позиция отдельно не сверяется: отпечаток покрывает источник и номер, и
+		// запись не на своём месте не сойдётся с листом этого места.
+		if want != digest {
+			return fmt.Errorf("%w: position %d (%s/%d): restore data_dir from a copy taken before the change, if there is one, and keep this one for the investigation", ErrEvidenceChanged, pos, h.Source, h.Seq)
+		}
+		return nil
+	}, stop
 }
 
 // scanChain поднимает индексы цепи одним проходом по листьям: где лежит

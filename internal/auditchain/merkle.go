@@ -144,34 +144,52 @@ type ProofStep struct {
 	SiblingLeft bool
 }
 
-// MerkleProof строит путь включения листа с индексом idx.
-func MerkleProof(leaves []Leaf, idx int) ([]ProofStep, error) {
-	if idx < 0 || idx >= len(leaves) {
-		return nil, fmt.Errorf("auditchain: leaf %d is outside a batch of %d", idx, len(leaves))
-	}
+// MerkleTree — уровни дерева звена. Пути всех листьев звена берутся из одного
+// дерева: строить его на каждый лист значит платить k² за звено (P-58), а при
+// всплеске и догоняющем приёме звено — это тысячи листьев.
+type MerkleTree struct {
+	levels [][][32]byte
+}
+
+// NewMerkleTree строит дерево над листьями звена.
+func NewMerkleTree(leaves []Leaf) *MerkleTree {
 	level := make([][32]byte, len(leaves))
 	for i, l := range leaves {
 		level[i] = LeafNode(l)
 	}
+	t := &MerkleTree{levels: [][][32]byte{level}}
+	for len(level) > 1 {
+		level = nextLevel(level)
+		t.levels = append(t.levels, level)
+	}
+	return t
+}
 
+// Proof — путь включения листа с индексом idx.
+func (t *MerkleTree) Proof(idx int) ([]ProofStep, error) {
+	if idx < 0 || idx >= len(t.levels[0]) {
+		return nil, fmt.Errorf("auditchain: leaf %d is outside a batch of %d", idx, len(t.levels[0]))
+	}
 	var path []ProofStep
 	pos := idx
-	for len(level) > 1 {
+	for _, level := range t.levels[:len(t.levels)-1] {
 		// Одинокий последний узел поднимается без соседа — шага в пути нет.
-		if pos == len(level)-1 && len(level)%2 == 1 {
-			level = nextLevel(level)
-			pos /= 2
-			continue
+		if pos != len(level)-1 || len(level)%2 != 1 {
+			if pos%2 == 0 {
+				path = append(path, ProofStep{Hash: level[pos+1], SiblingLeft: false})
+			} else {
+				path = append(path, ProofStep{Hash: level[pos-1], SiblingLeft: true})
+			}
 		}
-		if pos%2 == 0 {
-			path = append(path, ProofStep{Hash: level[pos+1], SiblingLeft: false})
-		} else {
-			path = append(path, ProofStep{Hash: level[pos-1], SiblingLeft: true})
-		}
-		level = nextLevel(level)
 		pos /= 2
 	}
 	return path, nil
+}
+
+// MerkleProof строит путь включения листа с индексом idx. Для одного листа; пути
+// многих листьев звена — через NewMerkleTree.
+func MerkleProof(leaves []Leaf, idx int) ([]ProofStep, error) {
+	return NewMerkleTree(leaves).Proof(idx)
 }
 
 // VerifyProof проверяет, что лист входит в батч с этим корнем.
