@@ -83,8 +83,18 @@ func verifyWindow(data []byte, trust proof.Trust, from, to time.Time) windowResu
 	if inWindow == 0 {
 		nothing = noRecords(win.FromBundle)
 	}
-	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies, nothing: nothing,
-		noBodies: "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), the source it was taken for has no records in the window, or the month keys were destroyed: there are no bodies to write"}
+	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), the source it was taken for has no records in the window, or the month keys were destroyed: there are no bodies to write"
+	if win.LeafOnly > 0 {
+		noBodies = leafOnlyNoBodies(win.LeafOnlyMonths)
+	}
+	out["leaf_only"], out["leaf_only_months"] = win.LeafOnly, win.LeafOnlyMonths
+	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies, nothing: nothing, noBodies: noBodies}
+}
+
+// leafOnlyNoBodies — почему -bodies нечего писать, когда записи окна пришли
+// листом: их месяц пакет отдал без улик (P-80).
+func leafOnlyNoBodies(months []string) string {
+	return fmt.Sprintf("the records of the window lie in months the bundle carries no evidence for (%s): the store sends a month whose key is destroyed or awaits destruction that way, and there are no bodies to write; that the key is gone is the store's word: its key receipts in the chain show it", proof.QuotedList(months))
 }
 
 // verifySource — пакет по одному источнику.
@@ -104,6 +114,10 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		"holes": src.Holes, "records_attached": src.Attached, "bodies_opened": len(src.Bodies),
 		"gateway_records": src.GatewayRecords, "gateway_broken": src.GatewayBroken}
 	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), or the month keys were destroyed: there are no bodies to write"
+	if src.LeafOnly > 0 {
+		noBodies = leafOnlyNoBodies(src.LeafOnlyMonths)
+	}
+	out["leaf_only"], out["leaf_only_months"] = src.LeafOnly, src.LeafOnlyMonths
 	if src.Withheld() > 0 {
 		noBodies = "the bundle opens no bodies in the window: the store found its records broken at intake, and their bodies are not opened here: single-record bundles show what is wrong"
 	}

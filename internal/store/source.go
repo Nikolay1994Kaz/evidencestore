@@ -90,6 +90,21 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 		}
 		return tag, nil
 	}
+	// openMonth — ключ месяца жив, одно решение на месяц и пакет: месяц не
+	// расходится на улики и листья, даже если ключ закроют посреди выдачи.
+	openMonths := map[string]bool{}
+	openMonth := func(scope string) (bool, error) {
+		ok, seen := openMonths[scope]
+		if !seen {
+			closed, err := s.monthClosed(scope)
+			if err != nil {
+				return false, err
+			}
+			ok = !closed
+			openMonths[scope] = ok
+		}
+		return ok, nil
+	}
 	if subject != "" {
 		if subjectField == "" {
 			return proof.SourceBundle{}, fmt.Errorf("%w: source %s has no subject_field in the configuration: a source that is retired keeps it, with \"disabled\": true", ErrWindow, source)
@@ -229,7 +244,7 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	}
 
 	b := proof.SourceBundle{Version: proof.WindowVersion, Kind: proof.SourceKind, Source: source,
-		From: from.UTC(), To: to.UTC(), Subject: claim}
+		From: from.UTC(), To: to.UTC(), Subject: claim, WithKeys: withDEK && claim == nil}
 	for _, l := range links {
 		b.Links = append(b.Links, proof.FromLink(l))
 	}
@@ -272,15 +287,21 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 					return proof.SourceBundle{}, err
 				}
 				attach := withDEK && proof.InWindow(time.Unix(0, leaf.UnixNano), from, to)
-				if attach && claim != nil {
-					// Месяц без метки — листом: улика показала бы метки и длины
-					// записей стёртого месяца, а метка, выданная до стирания, нашла
-					// бы по ним клиента (P-77). Месяц — по времени приёма в листе.
-					tag, err := labelFor(evidence.ScopeOf(source, leaf.UnixNano))
-					if err != nil {
+				if attach {
+					// Месяц с закрытым ключом — листом: улика показала бы заголовки
+					// с метками, тел всё равно нет, а метка, выданная до стирания,
+					// нашла бы по ним клиента (P-77, P-80). Месяц — по времени
+					// приёма в листе. У пакета по субъекту такой месяц — без метки.
+					scope := evidence.ScopeOf(source, leaf.UnixNano)
+					if claim != nil {
+						tag, err := labelFor(scope)
+						if err != nil {
+							return proof.SourceBundle{}, err
+						}
+						attach = tag != nil
+					} else if attach, err = openMonth(scope); err != nil {
 						return proof.SourceBundle{}, err
 					}
-					attach = tag != nil
 				}
 				if attach {
 					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf, mine); err != nil {

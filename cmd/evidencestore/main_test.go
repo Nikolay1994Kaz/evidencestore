@@ -75,6 +75,9 @@ func TestProofSubjectFlags(t *testing.T) {
 		"с -dek":          {append([]string{"-subject", "c-1", "-source", "agent", "-dek"}, window...), "drop -dek"},
 		"без окна":        {[]string{"-subject", "c-1", "-source", "agent"}, "a window takes both -from and -to"},
 		"с -seq":          {append([]string{"-subject", "c-1", "-source", "agent", "-seq", "1"}, window...), "a window takes both -from and -to"},
+		// -show-label — только у пакета одной улики: пакет за окно отдаёт месяц
+		// с закрытым ключом листом (P-80).
+		"-show-label с окном": {append([]string{"-show-label", "-source", "agent"}, window...), "-show-label is for a single-record bundle"},
 	} {
 		err := cmdProof(append([]string{"-config", cfg}, tc.args...))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

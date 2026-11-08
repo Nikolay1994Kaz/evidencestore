@@ -445,11 +445,13 @@ func TestWindowProofKeyPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Ключ месяца ждёт уничтожения: записи окна — листом (P-80), а отчёт знает
+	// источник ключей из пометки пакета и говорит, почему тел нет.
 	r := proof.VerifyWindow(roundTrip(t, b), trustOf(t, s), time.Time{}, time.Time{})
-	if !r.Valid() || r.Attached != 3 || len(r.Bodies) != 0 {
-		t.Fatalf("улик %d, тел %d:\n%s", r.Attached, len(r.Bodies), r.Text())
+	if !r.Valid() || r.Attached != 0 || r.LeafOnly != 3 || len(r.Bodies) != 0 {
+		t.Fatalf("улик %d, листом %d, тел %d:\n%s", r.Attached, r.LeafOnly, len(r.Bodies), r.Text())
 	}
-	if !strings.Contains(r.Text(), "3 of the 3 records attached carry no record key") {
+	if !strings.Contains(r.Text(), `3 records received in the window come without their evidence ("abs-core/2026-09")`) {
 		t.Fatalf("отчёт:\n%s", r.Text())
 	}
 }

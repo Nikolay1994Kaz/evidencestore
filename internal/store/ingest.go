@@ -268,6 +268,21 @@ func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, b
 	return nil
 }
 
+// monthClosed — ключ месяца scope уничтожен или ждёт уничтожения: тогда месяц
+// уходит в пакеты листом, без заголовков (P-77, P-80). Та же проверка, что у
+// ключа меток: закрыт месяц — метки его не посчитать.
+func (s *Store) monthClosed(scope string) (bool, error) {
+	key, err := s.keys.DeriveKey(scope, s.labelDomain)
+	clear(key[:])
+	switch {
+	case errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):
+		return true, nil
+	case err != nil:
+		return false, err
+	}
+	return false, nil
+}
+
 // subjectLabel — метка субъекта в месяце источника (DECISIONS, п. 32). Ключ
 // меток у каждого месяца свой и выведен из ключа месяца: уничтожен ключ месяца —
 // уничтожен и ключ меток, и метки этого месяца больше не посчитает никто, само

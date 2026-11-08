@@ -1414,7 +1414,7 @@
   {
    "name": "U41 источник: приложенные улики не проверяются",
    "file": "internal/proof/source.go",
-   "old": "\tif b.Subject != nil || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {",
+   "old": "\tif b.Subject != nil || b.WithKeys || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {",
    "new": "\tif false {"
   },
   {
@@ -1762,8 +1762,8 @@
   {
    "name": "V15 пакет по источнику: записи без приложенной улики не названы",
    "file": "internal/proof/source.go",
-   "old": "if outside := r.Records - r.Attached - r.leafOnly; r.Attached > 0 && outside > 0 {",
-   "new": "if outside := r.Records - r.Attached - r.leafOnly; false && r.Attached > 0 && outside > 0 {"
+   "old": "if outside := r.Records - r.Attached - r.LeafOnly; r.Attached > 0 && outside > 0 {",
+   "new": "if outside := r.Records - r.Attached - r.LeafOnly; false && r.Attached > 0 && outside > 0 {"
   },
   {
    "name": "V16 хранилище раскрывает хвосты только текущим видом источника",
@@ -2500,8 +2500,8 @@
   {
    "name": "Z34 ключ меток не выведен из ключа месяца",
    "file": "internal/store/ingest.go",
-   "old": "\tkey, err := s.keys.DeriveKey(scope, s.labelDomain)\n",
-   "new": "\tkey, err := [32]byte{1}, error(nil)\n"
+   "old": "\tkey, err := s.keys.DeriveKey(scope, s.labelDomain)\n\tswitch {\n\tcase errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):\n\t\treturn evidence.SubjectTag{}, false, nil\n",
+   "new": "\tkey, err := [32]byte{1}, error(nil)\n\tswitch {\n\tcase errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):\n\t\treturn evidence.SubjectTag{}, false, nil\n"
   },
   {
    "name": "Z35 запись не сверяется с листом при запуске (P-47)",
@@ -2602,8 +2602,8 @@
   {
    "name": "Z52 пакет по субъекту без улик не проверяется",
    "file": "internal/proof/source.go",
-   "old": "\tif b.Subject != nil || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {",
-   "new": "\tif slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {"
+   "old": "\tif b.Subject != nil || b.WithKeys || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {",
+   "new": "\tif b.WithKeys || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {"
   },
   {
    "name": "Z53 пакет по субъекту не проверяется как пакет по субъекту",
@@ -2764,7 +2764,7 @@
   {
    "name": "Z80 пакет за окно: полнота улик окна не проверяется",
    "file": "internal/proof/window.go",
-   "old": "\t\tif err == nil {\n\t\t\terr = windowAttached(b.Records, certLeaves, r.From, r.To)\n\t\t}\n",
+   "old": "\t\tif err == nil {\n\t\t\terr = windowAttached(b.Records, b.KeysFor, certLeaves, &r)\n\t\t}\n",
    "new": ""
   },
   {
@@ -2782,14 +2782,14 @@
   {
    "name": "Z83 пакет за окно: улики других источников требуются тоже",
    "file": "internal/proof/window.go",
-   "old": "if l.Type == auditchain.EventEvidence && sources[l.Scope] && !attached[l.Scope+\"\\x00\"+l.Subject] && InWindow(time.Unix(0, l.UnixNano), from, to) {",
-   "new": "if l.Type == auditchain.EventEvidence && !attached[l.Scope+\"\\x00\"+l.Subject] && InWindow(time.Unix(0, l.UnixNano), from, to) {"
+   "old": "if l.Type != auditchain.EventEvidence || !sources[l.Scope] || attached[l.Scope+\"\\x00\"+l.Subject] || !InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {",
+   "new": "if l.Type != auditchain.EventEvidence || attached[l.Scope+\"\\x00\"+l.Subject] || !InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {"
   },
   {
    "name": "Z84 пакет за окно: улики вне окна требуются тоже",
    "file": "internal/proof/window.go",
-   "old": "if l.Type == auditchain.EventEvidence && sources[l.Scope] && !attached[l.Scope+\"\\x00\"+l.Subject] && InWindow(time.Unix(0, l.UnixNano), from, to) {",
-   "new": "if l.Type == auditchain.EventEvidence && sources[l.Scope] && !attached[l.Scope+\"\\x00\"+l.Subject] {"
+   "old": "if l.Type != auditchain.EventEvidence || !sources[l.Scope] || attached[l.Scope+\"\\x00\"+l.Subject] || !InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {",
+   "new": "if l.Type != auditchain.EventEvidence || !sources[l.Scope] || attached[l.Scope+\"\\x00\"+l.Subject] {"
   },
   {
    "name": "Z85 -bodies без причины, почему записи окна закрыты",
@@ -3016,8 +3016,8 @@
   {
    "name": "Z130 запись месяца с меткой без улики проходит листом (P-77)",
    "file": "internal/proof/source.go",
-   "old": "\t\t\t\tif b.Subject != nil && !b.Subject.names(evidence.ScopeOf(b.Source, l.UnixNano)) {",
-   "new": "\t\t\t\tif b.Subject != nil {"
+   "old": "\t\t\t\tif withEvidence[scope] || b.Subject != nil && b.Subject.names(scope) {",
+   "new": "\t\t\t\tif withEvidence[scope] {"
   },
   {
    "name": "Z131 записи месяца без метки идут уликой с заголовком (P-77)",
@@ -3048,6 +3048,60 @@
    "file": "internal/proof/source.go",
    "old": "\t\t\t\tmonth(scope)\n\t\t\t\tr.SubjectNoLabel++\n",
    "new": "\t\t\t\tmonth(scope)\n"
+  },
+  {
+   "name": "Z137 пакет по источнику: в месяце с уликами запись приходит листом (P-80)",
+   "file": "internal/proof/source.go",
+   "old": "\t\t\t\tif withEvidence[scope] || b.Subject != nil && b.Subject.names(scope) {",
+   "new": "\t\t\t\tif b.Subject != nil && b.Subject.names(scope) {"
+  },
+  {
+   "name": "Z138 пакет за окно: в месяце с уликами запись приходит листом (P-80)",
+   "file": "internal/proof/window.go",
+   "old": "\t\tif scope := evidence.ScopeOf(l.Scope, l.UnixNano); !scopes[scope] {",
+   "new": "\t\tif scope := evidence.ScopeOf(l.Scope, l.UnixNano); scope != \"\" {"
+  },
+  {
+   "name": "Z139 -source -dek: месяц с закрытым ключом идёт уликами (P-80)",
+   "file": "internal/store/source.go",
+   "old": "\t\t\t\t\t} else if attach, err = openMonth(scope); err != nil {",
+   "new": "\t\t\t\t\t} else if _, err = openMonth(scope); err != nil {"
+  },
+  {
+   "name": "Z140 -window -dek: месяц с закрытым ключом идёт уликами (P-80)",
+   "file": "internal/store/window.go",
+   "old": "\t\tif !ok {\n\t\t\tcontinue\n\t\t}",
+   "new": "\t\tif !ok && false {\n\t\t\tcontinue\n\t\t}"
+  },
+  {
+   "name": "Z141 пакет одной улики с меткой стёртого месяца выдаётся без -show-label (P-80)",
+   "file": "internal/store/proofs.go",
+   "old": "\t\t\tif closed {\n\t\t\t\treturn proof.Bundle{}, fmt.Errorf(",
+   "new": "\t\t\tif false && closed {\n\t\t\t\treturn proof.Bundle{}, fmt.Errorf("
+  },
+  {
+   "name": "Z142 проверка пакета за окно не знает источник ключей (P-80)",
+   "file": "internal/proof/window.go",
+   "old": "\tif keysFor != \"\" {\n\t\tsources[keysFor] = true\n\t}\n",
+   "new": ""
+  },
+  {
+   "name": "Z143 проверка пакета по источнику не знает, что просили ключи (P-80)",
+   "file": "internal/proof/source.go",
+   "old": "if b.Subject != nil || b.WithKeys || slices.ContainsFunc(",
+   "new": "if b.Subject != nil || slices.ContainsFunc("
+  },
+  {
+   "name": "Z144 админка не слышит show_label (P-80)",
+   "file": "internal/server/server.go",
+   "old": "\t\tif r.URL.Query().Get(\"show_label\") == \"1\" {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "Z145 -bodies не называет месяцы, пришедшие листом (P-80)",
+   "file": "cmd/esverify/window.go",
+   "old": "\tif src.LeafOnly > 0 {\n\t\tnoBodies = leafOnlyNoBodies(src.LeafOnlyMonths)\n\t}",
+   "new": "\tif false {\n\t\tnoBodies = leafOnlyNoBodies(src.LeafOnlyMonths)\n\t}"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются. Q5 снята 07.11 как равносильная: ключи теперь только у записей окна, а запись из незаверенного хвоста легла после закрывающей метки, позже окна больше чем на WindowEdge, и в выдачу не попадёт; срез оставлен как явная граница. Z63 снята 07.11 вместе с веткой: тело без субъекта даёт пустое значение, а названное значение не пусто, поэтому сверка значений закрывает и этот случай. Z87 снята 07.11 как равносильная: перевод строки в любом тексте отказа гасит SourceReport.Text (Z99), а %q в отказе о теле оставлен ради читаемости значения."

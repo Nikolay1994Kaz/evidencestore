@@ -388,11 +388,20 @@ func (s *Server) AdminHandler() http.Handler {
 				return
 			}
 		}
-		b, err := s.store.ProofTo(r.URL.Query().Get("source"), seq, r.URL.Query().Get("dek") == "1", toHead)
+		proofOf := s.store.ProofTo
+		if r.URL.Query().Get("show_label") == "1" {
+			// Заголовок записи с меткой из месяца с закрытым ключом — только по
+			// явной просьбе (P-80).
+			proofOf = s.store.ProofShowingLabel
+		}
+		b, err := proofOf(r.URL.Query().Get("source"), seq, r.URL.Query().Get("dek") == "1", toHead)
 		if err != nil {
 			code := http.StatusInternalServerError
-			if errors.Is(err, store.ErrNotFound) {
+			switch {
+			case errors.Is(err, store.ErrNotFound):
 				code = http.StatusNotFound
+			case errors.Is(err, store.ErrLabelErased):
+				code = http.StatusConflict
 			}
 			writeErr(w, code, err)
 			return

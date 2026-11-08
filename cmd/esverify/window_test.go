@@ -822,3 +822,32 @@ func TestBodiesNameMonthsWithoutOpenBody(t *testing.T) {
 		t.Fatalf("честный пакет: код %d\n%s\n%s", code, out, errOut)
 	}
 }
+
+// P-80: пакет -source -dek и -window -dek, где весь месяц окна пришёл листом
+// (ключ ждёт уничтожения): -bodies называет месяц и причину, код 2 — записи в
+// окне есть, а тел нет.
+func TestBodiesLeafOnlyMonth(t *testing.T) {
+	w := newSubjectWorld(t)
+	scope := "agent/2026-10"
+	if err := w.s.Deactivate(true, scope); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.s.ScheduleDestroy(t.Context(), scope, time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
+		t.Fatal(err)
+	}
+	src, err := w.s.ProofSource("agent", w.from, w.to, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	win, err := w.s.ProofWindow(w.from, w.to, "agent", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, b := range map[string]any{"source": src, "window": win} {
+		code, out, errOut := w.run(t, w.file(t, name+".json", b), "-bodies", filepath.Join(w.dir, "bodies-"+name))
+		if code != exitUsage || !strings.Contains(errOut, `lie in months the bundle carries no evidence for ("agent/2026-10")`) ||
+			!strings.Contains(out, `come without their evidence ("agent/2026-10")`) {
+			t.Fatalf("%s: код %d\n%s\n%s", name, code, out, errOut)
+		}
+	}
+}

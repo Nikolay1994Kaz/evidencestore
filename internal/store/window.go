@@ -145,6 +145,7 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 		return proof.WindowBundle{}, err
 	}
 	if source != "" {
+		b.KeysFor = source
 		if b.Records, err = s.windowRecords(leaves[:certEnd-first], source, from, to); err != nil {
 			return proof.WindowBundle{}, err
 		}
@@ -154,12 +155,27 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 
 // windowRecords — улики источника с участка, полученные в окне, и ключи их
 // записей: записи участка вне окна остаются листьями (P-46). Ключ месяца
-// уничтожен или ждёт уничтожения — улика идёт без ключа: пакет доказывает её
-// существование и неизменность, только без тела.
+// уничтожен или ждёт уничтожения — записи месяца остаются листьями тоже: их
+// улики показали бы заголовки с метками, а тел нет (P-80). Решение одно на
+// месяц: месяц не расходится на улики и листья.
 func (s *Store) windowRecords(leaves []auditchain.Leaf, source string, from, to time.Time) ([]proof.WindowRecord, error) {
 	var out []proof.WindowRecord
+	open := map[string]bool{}
 	for _, l := range leaves {
 		if l.Type != auditchain.EventEvidence || l.Scope != source || !proof.InWindow(time.Unix(0, l.UnixNano), from, to) {
+			continue
+		}
+		scope := evidence.ScopeOf(source, l.UnixNano)
+		ok, seen := open[scope]
+		if !seen {
+			closed, err := s.monthClosed(scope)
+			if err != nil {
+				return nil, err
+			}
+			ok = !closed
+			open[scope] = ok
+		}
+		if !ok {
 			continue
 		}
 		pos, _, err := proof.ParseEvidenceLeaf(l)

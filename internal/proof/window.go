@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -90,6 +91,11 @@ type WindowBundle struct {
 	// Records — улики одного источника с участка и ключи их записей
 	// (proof -source S -dek).
 	Records []WindowRecord `json:"records,omitempty"`
+	// KeysFor — источник, для которого просили ключи (-window -source S -dek).
+	// Месяц с закрытым ключом хранилище отдаёт листом, и пакет, где так весь
+	// источник, без этой пометки не отличить от пакета без -dek. Пометка не
+	// подписана и меняет только заметки, не вердикт (P-80).
+	KeysFor string `json:"keys_for,omitempty"`
 }
 
 // WindowRecord — улика с участка и ключ её записи. Ключа нет — ключ месяца
@@ -175,6 +181,11 @@ type WindowReport struct {
 	Attached int
 	Bodies   []WindowBody
 	outside  int
+	// LeafOnly — записей окна у источника с приложенными уликами, пришедших
+	// листом: в их месяце пакет не несёт ни одной улики (P-80); LeafOnlyMonths
+	// — эти месяцы.
+	LeafOnly       int
+	LeafOnlyMonths []string
 	// GatewayRecords — приложенных улик из журнала гейтвея: их собственные
 	// проверки — в пакете одной улики.
 	GatewayRecords int
@@ -346,10 +357,10 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 
 	// 10. Приложенные улики — с заверенной части участка, тела вскрываются
 	// ключами записей.
-	if len(b.Records) > 0 {
+	if len(b.Records) > 0 || b.KeysFor != "" {
 		err := windowRecords(b.Records, certLeaves, &r)
 		if err == nil {
-			err = windowAttached(b.Records, certLeaves, r.From, r.To)
+			err = windowAttached(b.Records, b.KeysFor, certLeaves, &r)
 		}
 		r.Bodies = slices.DeleteFunc(r.Bodies, func(body WindowBody) bool {
 			out := !InWindow(time.Unix(0, body.ReceivedAt), r.From, r.To)
@@ -650,25 +661,42 @@ func unexplained(seqs []uint64, gaps []SeqRange) []SeqRange {
 // windowAttached: у источника с приложенными уликами приложены все его записи
 // окна (P-46), как в пакете по источнику: снятая улика прятала бы тело неудобной
 // записи. Окно — аудитора: шире окна пакета — и улик не хватит.
-func windowAttached(records []WindowRecord, leaves []auditchain.Leaf, from, to time.Time) error {
+func windowAttached(records []WindowRecord, keysFor string, leaves []auditchain.Leaf, r *WindowReport) error {
 	attached := map[string]bool{}
 	sources := map[string]bool{}
+	if keysFor != "" {
+		sources[keysFor] = true
+	}
+	// Месяцы источников, чьи улики пакет несёт: в таком месяце улика обязательна
+	// у каждой записи окна (P-46). Месяц источника без единой улики — листом:
+	// так хранилище отдаёт месяц, чей ключ уничтожен или ждёт уничтожения
+	// (P-80). Лист в пакете за окно и так целиком.
+	scopes := map[string]bool{}
 	for _, rec := range records {
 		sealed, err := evidence.Unmarshal(rec.Evidence)
 		if err != nil {
 			return err
 		}
 		sources[sealed.Source] = true
+		scopes[sealed.Scope()] = true
 		attached[sealed.Source+"\x00"+strconv.FormatUint(sealed.Seq, 10)] = true
 	}
+	leafMonths := map[string]bool{}
 	missing := 0
 	for _, l := range leaves {
-		if l.Type == auditchain.EventEvidence && sources[l.Scope] && !attached[l.Scope+"\x00"+l.Subject] && InWindow(time.Unix(0, l.UnixNano), from, to) {
-			missing++
+		if l.Type != auditchain.EventEvidence || !sources[l.Scope] || attached[l.Scope+"\x00"+l.Subject] || !InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {
+			continue
 		}
+		if scope := evidence.ScopeOf(l.Scope, l.UnixNano); !scopes[scope] {
+			r.LeafOnly++
+			leafMonths[scope] = true
+			continue
+		}
+		missing++
 	}
+	r.LeafOnlyMonths = slices.Sorted(maps.Keys(leafMonths))
 	if missing > 0 {
-		return fmt.Errorf("%d records received in the window come without their evidence: ask for a bundle over this window", missing)
+		return fmt.Errorf("%d records received in the window come without their evidence, in months whose other records the bundle does carry: ask for a bundle over this window", missing)
 	}
 	return nil
 }
@@ -739,6 +767,9 @@ func (r WindowReport) Notes() []string {
 	}
 	if keyless := r.Attached - len(r.Bodies) - r.outside; keyless > 0 {
 		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: %s", keyless, r.Attached, KeylessReasons))
+	}
+	if r.LeafOnly > 0 {
+		n = append(n, LeafOnlyNote(r.LeafOnly, r.LeafOnlyMonths))
 	}
 	if r.GatewayRecords > 0 {
 		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint signature) are in single-record bundles (evidencestore proof -source S -seq N)")

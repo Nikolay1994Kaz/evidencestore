@@ -86,7 +86,7 @@ func TestSubjectLabelDiesWithMonthKey(t *testing.T) {
 		}
 		if !strings.Contains(r.Text(), "lie in months the bundle names no label for (\"agent/2026-09\")") ||
 			!strings.Contains(r.Text(), "0 records under the label, the other 5 of the 5 in the window stay closed") ||
-			!strings.Contains(r.Text(), "5 records received in the window come without their evidence: they lie in months the bundle names no label for") {
+			!strings.Contains(r.Text(), `5 records received in the window come without their evidence ("agent/2026-09")`) {
 			t.Fatalf("отчёт молчит, почему записи ничьи:\n%s", r.Text())
 		}
 	}
@@ -357,9 +357,10 @@ func TestSubjectMonthWithoutOpenBodyIsNamed(t *testing.T) {
 	}
 }
 
-// P-77 (С5): метка a за сентябрь, выданная до стирания, после стирания ни с чем
-// не сопоставляется в пакетах по субъекту: записи стёртого месяца идут листом,
-// без заголовков. В пакете -source -dek заголовки остаются (docs/bundles.md).
+// P-77, P-80 (С5): метка a за сентябрь, выданная до стирания, после стирания ни
+// с чем не сопоставляется ни в одном пакете: записи стёртого месяца идут
+// листом, без заголовков, — в пакете по субъекту, -source -dek и -window -dek, а
+// пакет одной улики с меткой выдаётся только по явной просьбе (-show-label).
 func TestIssuedLabelFindsNothingAfterErasure(t *testing.T) {
 	s, c, _ := subjectStore(t)
 	from, to := clockAt(10, 1, 0), clockAt(10, 7, 30)
@@ -394,8 +395,106 @@ func TestIssuedLabelFindsNothingAfterErasure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if matches(dek) != 2 {
-		t.Fatal("пакет -source -dek: предел в docs/bundles.md описан не так, как есть")
+	if n := matches(dek); n != 0 {
+		t.Fatalf("пакет -source -dek: выданная метка a нашла %d записей", n)
+	}
+	if r := proof.VerifySource(sourceRoundTrip(t, dek), trustOf(t, s), time.Time{}, time.Time{}); !r.Valid() || r.LeafOnly != 5 {
+		t.Fatalf("пакет -source -dek стёртого месяца:\n%s", r.Text())
+	}
+	win, err := s.ProofWindow(from, to, "agent", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range win.Records {
+		if sealed, _ := evidence.Unmarshal(rec.Evidence); string(sealed.Subject[:]) == string(issued) {
+			t.Fatal("пакет -window -dek: выданная метка a нашла запись")
+		}
+	}
+	if r := proof.VerifyWindow(roundTrip(t, win), trustOf(t, s), time.Time{}, time.Time{}); !r.Valid() || r.LeafOnly != 5 || len(win.Records) != 0 {
+		t.Fatalf("пакет -window -dek стёртого месяца:\n%s", r.Text())
+	}
+
+	// Пакет одной улики: запись с меткой стёртого месяца — отказ с причиной;
+	// по явной просьбе — выдаётся, заголовок с меткой виден, пакет проходит.
+	if _, err := s.Proof("agent", 3, true); !errors.Is(err, ErrLabelErased) || !strings.Contains(err.Error(), "-show-label") {
+		t.Fatalf("пакет одной улики с меткой стёртого месяца: %v", err)
+	}
+	shown, err := s.ProofShowingLabel("agent", 3, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed, _ := evidence.Unmarshal(shown.Evidence); string(sealed.Subject[:]) != string(issued) || len(shown.DEK) != 0 {
+		t.Fatal("пакет -show-label: не та запись или ключ стёртого месяца")
+	}
+	if r := proof.Verify(shown, trustOf(t, s)); !r.Valid() {
+		t.Fatalf("пакет -show-label не проходит: %+v", r.Checks)
+	}
+	// Запись без метки (5) того же месяца выдаётся как раньше: её заголовок
+	// после стирания ни на кого не указывает.
+	if _, err := s.Proof("agent", 5, false); err != nil {
+		t.Fatalf("запись без метки стёртого месяца: %v", err)
+	}
+}
+
+// P-80: правило листьев по месяцам. Пакет -source -dek и -window -dek через
+// границу месяцев: снять улику одной записи живого месяца нельзя (P-46); снять
+// улики всего месяца можно — так выглядит стёртый месяц, и отчёт это называет.
+func TestDekBundleMonthIsWholeOrLeaves(t *testing.T) {
+	s, _, from, to := monthStore(t)
+	trust := trustOf(t, s)
+	src, err := s.ProofSource("agent", from, to, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	octSeq := func(rec proof.SourceRecord) bool {
+		return rec.Leaf.Leaf.UnixNano >= time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	}
+	// Одна запись октября без улики, другая с уликой — отказ.
+	f := sourceRoundTrip(t, src)
+	for i := range f.Records {
+		if octSeq(f.Records[i]) && len(f.Records[i].Evidence) > 0 {
+			f.Records[i].Evidence, f.Records[i].DEK = nil, nil
+			break
+		}
+	}
+	sourceFailed(t, proof.VerifySource(sourceRoundTrip(t, f), trust, time.Time{}, time.Time{}), "the records attached")
+	// Весь октябрь без улик — проходит, октябрь назван.
+	f = sourceRoundTrip(t, src)
+	for i := range f.Records {
+		if octSeq(f.Records[i]) {
+			f.Records[i].Evidence, f.Records[i].DEK = nil, nil
+		}
+	}
+	r := proof.VerifySource(sourceRoundTrip(t, f), trust, time.Time{}, time.Time{})
+	if !r.Valid() || r.LeafOnly != 2 || !slices.Equal(r.LeafOnlyMonths, []string{"agent/2026-10"}) ||
+		!strings.Contains(r.Text(), "that the key is gone is the store's word") {
+		t.Fatalf("весь октябрь листом:\n%s", r.Text())
+	}
+
+	// То же у пакета за окно.
+	win, err := s.ProofWindow(from, to, "agent", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	october := func(rec proof.WindowRecord) bool {
+		sealed, _ := evidence.Unmarshal(rec.Evidence)
+		return sealed.Scope() == "agent/2026-10"
+	}
+	w := roundTrip(t, win)
+	for i, rec := range w.Records {
+		if october(rec) {
+			w.Records = slices.Delete(w.Records, i, i+1)
+			break
+		}
+	}
+	if r := proof.VerifyWindow(roundTrip(t, w), trust, time.Time{}, time.Time{}); r.Valid() {
+		t.Fatalf("пакет за окно без одной записи октября прошёл:\n%s", r.Text())
+	}
+	w = roundTrip(t, win)
+	w.Records = slices.DeleteFunc(w.Records, october)
+	if r := proof.VerifyWindow(roundTrip(t, w), trust, time.Time{}, time.Time{}); !r.Valid() || r.LeafOnly != 2 ||
+		!slices.Equal(r.LeafOnlyMonths, []string{"agent/2026-10"}) {
+		t.Fatalf("пакет за окно, октябрь листом:\n%s", r.Text())
 	}
 }
 
@@ -499,5 +598,34 @@ func TestBackupDownDoesNotBlockSubjectBundles(t *testing.T) {
 	}
 	if kind(labelErr) != kind(plainErr) {
 		t.Fatalf("приём с меткой и без расходится: %v / %v", labelErr, plainErr)
+	}
+}
+
+// P-80: пакет -window -source S -dek называет листом только записи S: записи
+// других источников окна лежат в нём листьями всегда, и стёртым месяцем их
+// называть нельзя.
+func TestWindowDekLeavesOnlyItsSource(t *testing.T) {
+	c := newClock()
+	s := openStore(t, testConfig(t, withSubjects), c)
+	if _, err := s.Ingest("agent", []Incoming{{Seq: 1, Body: subjectLine("a", "до окна")}}); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s)
+	c.add(5 * time.Minute)
+	if _, err := s.Ingest("agent", []Incoming{{Seq: 2, Body: subjectLine("a", "в окне")}}); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 2, 3)
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustStampNow(t, s)
+	b, err := s.ProofWindow(clockAt(10, 4, 0), clockAt(10, 6, 0), "agent", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.VerifyWindow(roundTrip(t, b), trustOf(t, s), time.Time{}, time.Time{})
+	if !r.Valid() || r.Attached != 1 || r.LeafOnly != 0 || strings.Contains(r.Text(), "come without their evidence") {
+		t.Fatalf("записи abs-core названы листом стёртого месяца:\n%s", r.Text())
 	}
 }

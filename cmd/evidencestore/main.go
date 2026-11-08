@@ -253,6 +253,7 @@ func cmdProof(args []string) error {
 	to := fs.String("to", "", "a window of time: up to this time (RFC 3339)")
 	window := fs.Bool("window", false, "with -from and -to: every source in the window, not one (for an investigation inside the organization)")
 	subject := fs.String("subject", "", "with -source, -from and -to: open the records of this subject only (the value of the source's subject_field); the other records of the window stay closed")
+	showLabel := fs.Bool("show-label", false, "with -seq: issue the bundle also for a record with a subject label whose month key is destroyed or awaits destruction; its header, the label in it, is shown (a dispute over the collector's promise)")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
 		return err
@@ -270,6 +271,9 @@ func cmdProof(args []string) error {
 	if *from != "" || *to != "" || *window || *subject != "" {
 		if *from == "" || *to == "" || *seq != 0 {
 			return errors.New("proof: a window takes both -from and -to, and no -seq")
+		}
+		if *showLabel {
+			return errors.New("proof: -show-label is for a single-record bundle (-source S -seq N): a window bundle sends a month whose key is closed as leaves")
 		}
 		if *subject != "" && (*window || *source == "") {
 			return errors.New("proof: -subject takes one source: -source S, without -window")
@@ -305,6 +309,9 @@ func cmdProof(args []string) error {
 	q := url.Values{"source": {*source}, "seq": {fmt.Sprint(*seq)}}
 	if *dek {
 		q.Set("dek", "1")
+	}
+	if *showLabel {
+		q.Set("show_label", "1")
 	}
 	if *toHead > 0 {
 		q.Set("to_head", fmt.Sprint(*toHead))
