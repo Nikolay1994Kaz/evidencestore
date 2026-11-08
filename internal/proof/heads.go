@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -43,16 +45,19 @@ type Witness struct {
 // отверг: сборщик положил её в файл расхождений, потому что она не продолжает
 // принятую им. Такая голова — улика второй истории, а не голова свидетеля:
 // запись она не закрепляет, а пакет, который с ней сходится, не проходит.
-// Received — когда свидетель получил голову: received_at сборщика; у головы
-// из S3 — время её версии из списка версий (AddFile). Ноль — неизвестно.
+// Received — когда свидетель получил голову: received_at сборщика. У головы
+// из файла, который нашёл свою версию в списке версий S3, в счёт идёт только
+// время версии: содержимое объекта пишет тот, у кого ключи записи (P-96).
+// Ноль — неизвестно.
 type PublishedHead struct {
 	Name       string
 	Checkpoint Checkpoint
 	Refused    bool
 	Received   time.Time
-	// digest — MD5 файла, где голова лежит одна: так голова из S3 находит
-	// свою версию в списке (ETag одной записи PUT).
-	digest string
+	// file — файл, откуда голова (у строк журнала Name — «файл:строка»);
+	// digest — его MD5: по нему (ETag одной записи PUT) или по имени файла
+	// голова из S3 находит свою версию в списке.
+	file, digest string
 }
 
 // HeadVersion — версия объекта головы у свидетеля S3: ключ, номер головы из
@@ -67,18 +72,18 @@ type HeadVersion struct {
 }
 
 // AddFile — файл из каталога голов: список версий S3 или головы (ParseHeads).
-// Голова, которая лежит в файле одна (объект S3, скачанный по версии),
-// запоминает MD5 файла: по нему или по номеру версии в имени файла она
-// найдёт свою версию в списке.
+// Каждая голова файла запоминает его MD5: по нему или по имени файла объект
+// S3, скачанный по версии, найдёт свою версию в списке — и тогда, когда в нём
+// не одна голова или мусор (P-96).
 func (w *Witness) AddFile(name string, data []byte) {
 	if vs, ok := parseHeadVersions(data); ok {
 		w.Versions = append(w.Versions, vs...)
 		return
 	}
+	sum := md5.Sum(data)
 	hs := ParseHeads(name, data)
-	if len(hs) == 1 {
-		sum := md5.Sum(data)
-		hs[0].digest = hex.EncodeToString(sum[:])
+	for i := range hs {
+		hs[i].file, hs[i].digest = name, hex.EncodeToString(sum[:])
 	}
 	w.Heads = append(w.Heads, hs...)
 }
@@ -215,16 +220,25 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	// — MD5 файла или номер версии — в имени файла; из нескольких версий —
 	// самая ранняя (P-21). Версия, нашедшая файл, — не неизвестная, даже если
 	// файл не голова: мусор, положенный поверх головы, сверку не ломает (P-93).
+	// Версии ищутся по ETag и по номеру версии — имени файла без «.json»,
+	// точно: подстрока совпала бы и с чужим номером (у всех версий, записанных
+	// до включения версий, он «null»), а перебор списка на каждый файл — год
+	// голов раз в минуту, полмиллиона версий, — шёл бы часами (P-95).
 	matched := make([]bool, len(w.Versions))
-	received := func(h PublishedHead) time.Time {
-		at := h.Received
+	byETag, byID := map[string][]int{}, map[string][]int{}
+	for i, v := range w.Versions {
+		byETag[v.ETag] = append(byETag[v.ETag], i)
+		if v.VersionID != "" && v.VersionID != "null" {
+			byID[v.VersionID] = append(byID[v.VersionID], i)
+		}
+	}
+	fromS3 := func(h PublishedHead) (at time.Time) {
 		if h.digest == "" {
 			return at
 		}
-		for i, v := range w.Versions {
-			if v.ETag != h.digest && (v.VersionID == "" || !strings.Contains(h.Name, v.VersionID)) {
-				continue
-			}
+		name := strings.TrimSuffix(filepath.ToSlash(h.file), ".json")
+		for _, i := range slices.Concat(byETag[h.digest], byID[name], byID[path.Base(name)]) {
+			v := w.Versions[i]
 			matched[i] = true
 			if at.IsZero() || v.At.Before(at) {
 				at = v.At
@@ -236,13 +250,14 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	// Силу имеют только головы, подписанные ключом хранилища: чужие и
 	// испорченные файлы ничего не доказывают ни за, ни против. Под одним
 	// номером бывает больше одной головы: тогда хранилище подписало две версии
-	// цепи, и сохраняются все. Одна голова в нескольких файлах — одна, с самым
-	// ранним временем получения.
+	// цепи, и сохраняются все. Каждую голову видел свой свидетель (sightingOf):
+	// по ним — закрепление ниже.
 	versions := map[uint64][]PublishedHead{}
 	var refused []PublishedHead
+	var seen []sighting
 	signed := 0
 	for _, h := range w.Heads {
-		h.Received = received(h)
+		s3 := fromS3(h)
 		if VerifyCheckpoint(h.Checkpoint, key) != nil {
 			continue
 		}
@@ -251,15 +266,10 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			refused = append(refused, h)
 			continue
 		}
+		seen = append(seen, sightingOf(h, s3))
 		seq, known := h.Checkpoint.Size, false
-		for i, v := range versions[seq] {
-			if !bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root) {
-				continue
-			}
-			known = true
-			if !h.Received.IsZero() && (v.Received.IsZero() || h.Received.Before(v.Received)) {
-				versions[seq][i].Received = h.Received
-			}
+		for _, v := range versions[seq] {
+			known = known || bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root)
 		}
 		if !known {
 			versions[seq] = append(versions[seq], h)
@@ -317,46 +327,68 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	}
 	r.WitnessRefused = len(refused)
 
-	// Улику закрепляет голова свидетеля не раньше её звена (и не раньше
-	// первого звена пакета), которую свидетель получил первой: переписать
-	// цепь после этого — разойтись с ней. Не первая по номеру: держатель
+	// Каждый свидетель закрепляет запись сам: голова не раньше её звена (и не
+	// раньше первого звена пакета), которую он получил первой, — переписать
+	// цепь после этого значит разойтись с ней. Не первая по номеру: держатель
 	// sign.key и ключей свидетеля кладёт позже голову под свободным номером
-	// между звеном и ней, и такая голова пришла к свидетелю позже (P-21).
-	// При равном времени — бо́льший номер: пакет до него длиннее, и только.
-	// Пакет обязан дойти до закрепляющей.
+	// между звеном и ней, и такая голова пришла к свидетелю позже (P-21). При
+	// равном времени — бо́льший номер: пакет до него длиннее, и только. У
+	// свидетеля без времени — первая по номеру, с заметкой. Пакет обязан дойти
+	// до головы каждого свидетеля и сойтись с ней. Одна «первая» на всех
+	// свидетелей отдала бы запись голове, которую противник положил к одному
+	// свидетелю (S3) раньше, чем другой (сборщик пишет журнал раз в
+	// checkpoint_every) записал честную: добавленный свидетель ослаблял бы
+	// сверку (P-94).
 	lo := max(evLink, first)
-	var fix uint64
-	var fixAt time.Time
-	for _, seq := range seqs {
-		for _, h := range versions[seq] {
-			if seq < lo || h.Received.IsZero() {
-				continue
+	pins := map[string]sighting{}
+	for _, s := range seen {
+		p, ok := pins[s.witness]
+		switch {
+		case s.seq < lo:
+		case !ok:
+			pins[s.witness] = s
+		case s.at.IsZero():
+			if s.seq < p.seq {
+				pins[s.witness] = s
 			}
-			if fixAt.IsZero() || h.Received.Before(fixAt) || h.Received.Equal(fixAt) && seq > fix {
-				fix, fixAt = seq, h.Received
-			}
+		case s.at.Before(p.at) || s.at.Equal(p.at) && s.seq > p.seq:
+			pins[s.witness] = s
 		}
 	}
+	var fix uint64
+	var fixAt, s3At time.Time
+	untimed := false
+	names := make([]string, 0, len(pins))
+	for name, p := range pins {
+		names = append(names, name)
+		untimed = untimed || p.at.IsZero()
+		if p.seq > fix || p.seq == fix && !p.at.IsZero() && (fixAt.IsZero() || p.at.Before(fixAt)) {
+			fix, fixAt = p.seq, p.at
+		}
+		if p.s3 && p.at.After(s3At) {
+			s3At = p.at
+		}
+	}
+	sort.Strings(names)
 	// Версия из списка без файла: её голова неизвестна. Лежит она на участке
-	// пакета или получена не позже закрепляющей — сверке её не хватает, и её
-	// надо скачать.
+	// пакета или получена не позже головы, которую S3 получил первой, —
+	// сверке её не хватает, и её надо скачать.
 	for i, v := range w.Versions {
 		if matched[i] || err != nil {
 			continue
 		}
-		if first <= v.Size && v.Size <= last || v.Size >= lo && (fixAt.IsZero() || !v.At.After(fixAt)) {
-			err = fmt.Errorf("the S3 versions list names %s version %q, received at %s, and no file in the heads directory is that version (its MD5 is the ETag of a single-part upload, or its name holds the version ID): download every version of the heads, each to a file named after its version ID (aws s3api get-object --version-id)", v.Key, v.VersionID, fmtTime(v.At))
+		if first <= v.Size && v.Size <= last || v.Size >= lo && (s3At.IsZero() || !v.At.After(s3At)) {
+			err = fmt.Errorf("the S3 versions list names %s version %q, received at %s, and no file in the heads directory is that version (its MD5 is the ETag of a single-part upload, or its name is the version ID with .json): download every version of the heads, each to a file named after its version ID (aws s3api get-object --version-id)", v.Key, v.VersionID, fmtTime(v.At))
 		}
 	}
-	i := sort.Search(len(seqs), func(i int) bool { return seqs[i] >= lo })
 	switch {
 	case err != nil:
-	case fixAt.IsZero() && i == len(seqs):
+	case len(pins) == 0:
 		r.WitnessNone = true
-	case fixAt.IsZero():
-		// Ни у одной головы не раньше звена нет времени получения: первая по
-		// номеру, с замечанием (P-21).
-		fix, r.WitnessUntimed = seqs[i], true
+	case untimed:
+		// У свидетеля без времени получения закрепляет первая по номеру — с
+		// заметкой (P-21), даже если у других время есть (P-94).
+		r.WitnessUntimed = true
 	}
 	switch {
 	case err != nil || r.WitnessNone:
@@ -370,10 +402,55 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 		counted += fmt.Sprintf(", %d versions in the S3 versions list", len(w.Versions))
 	}
 	detail := "the witness has no head at or after the record's link yet; " + counted
-	if r.WitnessHead != 0 {
+	switch {
+	case r.WitnessHead != 0 && len(pins) > 1:
+		each := make([]string, 0, len(names))
+		for _, name := range names {
+			each = append(each, pins[name].String())
+		}
+		detail = fmt.Sprintf("head %d, the last of the heads each witness received first (%s); %s", r.WitnessHead, strings.Join(each, "; "), counted)
+	case r.WitnessHead != 0:
 		detail = fmt.Sprintf("head %d, which the witness %s; %s", r.WitnessHead, receivedFirst(fixAt), counted)
 	}
 	add("the chain in the bundle agrees with the heads the witness saw", err, detail)
+}
+
+// sighting — голова, какой её видел один свидетель: witness — кто (откуда
+// время и в каком подкаталоге файл), at — когда он её получил (ноль — без
+// времени), s3 — время из списка версий S3.
+type sighting struct {
+	witness string
+	seq     uint64
+	at      time.Time
+	s3      bool
+}
+
+// sightingOf — свидетель головы h: у каждого свои часы. S3 — время версии из
+// списка версий, сборщик — received_at его журнала, иначе — без времени;
+// каждый — в своём подкаталоге каталога голов.
+func sightingOf(h PublishedHead, s3 time.Time) sighting {
+	file := h.file
+	if file == "" {
+		file = h.Name
+	}
+	dir := path.Dir(filepath.ToSlash(file))
+	if dir == "." {
+		dir = "the heads directory"
+	}
+	switch {
+	case !s3.IsZero():
+		return sighting{"S3 (versions list) in " + dir, h.Checkpoint.Size, s3, true}
+	case !h.Received.IsZero():
+		return sighting{"the collector's journal in " + dir, h.Checkpoint.Size, h.Received, false}
+	}
+	return sighting{"heads without a time of receipt in " + dir, h.Checkpoint.Size, time.Time{}, false}
+}
+
+func (s sighting) String() string {
+	if s.at.IsZero() {
+		return fmt.Sprintf("%s: head %d, first by number", s.witness, s.seq)
+	}
+	return fmt.Sprintf("%s: head %d, received first at %s", s.witness, s.seq, fmtTime(s.at))
 }
 
 // receivedFirst — как голова стала закрепляющей: первой полученной (со
@@ -385,7 +462,7 @@ func receivedFirst(at time.Time) string {
 	return "received first, at " + fmtTime(at)
 }
 
-// WitnessUntimedNote — голов свидетеля со временем получения нет, и запись
-// закрепила первая по номеру: голову под свободным номером, положенную
-// позже, сверка не отличит (P-21).
-const WitnessUntimedNote = "the witness's heads at or after this point carry no time of receipt, so the first by number fixes it: a head added to the witness later under an unused number would be taken instead (P-21). Put the S3 versions list next to the heads (aws s3api list-object-versions … > DIR/versions.json, every version of the heads downloaded), or use a collector's head journal, which carries received_at; otherwise check the receipt times yourself (docs/copy-and-witness.md)"
+// WitnessUntimedNote — у свидетеля без времени получения запись закрепила
+// первая по номеру: голову под свободным номером, положенную позже, сверка
+// не отличит (P-21).
+const WitnessUntimedNote = "heads of a witness at or after this point carry no time of receipt, so for that witness the first by number fixes it: a head added to the witness later under an unused number would be taken instead (P-21). Put the S3 versions list next to the heads (aws s3api list-object-versions … > DIR/versions.json, every version of the heads downloaded), or use a collector's head journal, which carries received_at; otherwise check the receipt times yourself (docs/copy-and-witness.md)"
