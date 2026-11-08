@@ -23,9 +23,26 @@ func (s *Store) Proof(source string, seq uint64, withDEK bool) (proof.Bundle, er
 	return s.ProofTo(source, seq, withDEK, 0)
 }
 
+// ErrLabelErased — запись с меткой субъекта из месяца, чей ключ уничтожен или
+// ждёт уничтожения: пакет одной улики показал бы её заголовок, а с ним метку, и
+// метка, выданная до стирания, нашла бы по нему клиента (P-80).
+var ErrLabelErased = errors.New("store: the record carries a subject label, and its month key is destroyed or awaits destruction")
+
 // ProofTo — то же, но пакет доходит не меньше чем до головы toHead: до той,
-// что видел свидетель, когда она позже конца пакета (esverify -heads).
+// что видел свидетель, когда она позже конца пакета (esverify -heads). Запись с
+// меткой из месяца с закрытым ключом не выдаётся (ErrLabelErased); выдать её
+// заголовок, когда он нужен (спор об обещании сборщика), — ProofShowingLabel.
 func (s *Store) ProofTo(source string, seq uint64, withDEK bool, toHead uint64) (proof.Bundle, error) {
+	return s.proofTo(source, seq, withDEK, toHead, false)
+}
+
+// ProofShowingLabel — пакет одной улики и для записи с меткой из месяца с
+// закрытым ключом: по явной просьбе оператора (proof -show-label).
+func (s *Store) ProofShowingLabel(source string, seq uint64, withDEK bool, toHead uint64) (proof.Bundle, error) {
+	return s.proofTo(source, seq, withDEK, toHead, true)
+}
+
+func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, showLabel bool) (proof.Bundle, error) {
 	s.mu.Lock()
 	st, ok := s.sources[source]
 	var pos uint64
@@ -39,6 +56,19 @@ func (s *Store) ProofTo(source string, seq uint64, withDEK bool, toHead uint64) 
 	data, err := s.evlog.Read(pos)
 	if err != nil {
 		return proof.Bundle{}, err
+	}
+	// labelled — месяц записи с меткой: её пакет выдаётся, только пока ключ
+	// месяца жив (P-80). Проверка одна, в конце выдачи: ключ могли закрыть,
+	// пока пакет собирался (P-86).
+	var labelled string
+	if !showLabel {
+		sealed, err := evidence.Unmarshal(data)
+		if err != nil {
+			return proof.Bundle{}, err
+		}
+		if !sealed.Subject.IsZero() {
+			labelled = sealed.Scope()
+		}
 	}
 	b := proof.Bundle{Version: proof.Version, Evidence: data}
 
@@ -143,7 +173,25 @@ func (s *Store) ProofTo(source string, seq uint64, withDEK bool, toHead uint64) 
 			return proof.Bundle{}, err
 		}
 	}
+	if labelled != "" {
+		if err := s.recheckOpen([]string{labelled}); errors.Is(err, ErrReissue) {
+			return proof.Bundle{}, s.labelErased(source, seq)
+		} else if err != nil {
+			return proof.Bundle{}, err
+		}
+	}
 	return b, nil
+}
+
+// labelErased — отказ пакету одной улики для записи с меткой из месяца с
+// закрытым ключом. Совет взять пакет за окно — только когда у хранилища есть
+// TSA: без меток окна не собрать (E3-02).
+func (s *Store) labelErased(source string, seq uint64) error {
+	alt := "a one-source bundle over a window around it proves the record as a leaf, without the header; "
+	if s.tsaURL == "" && s.tsaLocal == nil {
+		alt = ""
+	}
+	return fmt.Errorf("%w: %s/%d: a single-record bundle shows the record header, the label in it, and a label handed out before the erasure would find the client by it; %sif the header must be shown (a dispute over the collector's promise), ask with -show-label", ErrLabelErased, source, seq, alt)
 }
 
 // inclusionLocked — лист с номером leaf и путь до корня его звена.

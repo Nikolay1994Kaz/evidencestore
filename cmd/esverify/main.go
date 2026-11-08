@@ -72,7 +72,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
-		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage, an unreadable key, certificate or promise file or heads directory, -body for a bundle without the record key, or -bodies for a bundle that opens no body though the window holds records (with no records to write it says so, and the code is 0)")
+		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage, an unreadable key, certificate or promise file or heads directory, -body for a bundle without the record key, or -bodies for a bundle that opens no body though the window holds the records asked for (when it holds none — no records, none under the subject's label, or only months the bundle names no label for — it says so, and the code is 0)")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -193,7 +193,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// байт: Text экранирует управляющие символы, а журнал поднимают
 		// ровно из тех байтов, что прислал источник.
 		if !report.BodyOpened {
-			fmt.Fprintln(stderr, "error: -body: the bundle carries no record key (request it with evidencestore proof -dek) or the month key was destroyed: there is no body to write")
+			fmt.Fprintln(stderr, "error: -body: the bundle carries no record key, and there is no body to write: it was asked without -dek (then request it with evidencestore proof -dek), the month key is destroyed or awaits destruction, the key was removed from this bundle, or the store held it back")
 			return exitUsage
 		}
 		// Тело — содержимое улики: файл только владельцу.

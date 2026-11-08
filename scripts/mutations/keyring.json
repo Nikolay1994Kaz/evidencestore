@@ -375,6 +375,12 @@
    "file": "internal/keyring/envelope.go",
    "old": "\tif string(envelope[:len(envelopeTag)]) != envelopeTag {",
    "new": "\tif t := string(envelope[:len(envelopeTag)]); t != envelopeTag && t != \"EV1\" {"
+  },
+  {
+   "name": "Z135 вывод ключа ждёт резерва и блокирует чтение пакетов (мелко 08.11)",
+   "file": "internal/keyring/derive.go",
+   "old": "\tcase e.state == Pending:\n\t\treturn out, ErrKeyPending\n\t}\n",
+   "new": "\tcase e.state == Pending:\n\t\treturn out, ErrKeyPending\n\tcase e.gen > k.safe:\n\t\treturn out, ErrNotBackedUp\n\t}\n"
   }
  ]
 }

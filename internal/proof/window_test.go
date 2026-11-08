@@ -410,7 +410,13 @@ func TestWindowKindAndVersion(t *testing.T) {
 			t.Fatalf("пакет одной улики версии %d: отказ без пояснения о прежнем выпуске или пояснение не к месту: %v", v, err)
 		}
 	}
-	if _, err := ParseWindow(bytes.Replace(data, []byte(`"v":4`), []byte(`"v":3`), 1)); err == nil || !strings.Contains(err.Error(), "esverify of that release") {
+	// Версия 4 выпуска не имела (сборка 07.11): советовать esverify «того
+	// выпуска» нельзя. Версия 3 — v0.4.0, совет к месту.
+	if _, err := ParseWindow(bytes.Replace(data, []byte(`"v":5`), []byte(`"v":4`), 1)); err == nil ||
+		!strings.Contains(err.Error(), "never released") || strings.Contains(err.Error(), "esverify of that release") {
+		t.Fatalf("пакет за окно версии 4: %v", err)
+	}
+	if _, err := ParseWindow(bytes.Replace(data, []byte(`"v":5`), []byte(`"v":3`), 1)); err == nil || !strings.Contains(err.Error(), "esverify of that release") {
 		t.Fatalf("пакет за окно версии 3: %v", err)
 	}
 	if _, err := ParseWindow(data); err != nil {

@@ -6,6 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"io"
+	"strconv"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Метка субъекта (DECISIONS, п. 32). Один источник — один агент, а записи в нём
@@ -56,7 +59,9 @@ func NewSubjectTag(key []byte, source, field, value string) SubjectTag {
 //
 // ok = false — субъекта назвать нельзя: тело не целый JSON-объект, поля нет или
 // оно другого типа, значение пустое или длиннее MaxSubjectLen, поле названо
-// дважды (чья это запись — неясно). Такая запись остаётся без метки.
+// дважды (чья это запись — неясно), строка не в UTF-8 или с одиночным
+// суррогатом (разбор подменил бы их на U+FFFD, и разные значения стали бы одним
+// субъектом, T-01). Такая запись остаётся без метки.
 func SubjectOf(body []byte, field string) (string, bool) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -81,17 +86,22 @@ func SubjectOf(body []byte, field string) (string, bool) {
 			return "", false
 		}
 		found = true
-		tok, err := dec.Token()
-		if err != nil {
+		// Значение — как записано: строку разбор отдал бы уже с U+FFFD вместо
+		// чужих байтов, и сверить её с телом «как записано» было бы нечем.
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
 			return "", false
 		}
-		switch v := tok.(type) {
-		case string:
-			value = v
-		case json.Number:
-			value = v.String()
+		switch {
+		case raw[0] == '"':
+			if !validRawString(raw) || json.Unmarshal(raw, &value) != nil {
+				return "", false
+			}
+		case raw[0] == '-' || raw[0] >= '0' && raw[0] <= '9':
+			// Число — его запись, как её отдал бы json.Number.
+			value = string(raw)
 		default:
-			// Вложенное значение: Token отдал скобку, остаток объекта не разобрать.
+			// null, true, false, объект, массив.
 			return "", false
 		}
 	}
@@ -106,4 +116,50 @@ func SubjectOf(body []byte, field string) (string, bool) {
 		return "", false
 	}
 	return value, true
+}
+
+// ValidSubject — значение, которое метку получить может: UTF-8. Им хранилище
+// проверяет субъекта, о котором просят пакет (T-01).
+func ValidSubject(v string) bool { return utf8.ValidString(v) }
+
+// validRawString — строка JSON (с кавычками) в UTF-8, и каждая \u-половина
+// суррогата — в паре. Разбор json заменяет и то и другое на U+FFFD.
+func validRawString(raw []byte) bool {
+	if !utf8.Valid(raw) {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		if i+1 < len(raw) && raw[i+1] != 'u' {
+			// \n, \", \\ и прочие: байт после них — не начало escape.
+			i++
+			continue
+		}
+		hi, ok := escapeAt(raw, i)
+		if !ok {
+			return false
+		}
+		i += 5
+		if !utf16.IsSurrogate(rune(hi)) {
+			continue
+		}
+		// Старшая половина — только с младшей следом; младшая одна — нет.
+		lo, ok := escapeAt(raw, i+1)
+		if hi >= 0xDC00 || !ok || lo < 0xDC00 || lo >= 0xE000 {
+			return false
+		}
+		i += 6
+	}
+	return true
+}
+
+// escapeAt — код \uXXXX, который начинается с raw[i].
+func escapeAt(raw []byte, i int) (uint16, bool) {
+	if i+6 > len(raw) || raw[i] != '\\' || raw[i+1] != 'u' {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(string(raw[i+2:i+6]), 16, 16)
+	return uint16(v), err == nil
 }

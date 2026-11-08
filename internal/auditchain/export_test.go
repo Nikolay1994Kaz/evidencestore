@@ -122,25 +122,3 @@ func TestVerifyStatement_RejectsRandomKeyOfRightSize(t *testing.T) {
 		t.Fatal("заявление прошло проверку случайным ключом")
 	}
 }
-
-// Выведенный ключ детерминирован, свой на домен и не совпадает с семенем.
-func TestDeriveKey(t *testing.T) {
-	s, err := LoadOrCreateSigner(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := s.DeriveKey("evidencestore/test/a")
-	if a != s.DeriveKey("evidencestore/test/a") {
-		t.Fatal("ключ не детерминирован")
-	}
-	if a == s.DeriveKey("evidencestore/test/b") {
-		t.Fatal("домены не разделены")
-	}
-	other, err := LoadOrCreateSigner(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a == other.DeriveKey("evidencestore/test/a") {
-		t.Fatal("ключ не зависит от ключа подписи")
-	}
-}

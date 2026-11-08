@@ -16,6 +16,11 @@ import (
 // ещё нет или листьев больше предела. Админка отвечает 400.
 var ErrWindow = errors.New("store: window")
 
+// ErrReissue — ключ месяца, отданного уликами, закрыли, пока пакет собирался:
+// пакет не выдан, и повторный запрос отдаст этот месяц листом (P-86). Админка
+// отвечает 409.
+var ErrReissue = errors.New("store: a month key was closed while the bundle was being issued")
+
 // maxWindowLeaves — предел листьев в пакете за окно: пакет собирается и
 // отдаётся целиком в памяти. Больше — окно просят разбить. Переменная —
 // чтобы тест проверил отказ без четверти миллиона записей.
@@ -145,7 +150,11 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 		return proof.WindowBundle{}, err
 	}
 	if source != "" {
-		if b.Records, err = s.windowRecords(leaves[:certEnd-first], source, from, to); err != nil {
+		b.KeysFor = source
+		// Листья и звенья от ключей не зависят: заново — только улики (P-86).
+		if b.Records, err = reissue(func() ([]proof.WindowRecord, error) {
+			return s.windowRecords(leaves[:certEnd-first], source, from, to)
+		}); err != nil {
 			return proof.WindowBundle{}, err
 		}
 	}
@@ -154,12 +163,27 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 
 // windowRecords — улики источника с участка, полученные в окне, и ключи их
 // записей: записи участка вне окна остаются листьями (P-46). Ключ месяца
-// уничтожен или ждёт уничтожения — улика идёт без ключа: пакет доказывает её
-// существование и неизменность, только без тела.
+// уничтожен или ждёт уничтожения — записи месяца остаются листьями тоже: их
+// улики показали бы заголовки с метками, а тел нет (P-80). Решение одно на
+// месяц: месяц не расходится на улики и листья.
 func (s *Store) windowRecords(leaves []auditchain.Leaf, source string, from, to time.Time) ([]proof.WindowRecord, error) {
 	var out []proof.WindowRecord
+	open := map[string]bool{}
 	for _, l := range leaves {
 		if l.Type != auditchain.EventEvidence || l.Scope != source || !proof.InWindow(time.Unix(0, l.UnixNano), from, to) {
+			continue
+		}
+		scope := evidence.ScopeOf(source, l.UnixNano)
+		ok, seen := open[scope]
+		if !seen {
+			closed, err := s.monthClosed(scope)
+			if err != nil {
+				return nil, err
+			}
+			ok = !closed
+			open[scope] = ok
+		}
+		if !ok {
 			continue
 		}
 		pos, _, err := proof.ParseEvidenceLeaf(l)
@@ -184,6 +208,16 @@ func (s *Store) windowRecords(leaves []auditchain.Leaf, source string, from, to 
 			return nil, err
 		}
 		out = append(out, rec)
+	}
+	// Месяцы, отданные уликами, — открыты и сейчас (P-86).
+	var opened []string
+	for scope, ok := range open {
+		if ok {
+			opened = append(opened, scope)
+		}
+	}
+	if err := s.recheckOpen(opened); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

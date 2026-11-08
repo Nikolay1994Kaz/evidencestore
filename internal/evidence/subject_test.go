@@ -44,6 +44,22 @@ func TestSubjectOf(t *testing.T) {
 		{"мусор в чужом значении", `{"client":"c-1","text":tru}`, "", false},
 		{"хвост после объекта", `{"client":"c-1"} {"client":"c-2"}`, "", false},
 		{"хвост мусором", `{"client":"c-1"}x`, "", false},
+
+		// Как записано (T-01): разбор json подменяет чужие байты и одиночные
+		// суррогаты на U+FFFD, и разные значения слились бы в одно.
+		{"экранированный дефис", `{"client":"c\u002d1"}`, "c-1", true},
+		{"пара суррогатов", `{"client":"c-\ud83d\ude00"}`, "c-\U0001F600", true},
+		{"U+FFFD так и записан", `{"client":"c-\ufffd"}`, "c-\ufffd", true},
+		{"обратная черта перед u", `{"client":"c-\\ud800"}`, `c-\ud800`, true},
+		{"чужие байты в чужом поле", "{\"text\":\"\xff\",\"client\":\"c-1\"}", "c-1", true},
+		{"байт не UTF-8", "{\"client\":\"c-\xff\"}", "", false},
+		{"другой байт не UTF-8", "{\"client\":\"c-\xfe\"}", "", false},
+		{"суррогат байтами UTF-8", "{\"client\":\"c-\xed\xa0\x80\"}", "", false},
+		{"одиночная старшая половина", `{"client":"c-\ud800"}`, "", false},
+		{"одиночная младшая половина", `{"client":"c-\udc00"}`, "", false},
+		{"старшая, за ней не младшая", `{"client":"c-\ud800\u0041"}`, "", false},
+		{"две старшие", `{"client":"c-\ud800\ud800"}`, "", false},
+		{"старшая в конце", `{"client":"\ud83d"}`, "", false},
 	} {
 		got, ok := SubjectOf([]byte(tc.body), "client")
 		if got != tc.want || ok != tc.ok {
@@ -141,9 +157,9 @@ func TestSubjectGoesWithItsField(t *testing.T) {
 	}
 }
 
-// versionTwo — запись версии 2 с пустым именем поля и этой меткой: Marshal такую
+// labelledVersion — запись с меткой (VersionSubject) с пустым именем поля и этой меткой: Marshal такую
 // не напишет, она из чужого файла.
-func versionTwo(tag SubjectTag) []byte {
+func labelledVersion(tag SubjectTag) []byte {
 	s := subjectSealed()
 	b, _ := Sealed{Header: Header{Source: s.Source, Seq: s.Seq, ReceivedAt: s.ReceivedAt, ContentType: s.ContentType}, Envelope: s.Envelope}.Marshal()
 	cut := 1 + 8 + 8 + 4 + len(s.Source) + 4 + len(s.ContentType)
@@ -175,9 +191,9 @@ func TestSubjectMalformed(t *testing.T) {
 			_ = s
 			return b
 		}(),
-		"метка без поля": versionTwo(subjectSealed().Subject),
+		"метка без поля": labelledVersion(subjectSealed().Subject),
 		// Запись без метки — всегда версия 1: у неё одно представление.
-		"версия 2 без метки и поля": versionTwo(SubjectTag{}),
+		"запись с меткой без метки и поля": labelledVersion(SubjectTag{}),
 		"версия 1 с меткой": func() []byte {
 			b := bytes.Clone(good)
 			b[0] = Version
@@ -192,5 +208,22 @@ func TestSubjectMalformed(t *testing.T) {
 		if _, err := Unmarshal(data); !errors.Is(err, ErrMalformed) {
 			t.Fatalf("%s: %v", name, err)
 		}
+	}
+}
+
+// P-76: запись версии 2 — метка из sign.key, сборка 07.11. Её не прочесть: метка
+// не совпала бы ни с чьей, и записи клиента молча ушли бы в «чужие».
+func TestSignKeyLabelsRefused(t *testing.T) {
+	good, err := subjectSealed().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if good[0] != VersionSubject || VersionSubject != 3 {
+		t.Fatalf("запись с меткой версии %d", good[0])
+	}
+	old := bytes.Clone(good)
+	old[0] = 2
+	if _, err := Unmarshal(old); !errors.Is(err, ErrSignKeyLabels) || !errors.Is(err, ErrMalformed) {
+		t.Fatalf("версия 2: %v", err)
 	}
 }

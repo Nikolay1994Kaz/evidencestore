@@ -388,11 +388,20 @@ func (s *Server) AdminHandler() http.Handler {
 				return
 			}
 		}
-		b, err := s.store.ProofTo(r.URL.Query().Get("source"), seq, r.URL.Query().Get("dek") == "1", toHead)
+		proofOf := s.store.ProofTo
+		if r.URL.Query().Get("show_label") == "1" {
+			// Заголовок записи с меткой из месяца с закрытым ключом — только по
+			// явной просьбе (P-80).
+			proofOf = s.store.ProofShowingLabel
+		}
+		b, err := proofOf(r.URL.Query().Get("source"), seq, r.URL.Query().Get("dek") == "1", toHead)
 		if err != nil {
 			code := http.StatusInternalServerError
-			if errors.Is(err, store.ErrNotFound) {
+			switch {
+			case errors.Is(err, store.ErrNotFound):
 				code = http.StatusNotFound
+			case errors.Is(err, store.ErrLabelErased):
+				code = http.StatusConflict
 			}
 			writeErr(w, code, err)
 			return
@@ -623,7 +632,8 @@ func windowQuery(q url.Values) (from, to time.Time, head uint64, err error) {
 }
 
 // windowError — отказ пакета за окно или по источнику: окно задано неверно
-// или ещё не закрыто — 400, нет источника — 404.
+// или ещё не закрыто — 400, нет источника — 404, ключ месяца закрыли посреди
+// выдачи — 409.
 func windowError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	switch {
@@ -631,6 +641,9 @@ func windowError(w http.ResponseWriter, err error) {
 		code = http.StatusBadRequest
 	case errors.Is(err, store.ErrNotFound):
 		code = http.StatusNotFound
+	case errors.Is(err, store.ErrReissue):
+		// Ключ месяца закрыли посреди выдачи: повтор соберёт пакет заново.
+		code = http.StatusConflict
 	}
 	writeErr(w, code, err)
 }

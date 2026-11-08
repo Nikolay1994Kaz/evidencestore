@@ -124,6 +124,10 @@ type Store struct {
 	chainSegment int64                // Options.chainSegment
 	replicaChunk int64                // Options.replicaChunk, без него — replicaChunk
 	wrapRoots    func(keyring.RootStore) keyring.RootStore
+	// issueHook (только тесты) зовётся перед повторной проверкой месяцев в
+	// конце выдачи пакета: тест закрывает здесь ключ месяца, как оператор
+	// посреди выдачи (P-86).
+	issueHook func()
 
 	keys     *keyring.Keyring
 	evlog    *evlog.Log
@@ -131,9 +135,10 @@ type Store struct {
 	tree     *linkTree // дерево звеньев (tree.go); открывает scanChain
 	signer   *auditchain.Signer
 	chainDir string
-	// subjectKey — ключ меток субъектов (evidence.NewSubjectTag), выведен из
-	// ключа подписи: у цепи он один, иначе записи клиента разошлись бы по меткам.
-	subjectKey [32]byte
+	// labelDomain — домен ключа меток в ключе месяца (subjectKeyDomain). Поле, а
+	// не глобальная переменная: тест подменяет его у своего хранилища, чтобы
+	// изобразить нечестный приём, и не задевает соседние тесты.
+	labelDomain string
 
 	tsaURL   string
 	tsaTrust tsa.Trust
@@ -627,7 +632,7 @@ func (s *Store) open() error {
 	if s.signer, err = auditchain.LoadOrCreateSigner(chainDir); err != nil {
 		return err
 	}
-	s.subjectKey = s.signer.DeriveKey(subjectKeyDomain)
+	s.labelDomain = subjectKeyDomain
 	if err := s.confirmSigner(); err != nil {
 		// Цепь пуста: этим ключом хранилище ещё ничего не подписало, и
 		// остановка ничего не стоит — какой из двух ключей верный, решает
@@ -670,6 +675,12 @@ func (s *Store) open() error {
 	defer stopCheck()
 	visit := func(pos uint64, data []byte) error {
 		sealed, err := evidence.Unmarshal(data)
+		if errors.Is(err, evidence.ErrSignKeyLabels) {
+			// P-76: метки этого журнала — из sign.key, а этот выпуск считает их
+			// ключами месяцев. Поднять такой журнал — молча отдать записи клиента
+			// в «чужие»: отказ, а не тихая потеря.
+			return fmt.Errorf("%w: evidence log position %d: this data_dir was written by that build and does not carry over; keep it for reference and start a new data_dir (docs/bundles.md)", err, pos)
+		}
 		if err != nil {
 			return fmt.Errorf("evidence log position %d: %w", pos, err)
 		}

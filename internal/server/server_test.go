@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pki"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
@@ -431,5 +433,60 @@ func TestEpochOverMTLS(t *testing.T) {
 	}
 	if code, er := do("POST", "/v1/ingest", b, records(2, 2)); code != 200 {
 		t.Fatalf("закреплённая оператором: %d %+v", code, er)
+	}
+}
+
+// P-80: пакет одной улики для записи с меткой из месяца, чей ключ ждёт
+// уничтожения, — 409 с причиной; с show_label=1 — выдаётся.
+func TestAdminProofShowLabel(t *testing.T) {
+	e := setup(t)
+	c := e.collector(t, "agent")
+	post(t, c, e.url+"/v1/ingest", IngestRequest{Records: []IngestRecord{{Seq: 1, Body: []byte(`{"client":"c-1"}`)}}})
+	b, err := e.st.ProofShowingLabel("agent", 1, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := evidence.Unmarshal(b.Evidence)
+	if err != nil || sealed.Subject.IsZero() {
+		t.Fatalf("запись без метки: %v", err)
+	}
+	if err := e.st.Deactivate(true, sealed.Scope()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.st.ScheduleDestroy(context.Background(), sealed.Scope(), time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := e.admin.Get("http://admin/admin/proof?source=agent&seq=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "-show-label") {
+		t.Fatalf("без show_label: %d %s", resp.StatusCode, body)
+	}
+	resp, err = e.admin.Get("http://admin/admin/proof?source=agent&seq=1&show_label=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("с show_label: %d", resp.StatusCode)
+	}
+}
+
+// P-86: ключ месяца закрыли посреди выдачи, и три сборки подряд не сошлись —
+// 409 и причина: запрос повторят; не 400 («окно задано неверно») и не 500.
+func TestWindowErrorReissueIsConflict(t *testing.T) {
+	for err, want := range map[error]int{
+		fmt.Errorf("%w: agent/2026-09: ask again, and the month comes as leaves", store.ErrReissue): http.StatusConflict,
+		fmt.Errorf("%w: both ends of the window are required", store.ErrWindow):                     http.StatusBadRequest,
+		fmt.Errorf("%w: source x", store.ErrNotFound):                                               http.StatusNotFound,
+	} {
+		rec := httptest.NewRecorder()
+		windowError(rec, err)
+		if rec.Code != want || !strings.Contains(rec.Body.String(), err.Error()) {
+			t.Fatalf("%v: %d %s", err, rec.Code, rec.Body.String())
+		}
 	}
 }

@@ -3,8 +3,10 @@ package store
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
@@ -31,7 +33,7 @@ import (
 // тела — нет, поэтому улики с ключами идут только у записей окна (P-46); записи
 // вне окна — листом: номер, время, отпечаток.
 func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toHead uint64) (proof.SourceBundle, error) {
-	return s.proofSource(source, "", from, to, withDEK, toHead)
+	return reissue(func() (proof.SourceBundle, error) { return s.proofSource(source, "", from, to, withDEK, toHead) })
 }
 
 // ProofSubject — пакет по источнику, открывающий записи одного субъекта
@@ -39,10 +41,19 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 // окна идут уликой без ключа: по заголовку видно, что метка у них другая, а
 // тела закрыты. Цепочка источника та же, поэтому полнота та же.
 func (s *Store) ProofSubject(source, subject string, from, to time.Time, toHead uint64) (proof.SourceBundle, error) {
-	if subject == "" {
+	switch {
+	case subject == "":
 		return proof.SourceBundle{}, fmt.Errorf("%w: name the subject", ErrWindow)
+	case len(subject) > evidence.MaxSubjectLen:
+		// При приёме такое значение метки не получает: пакет искал бы метку,
+		// которой нет ни у одной записи (T-06).
+		return proof.SourceBundle{}, fmt.Errorf("%w: the subject is %d bytes: a value longer than %d gets no label at intake, so no record is under it", ErrWindow, len(subject), evidence.MaxSubjectLen)
+	case !evidence.ValidSubject(subject):
+		// Байты не UTF-8 или одиночный суррогат: такое поле при приёме метки не
+		// даёт (T-01).
+		return proof.SourceBundle{}, fmt.Errorf("%w: the subject is not valid UTF-8: a field whose value is not valid UTF-8 gets no label at intake, so no record is under it", ErrWindow)
 	}
-	return s.proofSource(source, subject, from, to, true, toHead)
+	return reissue(func() (proof.SourceBundle, error) { return s.proofSource(source, subject, from, to, true, toHead) })
 }
 
 func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK bool, toHead uint64) (proof.SourceBundle, error) {
@@ -67,14 +78,51 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 		return proof.SourceBundle{}, fmt.Errorf("%w: source %s", ErrNotFound, source)
 	}
 	var claim *proof.SubjectClaim
-	var only *evidence.SubjectTag
+	// mine — запись субъекта: её метка — метка субъекта в месяце записи. Метки
+	// считаются по месяцам, которые встретились в окне; месяц с уничтоженным или
+	// ждущим уничтожения ключом метки не получает (nil): его записи ничьи.
+	var mine func(evidence.Sealed) (bool, error)
+	labels := map[string]*evidence.SubjectTag{}
+	// labelFor — метка субъекта в месяце scope, одна на пакет; nil — ключ месяца
+	// уничтожен или ждёт уничтожения.
+	labelFor := func(scope string) (*evidence.SubjectTag, error) {
+		tag, seen := labels[scope]
+		if !seen {
+			t, ok, err := s.subjectLabel(scope, source, subjectField, subject)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				tag = &t
+			}
+			labels[scope] = tag
+		}
+		return tag, nil
+	}
+	// openMonth — ключ месяца жив, одно решение на месяц и пакет: месяц не
+	// расходится на улики и листья, даже если ключ закроют посреди выдачи.
+	openMonths := map[string]bool{}
+	openMonth := func(scope string) (bool, error) {
+		ok, seen := openMonths[scope]
+		if !seen {
+			closed, err := s.monthClosed(scope)
+			if err != nil {
+				return false, err
+			}
+			ok = !closed
+			openMonths[scope] = ok
+		}
+		return ok, nil
+	}
 	if subject != "" {
 		if subjectField == "" {
 			return proof.SourceBundle{}, fmt.Errorf("%w: source %s has no subject_field in the configuration: a source that is retired keeps it, with \"disabled\": true", ErrWindow, source)
 		}
-		tag := evidence.NewSubjectTag(s.subjectKey[:], source, subjectField, subject)
-		only = &tag
-		claim = &proof.SubjectClaim{Field: subjectField, Value: subject, Tag: tag[:]}
+		claim = &proof.SubjectClaim{Field: subjectField, Value: subject}
+		mine = func(sealed evidence.Sealed) (bool, error) {
+			tag, err := labelFor(sealed.Scope())
+			return tag != nil && sealed.Subject == *tag, err
+		}
 	}
 
 	s.chainMu.Lock()
@@ -205,7 +253,7 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	}
 
 	b := proof.SourceBundle{Version: proof.WindowVersion, Kind: proof.SourceKind, Source: source,
-		From: from.UTC(), To: to.UTC(), Subject: claim}
+		From: from.UTC(), To: to.UTC(), Subject: claim, WithKeys: withDEK && claim == nil}
 	for _, l := range links {
 		b.Links = append(b.Links, proof.FromLink(l))
 	}
@@ -247,8 +295,25 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 				if rec.Leaf, err = inclusionIn(tree, l.Seq, ls, idx); err != nil {
 					return proof.SourceBundle{}, err
 				}
-				if withDEK && proof.InWindow(time.Unix(0, leaf.UnixNano), from, to) {
-					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf, only); err != nil {
+				attach := withDEK && proof.InWindow(time.Unix(0, leaf.UnixNano), from, to)
+				if attach {
+					// Месяц с закрытым ключом — листом: улика показала бы заголовки
+					// с метками, тел всё равно нет, а метка, выданная до стирания,
+					// нашла бы по ним клиента (P-77, P-80). Месяц — по времени
+					// приёма в листе. У пакета по субъекту такой месяц — без метки.
+					scope := evidence.ScopeOf(source, leaf.UnixNano)
+					if claim != nil {
+						tag, err := labelFor(scope)
+						if err != nil {
+							return proof.SourceBundle{}, err
+						}
+						attach = tag != nil
+					} else if attach, err = openMonth(scope); err != nil {
+						return proof.SourceBundle{}, err
+					}
+				}
+				if attach {
+					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf, mine); err != nil {
 						return proof.SourceBundle{}, err
 					}
 				}
@@ -320,6 +385,30 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	if _, err := proof.OpenTail(b.Upper.Tails.Chain(), source, b.Upper.Open); err != nil {
 		return proof.SourceBundle{}, fmt.Errorf("store: upper tails of %s: %w", source, err)
 	}
+	// Месяцы, отданные уликами, — открыты и сейчас (P-86).
+	var opened []string
+	for scope, ok := range openMonths {
+		if ok {
+			opened = append(opened, scope)
+		}
+	}
+	for scope, tag := range labels {
+		if tag != nil {
+			opened = append(opened, scope)
+		}
+	}
+	if err := s.recheckOpen(opened); err != nil {
+		return proof.SourceBundle{}, err
+	}
+	// Метки субъекта — тех месяцев окна, чей ключ жив, по порядку месяцев.
+	if claim != nil {
+		for scope, tag := range labels {
+			if tag != nil {
+				claim.Labels = append(claim.Labels, proof.SubjectLabel{Scope: scope, Tag: tag[:]})
+			}
+		}
+		slices.SortFunc(claim.Labels, func(a, b proof.SubjectLabel) int { return strings.Compare(a.Scope, b.Scope) })
+	}
 	// Голова — последнее звено пакета, подписана при выдаче.
 	if b.Frontier, b.Checkpoint, err = s.bundleHead(links); err != nil {
 		return proof.SourceBundle{}, err
@@ -369,9 +458,9 @@ func inclusionIn(tree *auditchain.MerkleTree, seq uint64, leaves []auditchain.Le
 }
 
 // sealedWithKey — улика под листом и ключ её записи. Ключ месяца уничтожен
-// или ждёт уничтожения — без ключа: улика доказывается, тело — нет. only — ключ
-// только записи с этой меткой субъекта, у остальных улика без ключа.
-func (s *Store) sealedWithKey(leaf auditchain.Leaf, only *evidence.SubjectTag) ([]byte, []byte, error) {
+// или ждёт уничтожения — без ключа: улика доказывается, тело — нет. mine — ключ
+// только записи субъекта (nil — всем), у остальных улика без ключа.
+func (s *Store) sealedWithKey(leaf auditchain.Leaf, mine func(evidence.Sealed) (bool, error)) ([]byte, []byte, error) {
 	pos, _, err := proof.ParseEvidenceLeaf(leaf)
 	if err != nil {
 		return nil, nil, err
@@ -384,8 +473,14 @@ func (s *Store) sealedWithKey(leaf auditchain.Leaf, only *evidence.SubjectTag) (
 	if err != nil {
 		return nil, nil, err
 	}
-	if only != nil && sealed.Subject != *only {
-		return data, nil, nil
+	if mine != nil {
+		ok, err := mine(sealed)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
+			return data, nil, nil
+		}
 	}
 	dek, err := s.keys.UnwrapDEK(sealed.Envelope)
 	switch {

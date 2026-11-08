@@ -182,14 +182,20 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 			release()
 			return nil, err
 		}
-		h := n.header
-		if subjectField != "" {
-			s.labelRecord(&h, st, subjectField, n.body)
-		}
-		sealed, err := evidence.Record{Header: h, Body: n.body}.Seal(s.keys)
+		sealed, err := evidence.Record{Header: n.header, Body: n.body}.Seal(s.keys)
 		if err != nil {
 			release()
 			return nil, err
+		}
+		// Метка — после Seal: ключ месяца уже выдан, то есть заведён, открыт для
+		// записи и лежит в резерве. Закрытый месяц отвечает ошибкой Seal (409), как
+		// у источника без метки, и метки из ключа не в резерве не бывает. Метка в
+		// открытом заголовке, конверт её не связывает (DECISIONS, § 8).
+		if subjectField != "" {
+			if err := s.labelRecord(&sealed.Header, st, subjectField, n.body); err != nil {
+				release()
+				return nil, err
+			}
 		}
 		if data[j], err = sealed.Marshal(); err != nil {
 			release()
@@ -233,21 +239,103 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	return results, nil
 }
 
-// subjectKeyDomain — домен ключа меток субъектов.
-const subjectKeyDomain = "evidencestore/subject-key/v1"
+// subjectKeyDomain — домен ключа меток субъектов внутри ключа месяца.
+const subjectKeyDomain = "evidencestore/subject-key/v2"
 
 // labelRecord ставит записи метку субъекта. Тело здесь ещё открыто, дальше
 // хранилище его не видит. Запись без субъекта — без метки: принять её важнее,
 // чем отметить; счётчик и журнал показывают, что поле настроено не на то (само
-// значение в журнал не идёт: это персональные данные).
-func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, body []byte) {
-	if v, ok := evidence.SubjectOf(body, field); ok {
-		h.Subject, h.SubjectField = evidence.NewSubjectTag(s.subjectKey[:], h.Source, field, v), field
-		return
+// значение в журнал не идёт: это персональные данные). Зовётся после Seal: ключ
+// месяца записи выдан, метка считается его ключом меток.
+func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, body []byte) error {
+	v, ok := evidence.SubjectOf(body, field)
+	if !ok {
+		if st.noSubject.Add(1) == 1 {
+			s.log.Warn("a record names no subject: it carries no label and stays closed in subject bundles", "source", h.Source, "subject_field", field)
+		}
+		return nil
 	}
-	if st.noSubject.Add(1) == 1 {
-		s.log.Warn("a record names no subject: it carries no label and stays closed in subject bundles", "source", h.Source, "subject_field", field)
+	tag, ok, err := s.subjectLabel(h.Scope(), h.Source, field, v)
+	if err != nil {
+		return err
 	}
+	if !ok {
+		// Seal только что выдал ключ этого месяца, а заявка на уничтожение успела
+		// между ними: тот же отказ, что дал бы Seal.
+		return fmt.Errorf("evidence: key for %q: %w", h.Scope(), keyring.ErrScopeClosed)
+	}
+	h.Subject, h.SubjectField = tag, field
+	return nil
+}
+
+// monthClosed — ключ месяца scope уничтожен или ждёт уничтожения: тогда месяц
+// уходит в пакеты листом, без заголовков (P-77, P-80). Та же проверка, что у
+// ключа меток: закрыт месяц — метки его не посчитать.
+func (s *Store) monthClosed(scope string) (bool, error) {
+	key, err := s.keys.DeriveKey(scope, s.labelDomain)
+	clear(key[:])
+	switch {
+	case errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):
+		return true, nil
+	case err != nil:
+		return false, err
+	}
+	return false, nil
+}
+
+// recheckOpen — ключи месяцев, которые пакет отдаёт уликами, живы и в конце
+// выдачи. Решение принято по первой записи месяца, а ключ могли закрыть, пока
+// пакет собирался: тогда пакет унёс бы заголовки месяца, который уже закрыт
+// (P-86). Такой пакет не выдаётся: reissue собирает его заново, и месяц идёт
+// листом; пакет одной улики с меткой — отказ ErrLabelErased.
+func (s *Store) recheckOpen(scopes []string) error {
+	if s.issueHook != nil {
+		s.issueHook()
+	}
+	slices.Sort(scopes)
+	for _, scope := range scopes {
+		closed, err := s.monthClosed(scope)
+		if err != nil {
+			return err
+		}
+		if closed {
+			return fmt.Errorf("%w: %s: ask again, and the month comes as leaves", ErrReissue, scope)
+		}
+	}
+	return nil
+}
+
+// reissueAttempts — сколько раз собирается пакет, пока ключи его месяцев
+// меняются посреди сборки. Закрыть месяц оператор успевает раз за выдачу; не
+// хватило трёх — отказ ErrReissue, и запрос повторят.
+const reissueAttempts = 3
+
+// reissue собирает пакет заново, когда ключ месяца, отданного уликами, закрыли
+// посреди сборки (ErrReissue): со второго раза этот месяц идёт листом (P-86).
+func reissue[B any](build func() (B, error)) (B, error) {
+	for attempt := 1; ; attempt++ {
+		b, err := build()
+		if !errors.Is(err, ErrReissue) || attempt == reissueAttempts {
+			return b, err
+		}
+	}
+}
+
+// subjectLabel — метка субъекта в месяце источника (DECISIONS, п. 32). Ключ
+// меток у каждого месяца свой и выведен из ключа месяца: уничтожен ключ месяца —
+// уничтожен и ключ меток, и метки этого месяца больше не посчитает никто, само
+// хранилище тоже. ok = false — ключ месяца уничтожен или ждёт уничтожения
+// (тогда хранилище метку не считает, а отмена уничтожения её вернёт).
+func (s *Store) subjectLabel(scope, source, field, value string) (evidence.SubjectTag, bool, error) {
+	key, err := s.keys.DeriveKey(scope, s.labelDomain)
+	switch {
+	case errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):
+		return evidence.SubjectTag{}, false, nil
+	case err != nil:
+		return evidence.SubjectTag{}, false, err
+	}
+	defer clear(key[:])
+	return evidence.NewSubjectTag(key[:], source, field, value), true, nil
 }
 
 // promise — подписанное обещание по принятой улике. Ed25519 детерминирован:

@@ -37,9 +37,14 @@ type Record struct {
 // Месяц берётся из ReceivedAt, то есть по нашим часам, а не по часам
 // источника. Поэтому новые записи всегда попадают в текущий месяц, и
 // стёртый прошлый месяц новых записей не получит.
-func (h Header) Scope() string {
-	t := time.Unix(0, h.ReceivedAt).UTC()
-	return fmt.Sprintf("%s/%04d-%02d", h.Source, t.Year(), int(t.Month()))
+func (h Header) Scope() string { return ScopeOf(h.Source, h.ReceivedAt) }
+
+// ScopeOf — скоуп (источник/месяц) записи источника source, принятой в
+// receivedAt (UnixNano). Тот же, что Header.Scope: по нему проверяющий берёт
+// месяц записи и из листа цепи, где лежит то же время приёма.
+func ScopeOf(source string, receivedAt int64) string {
+	t := time.Unix(0, receivedAt).UTC()
+	return fmt.Sprintf("%s/%04d-%02d", source, t.Year(), int(t.Month()))
 }
 
 // Seal шифрует тело под ключом скоупа и возвращает улику для хранения.

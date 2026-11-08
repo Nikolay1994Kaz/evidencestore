@@ -68,6 +68,17 @@ func subjectStore(t *testing.T) (*Store, *clock, *config.Config) {
 
 func subjectWindow() (time.Time, time.Time) { return clockAt(10, 4, 0), clockAt(10, 6, 0) }
 
+// labelOf — метка субъекта value источника agent в месяце теста (сентябрь):
+// ключ меток выведен из ключа этого месяца.
+func labelOf(t *testing.T, s *Store, value string) evidence.SubjectTag {
+	t.Helper()
+	tag, ok, err := s.subjectLabel("agent/2026-09", "agent", "client", value)
+	if err != nil || !ok {
+		t.Fatalf("метка %q: %v, %v", value, ok, err)
+	}
+	return tag
+}
+
 func seqOf(t *testing.T, rec proof.SourceRecord) uint64 {
 	t.Helper()
 	sealed, err := evidence.Unmarshal(rec.Evidence)
@@ -223,13 +234,14 @@ func TestSubjectLabelAtIntake(t *testing.T) {
 	if !label(5).IsZero() || !label(6).IsZero() {
 		t.Fatal("метка у записи без субъекта")
 	}
-	if a1 != evidence.NewSubjectTag(s.subjectKey[:], "agent", "client", "a") {
+	if a1 != labelOf(t, s, "a") {
 		t.Fatal("метка не та, что считает выдача пакета")
 	}
-	if s.subjectKey != s.signer.DeriveKey(subjectKeyDomain) || s.subjectKey == [32]byte{} {
-		t.Fatal("ключ меток не выведен из ключа подписи: нулевым меткам грош цена")
+	key, err := s.keys.DeriveKey("agent/2026-09", subjectKeyDomain)
+	if err != nil || key == [32]byte{} || a1 != evidence.NewSubjectTag(key[:], "agent", "client", "a") {
+		t.Fatalf("ключ меток не выведен из ключа месяца: %v", err)
 	}
-	if a1 == evidence.NewSubjectTag(s.subjectKey[:], "other", "client", "a") {
+	if other, _, _ := s.subjectLabel("agent/2026-09", "other", "client", "a"); a1 == other {
 		t.Fatal("один клиент в двух источниках связан меткой")
 	}
 	if got := s.sources["agent"].noSubject.Load(); got != 2 {
@@ -241,15 +253,14 @@ func TestSubjectLabelAtIntake(t *testing.T) {
 	if err != nil || data[0] != evidence.Version {
 		t.Fatalf("версия записи без метки: %d, %v", data[0], err)
 	}
-	// Ключ меток — из ключа подписи: после перезапуска те же метки.
-	key := s.subjectKey
+	// Ключ меток — из ключа месяца в keyring.dat: после перезапуска те же метки.
 	s.Close()
 	again, err := reopen(cfg, newClock())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer again.Close()
-	if again.subjectKey != key {
+	if labelOf(t, again, "a") != a1 {
 		t.Fatal("ключ меток сменился при перезапуске")
 	}
 }
@@ -317,10 +328,9 @@ func TestSubjectReportNamesTheIntakeBoundary(t *testing.T) {
 	mustStamp(t, s)
 	c.add(5 * time.Minute)
 	in(2, subjectLine("a", "открытая запись"))
-	good := s.subjectKey
-	s.subjectKey = [32]byte{1, 2, 3}
+	s.labelDomain = "evidencestore/subject-key/dishonest" // метка чужим ключом
 	in(3, subjectLine("a", "неудобная запись"))
-	s.subjectKey = good
+	s.labelDomain = subjectKeyDomain
 	c.add(5 * time.Minute)
 	mustStamp(t, s)
 	mustStampNow(t, s)
@@ -386,7 +396,7 @@ func TestSubjectBundle(t *testing.T) {
 		"2 records received in the window carry no subject label",
 		"rests on the store's word at intake",
 		"a dishonest store",
-		"1 records under the label, 1 of them open, 3 others closed",
+		"1 records of the subject, 1 of them open, 3 others closed",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("в отчёте нет %q:\n%s", want, text)
@@ -413,7 +423,7 @@ func TestSubjectBundleNoRecords(t *testing.T) {
 	for _, want := range []string{
 		`nothing here says that this label is "nobody"`,
 		"no open body ties the label to it: 0 records under the label, the other 4 of the 4 in the window stay closed",
-		"0 records under the label, 0 of them open, 4 others closed",
+		"0 records of the subject, 0 of them open, 4 others closed",
 	} {
 		if !strings.Contains(r.Text(), want) {
 			t.Fatalf("в отчёте нет %q:\n%s", want, r.Text())
@@ -421,8 +431,8 @@ func TestSubjectBundleNoRecords(t *testing.T) {
 	}
 	// Без записей субъекта тело не страхует заявление: его проверяет сам пакет.
 	for name, mutate := range map[string]func(c *proof.SubjectClaim){
-		"короткая метка":  func(c *proof.SubjectClaim) { c.Tag = c.Tag[:8] },
-		"нулевая метка":   func(c *proof.SubjectClaim) { c.Tag = make([]byte, evidence.SubjectTagLen) },
+		"короткая метка":  func(c *proof.SubjectClaim) { c.Labels[0].Tag = c.Labels[0].Tag[:8] },
+		"нулевая метка":   func(c *proof.SubjectClaim) { c.Labels[0].Tag = make([]byte, evidence.SubjectTagLen) },
 		"пустое значение": func(c *proof.SubjectClaim) { c.Value = "" },
 		"пустое поле":     func(c *proof.SubjectClaim) { c.Field = "" },
 	} {
@@ -502,9 +512,9 @@ func TestSubjectBundleForged(t *testing.T) {
 	sourceFailed(t, verify(b), opens)
 
 	// Пакет о клиенте a с меткой клиента b: открытое тело называет не того.
-	tagB := evidence.NewSubjectTag(s.subjectKey[:], "agent", "client", "b")
+	tagB := labelOf(t, s, "b")
 	b = clone()
-	b.Subject.Tag = tagB[:]
+	b.Subject.Labels[0].Tag = tagB[:]
 	at(&b, 3).DEK = nil
 	at(&b, 4).DEK = at(&dek, 4).DEK
 	sourceFailed(t, verify(b), opens)
@@ -525,7 +535,7 @@ func TestSubjectBundleForged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed.Subject = evidence.NewSubjectTag(s.subjectKey[:], "agent", "client", "c")
+	sealed.Subject = labelOf(t, s, "c")
 	forged, err := sealed.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -535,16 +545,41 @@ func TestSubjectBundleForged(t *testing.T) {
 
 	// Заявление без метки, с нулевой, без значения: чьи записи — не сказано.
 	for name, mutate := range map[string]func(c *proof.SubjectClaim){
-		"короткая метка":  func(c *proof.SubjectClaim) { c.Tag = c.Tag[:8] },
-		"нулевая метка":   func(c *proof.SubjectClaim) { c.Tag = make([]byte, evidence.SubjectTagLen) },
+		"короткая метка":  func(c *proof.SubjectClaim) { c.Labels[0].Tag = c.Labels[0].Tag[:8] },
+		"нулевая метка":   func(c *proof.SubjectClaim) { c.Labels[0].Tag = make([]byte, evidence.SubjectTagLen) },
 		"пустое значение": func(c *proof.SubjectClaim) { c.Value = "" },
 		"пустое поле":     func(c *proof.SubjectClaim) { c.Field = "" },
+		// Метки по месяцам: месяц другого источника, не месяц, месяц дважды,
+		// метка месяца снята, а ключ записи оставлен, метка за другой месяц.
+		"месяц другого источника": func(c *proof.SubjectClaim) { c.Labels[0].Scope = "other/2026-09" },
+		"не месяц":                   func(c *proof.SubjectClaim) { c.Labels[0].Scope = "agent/2026-9" },
+		"месяц дважды":               func(c *proof.SubjectClaim) { c.Labels = append(c.Labels, c.Labels[0]) },
+		"метка снята, ключ на месте": func(c *proof.SubjectClaim) { c.Labels = nil },
+		"метка за другой месяц":      func(c *proof.SubjectClaim) { c.Labels[0].Scope = "agent/2026-10" },
 	} {
 		b = clone()
 		mutate(b.Subject)
 		if r := verify(b); r.Valid() {
 			t.Fatalf("%s: прошло:\n%s", name, r.Text())
 		}
+	}
+
+	// Метка названа за месяц, которого у источника быть не может, а ключи сняты:
+	// без сверки месяца пакет сошёлся бы, и все записи окна стали бы «ничьими».
+	for _, scope := range []string{"other/2026-09", "agent/2026-9", "agent/2026-09\nVERIFIED"} {
+		b = clone()
+		for i := range b.Records {
+			b.Records[i].DEK = nil
+		}
+		b.Subject.Labels[0].Scope = scope
+		sourceFailed(t, verify(b), opens)
+		// Лишняя метка за такой «месяц» рядом с настоящей, ключи на месте:
+		// записей она не помечает, а в отчёте рисовала бы что угодно. После P-82
+		// пакет без метки месяца с уликами отвергается и так, а эта сверка — одна
+		// на лишнюю метку.
+		b = clone()
+		b.Subject.Labels = append(b.Subject.Labels, proof.SubjectLabel{Scope: scope, Tag: b.Subject.Labels[0].Tag})
+		sourceFailed(t, verify(b), opens)
 	}
 
 	// Без ключа у единственной записи субъекта открытых тел нет: метку ничто не
@@ -563,7 +598,7 @@ func TestSubjectBundleForged(t *testing.T) {
 	// заголовке, записи b идут под именем a, настоящая запись a среди закрытых.
 	// Секреты не нужны, поэтому отчёт обязан сказать, что метка не привязана.
 	b = clone()
-	b.Subject.Tag = tagB[:]
+	b.Subject.Labels[0].Tag = tagB[:]
 	at(&b, 3).DEK = nil
 	r = verify(b)
 	if !r.Valid() || r.SubjectOpened != 0 || !strings.Contains(r.Text(), `nothing here says that this label is "a"`) || strings.Contains(r.Text(), "1 of them open") {
@@ -764,7 +799,7 @@ func TestSubjectZeroLabelRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := sourceRoundTrip(t, b)
-	f.Subject.Tag = make([]byte, evidence.SubjectTagLen)
+	f.Subject.Labels[0].Tag = make([]byte, evidence.SubjectTagLen)
 	for i := range f.Records {
 		f.Records[i].DEK = nil
 	}
@@ -819,8 +854,16 @@ func TestSubjectBundleKeyDestroyed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Ключ месяца ждёт уничтожения: ключ меток не выводится, метки месяца нет, и
+	// записи окна ничьи.
+	if len(b.Subject.Labels) != 0 {
+		t.Fatalf("метка месяца, чей ключ ждёт уничтожения: %+v", b.Subject.Labels)
+	}
 	r := proof.VerifySource(sourceRoundTrip(t, b), trustOf(t, s), time.Time{}, time.Time{})
-	if !r.Valid() || r.SubjectRecords != 1 || r.SubjectKeyless != 1 || len(r.Bodies) != 0 {
+	// Записи месяца без метки — листом (P-77): 3–6, есть ли у них метка, не видно.
+	if !r.Valid() || r.SubjectRecords != 0 || r.SubjectNoLabel != 4 || r.SubjectUnlabeled != 0 || len(r.Bodies) != 0 ||
+		!strings.Contains(r.Text(), `4 records received in the window lie in months the bundle names no label for ("agent/2026-09")`) ||
+		!strings.Contains(r.Text(), "awaits destruction (then the store does not compute it, and a cancelled destruction brings back the same labels and the bodies)") {
 		t.Fatalf("без ключей:\n%s", r.Text())
 	}
 }

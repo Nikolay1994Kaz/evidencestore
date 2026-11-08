@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -59,15 +60,32 @@ type SourceEdge struct {
 	Open  *TailOpen `json:"open,omitempty"`
 }
 
-// SubjectClaim — о ком пакет по субъекту: поле записи, его значение и метка,
-// которую хранилище за ними считает. Сам проверяющий метку не посчитает: ключ у
-// хранилища. Поле закреплено в заголовке каждой записи под меткой. Значение
-// привязывает открытое тело: поле в нём обязано назвать этого субъекта. Тела нет
-// — не привязывает ничто, и отчёт это говорит.
+// SubjectClaim — о ком пакет по субъекту: поле записи, его значение и метки,
+// которые хранилище за ними считает, по месяцу на метку. Сам проверяющий метку
+// не посчитает: ключ меток выведен из ключа месяца и лежит у хранилища. Поле
+// закреплено в заголовке каждой записи под меткой. Значение привязывает
+// открытое тело: поле в нём обязано назвать этого субъекта. Тела нет — не
+// привязывает ничто, и отчёт это говорит.
+//
+// Метки нет у месяца, чей ключ уничтожен (её не посчитает никто, само хранилище
+// тоже) или ждёт уничтожения (хранилище её не считает, а отмена уничтожения
+// вернёт): записи такого месяца идут листом, и чьи они — не сказать.
 type SubjectClaim struct {
-	Field string `json:"field"`
-	Value string `json:"value"`
+	Field  string         `json:"field"`
+	Value  string         `json:"value"`
+	Labels []SubjectLabel `json:"labels,omitempty"`
+}
+
+// SubjectLabel — метка субъекта в одном месяце источника: Scope —
+// «источник/ГГГГ-ММ», тот же скоуп, что у ключа месяца записи.
+type SubjectLabel struct {
+	Scope string `json:"scope"`
 	Tag   []byte `json:"tag"`
+}
+
+// names — заявление называет метку для месяца scope.
+func (c *SubjectClaim) names(scope string) bool {
+	return slices.ContainsFunc(c.Labels, func(l SubjectLabel) bool { return l.Scope == scope })
 }
 
 // SourceRecord — запись источника: лист с путём Меркла, лист вердикта
@@ -104,8 +122,13 @@ type SourceBundle struct {
 	// Records — все записи источника между краями, в порядке цепи.
 	Records []SourceRecord `json:"records,omitempty"`
 	// Subject — пакет открывает записи одного субъекта (п. 32); nil — нет.
-	Subject    *SubjectClaim `json:"subject,omitempty"`
-	Checkpoint Checkpoint    `json:"checkpoint"`
+	Subject *SubjectClaim `json:"subject,omitempty"`
+	// WithKeys — пакет просили с ключами (-dek). Месяц с закрытым ключом
+	// хранилище отдаёт листом, и пакет, где так все записи окна, без этой
+	// пометки не отличить от пакета без -dek. Пометка не подписана и меняет
+	// только заметки, не вердикт (P-80).
+	WithKeys   bool       `json:"with_keys,omitempty"`
+	Checkpoint Checkpoint `json:"checkpoint"`
 }
 
 // ParseSource разбирает пакет по источнику.
@@ -115,7 +138,7 @@ func ParseSource(data []byte) (SourceBundle, error) {
 		return b, fmt.Errorf("proof: %w", err)
 	}
 	if b.Kind != SourceKind || b.Version != WindowVersion {
-		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d%s", b.Kind, b.Version, SourceKind, WindowVersion, olderRelease(b.Version, WindowVersion))
+		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d%s", b.Kind, b.Version, SourceKind, WindowVersion, olderRelease(b.Version, WindowVersion, unreleasedWindowVersions...))
 	}
 	return b, nil
 }
@@ -149,17 +172,32 @@ type SourceReport struct {
 	SourceNamed bool
 	// Subject, SubjectField — о ком пакет по субъекту. SubjectRecords — записей
 	// окна под его меткой, SubjectOpened — из них открыто и названо телом: только
-	// они привязывают метку к субъекту; SubjectKeyless — без ключа (ключ месяца
-	// уничтожен), SubjectOthers — закрытых записей окна с чужой меткой,
-	// SubjectUnlabeled — без метки.
-	Subject          string
-	SubjectField     string
-	SubjectLabel     string // метка из заявления, hex: сравнить с пакетом, где тело открыто
-	SubjectRecords   int
-	SubjectOpened    int
-	SubjectKeyless   int
-	SubjectOthers    int
-	SubjectUnlabeled int
+	// они привязывают метку к субъекту; SubjectKeyless — без ключа записи,
+	// SubjectOthers — закрытых записей окна с чужой меткой, SubjectUnlabeled —
+	// без метки. Метку месяца привязывает только открытое тело ЭТОГО месяца:
+	// SubjectRecords — записи под метками месяцев, где тело открыто,
+	// SubjectUnbound — под метками месяцев без открытого тела (чьи — не
+	// доказано), SubjectUnboundMonths — эти месяцы. SubjectNoLabel — записи
+	// месяцев, для которых пакет метки не называет, SubjectNoLabelMonths — эти
+	// месяцы: хранилище так поступает со стёртым месяцем, но пакет этого не
+	// доказывает.
+	Subject              string
+	SubjectField         string
+	SubjectLabel         string // метки из заявления, hex с месяцем: сравнить с пакетом, где тело открыто
+	SubjectRecords       int
+	SubjectOpened        int
+	SubjectKeyless       int
+	SubjectOthers        int
+	SubjectUnlabeled     int
+	SubjectUnbound       int
+	SubjectUnboundMonths []string
+	SubjectNoLabel       int
+	SubjectNoLabelMonths []string
+	// SubjectUnconfirmedMonths — месяцы окна (по записям окна), где не открыто
+	// ни одно тело субъекта: чьи там записи, пакет не показывает, и пакет,
+	// назвавший для такого месяца чужую или выдуманную метку, выглядит так же,
+	// как честный пакет без записей субъекта в этом месяце (P-75).
+	SubjectUnconfirmedMonths []string
 	// GatewayRecords — записей журнала гейтвея (с вердиктом хранилища);
 	// GatewayBroken — номера тех, что хранилище при приёме признало
 	// поломанными.
@@ -169,7 +207,12 @@ type SourceReport struct {
 	// у них есть, и «нет ключа записи» о них неверно.
 	withheld int
 	// outside — открытых тел вне окна аудитора: в отчёт и в файлы они не идут.
-	outside        int
+	outside int
+	// LeafOnly — записей окна, пришедших листом: в их месяце пакет не несёт ни
+	// одной улики (так хранилище отдаёт месяц, чей ключ уничтожен или ждёт
+	// уничтожения, P-77, P-80); LeafOnlyMonths — эти месяцы.
+	LeafOnly       int
+	LeafOnlyMonths []string
 	WitnessChecked bool
 	WitnessHead    uint64
 	WitnessNone    bool
@@ -179,6 +222,10 @@ type SourceReport struct {
 
 // Withheld — сколько тел поломанных записей гейтвея не вскрыто нарочно.
 func (r SourceReport) Withheld() int { return r.withheld }
+
+// Keyless — улик окна без ключа записи (у пакета не по субъекту): их тела
+// не открыты, и -bodies о них говорит (T-03).
+func (r SourceReport) Keyless() int { return r.Attached - len(r.Bodies) - r.withheld - r.outside }
 
 // Valid — все проверки прошли.
 func (r SourceReport) Valid() bool {
@@ -206,7 +253,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 		r.From, r.To, r.FromBundle = b.From, b.To, true
 	}
 	if b.Subject != nil {
-		r.Subject, r.SubjectField, r.SubjectLabel = b.Subject.Value, b.Subject.Field, fmt.Sprintf("%x", b.Subject.Tag)
+		r.Subject, r.SubjectField, r.SubjectLabel = b.Subject.Value, b.Subject.Field, labelsText(b.Subject.Labels)
 	}
 	add := func(name string, err error, detail string) bool {
 		c := Check{Name: name, OK: err == nil, Detail: detail}
@@ -297,7 +344,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	// улика журнала гейтвея — только с вердиктом. Пакет с уликами обязан
 	// приложить все записи окна; пакет по субъекту — и без единой улики: иначе
 	// снятые улики выглядели бы как «у него записей нет».
-	if b.Subject != nil || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {
+	if b.Subject != nil || b.WithKeys || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {
 		add("the records attached match their leaves, and their bodies open with their record keys", sourceAttached(b, &r),
 			fmt.Sprintf("%d records, %d bodies opened", r.Attached, len(r.Bodies)))
 	}
@@ -306,7 +353,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	// открытых телах назван он.
 	if b.Subject != nil {
 		add("record keys come only with the records under the label, and every open body names the subject", sourceSubject(b, &r),
-			fmt.Sprintf("%d records under the label, %d of them open, %d others closed", r.SubjectRecords, r.SubjectOpened, r.SubjectOthers+r.SubjectUnlabeled))
+			r.subjectCounts())
 	}
 
 	// 11. Свидетель голов — как у остальных пакетов.
@@ -534,13 +581,37 @@ func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Rec
 func sourceAttached(b SourceBundle, r *SourceReport) error {
 	var leaves []auditchain.Leaf
 	var attached []WindowRecord
+	// Месяцы, в которых пакет несёт улику хоть одной записи: там улика
+	// обязательна у каждой записи окна (P-46), и снять одну неудобную нельзя.
+	// Месяц без единой улики — листом: так хранилище отдаёт месяц, чей ключ
+	// уничтожен или ждёт уничтожения, — заголовки с метками там не нужны, тел
+	// всё равно нет (P-77, P-80). Пакет по субъекту несёт улики и в каждом
+	// месяце, которому называет метку. Месяц — по времени приёма в листе: оно
+	// то же, что в заголовке (windowRecords).
+	withEvidence := map[string]bool{}
+	for _, rec := range b.Records {
+		if len(rec.Evidence) > 0 {
+			withEvidence[evidence.ScopeOf(b.Source, rec.Leaf.Leaf.chain().UnixNano)] = true
+		}
+	}
+	leafMonths := map[string]bool{}
 	missing := 0
 	for _, rec := range b.Records {
 		l := rec.Leaf.Leaf.chain()
 		leaves = append(leaves, l)
 		if len(rec.Evidence) == 0 {
 			if InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {
-				missing++
+				// Листом — только запись из окна самого пакета: запись окна
+				// аудитора вне него хранилище прикладывать и не должно, и месяц,
+				// куда заходит окно шире, — не «закрытый месяц», а недостача: нужен
+				// пакет за это окно (P-81).
+				scope := evidence.ScopeOf(b.Source, l.UnixNano)
+				if withEvidence[scope] || b.Subject != nil && b.Subject.names(scope) || !InWindow(time.Unix(0, l.UnixNano), b.From, b.To) {
+					missing++
+					continue
+				}
+				r.LeafOnly++
+				leafMonths[scope] = true
 			}
 			continue
 		}
@@ -575,30 +646,70 @@ func sourceAttached(b SourceBundle, r *SourceReport) error {
 			r.Bodies = append(r.Bodies, body)
 		}
 	}
+	r.LeafOnlyMonths = slices.Sorted(maps.Keys(leafMonths))
 	if err == nil && missing > 0 {
 		err = fmt.Errorf("%d records received in the window come without their evidence: ask for a bundle over this window", missing)
 	}
 	return err
 }
 
+// LeafOnlyNote — заметка о записях окна, пришедших листом, одна на пакеты по
+// источнику, по субъекту и за окно (P-80).
+func LeafOnlyNote(n int, months []string) string {
+	return fmt.Sprintf("%d records received in the window come without their evidence (%s): the bundle carries the evidence of no record of those months, which is how the store sends a month whose key is destroyed or awaits destruction, so their headers (with any subject labels in them) are not shown, only their number, receive time and digest; anyone can take a month's evidence out of a bundle as well, and the with_keys and keys_for marks are not signed, so this bundle cannot tell which: %s", n, QuotedList(months), ReceiptsPath)
+}
+
 // sourceSubject проверяет пакет по субъекту: у записей окна с его меткой тело
-// называет его, а записи с другой меткой или без неё идут без ключа. Считает,
-// сколько каких записей в окне. Приложенность и сверку с листами делает
-// sourceAttached: сюда приходят те же улики.
+// называет его, а записи с другой меткой или без неё идут без ключа. Метка
+// своя у каждого месяца источника: запись сверяется с меткой месяца из её
+// заголовка. Считает, сколько каких записей в окне. Приложенность и сверку с
+// листами делает sourceAttached: сюда приходят те же улики.
 func sourceSubject(b SourceBundle, r *SourceReport) error {
 	c := b.Subject
-	var want evidence.SubjectTag
-	if len(c.Tag) != len(want) || c.Value == "" || c.Field == "" {
+	if c.Value == "" || c.Field == "" {
 		return errors.New("the bundle does not say whose records it opens")
 	}
-	copy(want[:], c.Tag)
-	if want.IsZero() {
-		return errors.New("the bundle names an empty subject label")
+	// Месяц → метка. Месяц — «источник/ГГГГ-ММ» этого источника: иначе он
+	// ничего не помечает, а в отчёте рисовал бы что угодно.
+	labels := map[string]evidence.SubjectTag{}
+	for _, l := range c.Labels {
+		var t evidence.SubjectTag
+		switch {
+		case !isMonthOf(b.Source, l.Scope):
+			return fmt.Errorf("the bundle names a label for %q, which is not a month of %q", l.Scope, b.Source)
+		case len(l.Tag) != len(t):
+			return fmt.Errorf("the label for %s is %d bytes, not %d", l.Scope, len(l.Tag), len(t))
+		}
+		copy(t[:], l.Tag)
+		if t.IsZero() {
+			return errors.New("the bundle names an empty subject label")
+		}
+		if _, dup := labels[l.Scope]; dup {
+			return fmt.Errorf("the bundle names two labels for %s", l.Scope)
+		}
+		labels[l.Scope] = t
 	}
 	opened := map[uint64][]byte{}
 	for _, body := range r.Bodies {
 		opened[body.Seq] = body.Body
 	}
+	// Счёт по месяцам окна: метку месяца привязывает только открытое тело того
+	// же месяца. Тело сентября о метке октября не говорит ничего: иначе пакет
+	// заменил бы метку одного месяца чужой и снял ключи этого месяца (P-71 — та
+	// же P-49 на уровне месяца). Месяц окна без открытого тела субъекта отчёт
+	// называет всегда: выдуманная метка такого месяца не совпадёт ни с одной
+	// записью, и пакет выглядит как честный без его записей там (P-75).
+	type monthCount struct{ records, opened, keyless int }
+	months := map[string]*monthCount{}
+	month := func(scope string) *monthCount {
+		m := months[scope]
+		if m == nil {
+			m = &monthCount{}
+			months[scope] = m
+		}
+		return m
+	}
+	noLabel := map[string]bool{}
 	for _, rec := range b.Records {
 		if len(rec.Evidence) == 0 {
 			// Здесь такой ключ ничего не открывает, а улику этой записи из другого
@@ -606,15 +717,26 @@ func sourceSubject(b SourceBundle, r *SourceReport) error {
 			if len(rec.DEK) > 0 {
 				return fmt.Errorf("record %s/%s comes with a record key and without its evidence", b.Source, rec.Leaf.Leaf.chain().Subject)
 			}
+			// Запись месяца без метки, листом (P-77); запись месяца с меткой
+			// без улики отвергает sourceAttached.
+			l := rec.Leaf.Leaf.chain()
+			scope := evidence.ScopeOf(b.Source, l.UnixNano)
+			if _, named := labels[scope]; !named && InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {
+				month(scope)
+				r.SubjectNoLabel++
+				noLabel[scope] = true
+			}
 			continue
 		}
 		sealed, err := evidence.Unmarshal(rec.Evidence)
 		if err != nil {
 			return fmt.Errorf("the record attached to %s/%s does not parse: %w", b.Source, rec.Leaf.Leaf.chain().Subject, err)
 		}
-		mine := sealed.Subject == want
+		// Месяц — из заголовка под отпечатком, а не из заявления.
+		want, labelled := labels[sealed.Scope()]
+		mine := labelled && sealed.Subject == want
 		if !mine && len(rec.DEK) > 0 {
-			return fmt.Errorf("record %s/%d does not carry the label of this subject, and it comes with its record key", sealed.Source, sealed.Seq)
+			return fmt.Errorf("record %s/%d does not carry the label of this subject for its month, and it comes with its record key", sealed.Source, sealed.Seq)
 		}
 		// Поле — из записи, под отпечатком: другое поле того же тела выдало бы
 		// чужую метку за этого субъекта, а его записи остались бы закрытыми.
@@ -624,11 +746,18 @@ func sourceSubject(b SourceBundle, r *SourceReport) error {
 		if !InWindow(time.Unix(0, sealed.ReceivedAt), r.From, r.To) {
 			continue
 		}
+		// Улика в месяце, которому пакет не называет метки: честное хранилище
+		// кладёт такой месяц листом (P-77), значит, метку из пакета вынули, а
+		// улики оставили — показать месяц «стёртым» так нельзя (P-82).
+		if !labelled {
+			return fmt.Errorf("record %s/%d comes with its evidence, and the bundle names no label for its month %q: a store sends such a month as leaves, so a label was taken out of this bundle", sealed.Source, sealed.Seq, sealed.Scope())
+		}
+		m := month(sealed.Scope())
 		switch {
 		case mine:
-			r.SubjectRecords++
+			m.records++
 			if len(rec.DEK) == 0 {
-				r.SubjectKeyless++
+				m.keyless++
 			}
 			// Тела нет в отчёте у записи без ключа и у поломанной записи гейтвея.
 			if body, ok := opened[sealed.Seq]; ok {
@@ -637,7 +766,7 @@ func sourceSubject(b SourceBundle, r *SourceReport) error {
 				if v, _ := evidence.SubjectOf(body, c.Field); v != c.Value {
 					return fmt.Errorf("record %s/%d carries the label of this subject, but its body does not name %q as %q", sealed.Source, sealed.Seq, c.Value, c.Field)
 				}
-				r.SubjectOpened++
+				m.opened++
 			}
 		case sealed.Subject.IsZero():
 			r.SubjectUnlabeled++
@@ -645,8 +774,106 @@ func sourceSubject(b SourceBundle, r *SourceReport) error {
 			r.SubjectOthers++
 		}
 	}
+	// По порядку месяцев: итог не зависит от порядка обхода карты.
+	unbound := map[string]bool{}
+	for _, scope := range slices.Sorted(maps.Keys(months)) {
+		m := months[scope]
+		r.SubjectOpened += m.opened
+		r.SubjectKeyless += m.keyless
+		if m.opened > 0 {
+			r.SubjectRecords += m.records
+			continue
+		}
+		r.SubjectUnbound += m.records
+		if m.records > 0 {
+			unbound[scope] = true
+		}
+		r.SubjectUnconfirmedMonths = append(r.SubjectUnconfirmedMonths, scope)
+	}
+	r.SubjectUnboundMonths = slices.Sorted(maps.Keys(unbound))
+	r.SubjectNoLabelMonths = slices.Sorted(maps.Keys(noLabel))
 	return nil
 }
+
+// isMonthOf — scope есть месяц источника: «источник/ГГГГ-ММ», как
+// evidence.Header.Scope.
+func isMonthOf(source, scope string) bool {
+	month, ok := strings.CutPrefix(scope, source+"/")
+	if !ok {
+		return false
+	}
+	t, err := time.Parse("2006-01", month)
+	return err == nil && t.Format("2006-01") == month
+}
+
+// labelsText — метки заявления для отчёта: hex и месяц.
+func labelsText(ls []SubjectLabel) string {
+	if len(ls) == 0 {
+		return "none"
+	}
+	parts := make([]string, len(ls))
+	for i, l := range ls {
+		parts[i] = fmt.Sprintf("%x in %q", l.Tag, l.Scope)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// QuotedList — имена через запятую, каждое в кавычках: они из заголовков
+// записей, перевод строки в имени источника не должен рисовать отчёт.
+func QuotedList(names []string) string {
+	parts := make([]string, len(names))
+	for i, n := range names {
+		parts[i] = strconv.Quote(n)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// closedOthers — закрытые записи окна не под меткой субъекта.
+func (r SourceReport) closedOthers() int {
+	return r.SubjectOthers + r.SubjectUnlabeled + r.SubjectNoLabel
+}
+
+// UnderLabels — записи окна под метками, названными в пакете, привязаны они
+// телом или нет.
+func (r SourceReport) UnderLabels() int { return r.SubjectRecords + r.SubjectUnbound }
+
+// ClosedOthers — закрытые записи окна не под метками субъекта.
+func (r SourceReport) ClosedOthers() int { return r.closedOthers() }
+
+// subjectCounts — разбивка записей окна пакета по субъекту, одна на деталь
+// проверки, строку Subject и -json: записи субъекта (под меткой месяца, где
+// открыто его тело), сколько из них открыто, под меткой в месяцах без
+// открытого тела, остальные. Вместе — все записи окна.
+func (r SourceReport) subjectCounts() string {
+	s := fmt.Sprintf("%d records of the subject, %d of them open", r.SubjectRecords, r.SubjectOpened)
+	if r.SubjectUnbound > 0 {
+		s += fmt.Sprintf(", %d more under its label in months where none of its bodies opens", r.SubjectUnbound)
+	}
+	return s + fmt.Sprintf(", %d others closed", r.closedOthers())
+}
+
+// KeylessReasons — почему улика пришла без ключа записи. Месяц с уничтоженным
+// или ждущим уничтожения ключом хранилище отдаёт листом, а не уликой без
+// ключа (P-80), так что причины две (P-83). Один текст на отчёты всех пакетов
+// за окно, -bodies и docs/bundles.md.
+const KeylessReasons = "the key was removed from this bundle, or the store held it back (a month whose key is destroyed or awaits destruction comes as leaves, not as evidence without keys)"
+
+// KeylessUnderLabel — то же для записи под меткой субъекта.
+const KeylessUnderLabel = KeylessReasons
+
+// ReceiptsPath — как отличить месяц, закрытый хранилищем, от вынутого из пакета
+// (P-84, P-90). Решает свежий пакет за то же окно: пока ключ жив, в нём улики
+// месяца. Ключ уничтожен — остаётся квитанция в цепи: пакет за окно несёт её
+// листом, esverify перечисляет со звеном и операцией. Закрывают месяц только
+// pending-destruction (до отмены) и destroyed; deactivated есть у любого
+// прошлого месяца. Времени выдачи в пакете нет, так что квитанция не говорит,
+// был ли месяц закрыт уже при выдаче, а пишется она, когда изменение дошло до
+// резерва ключей.
+const ReceiptsPath = "to tell a closed month from a stripped one, ask the store for the same bundle again: while the month key lives, a fresh bundle carries the month's evidence. Once the key is destroyed, only the store's key receipt speaks for it: a window bundle over the time the key was closed (evidencestore proof -window -from -to) carries it, and esverify lists it with its link and operation; pending-destruction or destroyed closes the month from that link on (a pending destruction until a later cancel: deactivated, op \"cancel-destroy\"), and deactivated does not close it, every past month gets one a few minutes after it ends. This bundle does not carry the time it was issued, so a receipt does not show that the month was closed already then; a receipt enters the chain once the change has reached the key backup, and it is the store's own statement"
+
+// noLabelWhy — что значит месяц, которому пакет не называет метки (С4, P-72):
+// уничтоженный ключ не даст метку никому, ждущий — не даёт, пока ждёт.
+const noLabelWhy = "the store names no label for a month whose key is destroyed (then no one can compute it, the store included) or awaits destruction (then the store does not compute it, and a cancelled destruction brings back the same labels and the bodies), and sends its records as leaves; the claim is not signed, so the same is seen when someone takes a month's label and all its evidence out of the bundle, and this bundle cannot tell which: " + ReceiptsPath
 
 // Notes — чего пакет по источнику не доказывает.
 func (r SourceReport) Notes() []string {
@@ -666,23 +893,54 @@ func (r SourceReport) Notes() []string {
 	if r.FromBundle {
 		n = append(n, "the window was taken from the bundle itself: check the bundle against your own window with esverify -from and -to")
 	}
-	if r.Attached > 0 && r.Attached < r.Records {
-		n = append(n, fmt.Sprintf("%d of the %d records come without their evidence: they were received outside the window, and the bundle shows only their number, receive time and digest", r.Records-r.Attached, r.Records))
+	if outside := r.Records - r.Attached - r.LeafOnly; r.Attached > 0 && outside > 0 {
+		n = append(n, fmt.Sprintf("%d of the %d records come without their evidence: they were received outside the window, and the bundle shows only their number, receive time and digest", outside, r.Records))
 	}
 	if r.Subject != "" {
 		n = append(n, "which records are this subject's rests on the store's word at intake: it sets a label when it receives a record, from the subject field in its body, and the label cannot change after that; a record whose line named someone else, or no one, is not under this label, and neither is one a dishonest store labelled otherwise: such a record stays closed here, and only its body shows whose it is")
-		n = append(n, "of the other records received in the window the bundle shows the number, receive time, length and subject label, a pseudonym that only the store can compute; their bodies stay closed")
+		// Другие записи окна: в месяцах с меткой — улики без ключей, в месяцах
+		// без метки — листья, и заголовков там нет (P-85, T-06).
+		others := "of the other records received in the window in months the bundle names a label for, it shows the number, receive time, length and subject label, a pseudonym that only the store can compute, and only while the month key lives: each month of a source has its own labels, so a client's records are linked within a month, not across months; their bodies stay closed"
+		switch {
+		case r.InWindow > 0 && r.SubjectNoLabel == r.InWindow:
+			others = "the bundle shows the header of no record received in the window: they all lie in months it names no label for, and come as leaves"
+		case r.SubjectNoLabel > 0:
+			others += "; records of the months it names no label for come as leaves, without headers or labels"
+		}
+		n = append(n, others+"; a label handed out before a month key was destroyed stays the client's pseudonym in that month, and no bundle shows the headers of a labelled record of such a month unless asked with -show-label")
 		if r.SubjectOpened == 0 {
-			n = append(n, fmt.Sprintf("no body under this label is open in the window, and only an open body ties a label to a subject: nothing here says that this label is %q, or that the subject has no records; ask for a wider window that opens one of its records, or compare label %s with a bundle that does", r.Subject, r.SubjectLabel))
+			if len(r.SubjectUnconfirmedMonths) == len(r.SubjectNoLabelMonths) {
+				// Метки нет ни у одного месяца окна: сравнивать нечего, и окно
+				// шире закрытый месяц не откроет.
+				n = append(n, fmt.Sprintf("the bundle names no label for any month of the window (%s): nothing here ties a label to %q or says whether it has records there", QuotedList(r.SubjectUnconfirmedMonths), r.Subject))
+			} else {
+				n = append(n, fmt.Sprintf("no body under this label is open in the window (%s), and only an open body of a month ties that month's label to a subject: nothing here says that this label is %q, or that the subject has no records; ask for a window that opens one of its records in those months, or compare the labels %s with a bundle that does", QuotedList(r.SubjectUnconfirmedMonths), r.Subject, r.SubjectLabel))
+			}
 		}
 		if r.SubjectUnlabeled > 0 {
 			n = append(n, fmt.Sprintf("%d records received in the window carry no subject label: their lines named no subject, or they came before the source had subject_field, and they could be anyone's", r.SubjectUnlabeled))
 		}
-		if r.SubjectKeyless > 0 {
-			n = append(n, fmt.Sprintf("%d of the %d records under this label come without a record key, so their bodies are not shown: the key was removed from this bundle, the month key was destroyed (retention) or awaits destruction, or the store held it back; ask its operator", r.SubjectKeyless, r.SubjectRecords))
+		if r.SubjectOpened > 0 && len(r.SubjectUnconfirmedMonths) > 0 {
+			k1 := fmt.Sprintf("no body of %q is open in %s, and only an open body of a month ties that month's label to the subject: a bundle can name any label for such a month, so the subject's records there, if it has any, can be among the closed records, and nothing here shows that it has none there", r.Subject, QuotedList(r.SubjectUnconfirmedMonths))
+			if r.SubjectUnbound > 0 {
+				k1 += fmt.Sprintf("; %d records lie under the labels the bundle names for %s, and nothing here says they are %q's", r.SubjectUnbound, QuotedList(r.SubjectUnboundMonths), r.Subject)
+			}
+			n = append(n, k1+"; ask for a window that opens one of its records in those months")
 		}
-	} else if keyless := r.Attached - len(r.Bodies) - r.withheld - r.outside; keyless > 0 {
-		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction, or the store held the key back", keyless, r.Attached))
+		if r.SubjectKeyless > 0 {
+			n = append(n, fmt.Sprintf("%d of the %d records under this label come without a record key, so their bodies are not shown: %s; ask its operator", r.SubjectKeyless, r.UnderLabels(), KeylessUnderLabel))
+		}
+		if r.SubjectNoLabel > 0 {
+			// Она же — заметка о листьях для пакета по субъекту: его месяц-лист и
+			// есть месяц без метки.
+			n = append(n, fmt.Sprintf("%d records received in the window lie in months the bundle names no label for (%s) and come as leaves, with only their number, receive time and digest: whose they are cannot be shown here; %s", r.SubjectNoLabel, QuotedList(r.SubjectNoLabelMonths), noLabelWhy))
+		}
+
+	} else if keyless := r.Keyless(); keyless > 0 {
+		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: %s", keyless, r.Attached, KeylessReasons))
+	}
+	if r.LeafOnly > 0 && r.Subject == "" {
+		n = append(n, LeafOnlyNote(r.LeafOnly, r.LeafOnlyMonths))
 	}
 	if len(r.GatewayBroken) > 0 {
 		var parts []string
@@ -750,11 +1008,25 @@ func (r SourceReport) Text() string {
 	case r.SubjectOpened > 0:
 		// %q: значение пришло из пакета и из тела, перевод строки в нём нарисовал
 		// бы чужие строки отчёта.
-		fmt.Fprintf(&b, "Subject: %q (field %q, label %s): %d of the %d records received in the window, %d of them open, the other %d stay closed\n",
-			r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.InWindow, r.SubjectOpened, r.SubjectOthers+r.SubjectUnlabeled)
+		fmt.Fprintf(&b, "Subject: %q (field %q, label %s): %d of the %d records received in the window, %d of them open",
+			r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.InWindow, r.SubjectOpened)
+		if r.SubjectUnbound > 0 {
+			fmt.Fprintf(&b, ", %d more under its label in months where none of its bodies opens", r.SubjectUnbound)
+		}
+		fmt.Fprintf(&b, ", the other %d stay closed", r.closedOthers())
+		if len(r.SubjectUnconfirmedMonths) > 0 {
+			// Оговорка в той же строке: её прочтут и без заметок (P-75).
+			fmt.Fprintf(&b, "; no body of the subject is open in %s, and its records there are not shown", QuotedList(r.SubjectUnconfirmedMonths))
+		}
+		b.WriteString("\n")
 	default:
-		fmt.Fprintf(&b, "Subject: %q (field %q, label %s) is named by the bundle, and no open body ties the label to it: %d records under the label, the other %d of the %d in the window stay closed\n",
-			r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.SubjectOthers+r.SubjectUnlabeled, r.InWindow)
+		fmt.Fprintf(&b, "Subject: %q (field %q, label %s) is named by the bundle, and no open body ties the label to it: %d records under the label, the other %d of the %d in the window stay closed",
+			r.Subject, r.SubjectField, r.SubjectLabel, r.UnderLabels(), r.closedOthers(), r.InWindow)
+		if len(r.SubjectUnconfirmedMonths) > 0 {
+			// Месяцы окна — и здесь, как в строке с открытыми телами (P-75, E2-02).
+			fmt.Fprintf(&b, "; no body of the subject is open in %s, and its records there are not shown", QuotedList(r.SubjectUnconfirmedMonths))
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("\nChecks:\n")
 	for _, c := range r.Checks {

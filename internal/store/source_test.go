@@ -532,8 +532,11 @@ func TestSourceProofKeyPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Ключ месяца ждёт уничтожения: записи окна — листом, без заголовков (P-80);
+	// пакет помечен как пакет с ключами, и отчёт говорит, почему тел нет.
 	r := proof.VerifySource(sourceRoundTrip(t, b), trustOf(t, s), time.Time{}, time.Time{})
-	if !r.Valid() || r.Attached != 3 || len(r.Bodies) != 0 || !strings.Contains(r.Text(), "3 of the 3 records attached carry no record key") {
+	if !r.Valid() || r.Attached != 0 || r.LeafOnly != 3 || len(r.Bodies) != 0 ||
+		!strings.Contains(r.Text(), `3 records received in the window come without their evidence ("abs-core/2026-09")`) {
 		t.Fatalf("без ключей:\n%s", r.Text())
 	}
 }

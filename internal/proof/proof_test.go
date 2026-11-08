@@ -561,7 +561,7 @@ func TestNotesTellWhyBodyIsClosed(t *testing.T) {
 		return ""
 	}
 	w, b := standard(t, nil)
-	if n := closed(Verify(b, w.trust())); !strings.Contains(n, "carries no record key") {
+	if n := closed(Verify(b, w.trust())); !strings.Contains(n, "carries no record key") || !strings.Contains(n, "awaits destruction") || strings.Contains(n, "retention") {
 		t.Errorf("без ключа записи: %q", n)
 	}
 	b.DEK = make([]byte, 32)

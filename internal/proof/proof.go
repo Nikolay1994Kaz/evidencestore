@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -289,9 +290,14 @@ func Parse(data []byte) (Bundle, error) {
 
 // olderRelease — пояснение к отказу пакету прежней версии: его проверяет
 // esverify того выпуска, который его выдал.
-func olderRelease(v, current int) string {
+func olderRelease(v, current int, unreleased ...int) string {
 	if v < 1 || v >= current {
 		return ""
+	}
+	if slices.Contains(unreleased, v) {
+		// Версии без выпуска esverify «того выпуска» нет: совет взять его вёл
+		// бы в никуда.
+		return fmt.Sprintf(" (version %d came from a development build that was never released, and no released esverify reads it: ask the store's operator for the bundle again from a store of this release; a data_dir of that build that holds records with subject labels does not carry over)", v)
 	}
 	return " (bundles of older versions come from an earlier release of evidencestore: verify them with esverify of that release)"
 }
@@ -386,7 +392,7 @@ func (r Report) Notes() []string {
 	case r.BodyKey:
 		n = append(n, "body not opened: the record key in the bundle does not fit the body (see the checks)")
 	default:
-		n = append(n, "body not opened: the bundle carries no record key, or the month key was destroyed (retention)")
+		n = append(n, "body not opened: the bundle carries no record key: it was asked without -dek, the month key is destroyed or awaits destruction, the key was removed from this bundle, or the store held it back")
 	}
 	n = append(n, r.gatewayNotes()...)
 	if r.WitnessRefused != 0 {
