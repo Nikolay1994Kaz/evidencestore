@@ -42,6 +42,10 @@ import (
 // (P-70) — метки субъекта по месяцам (SubjectClaim.Labels): пакет версии 4 с
 // одной меткой Go прочёл бы как пакет, не называющий ни одной. Прежние версии
 // этим выпуском не читаются.
+// unreleasedWindowVersions — версии пакетов за окно и по источнику, которые
+// писала только сборка между выпусками: версия 4 — сборка 07.11 (edae072).
+var unreleasedWindowVersions = []int{4}
+
 const (
 	WindowKind    = "window"
 	WindowVersion = 5
@@ -102,7 +106,7 @@ func ParseWindow(data []byte) (WindowBundle, error) {
 		return b, fmt.Errorf("proof: %w", err)
 	}
 	if b.Kind != WindowKind || b.Version != WindowVersion {
-		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d%s", b.Kind, b.Version, WindowKind, WindowVersion, olderRelease(b.Version, WindowVersion))
+		return b, fmt.Errorf("proof: bundle kind %q version %d, supported %q version %d%s", b.Kind, b.Version, WindowKind, WindowVersion, olderRelease(b.Version, WindowVersion, unreleasedWindowVersions...))
 	}
 	return b, nil
 }
@@ -734,7 +738,7 @@ func (r WindowReport) Notes() []string {
 		}
 	}
 	if keyless := r.Attached - len(r.Bodies) - r.outside; keyless > 0 {
-		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: the month key was destroyed (retention) or awaits destruction, or the store held the key back", keyless, r.Attached))
+		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: %s", keyless, r.Attached, KeylessReasons))
 	}
 	if r.GatewayRecords > 0 {
 		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint signature) are in single-record bundles (evidencestore proof -source S -seq N)")

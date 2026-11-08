@@ -24,12 +24,22 @@ import (
 )
 
 // Version — версия формата. Меняется при любом изменении состава полей.
-// VersionSubject — та же запись с меткой субъекта (subject.go): запись без
-// метки остаётся байт в байт версией 1, и журналы прежних выпусков читаются.
+// VersionSubject — та же запись с меткой субъекта (subject.go), метка — ключом
+// меток своего месяца: запись без метки остаётся байт в байт версией 1, и
+// журналы прежних выпусков читаются.
+//
+// Версия 2 — та же раскладка, но метка посчитана ключом из sign.key: сборка
+// 07.11 (коммит edae072), в выпуск не попала. Такие метки после P-70 не
+// совпадают ни с чьими, и записи клиента молча ушли бы в «чужие» (P-76):
+// версия 2 не читается, хранилище на ней не запускается (ErrSignKeyLabels).
 const (
-	Version        byte = 1
-	VersionSubject byte = 2
+	Version             byte = 1
+	versionSignKeyLabel byte = 2
+	VersionSubject      byte = 3
 )
+
+// ErrSignKeyLabels — запись версии 2: метка из sign.key, сборка 07.11.
+var ErrSignKeyLabels = fmt.Errorf("%w: record version 2, whose subject label came from sign.key in the development build of 7 November 2026 (commit edae072); this release labels by month keys and does not read it", ErrMalformed)
 
 // Пределы полей. Проверяются и при кодировании, и при разборе.
 const (
@@ -135,6 +145,9 @@ func Unmarshal(b []byte) (Sealed, error) {
 	var s Sealed
 	if len(b) < 1+8+8 {
 		return Sealed{}, fmt.Errorf("%w: too short", ErrMalformed)
+	}
+	if b[0] == versionSignKeyLabel {
+		return Sealed{}, ErrSignKeyLabels
 	}
 	if b[0] != Version && b[0] != VersionSubject {
 		return Sealed{}, fmt.Errorf("%w: unknown version %d", ErrMalformed, b[0])

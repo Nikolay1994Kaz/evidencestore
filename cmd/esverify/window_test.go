@@ -416,6 +416,12 @@ type subjectWorld struct {
 // openWorld — хранилище с этими источниками, часы теста стоят на 10:00.
 func openWorld(t *testing.T, sources []config.Source) subjectWorld {
 	t.Helper()
+	return openWorldAt(t, sources, time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC))
+}
+
+// openWorldAt — то же, часы теста стоят на start.
+func openWorldAt(t *testing.T, sources []config.Source, start time.Time) subjectWorld {
+	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{
 		DataDir: filepath.Join(dir, "data"), RootsDir: filepath.Join(dir, "roots"),
@@ -429,7 +435,7 @@ func openWorld(t *testing.T, sources []config.Source) subjectWorld {
 		t.Fatal(err)
 	}
 	var mu sync.Mutex
-	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	now := start
 	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
 	s, err := store.Open(cfg, store.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: clock, NoBackground: true})
@@ -657,8 +663,9 @@ func TestBodiesNoRecordUnderLabel(t *testing.T) {
 }
 
 // Ключ месяца ждёт уничтожения: ключ меток из него не выводится, у месяца нет
-// метки, и чьи записи — не сказать. Код 2 с настоящей причиной, без совета взять
-// -dek (открыл бы всех клиентов окна) и окно шире (шире не откроется).
+// метки, и чьи записи — не сказать. Под меткой пусто — код 0 (закон -bodies, как
+// обещают README и docs/bundles.md), фраза не говорит «записей нет» и не советует
+// -dek (открыл бы всех клиентов окна).
 func TestBodiesKeyAwaitsDestruction(t *testing.T) {
 	w := newSubjectWorld(t)
 	scope := "agent/2026-10"
@@ -673,11 +680,11 @@ func TestBodiesKeyAwaitsDestruction(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, out, errOut := w.run(t, w.file(t, "keyless.json", b), "-bodies", filepath.Join(w.dir, "bodies"))
-	if len(b.Subject.Labels) != 0 || code != exitUsage || !strings.Contains(out, `lie in months the bundle names no label for ("agent/2026-10")`) {
+	if len(b.Subject.Labels) != 0 || code != exitValid || !strings.Contains(out, `lie in months the bundle names no label for ("agent/2026-10")`) {
 		t.Fatalf("код %d:\n%s", code, out)
 	}
-	if !strings.Contains(errOut, "awaits destruction") || !strings.Contains(errOut, "which this bundle does not show") ||
-		strings.Contains(errOut, "wider window") || strings.Contains(errOut, "-dek") {
+	if !strings.Contains(errOut, `the bundle names no label for "agent/2026-10"`) || !strings.Contains(errOut, "does not show that the subject has none there") ||
+		strings.Contains(errOut, "-dek") {
 		t.Fatalf("сообщение: %s", errOut)
 	}
 }
@@ -765,5 +772,53 @@ func TestBodiesUnlabeledHistory(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "does not show that the subject has none") {
 		t.Fatalf("сообщение: %s", errOut)
+	}
+}
+
+// P-75: пакет через полночь 31.10 → 01.11, тело c-1 открыто в октябре. Метку
+// ноября заменили выдуманной и сняли ключи ноября: отчёт VERIFIED, но -bodies,
+// записав одно тело, называет месяц, где тел c-1 нет, и строка Subject — тоже.
+// Честный пакет, где у c-1 в ноябре записей нет, выглядит так же — и говорит то же.
+func TestBodiesNameMonthsWithoutOpenBody(t *testing.T) {
+	w := openWorldAt(t, []config.Source{{Name: "agent", ContentType: "application/json", SubjectField: "client"}},
+		time.Date(2026, 10, 31, 23, 50, 0, 0, time.UTC))
+	w.line(t, "agent", 1, `{"client":"c-1"}`)
+	w.stamp(t)
+	w.advance(5 * time.Minute) // 23:55, октябрь
+	w.line(t, "agent", 2, `{"client":"c-1"}`)
+	w.advance(10 * time.Minute) // 00:05, ноябрь
+	w.line(t, "agent", 3, `{"client":"c-1"}`)
+	w.line(t, "agent", 4, `{"client":"c-2"}`)
+	w.advance(5 * time.Minute)
+	w.closeUp(t)
+	from, to := time.Date(2026, 10, 31, 23, 54, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 6, 0, 0, time.UTC)
+	november := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+
+	honest, err := w.s.ProofSubject("agent", "c-1", from, to, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(honest.Subject.Labels) != 2 {
+		t.Fatalf("метки: %+v", honest.Subject.Labels)
+	}
+	forged := honest
+	forged.Subject = &proof.SubjectClaim{Field: honest.Subject.Field, Value: honest.Subject.Value,
+		Labels: []proof.SubjectLabel{honest.Subject.Labels[0], {Scope: "agent/2026-11", Tag: []byte("0123456789abcdef")}}}
+	forged.Records = append([]proof.SourceRecord(nil), honest.Records...)
+	for i := range forged.Records {
+		if forged.Records[i].Leaf.Leaf.UnixNano >= november {
+			forged.Records[i].DEK = nil
+		}
+	}
+	code, out, errOut := w.run(t, w.file(t, "forged.json", forged), "-bodies", filepath.Join(w.dir, "bodies"))
+	if code != exitValid || !strings.Contains(errOut, "1 bodies written") ||
+		!strings.Contains(errOut, `no body of "c-1" is open in "agent/2026-11"`) ||
+		!strings.Contains(out, `no body of the subject is open in "agent/2026-11", and its records there are not shown`) {
+		t.Fatalf("подделка ноября: код %d\n%s\n%s", code, out, errOut)
+	}
+	// Честный пакет, где тело ноября открыто, оговорки не несёт.
+	code, out, errOut = w.run(t, w.file(t, "honest.json", honest), "-bodies", filepath.Join(w.dir, "bodies-honest"))
+	if code != exitValid || !strings.Contains(errOut, "2 bodies written") || strings.Contains(errOut, "no body of") || strings.Contains(out, "no body of the subject is open") {
+		t.Fatalf("честный пакет: код %d\n%s\n%s", code, out, errOut)
 	}
 }

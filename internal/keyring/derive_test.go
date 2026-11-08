@@ -92,9 +92,9 @@ func TestDeriveKeySurvivesDeactivate(t *testing.T) {
 	}
 }
 
-// Ключ, который ещё не дошёл до резерва, ничего не выводит: метку из него после
-// потери диска не повторить. Резерв поднялся — тот же ключ выводится.
-func TestDeriveKeyWaitsForBackup(t *testing.T) {
+// Резерв выводу не мешает: ключ, не дошедший до резерва, не выдаёт Seal, а
+// пакеты за прошлые месяцы должны читаться и при лежащем резерве (как UnwrapDEK).
+func TestDeriveKeyDoesNotWaitForBackup(t *testing.T) {
 	down := false
 	backup := func(string, uint64) error {
 		if down {
@@ -111,14 +111,18 @@ func TestDeriveKeyWaitsForBackup(t *testing.T) {
 	if err := k.EnsureScopes("a/2026-09"); err == nil {
 		t.Fatal("ключ заведён при лежащем резерве")
 	}
-	if _, err := k.DeriveKey("a/2026-09", "d"); !errors.Is(err, ErrNotBackedUp) {
-		t.Fatalf("ключ не в резерве: %v", err)
+	if _, err := k.Seal("a/2026-09", []byte("тело")); !errors.Is(err, ErrNotBackedUp) {
+		t.Fatalf("Seal ключом не из резерва: %v", err)
+	}
+	before, err := k.DeriveKey("a/2026-09", "d")
+	if err != nil || before == ([32]byte{}) {
+		t.Fatalf("вывод при лежащем резерве: %v", err)
 	}
 	down = false
 	if err := k.Confirm(); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := k.DeriveKey("a/2026-09", "d"); err != nil || got == ([32]byte{}) {
-		t.Fatalf("после резерва: %v", err)
+	if after, err := k.DeriveKey("a/2026-09", "d"); err != nil || after != before {
+		t.Fatalf("после резерва другой ключ: %v", err)
 	}
 }

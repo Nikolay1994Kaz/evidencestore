@@ -74,25 +74,30 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	// ждущим уничтожения ключом метки не получает (nil): его записи ничьи.
 	var mine func(evidence.Sealed) (bool, error)
 	labels := map[string]*evidence.SubjectTag{}
+	// labelFor — метка субъекта в месяце scope, одна на пакет; nil — ключ месяца
+	// уничтожен или ждёт уничтожения.
+	labelFor := func(scope string) (*evidence.SubjectTag, error) {
+		tag, seen := labels[scope]
+		if !seen {
+			t, ok, err := s.subjectLabel(scope, source, subjectField, subject)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				tag = &t
+			}
+			labels[scope] = tag
+		}
+		return tag, nil
+	}
 	if subject != "" {
 		if subjectField == "" {
 			return proof.SourceBundle{}, fmt.Errorf("%w: source %s has no subject_field in the configuration: a source that is retired keeps it, with \"disabled\": true", ErrWindow, source)
 		}
 		claim = &proof.SubjectClaim{Field: subjectField, Value: subject}
 		mine = func(sealed evidence.Sealed) (bool, error) {
-			scope := sealed.Scope()
-			tag, seen := labels[scope]
-			if !seen {
-				t, ok, err := s.subjectLabel(scope, source, subjectField, subject)
-				if err != nil {
-					return false, err
-				}
-				if ok {
-					tag = &t
-				}
-				labels[scope] = tag
-			}
-			return tag != nil && sealed.Subject == *tag, nil
+			tag, err := labelFor(sealed.Scope())
+			return tag != nil && sealed.Subject == *tag, err
 		}
 	}
 
@@ -266,7 +271,18 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 				if rec.Leaf, err = inclusionIn(tree, l.Seq, ls, idx); err != nil {
 					return proof.SourceBundle{}, err
 				}
-				if withDEK && proof.InWindow(time.Unix(0, leaf.UnixNano), from, to) {
+				attach := withDEK && proof.InWindow(time.Unix(0, leaf.UnixNano), from, to)
+				if attach && claim != nil {
+					// Месяц без метки — листом: улика показала бы метки и длины
+					// записей стёртого месяца, а метка, выданная до стирания, нашла
+					// бы по ним клиента (P-77). Месяц — по времени приёма в листе.
+					tag, err := labelFor(evidence.ScopeOf(source, leaf.UnixNano))
+					if err != nil {
+						return proof.SourceBundle{}, err
+					}
+					attach = tag != nil
+				}
+				if attach {
 					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf, mine); err != nil {
 						return proof.SourceBundle{}, err
 					}

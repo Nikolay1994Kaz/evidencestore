@@ -39,6 +39,9 @@ type windowResult struct {
 	// nothing — в окне нет того, о чём просили: это ответ, а не ошибка (код 0),
 	// и скрипт, идущий окно за окном, не встаёт. Пусто — такого не доказано.
 	nothing string
+	// warn — что -bodies не записал и почему, при коде 0: месяцы окна, где не
+	// открыто ни одно тело субъекта (P-75).
+	warn string
 }
 
 // noRecords — в окне нет записей. Говорит только о том, что показывает пакет: окно
@@ -104,37 +107,43 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 	if src.Withheld() > 0 {
 		noBodies = "the bundle opens no bodies in the window: the store found its records broken at intake, and their bodies are not opened here: single-record bundles show what is wrong"
 	}
-	var nothing string
+	var nothing, warn string
 	if src.InWindow == 0 {
 		nothing = noRecords(src.FromBundle)
 	}
 	if src.Subject != "" {
 		// Не «попросите -dek»: это открыло бы всех клиентов окна. Сюда доходят
 		// записи под меткой без ключей: записей нет — это nothing.
-		noBodies = "the records under this label in the window come without record keys: the keys were removed from this bundle, the month key was destroyed (retention) or awaits destruction, or the store held it back; ask its operator"
-		// Не «записей нет»: без открытого тела метка ни к кому не привязана, а
-		// записи клиента могут лежать без метки.
+		noBodies = "the records under this label in the window come without record keys: " + proof.KeylessUnderLabel + "; ask its operator"
+		// Под метками записей нет — это «под меткой пусто», а не ошибка: код 0,
+		// скрипт идёт по окнам дальше (закон -bodies, DECISIONS, п. 32). Фраза
+		// не говорит «записей нет»: без открытого тела метка ни к кому не
+		// привязана, записи клиента могут лежать без метки, а месяцу без метки
+		// (ключ уничтожен или ждёт уничтожения, а может, метку сняли) пакет не
+		// показывает ничьих записей вовсе.
 		if src.UnderLabels() == 0 && src.InWindow > 0 {
 			nothing = "no bodies to write: no record of the window is under this label, which does not show that the subject has none: the report says why"
+			if src.SubjectNoLabel > 0 {
+				nothing = fmt.Sprintf("no bodies to write: the bundle names no label for %s, so whose the records of the window there are cannot be shown, and this does not show that the subject has none there: the report says why", proof.QuotedList(src.SubjectNoLabelMonths))
+			}
 		}
-		// Месяц, для которого пакет метки не называет: записи там есть, чьи — не
-		// узнать, тела не открыть ни шире, ни с -dek. Код 2, как у записей под
-		// меткой без ключа. Что ключ месяца стёрт, пакет не доказывает.
-		if src.UnderLabels() == 0 && src.SubjectNoLabel > 0 {
-			nothing = ""
-			noBodies = fmt.Sprintf("the bundle names no label for %s, so whose the records of the window there are cannot be shown and no body opens: the store leaves the label out when the month key is destroyed or awaits destruction, which this bundle does not show; ask its operator, or check the key receipts in the chain", proof.QuotedList(src.SubjectNoLabelMonths))
-		}
-		out["subject"] = map[string]any{"field": src.SubjectField, "value": src.Subject, "label": src.SubjectLabel, "records": src.SubjectRecords,
-			"opened": src.SubjectOpened, "keyless": src.SubjectKeyless, "others": src.SubjectOthers, "unlabeled": src.SubjectUnlabeled,
+		// Одна разбивка с отчётом: records + unbound + others_closed = records_in_window.
+		out["subject"] = map[string]any{"field": src.SubjectField, "value": src.Subject, "label": src.SubjectLabel,
+			"records": src.SubjectRecords, "opened": src.SubjectOpened, "keyless": src.SubjectKeyless,
 			"unbound": src.SubjectUnbound, "unbound_months": src.SubjectUnboundMonths,
-			"no_label": src.SubjectNoLabel, "no_label_months": src.SubjectNoLabelMonths}
+			"others_closed": src.ClosedOthers(), "others": src.SubjectOthers, "unlabeled": src.SubjectUnlabeled,
+			"no_label": src.SubjectNoLabel, "no_label_months": src.SubjectNoLabelMonths,
+			"unconfirmed_months": src.SubjectUnconfirmedMonths}
+		if len(src.SubjectUnconfirmedMonths) > 0 {
+			warn = fmt.Sprintf("no body of %q is open in %s: its records there, if any, are not among the bodies written (the report says why)", src.Subject, proof.QuotedList(src.SubjectUnconfirmedMonths))
+		}
 	}
 	if src.WitnessChecked {
 		out["witness_head"] = src.WitnessHead
 		out["witness_fork"] = src.WitnessFork
 		out["witness_refused"] = src.WitnessRefused
 	}
-	return windowResult{valid: src.Valid(), text: src.Text(), json: out, bodies: src.Bodies, noBodies: noBodies, nothing: nothing}
+	return windowResult{valid: src.Valid(), text: src.Text(), json: out, bodies: src.Bodies, noBodies: noBodies, nothing: nothing, warn: warn}
 }
 
 func runWindow(data []byte, kind string, a windowArgs, stdout, stderr io.Writer) int {
@@ -191,6 +200,9 @@ func runWindow(data []byte, kind string, a windowArgs, stdout, stderr io.Writer)
 		}
 		// Сообщение — в stderr: -json остаётся чистым JSON.
 		fmt.Fprintf(stderr, "%d bodies written to %s\n", len(res.bodies), a.bodies)
+		if res.warn != "" {
+			fmt.Fprintln(stderr, res.warn)
+		}
 	}
 	return exitValid
 }

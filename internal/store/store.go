@@ -671,6 +671,12 @@ func (s *Store) open() error {
 	defer stopCheck()
 	visit := func(pos uint64, data []byte) error {
 		sealed, err := evidence.Unmarshal(data)
+		if errors.Is(err, evidence.ErrSignKeyLabels) {
+			// P-76: метки этого журнала — из sign.key, а этот выпуск считает их
+			// ключами месяцев. Поднять такой журнал — молча отдать записи клиента
+			// в «чужие»: отказ, а не тихая потеря.
+			return fmt.Errorf("%w: evidence log position %d: this data_dir was written by that build and does not carry over; keep it for reference and start a new data_dir (docs/bundles.md)", err, pos)
+		}
 		if err != nil {
 			return fmt.Errorf("evidence log position %d: %w", pos, err)
 		}

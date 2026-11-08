@@ -182,17 +182,20 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 			release()
 			return nil, err
 		}
-		h := n.header
-		if subjectField != "" {
-			if err := s.labelRecord(&h, st, subjectField, n.body); err != nil {
-				release()
-				return nil, err
-			}
-		}
-		sealed, err := evidence.Record{Header: h, Body: n.body}.Seal(s.keys)
+		sealed, err := evidence.Record{Header: n.header, Body: n.body}.Seal(s.keys)
 		if err != nil {
 			release()
 			return nil, err
+		}
+		// Метка — после Seal: ключ месяца уже выдан, то есть заведён, открыт для
+		// записи и лежит в резерве. Закрытый месяц отвечает ошибкой Seal (409), как
+		// у источника без метки, и метки из ключа не в резерве не бывает. Метка в
+		// открытом заголовке, конверт её не связывает (DECISIONS, § 8).
+		if subjectField != "" {
+			if err := s.labelRecord(&sealed.Header, st, subjectField, n.body); err != nil {
+				release()
+				return nil, err
+			}
 		}
 		if data[j], err = sealed.Marshal(); err != nil {
 			release()
@@ -242,8 +245,8 @@ const subjectKeyDomain = "evidencestore/subject-key/v2"
 // labelRecord ставит записи метку субъекта. Тело здесь ещё открыто, дальше
 // хранилище его не видит. Запись без субъекта — без метки: принять её важнее,
 // чем отметить; счётчик и журнал показывают, что поле настроено не на то (само
-// значение в журнал не идёт: это персональные данные). Ключ месяца записи уже
-// заведён и в резерве (ensureScope): метка считается его ключом меток.
+// значение в журнал не идёт: это персональные данные). Зовётся после Seal: ключ
+// месяца записи выдан, метка считается его ключом меток.
 func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, body []byte) error {
 	v, ok := evidence.SubjectOf(body, field)
 	if !ok {
@@ -257,9 +260,9 @@ func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, b
 		return err
 	}
 	if !ok {
-		// Текущий месяц ждёт уничтожения или уничтожен: Seal ниже всё равно
-		// откажет, ключ закрыт для записи.
-		return fmt.Errorf("store: the key of %s is closed: no label and no seal", h.Scope())
+		// Seal только что выдал ключ этого месяца, а заявка на уничтожение успела
+		// между ними: тот же отказ, что дал бы Seal.
+		return fmt.Errorf("evidence: key for %q: %w", h.Scope(), keyring.ErrScopeClosed)
 	}
 	h.Subject, h.SubjectField = tag, field
 	return nil
@@ -268,7 +271,8 @@ func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, b
 // subjectLabel — метка субъекта в месяце источника (DECISIONS, п. 32). Ключ
 // меток у каждого месяца свой и выведен из ключа месяца: уничтожен ключ месяца —
 // уничтожен и ключ меток, и метки этого месяца больше не посчитает никто, само
-// хранилище тоже. ok = false — ключ месяца уничтожен или ждёт уничтожения.
+// хранилище тоже. ok = false — ключ месяца уничтожен или ждёт уничтожения
+// (тогда хранилище метку не считает, а отмена уничтожения её вернёт).
 func (s *Store) subjectLabel(scope, source, field, value string) (evidence.SubjectTag, bool, error) {
 	key, err := s.keys.DeriveKey(scope, s.labelDomain)
 	switch {

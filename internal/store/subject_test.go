@@ -396,7 +396,7 @@ func TestSubjectBundle(t *testing.T) {
 		"2 records received in the window carry no subject label",
 		"rests on the store's word at intake",
 		"a dishonest store",
-		"1 records under the label, 1 of them open, 3 others closed",
+		"1 records of the subject, 1 of them open, 3 others closed",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("в отчёте нет %q:\n%s", want, text)
@@ -423,7 +423,7 @@ func TestSubjectBundleNoRecords(t *testing.T) {
 	for _, want := range []string{
 		`nothing here says that this label is "nobody"`,
 		"no open body ties the label to it: 0 records under the label, the other 4 of the 4 in the window stay closed",
-		"0 records under the label, 0 of them open, 4 others closed",
+		"0 records of the subject, 0 of them open, 4 others closed",
 	} {
 		if !strings.Contains(r.Text(), want) {
 			t.Fatalf("в отчёте нет %q:\n%s", want, r.Text())
@@ -848,13 +848,15 @@ func TestSubjectBundleKeyDestroyed(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Ключ месяца ждёт уничтожения: ключ меток не выводится, метки месяца нет, и
-	// записи с меткой (a — 3, b — 4) ничьи; без метки — 5, 6.
+	// записи окна ничьи.
 	if len(b.Subject.Labels) != 0 {
 		t.Fatalf("метка месяца, чей ключ ждёт уничтожения: %+v", b.Subject.Labels)
 	}
 	r := proof.VerifySource(sourceRoundTrip(t, b), trustOf(t, s), time.Time{}, time.Time{})
-	if !r.Valid() || r.SubjectRecords != 0 || r.SubjectNoLabel != 2 || r.SubjectUnlabeled != 2 || len(r.Bodies) != 0 ||
-		!strings.Contains(r.Text(), `2 records received in the window lie in months the bundle names no label for ("agent/2026-09")`) {
+	// Записи месяца без метки — листом (P-77): 3–6, есть ли у них метка, не видно.
+	if !r.Valid() || r.SubjectRecords != 0 || r.SubjectNoLabel != 4 || r.SubjectUnlabeled != 0 || len(r.Bodies) != 0 ||
+		!strings.Contains(r.Text(), `4 records received in the window lie in months the bundle names no label for ("agent/2026-09")`) ||
+		!strings.Contains(r.Text(), "awaits destruction (then the store does not compute it, and a cancelled destruction brings back the same labels and the bodies)") {
 		t.Fatalf("без ключей:\n%s", r.Text())
 	}
 }

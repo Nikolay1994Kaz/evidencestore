@@ -141,9 +141,9 @@ func TestSubjectGoesWithItsField(t *testing.T) {
 	}
 }
 
-// versionTwo — запись версии 2 с пустым именем поля и этой меткой: Marshal такую
+// labelledVersion — запись с меткой (VersionSubject) с пустым именем поля и этой меткой: Marshal такую
 // не напишет, она из чужого файла.
-func versionTwo(tag SubjectTag) []byte {
+func labelledVersion(tag SubjectTag) []byte {
 	s := subjectSealed()
 	b, _ := Sealed{Header: Header{Source: s.Source, Seq: s.Seq, ReceivedAt: s.ReceivedAt, ContentType: s.ContentType}, Envelope: s.Envelope}.Marshal()
 	cut := 1 + 8 + 8 + 4 + len(s.Source) + 4 + len(s.ContentType)
@@ -175,9 +175,9 @@ func TestSubjectMalformed(t *testing.T) {
 			_ = s
 			return b
 		}(),
-		"метка без поля": versionTwo(subjectSealed().Subject),
+		"метка без поля": labelledVersion(subjectSealed().Subject),
 		// Запись без метки — всегда версия 1: у неё одно представление.
-		"версия 2 без метки и поля": versionTwo(SubjectTag{}),
+		"запись с меткой без метки и поля": labelledVersion(SubjectTag{}),
 		"версия 1 с меткой": func() []byte {
 			b := bytes.Clone(good)
 			b[0] = Version
@@ -192,5 +192,22 @@ func TestSubjectMalformed(t *testing.T) {
 		if _, err := Unmarshal(data); !errors.Is(err, ErrMalformed) {
 			t.Fatalf("%s: %v", name, err)
 		}
+	}
+}
+
+// P-76: запись версии 2 — метка из sign.key, сборка 07.11. Её не прочесть: метка
+// не совпала бы ни с чьей, и записи клиента молча ушли бы в «чужие».
+func TestSignKeyLabelsRefused(t *testing.T) {
+	good, err := subjectSealed().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if good[0] != VersionSubject || VersionSubject != 3 {
+		t.Fatalf("запись с меткой версии %d", good[0])
+	}
+	old := bytes.Clone(good)
+	old[0] = 2
+	if _, err := Unmarshal(old); !errors.Is(err, ErrSignKeyLabels) || !errors.Is(err, ErrMalformed) {
+		t.Fatalf("версия 2: %v", err)
 	}
 }
