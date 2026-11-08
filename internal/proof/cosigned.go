@@ -42,29 +42,17 @@ type Cosignature struct {
 	Sig  []byte `json:"sig"`
 }
 
-// Time — время подписи по часам свидетеля, без проверки подписи: для показа
-// и выбора. Ноль — подпись не разбирается.
-func (c Cosignature) Time() time.Time {
-	if len(c.Sig) != cosign.BlobSize {
-		return time.Time{}
-	}
-	var ts uint64
-	for _, b := range c.Sig[4:12] {
-		ts = ts<<8 | uint64(b)
-	}
-	return time.Unix(int64(ts), 0).UTC()
-}
-
 // CosignedHead — что закрепил один свидетель: голова, которую он подписал
 // раньше всех не раньше звена улики, и время подписи.
 type CosignedHead struct {
 	Witness string    `json:"witness"`
+	Key     string    `json:"key"` // номер ключа свидетеля, 8 hex
 	Size    uint64    `json:"size"`
 	Time    time.Time `json:"time"`
 }
 
 func (c CosignedHead) String() string {
-	return fmt.Sprintf("%s: head %d, cosigned at %s", c.Witness, c.Size, fmtTime(c.Time))
+	return fmt.Sprintf("%s (key %s): head %d, cosigned at %s", c.Witness, c.Key, c.Size, fmtTime(c.Time))
 }
 
 // Note — точка в виде подписанной заметки C2SP: текст, пустая строка и
@@ -75,11 +63,16 @@ func (c Checkpoint) Note(pub ed25519.PublicKey) []byte {
 }
 
 // CosignNotes — заметки отчёта о подписях свидетелей; part — что они
-// закрепляют («this record», «this stretch», «this part»).
-func CosignNotes(checked bool, pins []CosignedHead, unknown, carried int, part string) []string {
+// закрепляют («this record», «this stretch», «this part»); after — время
+// метки TSA, раньше которой голова существовать не могла (T1 записи), ноль —
+// не сверять.
+func CosignNotes(checked bool, pins []CosignedHead, unknown, carried int, part string, after time.Time) []string {
 	var n []string
 	for _, p := range pins {
 		n = append(n, fmt.Sprintf("witness %s cosigned head %d at %s, after checking that it extends every head it had cosigned before: a rewrite of %s after that time would contradict its cosignature, as long as the witness and its key are out of the store administrator's reach; a rewrite made before it received a head after %s is not caught", p.Witness, p.Size, fmtTime(p.Time), part, part))
+		if !after.IsZero() && p.Time.Before(after.Add(-ReceiveSkew)) {
+			n = append(n, fmt.Sprintf("witness %s dates its cosignature %s, before the TSA time-stamp T1 = %s that this record follows: its clock was behind, and the time of its cosignature cannot be relied on", p.Witness, fmtTime(p.Time), fmtTime(after)))
+		}
 	}
 	switch {
 	case !checked && carried > 0:
@@ -131,7 +124,7 @@ func checkCosigned(cs []Cosignature, keys []cosign.Verifier, storeKey ed25519.Pu
 		}
 		return cmp.Compare(a.ID, b.ID)
 	})
-	keys = slices.CompactFunc(keys, func(a, b cosign.Verifier) bool { return a.Name == b.Name && a.ID == b.ID })
+	keys = slices.CompactFunc(keys, func(a, b cosign.Verifier) bool { return a.Name == b.Name && a.ID == b.ID && a.Key.Equal(b.Key) })
 
 	type pick struct{ size, at uint64 }
 	inside := make([]*pick, len(keys)) // подписанная раньше всех голова внутри пакета
@@ -179,12 +172,12 @@ func checkCosigned(cs []Cosignature, keys []cosign.Verifier, storeKey ed25519.Pu
 	for i, k := range keys {
 		switch p := inside[i]; {
 		case p != nil:
-			pins = append(pins, CosignedHead{Witness: k.Name, Size: p.size, Time: time.Unix(int64(p.at), 0).UTC()})
+			pins = append(pins, CosignedHead{Witness: k.Name, Key: fmt.Sprintf("%08x", k.ID), Size: p.size, Time: time.Unix(int64(p.at), 0).UTC()})
 		case beyond[i] != nil:
 			b := beyond[i]
-			return nil, unknown, fmt.Errorf("the bundle ends at link %d, before head %d that witness %s cosigned at %s: request a bundle up to it (evidencestore proof … -to-head %d)", last, b.size, k.Name, fmtTime(time.Unix(int64(b.at), 0)), b.size)
+			return nil, unknown, fmt.Errorf("the bundle ends at link %d, before head %d that witness %s (key %08x) cosigned at %s: request a bundle up to it (evidencestore proof … -to-head %d)", last, b.size, k.Name, k.ID, fmtTime(time.Unix(int64(b.at), 0)), b.size)
 		default:
-			return nil, unknown, fmt.Errorf("the bundle carries no cosignature of witness %s on a head at or after link %d: the store has not had a head cosigned by it since then, or the cosignature was taken out of the bundle; ask for the bundle again later", k.Name, lo)
+			return nil, unknown, fmt.Errorf("the bundle carries no cosignature of witness %s (key %08x) on a head at or after link %d: the store has not had a head cosigned by this key since then, or the cosignature was taken out of the bundle; ask for the bundle again later", k.Name, k.ID, lo)
 		}
 	}
 	return pins, unknown, nil

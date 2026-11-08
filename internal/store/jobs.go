@@ -44,7 +44,7 @@ func (s *Store) startBackground() {
 	}
 	if s.witnessRemote != nil {
 		s.loop(s.cfg.Witness.Every.D(), func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			ctx, cancel := s.stopCtx(time.Minute)
 			defer cancel()
 			if err := s.WitnessOnce(ctx); err != nil {
 				s.log.Error("witness", "err", err)
@@ -53,7 +53,9 @@ func (s *Store) startBackground() {
 	}
 	if len(s.cosigners) > 0 {
 		s.loop(s.cfg.Witness.Every.D(), func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			// Зависший свидетель не держит остановку хранилища: обход
+			// бросается, когда хранилище закрывается.
+			ctx, cancel := s.stopCtx(time.Minute)
 			defer cancel()
 			if err := s.CosignOnce(ctx); err != nil {
 				s.log.Error("cosigners", "err", err)
@@ -141,6 +143,20 @@ func (s *Store) keepAnchor() {
 }
 
 func (s *Store) loop(every time.Duration, fn func()) { s.runLoop(every, false, fn) }
+
+// stopCtx — контекст обхода: кончается через d или когда хранилище
+// закрывается.
+func (s *Store) stopCtx(d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	go func() {
+		select {
+		case <-s.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
 
 // loopNow — loop, первый раз сразу.
 func (s *Store) loopNow(every time.Duration, fn func()) { s.runLoop(every, true, fn) }

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -151,5 +152,34 @@ func TestWitnessKeyFlag(t *testing.T) {
 	errb.Reset()
 	if code := run(append(base, "-witness-key", "witness.example/w1"), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "-witness-key") {
 		t.Fatalf("не ключ: %d %s", code, errb.String())
+	}
+}
+
+// Ключ в -witness-key разбирается как ключ раньше, чем как путь: файл по пути,
+// равному настоящему ключу (подложенный в каталог аудитора вместе с пакетом),
+// не подменяет ключ. Один ключ под двумя именами — неверный вызов.
+func TestWitnessKeyNotShadowedByFile(t *testing.T) {
+	bundle, key, trust, vkey := cosignedWorld(t)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	evil, _ := cosign.NewSigner("witness.example/w1", priv)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	planted := filepath.Join(dir, filepath.FromSlash(vkey))
+	if err := os.MkdirAll(filepath.Dir(planted), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planted, []byte(evil.Verifier().String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-witness-key", vkey}, &out, &errb); code != exitValid {
+		t.Fatalf("ключ подменён подложенным файлом: %d\n%s%s", code, out.String(), errb.String())
+	}
+	v, _ := cosign.ParseVerifier(vkey)
+	twin := strings.Replace(vkey, "witness.example/w1+", "witness.example/w2+", 1)
+	twin = strings.Replace(twin, fmt.Sprintf("+%08x+", v.ID), fmt.Sprintf("+%08x+", cosign.KeyID("witness.example/w2", cosign.TypeCosignatureV1, v.Key)), 1)
+	errb.Reset()
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-witness-key", vkey, "-witness-key", twin}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "it is one witness") {
+		t.Fatalf("один ключ под двумя именами: %d %s", code, errb.String())
 	}
 }

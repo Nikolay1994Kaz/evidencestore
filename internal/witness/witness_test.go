@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -207,6 +209,8 @@ func TestWitnessRefusals(t *testing.T) {
 		{"мусор", []byte("hello"), http.StatusBadRequest},
 		{"другая история", cosign.AddCheckpoint(4, forged.proof(8, 4), sameKey(t, c, forged, 8)), http.StatusUnprocessableEntity},
 		{"доказательство не того отрезка", cosign.AddCheckpoint(4, c.proof(8, 5), c.note(8)), http.StatusUnprocessableEntity},
+		{"тот же размер с доказательством", cosign.AddCheckpoint(4, [][32]byte{{1}}, c.note(4)), http.StatusUnprocessableEntity},
+		{"строка подписи не разбирается", cosign.AddCheckpoint(4, c.proof(8, 4), append(c.note(8), "not a signature line\n"...)), http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		if code, body, _ := r.add(tc.body); code != tc.code {
@@ -220,14 +224,67 @@ func TestWitnessRefusals(t *testing.T) {
 	if n, _ := r.w.Latest(c.origin()); n != 4 {
 		t.Fatalf("после отказов последняя %d, ждали 4", n)
 	}
+	// Повтор той же развилки журнал не раздувает.
+	r.add(cosign.AddCheckpoint(4, nil, sameKey(t, c, forged, 4)))
+	// В журнале отказов — только развилка одного размера: обе головы подписаны
+	// хранилищем, и строка несёт обе. Несошедшееся доказательство — не улика:
+	// его подставляет отправитель.
 	refusals := readRefusals(t, r.dir)
-	if len(refusals) != 3 {
-		t.Fatalf("в журнале отказов %d строк, ждали 3 (две другие истории и доказательство не того отрезка): %v", len(refusals), refusals)
+	if len(refusals) != 1 {
+		t.Fatalf("в журнале отказов %d строк, ждали 1 (развилка на размере 4): %v", len(refusals), refusals)
 	}
-	for _, rf := range refusals {
-		if rf.Origin != c.origin() || rf.Note == "" {
-			t.Fatalf("строка отказа без происхождения или заметки: %+v", rf)
+	rf := refusals[0]
+	if rf.Origin != c.origin() || rf.Size != 4 || !strings.Contains(rf.Note, "\n4\n") || !strings.Contains(rf.Cosigned, "— witness.example/w1 ") {
+		t.Fatalf("строка отказа: %+v", rf)
+	}
+	if bytes.Contains([]byte(rf.Note), []byte("— witness.example/w1")) {
+		t.Fatalf("в улике — чужие строки подписей: %q", rf.Note)
+	}
+}
+
+// Кто угодно с подписанной хранилищем головой может прислать мусорное
+// доказательство: журнал отказов от этого не растёт.
+func TestWitnessGarbageProofIsNotEvidence(t *testing.T) {
+	c := newChain(t)
+	r := newRig(t, t.TempDir(), c)
+	c.grow(10)
+	r.mustCosign(c, 0, 5)
+	junk := [][32]byte{{1}, {2}, {3}}
+	for range 20 {
+		if code, _, _ := r.add(cosign.AddCheckpoint(5, junk, c.note(10))); code != http.StatusUnprocessableEntity {
+			t.Fatalf("мусорное доказательство: %d", code)
 		}
+	}
+	if refusals := readRefusals(t, r.dir); len(refusals) != 0 {
+		t.Fatalf("мусорное доказательство попало в журнал отказов: %d строк", len(refusals))
+	}
+	r.mustCosign(c, 5, 10)
+}
+
+// Заметка, которую свидетель хранит и отдаёт мониторам, — текст точки, одна
+// подпись хранилища и подпись свидетеля, сколько бы строк ни пришло в запросе
+// (повтор, чужие ключи, строка под именем самого свидетеля).
+func TestWitnessStoredNoteIsClean(t *testing.T) {
+	c := newChain(t)
+	r := newRig(t, t.TempDir(), c)
+	c.grow(4)
+	r.mustCosign(c, 0, 4)
+	note := c.note(4)
+	text, sigs, _ := cosign.SplitNote(note)
+	junk := "— " + r.key.Name + " " + base64.StdEncoding.EncodeToString(append(binary.BigEndian.AppendUint32(nil, r.key.ID), make([]byte, 72)...))
+	poisoned := string(text) + "\n" + sigs[0] + "\n" + sigs[0] + "\n" + junk + "\n— other.example/k AAAAAAAA\n"
+	if code, body, _ := r.add(cosign.AddCheckpoint(4, nil, []byte(poisoned))); code != http.StatusOK {
+		t.Fatalf("та же голова с лишними строками: %d %s", code, body)
+	}
+	resp, err := http.Get(r.ts.URL + "/" + OriginHash(c.origin()) + "/checkpoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	_, gotSigs, err := cosign.SplitNote(got)
+	if err != nil || len(gotSigs) != 2 || gotSigs[0] != sigs[0] || !strings.HasPrefix(gotSigs[1], "— "+r.key.Name+" ") {
+		t.Fatalf("заметка свидетеля: %q %v", got, err)
 	}
 }
 
@@ -336,16 +393,61 @@ func TestWitnessConcurrentRequestsDoNotRollBack(t *testing.T) {
 }
 
 // Время подписей не идёт назад, даже если часы машины отступили.
+// Часы отступили немного (подстройка NTP) — подписи не идут назад. Часы
+// убежали вперёд, и их поправили — подписи снова берут текущее время, а не
+// застревают на убежавшем навсегда (и после перезапуска).
 func TestWitnessTimeIsMonotonic(t *testing.T) {
 	c := newChain(t)
-	r := newRig(t, t.TempDir(), c)
+	dir := t.TempDir()
+	r := newRig(t, dir, c)
 	now := time.Unix(1_800_000_000, 0)
 	r.w.Now = func() time.Time { return now }
-	c.grow(3)
+	c.grow(5)
 	t1 := r.mustCosign(c, 0, 2)
-	now = now.Add(-time.Hour)
-	if t2 := r.mustCosign(c, 2, 3); t2 < t1 {
-		t.Fatalf("время подписи пошло назад: %d после %d", t2, t1)
+	now = now.Add(-2 * time.Second)
+	if t2 := r.mustCosign(c, 2, 3); t2 != t1 {
+		t.Fatalf("часы отступили на 2 с: подпись %d после %d", t2, t1)
+	}
+	now = now.Add(30 * 365 * 24 * time.Hour) // убежали на 30 лет
+	far := r.mustCosign(c, 3, 4)
+	now = now.Add(-30 * 365 * 24 * time.Hour) // поправили
+	r2 := reopen(t, dir, r.key, c)
+	r2.w.Now = func() time.Time { return now }
+	if t3 := r2.mustCosign(c, 4, 5); t3 >= far || t3 != uint64(now.Unix()) {
+		t.Fatalf("после поправки часов подпись %d (убежавшая %d, сейчас %d)", t3, far, now.Unix())
+	}
+}
+
+// Свидетель не забывает: состояние убрали (или подняли старое из копии), а
+// журнал подписанного помнит голову новее — свидетель не стартует; иначе он
+// подписал бы тем же ключом вторую историю.
+func TestWitnessRefusesToForget(t *testing.T) {
+	c := newChain(t)
+	dir := t.TempDir()
+	r := newRig(t, dir, c)
+	c.grow(6)
+	r.mustCosign(c, 0, 3)
+	statePath := filepath.Join(dir, stateDir, OriginHash(c.origin())+".json")
+	old, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.mustCosign(c, 3, 6)
+	r.w.Close()
+
+	// Состояние подняли из старой копии: голова 3 при подписанной 6.
+	if err := os.WriteFile(statePath, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs []Log
+	logs = append(logs, Log{Origin: c.origin(), Key: c.signer.PublicKey()})
+	if _, err := New(r.key, logs, dir, nil); err == nil || !strings.Contains(err.Error(), "older than head 6") {
+		t.Fatalf("откат состояния: %v", err)
+	}
+	// Состояние убрали совсем.
+	os.Remove(statePath)
+	if _, err := New(r.key, logs, dir, nil); err == nil || !strings.Contains(err.Error(), "is missing") || !strings.Contains(err.Error(), "new key") {
+		t.Fatalf("пропавшее состояние: %v", err)
 	}
 }
 

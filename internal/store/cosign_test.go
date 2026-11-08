@@ -320,6 +320,11 @@ func TestCosignRefusedIsAlarm(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Журнал подписанного свидетель бы сверил с состоянием и не стартовал:
+	// здесь свидетель «видел» другую историю с самого начала.
+	if err := os.Remove(filepath.Join(w.dir, "cosigned.jsonl")); err != nil {
+		t.Fatal(err)
+	}
 	w.attach(s) // свидетель перечитал состояние
 	ingest(t, s, "abs-core", 4, 4)
 	mustStamp(t, s)
@@ -338,15 +343,199 @@ func TestCosignRefusedIsAlarm(t *testing.T) {
 		t.Fatal("тревога пропала на втором обходе")
 	}
 
-	// Владелец свидетеля разобрался и принял историю хранилища: убрал его
-	// состояние. Хранилище узнаёт это само (409 «0») и продолжает с нуля.
+	// Убрать состояние свидетеля — не выход: он забыл бы, что подписал, и
+	// подписал бы тем же ключом вторую историю. Хранилище это видит (409 с
+	// размером младше подписанного по его журналу) — тревога, а не «с нуля».
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 	w.attach(s)
+	err = s.CosignOnce(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "lost its state") {
+		t.Fatalf("свидетель без состояния: %v", err)
+	}
+	if st := s.Status(); !st.Cosigners[0].LostState {
+		t.Fatalf("status: %+v", st.Cosigners)
+	}
+	if n, ok := w.srv.Load().Latest(origin); ok {
+		t.Fatalf("свидетель без состояния подписал голову %d", n)
+	}
+}
+
+// Свидетель потерял состояние, а хранилище перезапустилось: оно спрашивает не
+// с нуля, а с последней головы этого свидетеля в журнале подписей, — и видит
+// потерю (409 «0»), вместо того чтобы получить подпись «первой» головы.
+func TestCosignWitnessLostStateAfterRestart(t *testing.T) {
+	c := newClock()
+	w := newLiveWitness(t, "witness.example/w1")
+	cfg := testConfig(t, w.option())
+	s := openStore(t, cfg, c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
 	mustCosign(t, s)
-	if st := s.Status(); st.Cosigners[0].Refused || st.Cosigners[0].Head != s.Head().Seq || st.Cosigners[0].LastError != "" {
-		t.Fatalf("после сброса свидетеля: %+v, голова %d", st.Cosigners, s.Head().Seq)
+	origin := proof.OriginFor(w.trust(t, s).StoreKey)
+	s.Close()
+	// Свидетель потерял каталог данных целиком (тот же ключ).
+	os.RemoveAll(w.dir)
+	os.MkdirAll(w.dir, 0o700)
+	s2, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	w.attach(s2)
+	ingest(t, s2, "abs-core", 4, 4)
+	mustStamp(t, s2)
+	err = s2.CosignOnce(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "lost its state") {
+		t.Fatalf("после перезапуска хранилища: %v", err)
+	}
+	if st := s2.Status(); !st.Cosigners[0].LostState {
+		t.Fatalf("status: %+v", st.Cosigners)
+	}
+	if n, ok := w.srv.Load().Latest(origin); ok {
+		t.Fatalf("свидетель без состояния подписал голову %d как первую", n)
+	}
+}
+
+// Падение между ответом свидетеля и записью в журнал: свидетель держит голову,
+// подписи которой у хранилища нет. После запуска хранилище узнаёт её из 409 и
+// просит подписать снова: пакет до неё (-to-head) несёт её подпись.
+func TestCosignRecoversLostCosignature(t *testing.T) {
+	c := newClock()
+	w := newLiveWitness(t, "witness.example/w1")
+	cfg := testConfig(t, w.option())
+	s := openStore(t, cfg, c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	mustCosign(t, s)
+	origin := proof.OriginFor(w.trust(t, s).StoreKey)
+	latest, _ := w.srv.Load().Latest(origin)
+	s.Close()
+	// Последняя строка журнала (подпись головы latest) не легла на диск.
+	path := filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile))
+	data, _ := os.ReadFile(path)
+	var keep []byte
+	for line := range bytes.Lines(data) {
+		var r cosigRecord
+		json.Unmarshal(line, &r)
+		if r.Size < latest {
+			keep = append(keep, line...)
+		}
+	}
+	os.WriteFile(path, keep, 0o600)
+	s2, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if s2.hasCosig(w.key.Name, latest) {
+		t.Fatal("подпись головы осталась в журнале")
+	}
+	ingest(t, s2, "abs-core", 4, 4)
+	mustStamp(t, s2)
+	mustCosign(t, s2)
+	if !s2.hasCosig(w.key.Name, latest) {
+		t.Fatalf("подпись головы %d, которую держит свидетель, не запрошена снова", latest)
+	}
+	b, err := s2.ProofTo("abs-core", 3, false, latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b, w.trust(t, s2)); !r.Valid() || r.Cosigned[0].Size > latest {
+		t.Fatalf("пакет до головы %d:\n%s", latest, r.Text())
+	}
+}
+
+// Свидетель отвечает перенаправлением на другой адрес: хранилище туда не
+// идёт, голова уходит только по адресу из конфигурации.
+func TestCosignNoRedirects(t *testing.T) {
+	c := newClock()
+	var elsewhere atomic.Int64
+	other := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { elsewhere.Add(1) }))
+	defer other.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.Redirect(rw, r, other.URL+"/add-checkpoint", http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+	w := newLiveWitness(t, "witness.example/w1")
+	s := openStore(t, testConfig(t, func(cf *config.Config) {
+		cf.Witness.Cosigners = []config.Cosigner{{URL: redirect.URL, Key: w.key.Verifier().String()}}
+	}), c)
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s)
+	if err := s.CosignOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "HTTP 307") {
+		t.Fatalf("перенаправление: %v", err)
+	}
+	if elsewhere.Load() != 0 {
+		t.Fatalf("голова ушла по перенаправлению: %d запросов", elsewhere.Load())
+	}
+}
+
+// Зависший свидетель не держит остановку хранилища: обход отменяется, когда
+// хранилище закрывается (контекст stopCtx, как в фоновом цикле).
+func TestCosignCloseNotHeldByHangingWitness(t *testing.T) {
+	c := newClock()
+	w := newLiveWitness(t, "witness.example/w1")
+	s := openStore(t, testConfig(t, w.option()), c)
+	w.attach(s)
+	w.hang.Store(true)
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s)
+	ctx, cancel := s.stopCtx(time.Minute)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.CosignOnce(ctx) }()
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	close(s.stop)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("обход ждёт зависшего свидетеля после остановки")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("остановка ждала свидетеля %v", d)
+	}
+	s.stop = make(chan struct{}) // Close закроет свой
+}
+
+// С копией наружу текущая голова под нагрузкой всегда дальше копии; свидетелю
+// уходит голова копии, и подписанная голова идёт за копией каждый обход, а не
+// раз в метку TSA.
+func TestCosignFollowsCopyWithoutStamps(t *testing.T) {
+	c := newClock()
+	ctx := context.Background()
+	w := newLiveWitness(t, "witness.example/w1")
+	cfg, remote := replicaConfig(t)
+	w.option()(cfg)
+	s := openStore(t, cfg, c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 2)
+	mustStamp(t, s)
+	origin := proof.OriginFor(w.trust(t, s).StoreKey)
+	var seq uint64 = 3
+	for round := range 5 {
+		ingest(t, s, "abs-core", seq, seq)
+		seq++
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ShipOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		ingest(t, s, "abs-core", seq, seq) // голова снова дальше копии
+		seq++
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
+		mustCosign(t, s)
+		n, _ := w.srv.Load().Latest(origin)
+		if shipped := s.replicaShipped.Load(); n != shipped {
+			t.Fatalf("обход %d: свидетель на голове %d, копия держит %d", round, n, shipped)
+		}
 	}
 }
 
@@ -396,7 +585,7 @@ func TestCosignWrongKeyConfigured(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "without a cosignature by its configured key") {
 		t.Fatalf("подпись чужого ключа: %v", err)
 	}
-	if fi, err := os.Stat(filepath.Join(cfg.DataDir, cosignFile)); err != nil || fi.Size() != 0 {
+	if fi, err := os.Stat(filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile))); err != nil || fi.Size() != 0 {
 		t.Fatalf("журнал подписей после чужой подписи: %v %v", fi, err)
 	}
 }
@@ -440,8 +629,9 @@ func TestCosignJournalDamage(t *testing.T) {
 	mustStamp(t, s)
 	mustCosign(t, s)
 	pub, _ := base64.RawStdEncoding.DecodeString(s.PublicKey())
+	chainLen := s.Head().Seq
 	s.Close()
-	path := filepath.Join(cfg.DataDir, cosignFile)
+	path := filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile))
 	good, err := os.ReadFile(path)
 	if err != nil || len(good) == 0 {
 		t.Fatalf("журнал: %v", err)
@@ -470,8 +660,21 @@ func TestCosignJournalDamage(t *testing.T) {
 	beyond := rec
 	beyond.Size = 1 << 40
 	beyond.Sig = w.key.Cosign(cosign.CheckpointText(proof.OriginFor(pub), beyond.Size, [32]byte(rec.Root)), uint64(c.now().Unix()))
+	// Последняя целая строка — голова длины цепи с испорченной подписью: при
+	// запуске она не берётся, и status с запросом к свидетелю опираются на
+	// последнюю верную.
+	tail := rec
+	tail.Size = chainLen
+	tail.Sig = bytes.Clone(rec.Sig)
+	tail.Sig[len(tail.Sig)-1] ^= 1
+	var lastGood uint64
+	for l := range bytes.Lines(good) {
+		var r cosigRecord
+		json.Unmarshal(l, &r)
+		lastGood = max(lastGood, r.Size)
+	}
 	damaged := `{"name":"witness.example/w1","size":1,"root":"AAAA","sig":"AAAA"}` + "\n" +
-		`not json` + "\n" + line(forged) + line(foreign) + string(good) + line(beyond) + `{"name":"witness.example/w1","si`
+		`not json` + "\n" + line(forged) + line(foreign) + string(good) + line(beyond) + line(tail) + `{"name":"witness.example/w1","si`
 	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -489,8 +692,8 @@ func TestCosignJournalDamage(t *testing.T) {
 	if r := proof.Verify(b, w.trust(t, s2)); !r.Valid() || len(b.Cosignatures) != 1 || b.Cosignatures[0].Size != rec.Size || !bytes.Equal(b.Cosignatures[0].Sig, rec.Sig) {
 		t.Fatalf("пакет после порчи журнала:\n%s", r.Text())
 	}
-	if st := s2.Status(); st.Cosigners[0].Head > s2.Head().Seq {
-		t.Fatalf("status: свидетель подписал %d, в цепи %d", st.Cosigners[0].Head, s2.Head().Seq)
+	if st := s2.Status(); st.Cosigners[0].Head != lastGood || s2.lastCosigned(w.key.Name) != lastGood {
+		t.Fatalf("status: свидетель подписал %d (по журналу %d), последняя верная строка — %d", st.Cosigners[0].Head, s2.lastCosigned(w.key.Name), lastGood)
 	}
 	back, _ := os.ReadFile(path)
 	if strings.HasSuffix(string(back), `"si`) || !strings.HasSuffix(string(back), "\n") {
@@ -550,7 +753,7 @@ func TestCosignBrokenAnswerRefused(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not verify") {
 		t.Fatalf("испорченная подпись свидетеля: %v", err)
 	}
-	if fi, err := os.Stat(filepath.Join(cfg.DataDir, cosignFile)); err != nil || fi.Size() != 0 {
+	if fi, err := os.Stat(filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile))); err != nil || fi.Size() != 0 {
 		t.Fatalf("журнал подписей после испорченной подписи: %v %v", fi, err)
 	}
 	w.corrupt.Store(false)
@@ -576,6 +779,8 @@ func TestCosign409NeedsSizeType(t *testing.T) {
 	mustStamp(t, s)
 	mustCosign(t, s)
 	s.Close()
+	// Журнал подписей пропал: хранилище спросит с нуля и получит 409.
+	os.Remove(filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile)))
 	s2, err := reopen(cfg, c)
 	if err != nil {
 		t.Fatal(err)
@@ -649,5 +854,47 @@ func TestCosignSlowWitnessDoesNotStarveOthers(t *testing.T) {
 	st := s.Status()
 	if st.Cosigners[1].Name != "witness.example/fast" || st.Cosigners[1].Head == 0 || st.Cosigners[0].Head != 0 {
 		t.Fatalf("status: %+v", st.Cosigners)
+	}
+}
+
+// Журнал подписей едет в копию наружу и возвращается при подъёме: после
+// потери диска пакеты старых записей несут те же подписи свидетеля, без
+// -to-head и без самого свидетеля (он хранит только последнюю голову).
+func TestCosignJournalInCopy(t *testing.T) {
+	c := newClock()
+	ctx := context.Background()
+	w := newLiveWitness(t, "witness.example/w1")
+	cfg, remote := replicaConfig(t)
+	w.option()(cfg)
+	s := openStore(t, cfg, c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	mustCosign(t, s)
+	before, err := s.Proof("abs-core", 2, false)
+	if err != nil || len(before.Cosignatures) != 1 {
+		t.Fatalf("до потери диска: %v %+v", err, before.Cosignatures)
+	}
+	if _, err := s.ShipOnce(ctx, remote); err != nil { // журнал подписей — в копию
+		t.Fatal(err)
+	}
+	w.down.Store(true)
+	s2, err := restoreCopy(t, cfg, s, remote, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	after, err := s2.Proof("abs-core", 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Cosignatures) != 1 || !bytes.Equal(after.Cosignatures[0].Sig, before.Cosignatures[0].Sig) {
+		t.Fatalf("после подъёма подписи в пакете: %+v, до: %+v", after.Cosignatures, before.Cosignatures)
+	}
+	if r := proof.Verify(after, w.trust(t, s2)); !r.Valid() {
+		t.Fatalf("пакет после подъёма:\n%s", r.Text())
 	}
 }

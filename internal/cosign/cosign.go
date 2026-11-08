@@ -295,6 +295,13 @@ func SplitNote(note []byte) (text []byte, sigs []string, err error) {
 	return text, lines, nil
 }
 
+// LogVerifierKey — ключ проверки журнала в виде vkey signed-note: имя —
+// происхождение, тип 0x01 (Ed25519). Его просит свидетель, который
+// подписывает головы этого журнала.
+func LogVerifierKey(origin string, pub ed25519.PublicKey) string {
+	return fmt.Sprintf("%s+%08x+%s", origin, KeyID(origin, TypeEd25519, pub), b64.EncodeToString(append([]byte{TypeEd25519}, pub...)))
+}
+
 // LogSignature — подпись журнала (хранилища) над текстом точки: тип 0x01,
 // имя ключа — происхождение.
 func LogSignature(origin string, pub ed25519.PublicKey, sig []byte) string {

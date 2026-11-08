@@ -925,12 +925,14 @@ func (r WindowReport) Notes() []string {
 		if r.WitnessUntimed {
 			n = append(n, WitnessUntimedNote)
 		}
+	case r.WitnessNone && len(r.Cosigned) > 0:
+		n = append(n, "the witness has no head at or after the end of this stretch yet")
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after the end of this stretch yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
 	case len(r.Cosigned) == 0:
 		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the whole chain")
 	}
-	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this stretch")...)
+	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this stretch", time.Time{})...)
 }
 
 // Text — отчёт человеческим языком. Как у пакета одной улики, всё, что

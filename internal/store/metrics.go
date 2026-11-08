@@ -77,14 +77,16 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		ok := metrics.Family{Name: "evidencestore_cosigner_last_success_timestamp_seconds", Help: "when the C2SP witness last returned a cosignature that verified, 0 if none since start", Type: metrics.Gauge}
 		errs := metrics.Family{Name: "evidencestore_cosigner_errors_total", Help: "failed rounds of sending heads to the C2SP witness", Type: metrics.Counter}
 		refused := metrics.Family{Name: "evidencestore_cosigner_refused", Help: "1 when the C2SP witness refused the consistency proof from the last head it cosigned: it holds another history of this store's chain", Type: metrics.Gauge}
+		lost := metrics.Family{Name: "evidencestore_cosigner_lost_state", Help: "1 when the C2SP witness reports an older head than it cosigned for this store: it lost its state and would cosign a second history under the same key", Type: metrics.Gauge}
 		for _, c := range st.Cosigners {
 			l := [][2]string{{"witness", c.Name}}
 			head.Samples = append(head.Samples, metrics.Sample{Labels: l, Value: float64(c.Head)})
 			ok.Samples = append(ok.Samples, metrics.Sample{Labels: l, Value: seconds(c.LastAt)})
 			errs.Samples = append(errs.Samples, metrics.Sample{Labels: l, Value: float64(c.Errors)})
 			refused.Samples = append(refused.Samples, metrics.Sample{Labels: l, Value: metrics.Bool(c.Refused)})
+			lost.Samples = append(lost.Samples, metrics.Sample{Labels: l, Value: metrics.Bool(c.LostState)})
 		}
-		fams = append(fams, head, ok, errs, refused)
+		fams = append(fams, head, ok, errs, refused, lost)
 	}
 	return fams
 }

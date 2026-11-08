@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
@@ -249,14 +250,17 @@ type SourceStatus struct {
 
 // Status — сводка для оператора.
 type Status struct {
-	Records    uint64         `json:"records"`
-	HeadSeq    uint64         `json:"head_seq"`
-	HeadHash   string         `json:"head_hash"`
-	Leaves     uint64         `json:"leaves"`
-	Stamps     int            `json:"tsa_stamps"`
-	LastStamp  time.Time      `json:"last_stamp,omitempty"`
-	StampedTo  uint64         `json:"stamped_head"`
-	PublicKey  string         `json:"public_key"`
+	Records   uint64    `json:"records"`
+	HeadSeq   uint64    `json:"head_seq"`
+	HeadHash  string    `json:"head_hash"`
+	Leaves    uint64    `json:"leaves"`
+	Stamps    int       `json:"tsa_stamps"`
+	LastStamp time.Time `json:"last_stamp,omitempty"`
+	StampedTo uint64    `json:"stamped_head"`
+	PublicKey string    `json:"public_key"`
+	// LogKey — ключ проверки хранилища в виде vkey C2SP (имя — его
+	// происхождение, тип 0x01): его просит свидетель другого проекта.
+	LogKey     string         `json:"log_vkey"`
 	Sources    []SourceStatus `json:"sources"`
 	LogFailure string         `json:"log_failure,omitempty"`
 	// ChainFailure — цепь защёлкнута ошибкой записи (входит и в LogFailure:
@@ -304,6 +308,7 @@ func (s *Store) Status() Status {
 	}
 	s.chainMu.Unlock()
 	out.PublicKey = s.signer.PublicKeyString()
+	out.LogKey = cosign.LogVerifierKey(proof.OriginFor(s.signer.PublicKey()), s.signer.PublicKey())
 	if err := s.Healthy(); err != nil {
 		out.LogFailure = err.Error()
 	}

@@ -3,9 +3,13 @@ package proof
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/mod/sumdb/note"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
@@ -77,7 +81,7 @@ func TestCosignedEarliestPins(t *testing.T) {
 		t.Fatalf("закрепить обязана голова 4:\n%s", r.Text())
 	}
 	b.Cosignatures = b.Cosignatures[:1] // только голова 2 — раньше звена улики
-	if r := Verify(b, cosignTrust(w, s)); r.Valid() || !strings.Contains(r.Text(), "no cosignature of witness witness.example/w1 on a head at or after link 3") {
+	if r := Verify(b, cosignTrust(w, s)); r.Valid() || !strings.Contains(r.Text(), "no cosignature of witness witness.example/w1 (key "+fmt.Sprintf("%08x", s.ID)+") on a head at or after link 3") {
 		t.Fatalf("голова раньше звена улики закрепила её:\n%s", r.Text())
 	}
 }
@@ -95,7 +99,7 @@ func TestCosignedCatchesRewrite(t *testing.T) {
 	y, forged := rewritten(t, w) // звено 3 переписано, пакет кончается головой 3
 	forged.Cosignatures = []Cosignature{sig}
 	r := Verify(forged, cosignTrust(y, s))
-	if r.Valid() || !strings.Contains(r.Text(), "before head 4 that witness witness.example/w1 cosigned") {
+	if r.Valid() || !strings.Contains(r.Text(), "before head 4 that witness witness.example/w1 (key "+fmt.Sprintf("%08x", s.ID)+") cosigned") {
 		t.Fatalf("переписанная цепь без головы 4:\n%s", r.Text())
 	}
 	// Дотянутая до 4 — корень не тот, что подписал свидетель.
@@ -217,5 +221,57 @@ func TestCheckpointNote(t *testing.T) {
 	}
 	if err := cosign.VerifyLogSignature(text, sigs, c.Origin, w.signer.PublicKey()); err != nil {
 		t.Fatalf("подпись хранилища в заметке: %v", err)
+	}
+}
+
+// Заметка головы открывается эталонной реализацией signed-note
+// (golang.org/x/mod/sumdb/note) с ключом проверки, который хранилище
+// показывает в status (log_vkey): свидетель другого проекта её примет.
+func TestCheckpointNoteOpensWithGoNote(t *testing.T) {
+	w := newWorld(t)
+	cp := SignCheckpoint(w.signer, 3, [32]byte{1, 2, 3})
+	vkey := cosign.LogVerifierKey(cp.Origin, w.signer.PublicKey())
+	v, err := note.NewVerifier(vkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := note.Open(cp.Note(w.signer.PublicKey()), note.VerifierList(v))
+	if err != nil || len(n.Sigs) != 1 {
+		t.Fatalf("note.Open: %v", err)
+	}
+}
+
+// С -heads без головы после записи и с подписью свидетеля C2SP отчёт не пишет,
+// что против переписки стоит одна метка TSA.
+func TestCosignedNotesWithHeadsNone(t *testing.T) {
+	w, b := standard(t, nil)
+	s := cosigner(t, "witness.example/w1")
+	b.Cosignatures = []Cosignature{w.cosigned(s, 4, w.root(4), w.now.Add(time.Minute))}
+	tr := cosignTrust(w, s)
+	line, _ := json.Marshal(map[string]any{"received_at": w.now, "checkpoint": w.checkpoint(2)})
+	tr.Witness = &Witness{Heads: ParseHeads("checkpoints.jsonl", line)} // голова свидетеля — до звена записи
+	r := Verify(b, tr)
+	if !r.Valid() || !r.WitnessNone || len(r.Cosigned) != 1 || strings.Contains(r.Text(), "only a TSA time-stamp stands") {
+		t.Fatalf("отчёт с -heads без головы и с подписью свидетеля:\n%s", r.Text())
+	}
+}
+
+// Подпись, датированная раньше T1 записи: часы свидетеля отставали, и отчёт
+// говорит, что её времени верить нельзя.
+func TestCosignedClockBehindNoted(t *testing.T) {
+	w, b := standard(t, nil)
+	s := cosigner(t, "witness.example/w1")
+	t1 := Verify(b, w.trust()).Lower
+	if t1.IsZero() {
+		t.Fatal("в пакете нет T1")
+	}
+	b.Cosignatures = []Cosignature{w.cosigned(s, 4, w.root(4), t1.Add(-time.Hour))}
+	r := Verify(b, cosignTrust(w, s))
+	if !r.Valid() || !strings.Contains(r.Text(), "its clock was behind") {
+		t.Fatalf("подпись раньше T1:\n%s", r.Text())
+	}
+	b.Cosignatures = []Cosignature{w.cosigned(s, 4, w.root(4), t1.Add(time.Second))}
+	if r := Verify(b, cosignTrust(w, s)); strings.Contains(r.Text(), "its clock was behind") {
+		t.Fatalf("подпись после T1 названа отстающей:\n%s", r.Text())
 	}
 }

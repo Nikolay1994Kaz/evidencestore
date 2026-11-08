@@ -108,12 +108,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	pt := proof.Trust{StoreKey: key, TSA: trust, AllowNoTSA: *allowNoTSA}
 	if *gatewayKey != "" {
-		raw := *gatewayKey
-		if b, err := os.ReadFile(raw); err == nil {
-			raw = string(b)
-		}
-		if pt.GatewayKey, err = gateway.ParseKey(raw); err != nil {
-			return usageErr(err)
+		// Сначала — как ключ: файл с именем, равным ключу, его не подменяет.
+		if pt.GatewayKey, err = gateway.ParseKey(*gatewayKey); err != nil {
+			b, ferr := os.ReadFile(*gatewayKey)
+			if ferr != nil {
+				return usageErr(err)
+			}
+			if pt.GatewayKey, err = gateway.ParseKey(string(b)); err != nil {
+				return usageErr(err)
+			}
 		}
 	}
 	if *headsDir != "" {
@@ -121,14 +124,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return usageErr(fmt.Errorf("heads: %w", err))
 		}
 	}
+	seenKey := map[string]string{}
 	for _, raw := range witnessKeys {
-		if b, err := os.ReadFile(raw); err == nil {
-			raw = strings.TrimSpace(string(b))
-		}
+		// Сначала — как ключ проверки: в нём всегда есть «/», и файл по пути,
+		// равному настоящему ключу (подложенный в каталог аудитора), его не
+		// подменяет. Не ключ — тогда путь к файлу с ключом.
 		v, err := cosign.ParseVerifier(raw)
 		if err != nil {
-			return usageErr(fmt.Errorf("-witness-key: %w", err))
+			b, ferr := os.ReadFile(raw)
+			if ferr != nil {
+				return usageErr(fmt.Errorf("-witness-key: %w", err))
+			}
+			if v, err = cosign.ParseVerifier(strings.TrimSpace(string(b))); err != nil {
+				return usageErr(fmt.Errorf("-witness-key %s: %w", raw, err))
+			}
 		}
+		// Имя в подписи cosignature/v1 не подписано: один ключ под двумя
+		// именами был бы двумя «свидетелями» с одной подписью.
+		if name, ok := seenKey[string(v.Key)]; ok && name != v.Name {
+			return usageErr(fmt.Errorf("-witness-key: one key is given as witness %s and as witness %s: it is one witness", name, v.Name))
+		}
+		seenKey[string(v.Key)] = v.Name
 		pt.Cosigners = append(pt.Cosigners, v)
 	}
 	var promise *proof.Promise
@@ -257,13 +273,24 @@ func readHeads(dir string) (*proof.Witness, error) {
 	return w, err
 }
 
+// readKey — ключ хранилища: сначала как ключ (файл с именем, равным ключу,
+// его не подменяет), иначе — файл с ключом.
 func readKey(v string) (ed25519.PublicKey, error) {
-	if data, err := os.ReadFile(v); err == nil {
-		v = strings.TrimSpace(string(data))
+	if key, ok := parseStoreKey(v); ok {
+		return key, nil
 	}
+	if data, err := os.ReadFile(v); err == nil {
+		if key, ok := parseStoreKey(strings.TrimSpace(string(data))); ok {
+			return key, nil
+		}
+	}
+	return nil, errors.New("store key must be a base64 Ed25519 public key")
+}
+
+func parseStoreKey(v string) (ed25519.PublicKey, bool) {
 	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(v, "="))
 	if err != nil || len(raw) != ed25519.PublicKeySize {
-		return nil, errors.New("store key must be a base64 Ed25519 public key")
+		return nil, false
 	}
-	return ed25519.PublicKey(raw), nil
+	return ed25519.PublicKey(raw), true
 }

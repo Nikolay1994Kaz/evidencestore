@@ -25,6 +25,7 @@ import (
 //	evidence/seg_….log/<начало>-<конец>   журнал улик (только подтверждённое fsync)
 //	chain/chain.log/<начало>-<конец>      звенья цепи
 //	chain/leaves_….log/<начало>-<конец>   листья цепи
+//	cosign/cosignatures.jsonl/<начало>-<конец>  подписи свидетелей C2SP (cosign.go)
 //	heads/<номер головы>.json             подписанная голова (контрольная точка) на момент копии
 //
 // Объекты неизменяемы и не удаляются никогда: копия улик тоже улика.
@@ -98,6 +99,14 @@ func (s *Store) replicaFiles() (replicaSnapshot, error) {
 	s.chainMu.Unlock()
 	for _, seg := range s.evlog.Segments() {
 		snap.sizes["evidence/"+filepath.Base(seg.Path)] = seg.Size
+	}
+	// Подписи свидетелей — только для голов, которые копия уже держит (их
+	// свидетелям отдают не дальше replicaShipped), так что после подъёма они
+	// не дальше поднятой цепи.
+	if size, ok, err := s.cosignLogSize(); err != nil {
+		return snap, err
+	} else if ok {
+		snap.sizes[cosignFile] = size
 	}
 	return snap, nil
 }
@@ -346,7 +355,7 @@ func listReplica(ctx context.Context, r ship.Remote, prefix string) (map[string]
 
 // parseReplica разбирает ключи поколения prefix: имена файлов — без prefix,
 // ключи кусков и голов — полные. Ключи других поколений пропускаются (у
-// первого поколения — как чужие: не под evidence/, chain/ или heads/).
+// первого поколения — как чужие: не под evidence/, chain/, cosign/ или heads/).
 func parseReplica(keys []string, prefix string) (map[string][]chunk, []string, error) {
 	files := map[string][]chunk{}
 	var heads []string
@@ -361,7 +370,7 @@ func parseReplica(keys []string, prefix string) (map[string][]chunk, []string, e
 		}
 		dir, base := path.Split(rel)
 		se := strings.SplitN(base, "-", 2)
-		if len(se) != 2 || (!strings.HasPrefix(dir, "evidence/") && !strings.HasPrefix(dir, "chain/")) {
+		if len(se) != 2 || (!strings.HasPrefix(dir, "evidence/") && !strings.HasPrefix(dir, "chain/") && !strings.HasPrefix(dir, "cosign/")) {
 			continue // чужие объекты в бакете не наши
 		}
 		start, err1 := strconv.ParseInt(se[0], 10, 64)
@@ -401,7 +410,7 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 		return rep, err
 	}
 	defer lock.Close()
-	for _, sub := range []string{"evidence", "chain"} {
+	for _, sub := range []string{"evidence", "chain", "cosign"} {
 		if entries, err := os.ReadDir(filepath.Join(dataDir, sub)); err == nil && len(entries) > 0 {
 			return rep, fmt.Errorf("replica restore: %s is not empty — refusing to overwrite", filepath.Join(dataDir, sub))
 		}

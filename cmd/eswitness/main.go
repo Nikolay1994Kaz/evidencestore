@@ -203,6 +203,10 @@ func cmdInit(cfg *Config, stdout io.Writer) error {
 		return err
 	}
 	tmp := path + ".tmp"
+	// Остаток init, прерванного падением: ключа ещё нет, временный файл — не ключ.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -264,6 +268,7 @@ func cmdServe(cfg *Config, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	defer w.Close()
 	srv := &http.Server{
 		Handler:           w.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
