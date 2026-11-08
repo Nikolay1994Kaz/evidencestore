@@ -112,12 +112,6 @@
    "new": "\t\t\t\t\tif false {"
   },
   {
-   "name": "Z20 домен не входит в выведенный ключ",
-   "file": "internal/auditchain/export.go",
-   "old": "\tm.Write([]byte(domain))\n",
-   "new": ""
-  },
-  {
    "name": "Z110 шаг без соседа не пропускается",
    "file": "internal/auditchain/merkle.go",
    "old": "if pos != len(level)-1 || len(level)%2 != 1 {",

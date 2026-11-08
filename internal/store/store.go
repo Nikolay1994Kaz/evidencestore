@@ -131,9 +131,10 @@ type Store struct {
 	tree     *linkTree // дерево звеньев (tree.go); открывает scanChain
 	signer   *auditchain.Signer
 	chainDir string
-	// subjectKey — ключ меток субъектов (evidence.NewSubjectTag), выведен из
-	// ключа подписи: у цепи он один, иначе записи клиента разошлись бы по меткам.
-	subjectKey [32]byte
+	// labelDomain — домен ключа меток в ключе месяца (subjectKeyDomain). Поле, а
+	// не глобальная переменная: тест подменяет его у своего хранилища, чтобы
+	// изобразить нечестный приём, и не задевает соседние тесты.
+	labelDomain string
 
 	tsaURL   string
 	tsaTrust tsa.Trust
@@ -627,7 +628,7 @@ func (s *Store) open() error {
 	if s.signer, err = auditchain.LoadOrCreateSigner(chainDir); err != nil {
 		return err
 	}
-	s.subjectKey = s.signer.DeriveKey(subjectKeyDomain)
+	s.labelDomain = subjectKeyDomain
 	if err := s.confirmSigner(); err != nil {
 		// Цепь пуста: этим ключом хранилище ещё ничего не подписало, и
 		// остановка ничего не стоит — какой из двух ключей верный, решает

@@ -184,7 +184,10 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 		}
 		h := n.header
 		if subjectField != "" {
-			s.labelRecord(&h, st, subjectField, n.body)
+			if err := s.labelRecord(&h, st, subjectField, n.body); err != nil {
+				release()
+				return nil, err
+			}
 		}
 		sealed, err := evidence.Record{Header: h, Body: n.body}.Seal(s.keys)
 		if err != nil {
@@ -233,21 +236,49 @@ func (s *Store) Ingest(source string, recs []Incoming) (_ []Result, err error) {
 	return results, nil
 }
 
-// subjectKeyDomain — домен ключа меток субъектов.
-const subjectKeyDomain = "evidencestore/subject-key/v1"
+// subjectKeyDomain — домен ключа меток субъектов внутри ключа месяца.
+const subjectKeyDomain = "evidencestore/subject-key/v2"
 
 // labelRecord ставит записи метку субъекта. Тело здесь ещё открыто, дальше
 // хранилище его не видит. Запись без субъекта — без метки: принять её важнее,
 // чем отметить; счётчик и журнал показывают, что поле настроено не на то (само
-// значение в журнал не идёт: это персональные данные).
-func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, body []byte) {
-	if v, ok := evidence.SubjectOf(body, field); ok {
-		h.Subject, h.SubjectField = evidence.NewSubjectTag(s.subjectKey[:], h.Source, field, v), field
-		return
+// значение в журнал не идёт: это персональные данные). Ключ месяца записи уже
+// заведён и в резерве (ensureScope): метка считается его ключом меток.
+func (s *Store) labelRecord(h *evidence.Header, st *sourceState, field string, body []byte) error {
+	v, ok := evidence.SubjectOf(body, field)
+	if !ok {
+		if st.noSubject.Add(1) == 1 {
+			s.log.Warn("a record names no subject: it carries no label and stays closed in subject bundles", "source", h.Source, "subject_field", field)
+		}
+		return nil
 	}
-	if st.noSubject.Add(1) == 1 {
-		s.log.Warn("a record names no subject: it carries no label and stays closed in subject bundles", "source", h.Source, "subject_field", field)
+	tag, ok, err := s.subjectLabel(h.Scope(), h.Source, field, v)
+	if err != nil {
+		return err
 	}
+	if !ok {
+		// Текущий месяц ждёт уничтожения или уничтожен: Seal ниже всё равно
+		// откажет, ключ закрыт для записи.
+		return fmt.Errorf("store: the key of %s is closed: no label and no seal", h.Scope())
+	}
+	h.Subject, h.SubjectField = tag, field
+	return nil
+}
+
+// subjectLabel — метка субъекта в месяце источника (DECISIONS, п. 32). Ключ
+// меток у каждого месяца свой и выведен из ключа месяца: уничтожен ключ месяца —
+// уничтожен и ключ меток, и метки этого месяца больше не посчитает никто, само
+// хранилище тоже. ok = false — ключ месяца уничтожен или ждёт уничтожения.
+func (s *Store) subjectLabel(scope, source, field, value string) (evidence.SubjectTag, bool, error) {
+	key, err := s.keys.DeriveKey(scope, s.labelDomain)
+	switch {
+	case errors.Is(err, keyring.ErrKeyDestroyed), errors.Is(err, keyring.ErrKeyPending):
+		return evidence.SubjectTag{}, false, nil
+	case err != nil:
+		return evidence.SubjectTag{}, false, err
+	}
+	defer clear(key[:])
+	return evidence.NewSubjectTag(key[:], source, field, value), true, nil
 }
 
 // promise — подписанное обещание по принятой улике. Ed25519 детерминирован:

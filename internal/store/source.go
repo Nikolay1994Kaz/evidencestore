@@ -3,8 +3,10 @@ package store
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
@@ -67,14 +69,31 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 		return proof.SourceBundle{}, fmt.Errorf("%w: source %s", ErrNotFound, source)
 	}
 	var claim *proof.SubjectClaim
-	var only *evidence.SubjectTag
+	// mine — запись субъекта: её метка — метка субъекта в месяце записи. Метки
+	// считаются по месяцам, которые встретились в окне; месяц с уничтоженным или
+	// ждущим уничтожения ключом метки не получает (nil): его записи ничьи.
+	var mine func(evidence.Sealed) (bool, error)
+	labels := map[string]*evidence.SubjectTag{}
 	if subject != "" {
 		if subjectField == "" {
 			return proof.SourceBundle{}, fmt.Errorf("%w: source %s has no subject_field in the configuration: a source that is retired keeps it, with \"disabled\": true", ErrWindow, source)
 		}
-		tag := evidence.NewSubjectTag(s.subjectKey[:], source, subjectField, subject)
-		only = &tag
-		claim = &proof.SubjectClaim{Field: subjectField, Value: subject, Tag: tag[:]}
+		claim = &proof.SubjectClaim{Field: subjectField, Value: subject}
+		mine = func(sealed evidence.Sealed) (bool, error) {
+			scope := sealed.Scope()
+			tag, seen := labels[scope]
+			if !seen {
+				t, ok, err := s.subjectLabel(scope, source, subjectField, subject)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					tag = &t
+				}
+				labels[scope] = tag
+			}
+			return tag != nil && sealed.Subject == *tag, nil
+		}
 	}
 
 	s.chainMu.Lock()
@@ -248,7 +267,7 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 					return proof.SourceBundle{}, err
 				}
 				if withDEK && proof.InWindow(time.Unix(0, leaf.UnixNano), from, to) {
-					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf, only); err != nil {
+					if rec.Evidence, rec.DEK, err = s.sealedWithKey(leaf, mine); err != nil {
 						return proof.SourceBundle{}, err
 					}
 				}
@@ -320,6 +339,15 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	if _, err := proof.OpenTail(b.Upper.Tails.Chain(), source, b.Upper.Open); err != nil {
 		return proof.SourceBundle{}, fmt.Errorf("store: upper tails of %s: %w", source, err)
 	}
+	// Метки субъекта — тех месяцев окна, чей ключ жив, по порядку месяцев.
+	if claim != nil {
+		for scope, tag := range labels {
+			if tag != nil {
+				claim.Labels = append(claim.Labels, proof.SubjectLabel{Scope: scope, Tag: tag[:]})
+			}
+		}
+		slices.SortFunc(claim.Labels, func(a, b proof.SubjectLabel) int { return strings.Compare(a.Scope, b.Scope) })
+	}
 	// Голова — последнее звено пакета, подписана при выдаче.
 	if b.Frontier, b.Checkpoint, err = s.bundleHead(links); err != nil {
 		return proof.SourceBundle{}, err
@@ -369,9 +397,9 @@ func inclusionIn(tree *auditchain.MerkleTree, seq uint64, leaves []auditchain.Le
 }
 
 // sealedWithKey — улика под листом и ключ её записи. Ключ месяца уничтожен
-// или ждёт уничтожения — без ключа: улика доказывается, тело — нет. only — ключ
-// только записи с этой меткой субъекта, у остальных улика без ключа.
-func (s *Store) sealedWithKey(leaf auditchain.Leaf, only *evidence.SubjectTag) ([]byte, []byte, error) {
+// или ждёт уничтожения — без ключа: улика доказывается, тело — нет. mine — ключ
+// только записи субъекта (nil — всем), у остальных улика без ключа.
+func (s *Store) sealedWithKey(leaf auditchain.Leaf, mine func(evidence.Sealed) (bool, error)) ([]byte, []byte, error) {
 	pos, _, err := proof.ParseEvidenceLeaf(leaf)
 	if err != nil {
 		return nil, nil, err
@@ -384,8 +412,14 @@ func (s *Store) sealedWithKey(leaf auditchain.Leaf, only *evidence.SubjectTag) (
 	if err != nil {
 		return nil, nil, err
 	}
-	if only != nil && sealed.Subject != *only {
-		return data, nil, nil
+	if mine != nil {
+		ok, err := mine(sealed)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
+			return data, nil, nil
+		}
 	}
 	dek, err := s.keys.UnwrapDEK(sealed.Envelope)
 	switch {

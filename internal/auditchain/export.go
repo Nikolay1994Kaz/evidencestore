@@ -2,9 +2,7 @@ package auditchain
 
 import (
 	"crypto/ed25519"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -108,18 +106,6 @@ func LoadOrCreateSigner(dir string) (*Signer, error) {
 // statementBytes: тогда подпись над одним видом сообщений не предъявить как
 // подпись над другим.
 func (s *Signer) SignMessage(msg []byte) []byte { return ed25519.Sign(s.priv, msg) }
-
-// DeriveKey — ключ для другой задачи, выведенный из ключа подписи: HMAC-SHA-256
-// от домена под семенем ключа. Отдельному файлу пришлось бы заводить резерв и
-// сверку при запуске, а sign.key всё это уже имеет и у цепи не меняется. Домен —
-// своя строка на задачу.
-func (s *Signer) DeriveKey(domain string) [32]byte {
-	m := hmac.New(sha256.New, s.priv.Seed())
-	m.Write([]byte(domain))
-	var k [32]byte
-	copy(k[:], m.Sum(nil))
-	return k
-}
 
 // PublicKey — то, что публикуют и закрепляют у аудитора.
 func (s *Signer) PublicKey() ed25519.PublicKey {

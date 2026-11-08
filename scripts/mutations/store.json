@@ -2476,8 +2476,8 @@
   {
    "name": "Z30 метка не ставится при приёме",
    "file": "internal/store/ingest.go",
-   "old": "\t\tif subjectField != \"\" {\n\t\t\ts.labelRecord(",
-   "new": "\t\tif false {\n\t\t\ts.labelRecord("
+   "old": "\t\tif subjectField != \"\" {\n\t\t\tif err := s.labelRecord(",
+   "new": "\t\tif false {\n\t\t\tif err := s.labelRecord("
   },
   {
    "name": "Z31 запись уходит без метки",
@@ -2494,14 +2494,14 @@
   {
    "name": "Z33 метка при приёме без источника",
    "file": "internal/store/ingest.go",
-   "old": "h.Subject, h.SubjectField = evidence.NewSubjectTag(s.subjectKey[:], h.Source, field, v), field",
-   "new": "h.Subject, h.SubjectField = evidence.NewSubjectTag(s.subjectKey[:], \"\", field, v), field"
+   "old": "return evidence.NewSubjectTag(key[:], source, field, value), true, nil",
+   "new": "return evidence.NewSubjectTag(key[:], \"\", field, value), true, nil"
   },
   {
-   "name": "Z34 ключ меток не выведен из ключа подписи",
-   "file": "internal/store/store.go",
-   "old": "\ts.subjectKey = s.signer.DeriveKey(subjectKeyDomain)\n",
-   "new": ""
+   "name": "Z34 ключ меток не выведен из ключа месяца",
+   "file": "internal/store/ingest.go",
+   "old": "\tkey, err := s.keys.DeriveKey(scope, s.labelDomain)\n",
+   "new": "\tkey, err := [32]byte{1}, error(nil)\n"
   },
   {
    "name": "Z35 запись не сверяется с листом при запуске (P-47)",
@@ -2536,14 +2536,14 @@
   {
    "name": "Z41 пакет по субъекту: ключи всем записям окна",
    "file": "internal/store/source.go",
-   "old": "if only != nil && sealed.Subject != *only {",
-   "new": "if false {"
+   "old": "\t\tif !ok {\n\t\t\treturn data, nil, nil\n\t\t}",
+   "new": "\t\tif !ok && false {\n\t\t\treturn data, nil, nil\n\t\t}"
   },
   {
    "name": "Z42 заявление о субъекте без метки",
    "file": "internal/store/source.go",
-   "old": "claim = &proof.SubjectClaim{Field: subjectField, Value: subject, Tag: tag[:]}",
-   "new": "claim = &proof.SubjectClaim{Field: subjectField, Value: subject}"
+   "old": "claim.Labels = append(claim.Labels, proof.SubjectLabel{Scope: scope, Tag: tag[:]})",
+   "new": "_ = scope"
   },
   {
    "name": "Z43 пакет по субъекту у источника без subject_field",
@@ -2632,26 +2632,26 @@
   {
    "name": "Z57 заявление без значения принимается",
    "file": "internal/proof/source.go",
-   "old": "if len(c.Tag) != len(want) || c.Value == \"\" || c.Field == \"\" {",
-   "new": "if len(c.Tag) != len(want) || c.Field == \"\" {"
+   "old": "\tif c.Value == \"\" || c.Field == \"\" {\n\t\treturn errors.New(\"the bundle does not say whose",
+   "new": "\tif c.Field == \"\" {\n\t\treturn errors.New(\"the bundle does not say whose"
   },
   {
    "name": "Z58 заявление без поля принимается",
    "file": "internal/proof/source.go",
-   "old": "if len(c.Tag) != len(want) || c.Value == \"\" || c.Field == \"\" {",
-   "new": "if len(c.Tag) != len(want) || c.Value == \"\" {"
+   "old": "\tif c.Value == \"\" || c.Field == \"\" {\n\t\treturn errors.New(\"the bundle does not say whose",
+   "new": "\tif c.Value == \"\" {\n\t\treturn errors.New(\"the bundle does not say whose"
   },
   {
    "name": "Z59 метка любой длины принимается",
    "file": "internal/proof/source.go",
-   "old": "if len(c.Tag) != len(want) || c.Value == \"\" || c.Field == \"\" {",
-   "new": "if c.Value == \"\" || c.Field == \"\" {"
+   "old": "\t\tcase len(l.Tag) != len(t):\n",
+   "new": "\t\tcase false:\n"
   },
   {
    "name": "Z60 нулевая метка в заявлении принимается",
    "file": "internal/proof/source.go",
-   "old": "\tif want.IsZero() {\n\t\treturn errors.New(\"the bundle names an empty subject label\")",
-   "new": "\tif false {\n\t\treturn errors.New(\"the bundle names an empty subject label\")"
+   "old": "\t\tif t.IsZero() {\n\t\t\treturn errors.New(\"the bundle names an empty subject label\")",
+   "new": "\t\tif false {\n\t\t\treturn errors.New(\"the bundle names an empty subject label\")"
   },
   {
    "name": "Z61 чужая запись с ключом проходит",
@@ -2680,8 +2680,8 @@
   {
    "name": "Z66 записи субъекта без ключа не считаются",
    "file": "internal/proof/source.go",
-   "old": "\t\t\tif len(rec.DEK) == 0 {\n\t\t\t\tr.SubjectKeyless++",
-   "new": "\t\t\tif false {\n\t\t\t\tr.SubjectKeyless++"
+   "old": "\t\t\tif len(rec.DEK) == 0 {\n\t\t\t\tm.keyless++",
+   "new": "\t\t\tif false {\n\t\t\t\tm.keyless++"
   },
   {
    "name": "Z67 отчёт молчит, что метка ничем не привязана",
@@ -2704,7 +2704,7 @@
   {
    "name": "Z70 отчёт не называет субъекта",
    "file": "internal/proof/source.go",
-   "old": "\t\tr.Subject, r.SubjectField, r.SubjectLabel = b.Subject.Value, b.Subject.Field, fmt.Sprintf(\"%x\", b.Subject.Tag)\n",
+   "old": "\t\tr.Subject, r.SubjectField, r.SubjectLabel = b.Subject.Value, b.Subject.Field, labelsText(b.Subject.Labels)\n",
    "new": "\t\t_ = b.Subject.Value\n"
   },
   {
@@ -2728,8 +2728,8 @@
   {
    "name": "Z74 запись без поля в заголовке",
    "file": "internal/store/ingest.go",
-   "old": "h.Subject, h.SubjectField = evidence.NewSubjectTag(s.subjectKey[:], h.Source, field, v), field",
-   "new": "h.Subject = evidence.NewSubjectTag(s.subjectKey[:], h.Source, field, v)"
+   "old": "\th.Subject, h.SubjectField = tag, field\n",
+   "new": "\th.Subject = tag\n"
   },
   {
    "name": "Z75 поле в заголовке не сверяется с заявлением",
@@ -2740,7 +2740,7 @@
   {
    "name": "Z76 открытые тела не считаются",
    "file": "internal/proof/source.go",
-   "old": "\t\t\t\tr.SubjectOpened++\n",
+   "old": "\t\t\t\tm.opened++\n",
    "new": ""
   },
   {
@@ -2830,8 +2830,8 @@
   {
    "name": "Z92 пустое окно у пакета по субъекту не названо пустым",
    "file": "cmd/esverify/window.go",
-   "old": "if src.SubjectRecords == 0 && src.InWindow > 0 {",
-   "new": "if src.SubjectRecords == 0 {"
+   "old": "if src.UnderLabels() == 0 && src.InWindow > 0 {",
+   "new": "if src.UnderLabels() == 0 {"
   },
   {
    "name": "Z93 метка не видна в отчёте с открытым телом",
@@ -2842,8 +2842,8 @@
   {
    "name": "Z94 метка не видна в отчёте без открытого тела",
    "file": "internal/proof/source.go",
-   "old": "r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.SubjectOthers+r.SubjectUnlabeled, r.InWindow)",
-   "new": "r.Subject, r.SubjectField, \"\", r.SubjectRecords, r.SubjectOthers+r.SubjectUnlabeled, r.InWindow)"
+   "old": "r.Subject, r.SubjectField, r.SubjectLabel, r.UnderLabels(), r.closedOthers(), r.InWindow)",
+   "new": "r.Subject, r.SubjectField, \"\", r.UnderLabels(), r.closedOthers(), r.InWindow)"
   },
   {
    "name": "Z95 пропуск записей без улики: -bodies пишет причину субъекта всем",
@@ -2920,20 +2920,80 @@
   {
    "name": "Z107 деталь проверки не считает записи без метки",
    "file": "internal/proof/source.go",
-   "old": "r.SubjectRecords, r.SubjectOpened, r.SubjectOthers+r.SubjectUnlabeled))",
-   "new": "r.SubjectRecords, r.SubjectOpened, r.SubjectOthers))"
+   "old": "r.UnderLabels(), r.SubjectOpened, r.closedOthers()))",
+   "new": "r.UnderLabels(), r.SubjectOpened, r.SubjectOthers))"
   },
   {
    "name": "Z108 строка Subject без открытых тел не считает записи без метки",
    "file": "internal/proof/source.go",
-   "old": "r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.SubjectOthers+r.SubjectUnlabeled, r.InWindow)",
-   "new": "r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.SubjectOthers, r.InWindow)"
+   "old": "r.Subject, r.SubjectField, r.SubjectLabel, r.UnderLabels(), r.closedOthers(), r.InWindow)",
+   "new": "r.Subject, r.SubjectField, r.SubjectLabel, r.UnderLabels(), r.SubjectOthers, r.InWindow)"
   },
   {
    "name": "Z109 строка Subject без открытых тел: число записей окна неверно",
    "file": "internal/proof/source.go",
-   "old": "r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.SubjectOthers+r.SubjectUnlabeled, r.InWindow)",
-   "new": "r.Subject, r.SubjectField, r.SubjectLabel, r.SubjectRecords, r.SubjectOthers+r.SubjectUnlabeled, r.SubjectRecords)"
+   "old": "r.Subject, r.SubjectField, r.SubjectLabel, r.UnderLabels(), r.closedOthers(), r.InWindow)",
+   "new": "r.Subject, r.SubjectField, r.SubjectLabel, r.UnderLabels(), r.closedOthers(), r.UnderLabels())"
+  },
+  {
+   "name": "Z117 метка месяца берётся из заявления, а не из заголовка записи",
+   "file": "internal/proof/source.go",
+   "old": "\t\twant, labelled := labels[sealed.Scope()]\n",
+   "new": "\t\twant, labelled := labels[c.Labels[0].Scope]\n"
+  },
+  {
+   "name": "Z118 ключ меток выдаётся у ключа, ждущего уничтожения",
+   "file": "internal/keyring/derive.go",
+   "old": "\tcase e.state == Pending:\n\t\treturn out, ErrKeyPending\n",
+   "new": ""
+  },
+  {
+   "name": "Z119 месяц метки не сверяется с источником",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase !isMonthOf(b.Source, l.Scope):",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "Z120 месяц дважды в заявлении",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif _, dup := labels[l.Scope]; dup {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "Z121 записи месяца без метки считаются чужими",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase !labelled:\n",
+   "new": "\t\tcase false:\n"
+  },
+  {
+   "name": "Z122 записи месяцев без метки не считаются закрытыми",
+   "file": "internal/proof/source.go",
+   "old": "\treturn r.SubjectOthers + r.SubjectUnlabeled + r.SubjectNoLabel\n",
+   "new": "\treturn r.SubjectOthers + r.SubjectUnlabeled\n"
+  },
+  {
+   "name": "Z123 метку месяца привязывает тело любого месяца (P-71)",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif m.opened > 0 {\n\t\t\tr.SubjectRecords += m.records\n",
+   "new": "\t\tif r.SubjectOpened > 0 {\n\t\t\tr.SubjectRecords += m.records\n"
+  },
+  {
+   "name": "Z124 отчёт молчит о месяцах без открытого тела (P-71)",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif r.SubjectOpened > 0 && r.SubjectUnbound > 0 {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "Z125 непривязанные записи не считаются закрытыми в строке Subject (P-71)",
+   "file": "internal/proof/source.go",
+   "old": "r.SubjectOpened, r.closedOthers()+r.SubjectUnbound)",
+   "new": "r.SubjectOpened, r.closedOthers())"
+  },
+  {
+   "name": "Z126 хранилище само себе подменяет домен меток (P-73)",
+   "file": "internal/store/store.go",
+   "old": "\ts.labelDomain = subjectKeyDomain\n",
+   "new": "\ts.labelDomain = \"\"\n"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются. Q5 снята 07.11 как равносильная: ключи теперь только у записей окна, а запись из незаверенного хвоста легла после закрывающей метки, позже окна больше чем на WindowEdge, и в выдачу не попадёт; срез оставлен как явная граница. Z63 снята 07.11 вместе с веткой: тело без субъекта даёт пустое значение, а названное значение не пусто, поэтому сверка значений закрывает и этот случай. Z87 снята 07.11 как равносильная: перевод строки в любом тексте отказа гасит SourceReport.Text (Z99), а %q в отказе о теле оставлен ради читаемости значения."

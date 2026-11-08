@@ -357,7 +357,7 @@ func TestSubjectBundle(t *testing.T) {
 
 	bodies := filepath.Join(dir, "bodies")
 	code, out, _ := w.run(t, bundle, "-bodies", bodies)
-	if code != exitValid || !strings.Contains(out, "(field \"client\", label "+fmt.Sprintf("%x", b.Subject.Tag)+"): 1 of the 2 records received in the window, 1 of them open, the other 1 stay closed") {
+	if code != exitValid || !strings.Contains(out, "(field \"client\", label "+fmt.Sprintf("%x in %q", b.Subject.Labels[0].Tag, b.Subject.Labels[0].Scope)+"): 1 of the 2 records received in the window, 1 of them open, the other 1 stay closed") {
 		t.Fatalf("код %d:\n%s", code, out)
 	}
 	files, _ := os.ReadDir(bodies)
@@ -646,7 +646,7 @@ func TestBodiesNoRecordUnderLabel(t *testing.T) {
 	for i := range b.Records {
 		b.Records[i].DEK = nil
 	}
-	b.Subject.Tag = []byte("0123456789abcdef")
+	b.Subject.Labels[0].Tag = []byte("0123456789abcdef")
 	code, out, errOut := w.run(t, w.file(t, "forged.json", b), "-bodies", filepath.Join(w.dir, "bodies"))
 	if code != exitValid || !strings.Contains(out, "that the subject has no records") {
 		t.Fatalf("код %d:\n%s", code, out)
@@ -656,8 +656,9 @@ func TestBodiesNoRecordUnderLabel(t *testing.T) {
 	}
 }
 
-// Записи субъекта есть, ключ месяца ждёт уничтожения: код 2 с настоящей причиной,
-// без совета взять -dek (открыл бы всех клиентов окна) и окно шире (шире не откроется).
+// Ключ месяца ждёт уничтожения: ключ меток из него не выводится, у месяца нет
+// метки, и чьи записи — не сказать. Код 2 с настоящей причиной, без совета взять
+// -dek (открыл бы всех клиентов окна) и окно шире (шире не откроется).
 func TestBodiesKeyAwaitsDestruction(t *testing.T) {
 	w := newSubjectWorld(t)
 	scope := "agent/2026-10"
@@ -672,10 +673,10 @@ func TestBodiesKeyAwaitsDestruction(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, out, errOut := w.run(t, w.file(t, "keyless.json", b), "-bodies", filepath.Join(w.dir, "bodies"))
-	if code != exitUsage || !strings.Contains(out, "come without a record key") {
+	if len(b.Subject.Labels) != 0 || code != exitUsage || !strings.Contains(out, `lie in months the bundle names no label for ("agent/2026-10")`) {
 		t.Fatalf("код %d:\n%s", code, out)
 	}
-	if !strings.Contains(errOut, "the month key was destroyed") || !strings.Contains(errOut, "removed from this bundle") ||
+	if !strings.Contains(errOut, "awaits destruction") || !strings.Contains(errOut, "which this bundle does not show") ||
 		strings.Contains(errOut, "wider window") || strings.Contains(errOut, "-dek") {
 		t.Fatalf("сообщение: %s", errOut)
 	}
@@ -696,7 +697,7 @@ func TestSubjectLabelIsInTheReport(t *testing.T) {
 	for i := range closed.Records {
 		closed.Records[i].DEK = nil
 	}
-	label := fmt.Sprintf(`Subject: "c-1" (field "client", label %x)`, open.Subject.Tag)
+	label := fmt.Sprintf(`Subject: "c-1" (field "client", label %x in %q)`, open.Subject.Labels[0].Tag, open.Subject.Labels[0].Scope)
 	for name, b := range map[string]any{"open": open, "closed": closed} {
 		code, out, _ := w.run(t, w.file(t, name+".json", b))
 		if code != exitValid || !strings.Contains(out, label) {

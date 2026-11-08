@@ -114,11 +114,20 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		noBodies = "the records under this label in the window come without record keys: the keys were removed from this bundle, the month key was destroyed (retention) or awaits destruction, or the store held it back; ask its operator"
 		// Не «записей нет»: без открытого тела метка ни к кому не привязана, а
 		// записи клиента могут лежать без метки.
-		if src.SubjectRecords == 0 && src.InWindow > 0 {
+		if src.UnderLabels() == 0 && src.InWindow > 0 {
 			nothing = "no bodies to write: no record of the window is under this label, which does not show that the subject has none: the report says why"
 		}
+		// Месяц, для которого пакет метки не называет: записи там есть, чьи — не
+		// узнать, тела не открыть ни шире, ни с -dek. Код 2, как у записей под
+		// меткой без ключа. Что ключ месяца стёрт, пакет не доказывает.
+		if src.UnderLabels() == 0 && src.SubjectNoLabel > 0 {
+			nothing = ""
+			noBodies = fmt.Sprintf("the bundle names no label for %s, so whose the records of the window there are cannot be shown and no body opens: the store leaves the label out when the month key is destroyed or awaits destruction, which this bundle does not show; ask its operator, or check the key receipts in the chain", proof.QuotedList(src.SubjectNoLabelMonths))
+		}
 		out["subject"] = map[string]any{"field": src.SubjectField, "value": src.Subject, "label": src.SubjectLabel, "records": src.SubjectRecords,
-			"opened": src.SubjectOpened, "keyless": src.SubjectKeyless, "others": src.SubjectOthers, "unlabeled": src.SubjectUnlabeled}
+			"opened": src.SubjectOpened, "keyless": src.SubjectKeyless, "others": src.SubjectOthers, "unlabeled": src.SubjectUnlabeled,
+			"unbound": src.SubjectUnbound, "unbound_months": src.SubjectUnboundMonths,
+			"no_label": src.SubjectNoLabel, "no_label_months": src.SubjectNoLabelMonths}
 	}
 	if src.WitnessChecked {
 		out["witness_head"] = src.WitnessHead
