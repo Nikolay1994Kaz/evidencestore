@@ -37,7 +37,7 @@ func headObject(t *testing.T, c Checkpoint, vid string, at time.Time) s3Object {
 		t.Fatal(err)
 	}
 	key := fmt.Sprintf("witness/heads/%020d.json", c.Size)
-	return s3Object{key: key, vid: vid, file: key, data: data, at: at}
+	return s3Object{key: key, vid: vid, file: vid + ".json", data: data, at: at} // как велят документы: DIR/<номер версии>.json
 }
 
 // s3Witness — каталог голов, как его собирает проверяющий: файл на каждую
@@ -392,7 +392,7 @@ func TestWitnessClocksNotCompared(t *testing.T) {
 	tr.Witness.AddFile("C/checkpoints.jsonl", line(y.checkpoint(3), y.now))
 	r := Verify(forged, tr)
 	if !r.Valid() || !r.WitnessUntimed || !strings.Contains(strings.Join(r.Notes(), "\n"), WitnessUntimedNote) ||
-		!strings.Contains(r.Text(), "heads without a time of receipt in witness/heads: head 3, first by number") {
+		!strings.Contains(r.Text(), "heads without a time of receipt in the heads directory: head 3, first by number") {
 		t.Fatalf("(3) S3 без списка с подложенной головой:\n%s", r.Text())
 	}
 }
@@ -425,9 +425,12 @@ func TestWitnessS3ObjectTimes(t *testing.T) {
 	// Копия честной головы 4 строкой журнала с received_at раньше всех: время
 	// головы 4 — всё равно время её версии.
 	early := s3Object{key: h4.key, vid: "v-4b", file: "v-4b.json", data: line(w.checkpoint(4), w.now.Add(-time.Hour)), at: t5.Add(time.Hour)}
-	tr.Witness = s3Witness(t, true, h4, h5, early)
-	if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || !r.WitnessReceived.Equal(t4) {
-		t.Fatalf("received_at в объекте S3 дал голове время:\n%s", r.Text())
+	for _, file := range []string{"v-4b.json", "by-key/" + h4.key} { // по номеру версии и одними байтами
+		early.file = file
+		tr.Witness = s3Witness(t, true, h4, h5, early)
+		if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || !r.WitnessReceived.Equal(t4) {
+			t.Fatalf("received_at в объекте S3 (%s) дал голове время:\n%s", file, r.Text())
+		}
 	}
 	junk := s3Object{key: h5.key, vid: "j-5", file: "j-5.json", data: []byte("junk\nmore junk\n"), at: t5.Add(time.Hour)}
 	tr.Witness = s3Witness(t, true, h4, h5, junk)
@@ -603,6 +606,27 @@ func TestWitnessS3ByVersionsList(t *testing.T) {
 	if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || !r.WitnessReceived.Equal(byKey[0].at) {
 		t.Fatalf("версии по ключам:\n%s", r.Text())
 	}
+	// Список страницами (--max-items, --starting-token): страницы одного
+	// бакета были бы разными свидетелями — сверка просит склеить их (P-105).
+	pages := &Witness{}
+	for i, o := range byKey {
+		one := s3Witness(t, true, o)
+		pages.Heads = append(pages.Heads, one.Heads...)
+		page := map[string]any{"Versions": []map[string]any{{"Key": o.key, "VersionId": o.vid,
+			"ETag": `"` + one.Versions[0].ETag + `"`, "LastModified": o.at.UTC().Format(time.RFC3339)}}}
+		if i < len(byKey)-1 {
+			page["NextToken"] = fmt.Sprintf("token-%d", i+1)
+		}
+		list, err := json.Marshal(page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages.AddFile(fmt.Sprintf("versions-%d.json", i+1), list)
+	}
+	tr.Witness = pages
+	if r := Verify(honest, tr); r.Valid() || !strings.Contains(r.Text(), "the S3 versions list versions-1.json is one page of several") {
+		t.Fatalf("список страницами:\n%s", r.Text())
+	}
 	second := s3Witness(t, true, headObject(t, y.checkpoint(3), "u-3", w.now)) // второй бакет, часы отстают
 	for i := range second.Versions {
 		second.Versions[i].list = "bucket-2/versions.json"
@@ -662,6 +686,13 @@ func TestWitnessCollectorFiles(t *testing.T) {
 			t.Fatalf("файлы сборщика %q:\n%s", prefix, r.Text())
 		}
 	}
+	// Журнал, отложенный сборщиком при запуске, и новый журнал — один свидетель.
+	tr.Witness = &Witness{}
+	tr.Witness.AddFile("A/checkpoints.jsonl.unverified-1791000000", line(w.checkpoint(4), t4))
+	tr.Witness.AddFile("A/checkpoints.jsonl", line(w.checkpoint(5), t5.Add(time.Hour)))
+	if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || !r.WitnessReceived.Equal(t4) {
+		t.Fatalf("отложенный журнал:\n%s", r.Text())
+	}
 	tr.Witness = &Witness{}
 	tr.Witness.AddFile("C/a.jsonl", line(y.checkpoint(3), w.now.Add(time.Minute)))
 	tr.Witness.AddFile("C/b.jsonl", line(w.checkpoint(4), w.now.Add(5*time.Minute)))
@@ -696,5 +727,43 @@ func TestWitnessTieTimedUntimed(t *testing.T) {
 		if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || !r.WitnessReceived.Equal(t4) || !r.WitnessUntimed {
 			t.Fatalf("ничья по номеру, порядок %v:\n%s", order, r.Text())
 		}
+	}
+}
+
+// ⭐ P-104: газета (evidencestore statement) в своём подкаталоге — свой
+// свидетель, даже если бакет держит ту же голову байт в байт. Администратор
+// переписал запись 3, положил в бакет голову 3 новой цепи, а потом честную
+// голову 4 — как в газете. По ETag газета нашла бы «свою» версию и стала бы
+// частью свидетеля S3 с поздним временем (так было после P-99). Файлы S3,
+// названные по ключу (aws s3 sync), находят версии тоже только по ETag — и
+// они тоже ещё и головы без времени в своём подкаталоге, о чём говорит
+// заметка; названные номером версии — только S3.
+func TestWitnessStatementNotAbsorbed(t *testing.T) {
+	w, honest := standard(t, nil)
+	y, forged := rewritten(t, w)
+	statement, err := w.checkpoint(4).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := w.trust()
+	tr.Witness = s3Witness(t, true, headObject(t, y.checkpoint(3), "v-3", w.now.Add(time.Minute)), headObject(t, w.checkpoint(4), "v-4", w.now.Add(time.Hour)))
+	tr.Witness.AddFile("mail/statement.json", statement)
+	if r := Verify(forged, tr); r.Valid() || !strings.Contains(r.Text(), "proof -to-head 4") {
+		t.Fatalf("бакет поглотил газету:\n%s", r.Text())
+	}
+	var byVersion, byKey []s3Object
+	for i, seq := range []uint64{4, 5} {
+		o := headObject(t, w.checkpoint(seq), fmt.Sprintf("v-%d", seq), w.now.Add(time.Duration(i+1)*time.Minute))
+		byVersion = append(byVersion, o)
+		o.file = o.key
+		byKey = append(byKey, o)
+	}
+	tr.Witness = s3Witness(t, true, byKey...)
+	if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || !r.WitnessReceived.Equal(byKey[0].at) || !r.WitnessUntimed {
+		t.Fatalf("файлы S3 по ключу:\n%s", r.Text())
+	}
+	tr.Witness = s3Witness(t, true, byVersion...)
+	if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || r.WitnessUntimed {
+		t.Fatalf("файлы S3 по номеру версии:\n%s", r.Text())
 	}
 }

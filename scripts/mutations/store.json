@@ -3304,8 +3304,8 @@
   {
    "name": "Z182 версия не находит файл по номеру версии в имени (P-21)",
    "file": "internal/proof/heads.go",
-   "old": "\t\tfor _, i := range slices.Concat(byETag[h.digest], byID[name], byID[path.Base(name)]) {",
-   "new": "\t\tfor _, i := range slices.Concat(byETag[h.digest], byID[name+\".json\"], byID[path.Base(name)+\".json\"]) {"
+   "old": "\t\tids := slices.Concat(byID[name], byID[path.Base(name)])",
+   "new": "\t\tids := slices.Concat(byID[name+\".json\"], byID[path.Base(name)+\".json\"])"
   },
   {
    "name": "Z183 из версий одной головы берётся поздняя (P-21)",
@@ -3352,8 +3352,8 @@
   {
    "name": "Z190 мусор, положенный поверх головы, ломает сверку честного пакета (P-93)",
    "file": "internal/proof/heads.go",
-   "old": "\t\ts3 := fromS3(h)\n",
-   "new": "\t\tvar s3 map[string]time.Time\n\t\tif VerifyCheckpoint(h.Checkpoint, key) == nil {\n\t\t\ts3 = fromS3(h)\n\t\t}\n"
+   "old": "\t\ts3, named := fromS3(h)\n",
+   "new": "\t\tvar s3 map[string]time.Time\n\t\tvar named bool\n\t\tif VerifyCheckpoint(h.Checkpoint, key) == nil {\n\t\t\ts3, named = fromS3(h)\n\t\t}\n"
   },
   {
    "name": "Z191 сборщики из разных подкаталогов — один свидетель (P-94)",
@@ -3364,8 +3364,8 @@
   {
    "name": "Z192 S3 и журнал сборщика в корне каталога — один свидетель (P-94)",
    "file": "internal/proof/heads.go",
-   "old": "\t\t\tout = append(out, sighting{s3Name(list), seq, at})",
-   "new": "\t\t\tout = append(out, sighting{\"the collector's journal in the heads directory\" + list[:0], seq, at})"
+   "old": "\t\tout = append(out, sighting{s3Name(list), seq, at})",
+   "new": "\t\tout = append(out, sighting{\"the collector's journal in the heads directory\" + list[:0], seq, at})"
   },
   {
    "name": "Z193 пакету хватает дойти до одной из закрепляющих голов (P-94)",
@@ -3400,14 +3400,14 @@
   {
    "name": "Z198 номер версии с «/» не находит файл по пути (P-95)",
    "file": "internal/proof/heads.go",
-   "old": "byID[name], byID[path.Base(name)]) {",
-   "new": "byID[path.Base(name)]) {"
+   "old": "\t\tids := slices.Concat(byID[name], byID[path.Base(name)])",
+   "new": "\t\tids := slices.Concat(byID[path.Base(name)])"
   },
   {
    "name": "Z199 файл в подкаталоге не находит версию по имени (P-95)",
    "file": "internal/proof/heads.go",
-   "old": "byID[name], byID[path.Base(name)]) {",
-   "new": "byID[name]) {"
+   "old": "\t\tids := slices.Concat(byID[name], byID[path.Base(name)])",
+   "new": "\t\tids := slices.Concat(byID[name])"
   },
   {
    "name": "Z200 мусор из нескольких строк поверх головы ломает сверку (P-96)",
@@ -3418,8 +3418,8 @@
   {
    "name": "Z201 received_at из объекта S3 идёт в счёт (P-96)",
    "file": "internal/proof/heads.go",
-   "old": "\tif len(s3) > 0 {\n\t\tout := make([]sighting, 0, len(s3))",
-   "new": "\tif len(s3) > 0 && h.Received.IsZero() {\n\t\tout := make([]sighting, 0, len(s3))"
+   "old": "\tif len(s3) == 0 && !h.Received.IsZero() {",
+   "new": "\tif !h.Received.IsZero() {"
   },
   {
    "name": "Z202 из нескольких страниц списка версий в счёт последняя",
@@ -3508,14 +3508,14 @@
   {
    "name": "Z216 свидетель S3 — по подкаталогу файлов, а не по списку версий (P-99)",
    "file": "internal/proof/heads.go",
-   "old": "\t\t\tout = append(out, sighting{s3Name(list), seq, at})",
-   "new": "\t\t\tout = append(out, sighting{s3Name(list + path.Dir(h.file)), seq, at})"
+   "old": "\t\tout = append(out, sighting{s3Name(list), seq, at})",
+   "new": "\t\tout = append(out, sighting{s3Name(list + path.Dir(h.file)), seq, at})"
   },
   {
    "name": "Z217 два списка версий — один свидетель S3 (P-99)",
    "file": "internal/proof/heads.go",
-   "old": "\t\t\tout = append(out, sighting{s3Name(list), seq, at})",
-   "new": "\t\t\tout = append(out, sighting{s3Name(list[:0]), seq, at})"
+   "old": "\t\tout = append(out, sighting{s3Name(list), seq, at})",
+   "new": "\t\tout = append(out, sighting{s3Name(list[:0]), seq, at})"
   },
   {
    "name": "Z218 «сборщик отверг» из объекта S3 идёт в счёт (P-100)",
@@ -3546,6 +3546,96 @@
    "file": "internal/proof/heads.go",
    "old": "len(seqs), len(w.Heads)-signed, len(w.Heads))",
    "new": "len(seqs), signed, len(w.Heads))"
+  },
+  {
+   "name": "Z223 газета, совпавшая с объектом S3 байтами, — часть свидетеля S3 (P-104)",
+   "file": "internal/proof/heads.go",
+   "old": "\tif named {\n\t\treturn out\n\t}",
+   "new": "\tif len(s3) > 0 {\n\t\treturn out\n\t}"
+  },
+  {
+   "name": "Z224 файл, названный номером версии, — ещё и голова без времени (P-104)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\treturn at, len(ids) > 0",
+   "new": "\t\treturn at, false"
+  },
+  {
+   "name": "Z225 страница списка версий — не отказ, а свидетель (P-105)",
+   "file": "internal/proof/heads.go",
+   "old": "\tif len(w.pages) > 0 && err == nil {",
+   "new": "\tif len(w.pages) > 0 && err == nil && false {"
+  },
+  {
+   "name": "Z226 отложенный журнал сборщика — чужой свидетель (P-105)",
+   "file": "internal/proof/heads.go",
+   "old": "\tif i := strings.LastIndex(base, \".unverified-\"); i > 0 && strings.Trim(base[i+len(\".unverified-\"):], \"0123456789\") == \"\" {",
+   "new": "\tif i := strings.LastIndex(base, \".unverified-\"); i > 0 && false {"
+  },
+  {
+   "name": "Z227 NextToken CLI v2 не узнаётся как страница списка (P-105)",
+   "file": "internal/proof/heads.go",
+   "old": "\treturn json.Unmarshal(data, &page) == nil && (page.NextToken != \"\" || page.IsTruncated || page.NextKeyMarker != \"\")",
+   "new": "\treturn json.Unmarshal(data, &page) == nil && (page.IsTruncated || page.NextKeyMarker != \"\")"
+  },
+  {
+   "name": "Z228 из версий одной головы в списке — последняя по порядку (T, P-102)",
+   "file": "internal/proof/heads.go",
+   "old": "!ok || v.At.Before(t) {",
+   "new": "!ok || v.At.Before(t) || !t.IsZero() {"
+  },
+  {
+   "name": "Z229 у сборщика в корне — без ярлыка «the heads directory» (T, P-102)",
+   "file": "internal/proof/heads.go",
+   "old": "\tif dir == \".\" {\n\t\tdir = \"the heads directory\"\n\t}\n\tif len(s3) == 0",
+   "new": "\tif dir == \".\" && h.Received.IsZero() {\n\t\tdir = \"the heads directory\"\n\t}\n\tif len(s3) == 0"
+  },
+  {
+   "name": "Z230 файл расхождений — не свой файл сборщика (T, P-101)",
+   "file": "internal/proof/heads.go",
+   "old": "[]string{\"checkpoints-conflict.jsonl\", \"checkpoints.jsonl\", \"checkpoint.json\"}",
+   "new": "[]string{\"checkpoints.jsonl\", \"checkpoint.json\"}"
+  },
+  {
+   "name": "Z231 сборщики с разными приставками в одном каталоге — один свидетель (T, P-101)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\t\treturn \"the collector's journal \" + prefix + \"* in \" + dir",
+   "new": "\t\t\treturn \"the collector's journal in \" + dir"
+  },
+  {
+   "name": "Z232 версию без файла меряют головой чужого списка (T, P-99)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tp, ok := pins[s3Name(v.list)]",
+   "new": "\t\tp, ok := pins[s3Name(\"versions.json\")]"
+  },
+  {
+   "name": "Z233 свидетели в отчёте — не по именам (T, P-102)",
+   "file": "internal/proof/heads.go",
+   "old": "\tsort.Strings(names)",
+   "new": "\t_ = sort.Strings"
+  },
+  {
+   "name": "Z234 заметка «без времени» — только у дальней головы (T, P-94)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tuntimed = untimed || p.at.IsZero()",
+   "new": "\t\tuntimed = untimed || p.at.IsZero() && p.seq >= fix"
+  },
+  {
+   "name": "Z235 на равном номере — время самого позднего свидетеля (T, P-102)",
+   "file": "internal/proof/heads.go",
+   "old": "(fixAt.IsZero() || p.at.Before(fixAt))",
+   "new": "(fixAt.IsZero() || p.at.After(fixAt))"
+  },
+  {
+   "name": "Z236 голова из нескольких списков — только у одного (T, P-99)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tseen = append(seen, sightingsOf(h, s3, named)...)",
+   "new": "\t\tseen = append(seen, sightingsOf(h, s3, named)[0])"
+  },
+  {
+   "name": "Z237 голова получает время первого по обходу списка у всех списков (T, P-99)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tout = append(out, sighting{s3Name(list), seq, at})",
+   "new": "\t\tout = append(out, sighting{s3Name(list), seq, at})\n\t\tfor l := range s3 {\n\t\t\ts3[l] = at\n\t\t}"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются. Q5 снята 07.11 как равносильная: ключи теперь только у записей окна, а запись из незаверенного хвоста легла после закрывающей метки, позже окна больше чем на WindowEdge, и в выдачу не попадёт; срез оставлен как явная граница. Z63 снята 07.11 вместе с веткой: тело без субъекта даёт пустое значение, а названное значение не пусто, поэтому сверка значений закрывает и этот случай. Z87 снята 07.11 как равносильная: перевод строки в любом тексте отказа гасит SourceReport.Text (Z99), а %q в отказе о теле оставлен ради читаемости значения."

@@ -38,6 +38,9 @@ import (
 type Witness struct {
 	Heads    []PublishedHead
 	Versions []HeadVersion
+	// pages — файлы списка версий, которые лишь страница списка (у них есть
+	// NextToken или IsTruncated): сверка с ними отказывает (P-105).
+	pages []string
 }
 
 // PublishedHead — подписанная голова (контрольная точка) у свидетеля. Name —
@@ -84,6 +87,9 @@ func (w *Witness) AddFile(name string, data []byte) {
 			vs[i].list = name
 		}
 		w.Versions = append(w.Versions, vs...)
+		if listPage(data) {
+			w.pages = append(w.pages, name)
+		}
 		return
 	}
 	sum := md5.Sum(data)
@@ -238,12 +244,13 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			byID[v.VersionID] = append(byID[v.VersionID], i)
 		}
 	}
-	fromS3 := func(h PublishedHead) (at map[string]time.Time) {
+	fromS3 := func(h PublishedHead) (at map[string]time.Time, named bool) {
 		if h.digest == "" {
-			return nil
+			return nil, false
 		}
 		name := strings.TrimSuffix(filepath.ToSlash(h.file), ".json")
-		for _, i := range slices.Concat(byETag[h.digest], byID[name], byID[path.Base(name)]) {
+		ids := slices.Concat(byID[name], byID[path.Base(name)])
+		for _, i := range slices.Concat(byETag[h.digest], ids) {
 			v := w.Versions[i]
 			matched[i] = true
 			if at == nil {
@@ -253,7 +260,7 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 				at[v.list] = v.At
 			}
 		}
-		return at
+		return at, len(ids) > 0
 	}
 
 	// Силу имеют только головы, подписанные ключом хранилища: чужие и
@@ -266,7 +273,7 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	var seen []sighting
 	signed := 0
 	for _, h := range w.Heads {
-		s3 := fromS3(h)
+		s3, named := fromS3(h)
 		if len(s3) > 0 {
 			// Файл из бакета: его содержимое пишет тот, у кого ключи записи, и
 			// «сборщик отверг» из него не в счёт (P-100), как и received_at
@@ -281,7 +288,7 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			refused = append(refused, h)
 			continue
 		}
-		seen = append(seen, sightingsOf(h, s3)...)
+		seen = append(seen, sightingsOf(h, s3, named)...)
 		seq, known := h.Checkpoint.Size, false
 		for _, v := range versions[seq] {
 			known = known || bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root)
@@ -388,6 +395,9 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			fix, fixAt = p.seq, p.at
 		}
 	}
+	if len(w.pages) > 0 && err == nil {
+		err = fmt.Errorf("the S3 versions list %s is one page of several (it has NextToken or IsTruncated): put the whole list in one file, as aws s3api list-object-versions without --max-items writes it", filepath.ToSlash(w.pages[0]))
+	}
 	// Версия из списка без файла: её голова неизвестна. Лежит она на участке
 	// пакета или получена не позже головы, которую этот свидетель S3 получил
 	// первой, — сверке её не хватает, и её надо скачать.
@@ -444,16 +454,19 @@ type sighting struct {
 
 // sightingsOf — свидетели головы h, у каждого свои часы. S3 — каждый список
 // версий, где нашлась версия файла головы, с её временем (P-99: свидетель —
-// список, а не подкаталог: файлы версий раскладывают и по ключам). Иначе —
-// сборщик (received_at его журнала) или головы без времени, каждые в своём
-// подкаталоге каталога голов.
-func sightingsOf(h PublishedHead, s3 map[string]time.Time) []sighting {
+// список, а не подкаталог: файлы версий раскладывают и по ключам). Файл,
+// названный номером версии (named), — скачанная версия, и только. Файл,
+// совпавший с версией одними байтами, может быть и своим свидетелем — газетой
+// с той же головой, что администратор положил в бакет позже: тогда он ещё и
+// голова без времени в своём подкаталоге (P-104). Иначе — сборщик (received_at
+// его журнала) или головы без времени, каждые в своём подкаталоге.
+func sightingsOf(h PublishedHead, s3 map[string]time.Time, named bool) []sighting {
 	seq := h.Checkpoint.Size
-	if len(s3) > 0 {
-		out := make([]sighting, 0, len(s3))
-		for list, at := range s3 {
-			out = append(out, sighting{s3Name(list), seq, at})
-		}
+	var out []sighting
+	for list, at := range s3 {
+		out = append(out, sighting{s3Name(list), seq, at})
+	}
+	if named {
 		return out
 	}
 	file := h.file
@@ -465,10 +478,10 @@ func sightingsOf(h PublishedHead, s3 map[string]time.Time) []sighting {
 	if dir == "." {
 		dir = "the heads directory"
 	}
-	if !h.Received.IsZero() {
+	if len(s3) == 0 && !h.Received.IsZero() {
 		return []sighting{{collectorOf(dir, path.Base(file)), seq, h.Received}}
 	}
-	return []sighting{{"heads without a time of receipt in " + dir, seq, time.Time{}}}
+	return append(out, sighting{"heads without a time of receipt in " + dir, seq, time.Time{}})
 }
 
 // collectorOf — чей файл сборщика. Файлы одного сборщика — журнал, последняя
@@ -477,6 +490,11 @@ func sightingsOf(h PublishedHead, s3 map[string]time.Time) []sighting {
 // имени. Файл с другим именем — свидетель сам по себе: сборщики, сложенные в
 // один каталог под своими именами, не сливаются в одного (P-101).
 func collectorOf(dir, base string) string {
+	// Журнал, который сборщик отложил при запуске (…unverified-<время>), —
+	// тоже его (P-105).
+	if i := strings.LastIndex(base, ".unverified-"); i > 0 && strings.Trim(base[i+len(".unverified-"):], "0123456789") == "" {
+		base = base[:i]
+	}
 	for _, own := range []string{"checkpoints-conflict.jsonl", "checkpoints.jsonl", "checkpoint.json"} {
 		if prefix, ok := strings.CutSuffix(base, own); ok {
 			if prefix == "" {
@@ -490,6 +508,19 @@ func collectorOf(dir, base string) string {
 
 // s3Name — свидетель S3 по файлу его списка версий.
 func s3Name(list string) string { return "S3 (versions list " + filepath.ToSlash(list) + ")" }
+
+// listPage — вывод list-object-versions лишь страница списка: CLI с
+// --max-items пишет NextToken, API — IsTruncated и NextKeyMarker. Страницы
+// одного бакета были бы разными свидетелями, и честный пакет тянули бы до
+// первой головы последней страницы (P-105); склеить их проще проверяющему.
+func listPage(data []byte) bool {
+	var page struct {
+		NextToken     string `json:"NextToken"`
+		IsTruncated   bool   `json:"IsTruncated"`
+		NextKeyMarker string `json:"NextKeyMarker"`
+	}
+	return json.Unmarshal(data, &page) == nil && (page.NextToken != "" || page.IsTruncated || page.NextKeyMarker != "")
+}
 
 func (s sighting) String() string {
 	if s.at.IsZero() {
