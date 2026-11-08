@@ -127,12 +127,15 @@ func TestParseVerifierStrict(t *testing.T) {
 	ed := append([]byte{TypeEd25519}, raw[1:]...)
 	edID := KeyID(parts[0], TypeEd25519, raw[1:])
 	cases := map[string]string{
-		"две части":            parts[0] + "+" + parts[1],
-		"имя с пробелом":       "witness example+" + parts[1] + "+" + parts[2],
-		"номер не hex":         parts[0] + "+zz0d903a+" + parts[2],
-		"номер прописными":     parts[0] + "+" + strings.ToUpper(parts[1]) + "+" + parts[2],
-		"номер не сходится":    parts[0] + "+00000000+" + parts[2],
-		"тип 0x01":             parts[0] + "+" + hex8(edID) + "+" + base64.StdEncoding.EncodeToString(ed),
+		"две части":         parts[0] + "+" + parts[1],
+		"имя с пробелом":    "witness example+" + parts[1] + "+" + parts[2],
+		"номер не hex":      parts[0] + "+zz0d903a+" + parts[2],
+		"номер прописными":  parts[0] + "+" + strings.ToUpper(parts[1]) + "+" + parts[2],
+		"номер не сходится": parts[0] + "+00000000+" + parts[2],
+		"тип 0x01":          parts[0] + "+" + hex8(edID) + "+" + base64.StdEncoding.EncodeToString(ed),
+		// Номер посчитан для cosignature/v1, а байт типа — 0x01: такой ключ
+		// противоречит сам себе.
+		"тип 0x01, номер 0x04": parts[0] + "+" + parts[1] + "+" + base64.StdEncoding.EncodeToString(ed),
 		"короткий ключ":        parts[0] + "+" + parts[1] + "+" + base64.StdEncoding.EncodeToString(raw[:20]),
 		"base64 с лишним =":    parts[0] + "+" + parts[1] + "+" + parts[2] + "==",
 		"base64 URL-алфавитом": parts[0] + "+" + parts[1] + "+" + strings.NewReplacer("+", "-", "/", "_").Replace(parts[2]) + "-",
@@ -194,6 +197,14 @@ func TestNonCanonicalBase64(t *testing.T) {
 	if _, err := decode64(enc); err != nil {
 		t.Fatal(err)
 	}
+	// Перевод строки внутри base64 пакет encoding/base64 пропускает и в
+	// строгом режиме: у ключа из конфигурации или JSON было бы второе
+	// написание.
+	for _, s := range []string{enc[:8] + "\n" + enc[8:], enc[:8] + "\r" + enc[8:], enc + "\n"} {
+		if _, err := decode64(s); err == nil {
+			t.Errorf("base64 с переводом строки %q принят", s)
+		}
+	}
 }
 
 func TestSplitNote(t *testing.T) {
@@ -240,6 +251,7 @@ func TestAddCheckpointBody(t *testing.T) {
 		"old с нулём":        []byte("old 04\n\n" + string(note)),
 		"без пустой":         []byte("old 4\n"),
 		"хеш 31 байт":        []byte("old 4\n" + base64.StdEncoding.EncodeToString(make([]byte, 31)) + "\n\n" + string(note)),
+		"хеш 33 байта":       []byte("old 4\n" + base64.StdEncoding.EncodeToString(make([]byte, 33)) + "\n\n" + string(note)),
 		"хеш без дополнения": []byte("old 4\n" + strings.TrimRight(base64.StdEncoding.EncodeToString(make([]byte, 32)), "=") + "\n\n" + string(note)),
 	}
 	var long [][32]byte

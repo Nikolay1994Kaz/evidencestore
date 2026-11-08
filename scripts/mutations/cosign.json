@@ -76,10 +76,10 @@
    "new": "\tif len(raw) != 1+ed25519.PublicKeySize {"
   },
   {
-   "name": "C12 управляющий символ в заметке",
+   "name": "C12 табуляция в заметке",
    "file": "internal/cosign/cosign.go",
    "old": "\t\tif c < 0x20 && c != '\\n' {",
-   "new": "\t\tif false {"
+   "new": "\t\tif c < 0x20 && c != '\\n' && c != '\\t' {"
   },
   {
    "name": "C13 подпись журнала с верным номером не проверяется",
@@ -91,7 +91,7 @@
    "name": "C14 заметка без подписи журнала",
    "file": "internal/cosign/cosign.go",
    "old": "\tif !found {\n\t\treturn errors.New(\"no signature by the log key\")",
-   "new": "\tif false {\n\t\treturn errors.New(\"no signature by the log key\")"
+   "new": "\tif !found && false {\n\t\treturn errors.New(\"no signature by the log key\")"
   },
   {
    "name": "C15 доказательство длиннее 63 строк",
@@ -106,10 +106,10 @@
    "new": "\t\tif err != nil || len(h) < 32 {\n\t\t\treturn 0, nil, nil, errors.New(\"a consistency proof line"
   },
   {
-   "name": "C17 пустая строка подписи в заметке",
+   "name": "C17 больше 64 строк подписей в заметке",
    "file": "internal/cosign/cosign.go",
-   "old": "\t\tif l == \"\" {\n\t\t\treturn nil, nil, errors.New(\"the note has an empty signature line\")",
-   "new": "\t\tif false {\n\t\t\treturn nil, nil, errors.New(\"the note has an empty signature line\")"
+   "old": "\tif len(lines) > MaxSigLines {\n\t\treturn nil, nil, fmt.Errorf(\"the note has more than %d signatures\", MaxSigLines)",
+   "new": "\tif false {\n\t\treturn nil, nil, fmt.Errorf(\"the note has more than %d signatures\", MaxSigLines)"
   },
   {
    "name": "W1 подпись журнала у свидетеля не проверяется",
@@ -151,7 +151,7 @@
    "name": "W7 тот же размер, другой корень",
    "file": "internal/witness/witness.go",
    "old": "\t\tif !bytes.Equal(cur.Root, root[:]) {",
-   "new": "\t\tif false {"
+   "new": "\t\tif !bytes.Equal(cur.Root, root[:]) && false {"
   },
   {
    "name": "W8 доказательство продолжения не проверяется",
@@ -222,20 +222,20 @@
   {
    "name": "S1 строка журнала без проверки подписи",
    "file": "internal/store/cosign.go",
-   "old": "\tif err != nil {\n\t\treturn cosigRef{}, nil, fmt.Errorf(\"witness %s, head %d: %w\", r.Name, r.Size, err)",
-   "new": "\tif false {\n\t\treturn cosigRef{}, nil, fmt.Errorf(\"witness %s, head %d: %w\", r.Name, r.Size, err)"
+   "old": "\t\t\t\tif _, err := c.v.Verify(cosign.CheckpointText(origin, r.Size, root), r.Sig); err != nil {",
+   "new": "\t\t\t\tif _, err := c.v.Verify(cosign.CheckpointText(origin, r.Size, root), r.Sig); false && err != nil {"
   },
   {
    "name": "S2 строка журнала без сверки с цепью",
    "file": "internal/store/cosign.go",
-   "old": "\tif err := s.tree.agreesLocked(r.Size, root); err != nil {",
-   "new": "\tif err := s.tree.agreesLocked(r.Size, root); false && err != nil {"
+   "old": "\t\t\t\tif err := s.tree.agreesLocked(r.Size, root); err != nil {",
+   "new": "\t\t\t\tif err := s.tree.agreesLocked(r.Size, root); false && err != nil {"
   },
   {
    "name": "S3 оборванная строка журнала не отрезается",
    "file": "internal/store/cosign.go",
-   "old": "\tif i := bytes.LastIndexByte(data, '\\n'); i+1 != len(data) {",
-   "new": "\tif i := bytes.LastIndexByte(data, '\\n'); false && i+1 != len(data) {"
+   "old": "\t\t\tif len(line) > 0 {",
+   "new": "\t\t\tif false && len(line) > 0 {"
   },
   {
    "name": "S4 текущая голова не накрывает прежнюю текущую",
@@ -306,14 +306,14 @@
   {
    "name": "S15 в пакет — последняя подпись, а не ранняя",
    "file": "internal/store/cosign.go",
-   "old": "\t\ti := sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo })\n\t\tif i == len(refs) {\n\t\t\tcontinue\n\t\t}",
-   "new": "\t\tif len(refs) == 0 {\n\t\t\tcontinue\n\t\t}\n\t\ti := len(refs) - 1"
+   "old": "\t\tfor i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }); i < len(refs); {",
+   "new": "\t\tfor i := max(sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }), len(refs)-1); i < len(refs); {"
   },
   {
    "name": "S16 подпись раньше звена улики идёт в пакет",
    "file": "internal/store/cosign.go",
-   "old": "\t\ti := sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo })",
-   "new": "\t\ti := sort.Search(len(refs), func(i int) bool { return refs[i].size >= 0 })"
+   "old": "\tlo := max(evLink, first)",
+   "new": "\tlo := first"
   },
   {
    "name": "S17 ca свидетеля не применяется",
@@ -330,7 +330,7 @@
   {
    "name": "S19 пакет одной улики без подписей свидетелей",
    "file": "internal/store/proofs.go",
-   "old": "\tif b.Cosignatures, err = s.cosignaturesFor(links[0].Seq, links[len(links)-1].Seq, n); err != nil {",
+   "old": "\tif b.Cosignatures, err = s.cosignaturesForLocked(links[0].Seq, links[len(links)-1].Seq, n); err != nil {",
    "new": "\tif b.Cosignatures, err = []proof.Cosignature(nil), error(nil); err != nil {"
   },
   {
@@ -338,6 +338,30 @@
    "file": "internal/store/witness.go",
    "old": "\ts.queueCosignLocked(h) // свидетелям C2SP — те же головы (cosign.go)\n",
    "new": ""
+  },
+  {
+   "name": "S21 свидетели по очереди: медленный держит остальных",
+   "file": "internal/store/cosign.go",
+   "old": "\t\twg.Go(func() {\n\t\t\tif err := s.cosignQueue(ctx, c, limit); err != nil {\n\t\t\t\tc.errors.Add(1)\n\t\t\t\tmsg := err.Error()\n\t\t\t\tc.lastErr.Store(&msg)\n\t\t\t\terrs[i] = fmt.Errorf(\"witness %s: %w\", c.v.Name, err)\n\t\t\t}\n\t\t})",
+   "new": "\t\tfunc() {\n\t\t\tif err := s.cosignQueue(ctx, c, limit); err != nil {\n\t\t\t\tc.errors.Add(1)\n\t\t\t\tmsg := err.Error()\n\t\t\t\tc.lastErr.Store(&msg)\n\t\t\t\terrs[i] = fmt.Errorf(\"witness %s: %w\", c.v.Name, err)\n\t\t\t}\n\t\t}()"
+  },
+  {
+   "name": "S22 испорченная строка журнала прячет верную того же размера",
+   "file": "internal/store/cosign.go",
+   "old": "\t\t\tif len(refs) == 0 || ref.size >= refs[len(refs)-1].size {",
+   "new": "\t\t\tif len(refs) == 0 || ref.size > refs[len(refs)-1].size {"
+  },
+  {
+   "name": "S23 строка с чужой подписью — свидетель без подписи в пакете",
+   "file": "internal/store/cosign.go",
+   "old": "\t\t\t\t\trefs = slices.Delete(refs, i, i+1)\n\t\t\t\t\ts.cosignIdx[c.v.Name] = refs\n\t\t\t\t\tcontinue",
+   "new": "\t\t\t\t\tbreak"
+  },
+  {
+   "name": "S24 голова за концом цепи из журнала — в status и пакеты",
+   "file": "internal/store/cosign.go",
+   "old": "\tif r.Size > n {",
+   "new": "\tif false {"
   },
   {
    "name": "P1 корень подписанной головы не сверяется с пакетом",
@@ -432,8 +456,8 @@
   {
    "name": "F4 путь ca не от каталога конфигурации",
    "file": "internal/config/config.go",
-   "old": "\t\tabs(&c.Witness.Cosigners[i].CA)\n",
-   "new": ""
+   "old": "\t\tabs(&c.Witness.Cosigners[i].CA)",
+   "new": "\t\t_ = c.Witness.Cosigners[i].CA"
   },
   {
    "name": "E1 -witness-key не читает файл",

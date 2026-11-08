@@ -157,7 +157,7 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 		return proof.Bundle{}, err
 	}
 	// Подписи свидетелей C2SP: голова не раньше звена улики.
-	if b.Cosignatures, err = s.cosignaturesFor(links[0].Seq, links[len(links)-1].Seq, n); err != nil {
+	if b.Cosignatures, err = s.cosignaturesForLocked(links[0].Seq, links[len(links)-1].Seq, n); err != nil {
 		return proof.Bundle{}, err
 	}
 

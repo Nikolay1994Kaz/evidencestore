@@ -189,6 +189,16 @@ func TestCosignedWindowAndSource(t *testing.T) {
 	if sr := VerifySource(sb, cosignTrust(sw.world, s), time.Time{}, time.Time{}); sr.Valid() {
 		t.Fatalf("источник без подписи:\n%s", sr.Text())
 	}
+	// Голова раньше звена токена, закрывающего пакет, его не закрепляет:
+	// звенья между ними можно переписать, не разойдясь с ней.
+	if tok := sb.Upper.Token.LinkSeq; tok-1 >= sb.Links[0].Seq {
+		sb.Cosignatures = []Cosignature{sw.cosigned(s, tok-1, sw.root(tok-1), at(10, 30, 0))}
+		if sr := VerifySource(sb, cosignTrust(sw.world, s), time.Time{}, time.Time{}); sr.Valid() {
+			t.Fatalf("источник: голова %d раньше звена токена %d закрепила его:\n%s", tok-1, tok, sr.Text())
+		}
+	} else {
+		t.Fatalf("в мире источника звено токена %d — первое звено пакета", tok)
+	}
 }
 
 // Заметка точки — та, что примет свидетель: текст, пустая строка, подпись

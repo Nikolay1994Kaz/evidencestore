@@ -5,10 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/witness"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -99,5 +102,34 @@ func TestExampleConfig(t *testing.T) {
 	}
 	if cfg.Name != "witness.example/w1" || len(cfg.logs) != 1 || cfg.TLS == nil {
 		t.Fatalf("пример: %+v", cfg)
+	}
+}
+
+// Второй serve над тем же data_dir не стартует: два процесса подписывали бы
+// головы мимо общего замка, и сверка с записью перестали бы быть атомарными.
+func TestServeTakesLock(t *testing.T) {
+	path := writeConfig(t, `{"name": "witness.example/w1", "listen": "127.0.0.1:0", "data_dir": "data", "logs": [{"store_key": "`+storeKey(t)+`"}]}`)
+	var out, errb bytes.Buffer
+	if code := run([]string{"init", "-config", path}, &out, &errb); code != 0 {
+		t.Fatalf("init: %s", errb.String())
+	}
+	held, err := witness.Lock(filepath.Join(filepath.Dir(path), "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	done := make(chan int, 1)
+	var serr bytes.Buffer
+	go func() { done <- run([]string{"serve", "-config", path}, &out, &serr) }()
+	select {
+	case code := <-done:
+		if code != 1 || !strings.Contains(serr.String(), "used by another eswitness process") {
+			t.Fatalf("serve при занятом замке: %d %s", code, serr.String())
+		}
+	case <-time.After(5 * time.Second):
+		// serve пошёл слушать мимо замка; он ждёт сигнала — останавливаем.
+		syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		<-done
+		t.Fatal("serve стартовал при занятом замке data_dir")
 	}
 }

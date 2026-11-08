@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -37,8 +38,9 @@ type liveWitness struct {
 	down atomic.Bool
 	hits atomic.Int64
 	// corrupt — в ответе 200 испорчен последний байт подписи (имя и номер
-	// ключа верные); plain409 — ответ 409 без типа text/x.tlog.size.
-	corrupt, plain409 atomic.Bool
+	// ключа верные); plain409 — ответ 409 без типа text/x.tlog.size; hang —
+	// свидетель не отвечает, пока клиент не бросит запрос.
+	corrupt, plain409, hang atomic.Bool
 }
 
 func newLiveWitness(t *testing.T, name string) *liveWitness {
@@ -63,6 +65,12 @@ func startLiveWitness(t *testing.T, name string, tls bool) *liveWitness {
 		srv := w.srv.Load()
 		if w.down.Load() || srv == nil {
 			http.Error(rw, "down", http.StatusServiceUnavailable)
+			return
+		}
+		if w.hang.Load() {
+			// Тело дочитано: тогда сервер видит, что клиент бросил запрос.
+			io.Copy(io.Discard, r.Body)
+			<-r.Context().Done()
 			return
 		}
 		rec := httptest.NewRecorder()
@@ -457,8 +465,13 @@ func TestCosignJournalDamage(t *testing.T) {
 		b, _ := json.Marshal(r)
 		return string(b) + "\n"
 	}
+	// После настоящих строк — голова за концом цепи: в пакеты и в status она
+	// не идёт.
+	beyond := rec
+	beyond.Size = 1 << 40
+	beyond.Sig = w.key.Cosign(cosign.CheckpointText(proof.OriginFor(pub), beyond.Size, [32]byte(rec.Root)), uint64(c.now().Unix()))
 	damaged := `{"name":"witness.example/w1","size":1,"root":"AAAA","sig":"AAAA"}` + "\n" +
-		`not json` + "\n" + line(forged) + line(foreign) + string(good) + `{"name":"witness.example/w1","si`
+		`not json` + "\n" + line(forged) + line(foreign) + string(good) + line(beyond) + `{"name":"witness.example/w1","si`
 	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -471,8 +484,13 @@ func TestCosignJournalDamage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := proof.Verify(b, w.trust(t, s2)); !r.Valid() || len(b.Cosignatures) != 1 || b.Cosignatures[0].Size == rec.Size && !bytes.Equal(b.Cosignatures[0].Sig, rec.Sig) {
+	// Пакет закрепляет та же ранняя подпись, что до порчи: испорченные строки
+	// того же размера её не спрятали.
+	if r := proof.Verify(b, w.trust(t, s2)); !r.Valid() || len(b.Cosignatures) != 1 || b.Cosignatures[0].Size != rec.Size || !bytes.Equal(b.Cosignatures[0].Sig, rec.Sig) {
 		t.Fatalf("пакет после порчи журнала:\n%s", r.Text())
+	}
+	if st := s2.Status(); st.Cosigners[0].Head > s2.Head().Seq {
+		t.Fatalf("status: свидетель подписал %d, в цепи %d", st.Cosigners[0].Head, s2.Head().Seq)
 	}
 	back, _ := os.ReadFile(path)
 	if strings.HasSuffix(string(back), `"si`) || !strings.HasSuffix(string(back), "\n") {
@@ -607,5 +625,29 @@ func TestCosignOverHTTPSWithCA(t *testing.T) {
 	})
 	if _, err := Open(bad, Options{Logger: quiet, Now: c.now, NoBackground: true}); err == nil || !strings.Contains(err.Error(), "holds no PEM certificates") {
 		t.Fatalf("ca без сертификатов: %v", err)
+	}
+}
+
+// Свидетели — параллельно: зависший свидетель съедает время обхода только у
+// себя, второй подписывает в тот же обход.
+func TestCosignSlowWitnessDoesNotStarveOthers(t *testing.T) {
+	c := newClock()
+	slow := newLiveWitness(t, "witness.example/slow")
+	fast := newLiveWitness(t, "witness.example/fast")
+	s := openStore(t, testConfig(t, slow.option(), fast.option()), c)
+	slow.attach(s)
+	fast.attach(s)
+	slow.hang.Store(true)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := s.CosignOnce(ctx)
+	if err == nil || !strings.Contains(err.Error(), "witness.example/slow") || strings.Contains(err.Error(), "witness.example/fast") {
+		t.Fatalf("обход с зависшим свидетелем: %v", err)
+	}
+	st := s.Status()
+	if st.Cosigners[1].Name != "witness.example/fast" || st.Cosigners[1].Head == 0 || st.Cosigners[0].Head != 0 {
+		t.Fatalf("status: %+v", st.Cosigners)
 	}
 }

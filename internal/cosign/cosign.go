@@ -287,14 +287,10 @@ func SplitNote(note []byte) (text []byte, sigs []string, err error) {
 		return nil, nil, errors.New("the note has no signatures")
 	}
 	text = note[:i+1]
+	// Пустой строки среди подписей не бывает: она была бы последней пустой.
 	lines := strings.Split(string(note[i+2:len(note)-1]), "\n")
 	if len(lines) > MaxSigLines {
 		return nil, nil, fmt.Errorf("the note has more than %d signatures", MaxSigLines)
-	}
-	for _, l := range lines {
-		if l == "" {
-			return nil, nil, errors.New("the note has an empty signature line")
-		}
 	}
 	return text, lines, nil
 }

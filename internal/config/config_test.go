@@ -3,9 +3,9 @@ package config
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
 	"net"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -173,8 +173,18 @@ func TestValidateCosigners(t *testing.T) {
 		"с запросом": {{URL: "https://w.example/?a=1", Key: key}},
 		"не ключ":    {{URL: "https://w.example/", Key: "witness.example/w1"}},
 		"дважды":     {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: key}},
-		"девять":     slices.Repeat([]Cosigner{{URL: "https://w.example/", Key: key}}, MaxCosigners+1),
 	}
+	// Девять разных свидетелей — больше предела, даже без повторов.
+	var nine []Cosigner
+	for i := range MaxCosigners + 1 {
+		_, priv, _ := ed25519.GenerateKey(rand.Reader)
+		w, err := cosign.NewSigner(fmt.Sprintf("witness.example/n%d", i), priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nine = append(nine, Cosigner{URL: "https://w.example/", Key: w.Verifier().String()})
+	}
+	bad["девять"] = nine
 	for name, cs := range bad {
 		c := Config{Witness: Witness{Cosigners: cs}}
 		if errs := c.validateCosigners(); len(errs) == 0 {

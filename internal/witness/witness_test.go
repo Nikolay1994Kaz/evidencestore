@@ -291,8 +291,21 @@ func TestWitnessConcurrentRequestsDoNotRollBack(t *testing.T) {
 	r := newRig(t, t.TempDir(), c)
 	c.grow(64)
 	r.mustCosign(c, 0, 1)
+	// Все 63 запроса входят в свидетеля разом: без общего замка на сверку и
+	// запись подпись получили бы несколько.
+	const n = 63
+	var arrived sync.WaitGroup
+	arrived.Add(n)
+	inner := r.w.Handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		arrived.Done()
+		arrived.Wait()
+		inner.ServeHTTP(w, req)
+	}))
+	defer ts.Close()
+	r.ts = ts
 	var wg sync.WaitGroup
-	codes := make([]int, 63)
+	codes := make([]int, n)
 	for i := range codes {
 		n := int64(i + 2)
 		wg.Add(1)
@@ -396,7 +409,7 @@ func TestBodyLimit(t *testing.T) {
 	c := newChain(t)
 	r := newRig(t, t.TempDir(), c)
 	big := fmt.Sprintf("old 0\n\n%s", strings.Repeat("x", MaxBody))
-	if code, _, _ := r.add([]byte(big)); code != http.StatusBadRequest {
-		t.Fatalf("тело больше предела: %d", code)
+	if code, body, _ := r.add([]byte(big)); code != http.StatusBadRequest || !strings.Contains(body, "too large") {
+		t.Fatalf("тело больше предела: %d %q", code, body)
 	}
 }
