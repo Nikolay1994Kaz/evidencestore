@@ -149,6 +149,10 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 	if b.Frontier, b.Checkpoint, err = s.bundleHead(links); err != nil {
 		return proof.WindowBundle{}, err
 	}
+	// Подписи свидетелей C2SP: голова не раньше конца участка.
+	if b.Cosignatures, err = s.cosignaturesFor(links[0].Seq, links[len(links)-1].Seq, b.StretchEnd); err != nil {
+		return proof.WindowBundle{}, err
+	}
 	if source != "" {
 		b.KeysFor = source
 		// Листья и звенья от ключей не зависят: заново — только улики (P-86).

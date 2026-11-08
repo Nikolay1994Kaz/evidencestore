@@ -39,6 +39,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
@@ -62,6 +63,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
 	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them; with the S3 versions list next to them (aws s3api list-object-versions > DIR/versions.json) or a collector's head journal, each witness fixes the record with the head it received first (give each collector a subdirectory of its own)")
+	var witnessKeys []string
+	fs.Func("witness-key", "verifier key of a C2SP witness (as eswitness vkey prints it) or a file containing it, taken from the witness's operator; repeat the flag for more witnesses: each must have cosigned a head at or after the record (for a bundle over a window, at or after its end), and the chain in the bundle must agree with it", func(v string) error {
+		witnessKeys = append(witnessKeys, v)
+		return nil
+	})
 	allowNoTSA := fs.Bool("allow-no-tsa", false, "accept a bundle without a TSA time-stamp after the record (then only the store's own signature vouches for it)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	bodyPath := fs.String("body", "", "once the bundle verifies, write the record body to FILE exactly as the source sent it (the bundle must carry the record key: evidencestore proof -dek)")
@@ -70,8 +76,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	windowTo := fs.String("to", "", "bundle over a window of time: the end of your window (RFC 3339)")
 	bodiesDir := fs.String("bodies", "", "bundle over a window of time: once it verifies, write every opened body to DIR/<source>-<seq> exactly as the source sent it")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-heads DIR] [-allow-no-tsa] [-json] [-body FILE]")
-		fmt.Fprintln(stderr, "       esverify -proof WINDOW -store-key KEY -tsa-trust CERT[,CERT] [-from T -to T] [-heads DIR] [-json] [-bodies DIR]")
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
+		fmt.Fprintln(stderr, "       esverify -proof WINDOW -store-key KEY -tsa-trust CERT[,CERT] [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
 		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
@@ -114,6 +120,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if pt.Witness, err = readHeads(*headsDir); err != nil {
 			return usageErr(fmt.Errorf("heads: %w", err))
 		}
+	}
+	for _, raw := range witnessKeys {
+		if b, err := os.ReadFile(raw); err == nil {
+			raw = strings.TrimSpace(string(b))
+		}
+		v, err := cosign.ParseVerifier(raw)
+		if err != nil {
+			return usageErr(fmt.Errorf("-witness-key: %w", err))
+		}
+		pt.Cosigners = append(pt.Cosigners, v)
 	}
 	var promise *proof.Promise
 	if *promisePath != "" {
@@ -181,6 +197,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			out["witness_fork"] = report.WitnessFork
 			out["witness_refused"] = report.WitnessRefused
 			out["witness_received"] = witnessReceived(report.WitnessReceived)
+		}
+		if report.CosignChecked {
+			out["cosigned"] = report.Cosigned
 		}
 		enc.Encode(out)
 	} else {

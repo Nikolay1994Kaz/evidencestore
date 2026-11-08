@@ -96,6 +96,9 @@ type WindowBundle struct {
 	// источник, без этой пометки не отличить от пакета без -dek. Пометка не
 	// подписана и меняет только заметки, не вердикт (P-80).
 	KeysFor string `json:"keys_for,omitempty"`
+	// Cosignatures — подписи свидетелей C2SP над головой не раньше конца
+	// участка (cosigned.go).
+	Cosignatures []Cosignature `json:"cosignatures,omitempty"`
 }
 
 // WindowRecord — улика с участка и ключ её записи. Ключа нет — ключ месяца
@@ -201,6 +204,12 @@ type WindowReport struct {
 	// WitnessReceived, WitnessUntimed — как у пакета одной улики (P-21).
 	WitnessReceived time.Time
 	WitnessUntimed  bool
+	// CosignChecked, Cosigned, CosignUnknown, CosignCarried — как у пакета
+	// одной улики: закрепляется конец участка.
+	CosignChecked bool
+	Cosigned      []CosignedHead
+	CosignUnknown int
+	CosignCarried int
 }
 
 // Valid — все проверки прошли.
@@ -389,6 +398,13 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 		checkWitness(trust.Witness, trust.StoreKey, b.StretchEnd, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
 		r.WitnessReceived, r.WitnessUntimed = wr.WitnessReceived, wr.WitnessUntimed
+	}
+	r.CosignCarried = len(b.Cosignatures)
+	if len(trust.Cosigners) > 0 {
+		r.CosignChecked = true
+		var err error
+		r.Cosigned, r.CosignUnknown, err = checkCosigned(b.Cosignatures, trust.Cosigners, trust.StoreKey, b.StretchEnd, links, rootAt)
+		add(cosignCheckName, err, cosignDetail(r.Cosigned))
 	}
 	return r
 }
@@ -911,10 +927,10 @@ func (r WindowReport) Notes() []string {
 		}
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after the end of this stretch yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
-	default:
+	case len(r.Cosigned) == 0:
 		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the whole chain")
 	}
-	return n
+	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this stretch")...)
 }
 
 // Text — отчёт человеческим языком. Как у пакета одной улики, всё, что

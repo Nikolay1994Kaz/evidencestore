@@ -231,6 +231,12 @@ type Store struct {
 	witnessRemote ship.Remote
 	witnessQueue  []witnessHead
 	witnessQueued uint64 // наибольшая голова, поставленная в очередь
+	// Свидетели C2SP (cosign.go): очереди — под chainMu; журнал подписей и
+	// его указатели — под cosignMu. Порядок захвата: chainMu раньше cosignMu.
+	cosigners []*cosigner
+	cosignMu  sync.Mutex
+	cosignLog *os.File
+	cosignIdx map[string][]cosigRef
 	// servedHead — последняя голова, подписанная для сборщиков и statement
 	// (servedHeadLocked), под chainMu: подпись не повторяется на каждый
 	// ответ.
@@ -805,6 +811,9 @@ func (s *Store) open() error {
 	if err := s.reconcileKeys(cs.keyEvents); err != nil {
 		return err
 	}
+	if err := s.openCosigners(); err != nil {
+		return err
+	}
 	s.appendEvent(auditchain.EventStart, "", "", []byte(s.signer.PublicKeyString()))
 	if err := s.ensureMonthScopes(s.nowTime()); err != nil {
 		// Копия в резерв не прошла: ключ заведён, но не выдаётся, пока
@@ -923,6 +932,7 @@ func (s *Store) closeFiles() error {
 	if s.tree != nil {
 		err = errors.Join(err, s.tree.close())
 	}
+	err = errors.Join(err, s.closeCosignLog())
 	if s.keys != nil {
 		err = errors.Join(err, s.keys.Close())
 	}

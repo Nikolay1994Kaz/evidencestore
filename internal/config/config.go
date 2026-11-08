@@ -12,12 +12,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
@@ -74,9 +76,30 @@ type Witness struct {
 	// file:///abs/path. Пусто — без свидетеля.
 	URL string `json:"url"`
 	// Every — как часто отправлять текущую голову. По умолчанию 1m. Голова
-	// под каждой меткой TSA уходит и без этого: ею кончается пакет.
+	// под каждой меткой TSA уходит и без этого: ею кончается пакет. Тот же
+	// ритм — у свидетелей C2SP (Cosigners).
 	Every Duration `json:"every"`
+	// Cosigners — свидетели C2SP (tlog-witness, eswitness): им уходят головы
+	// с доказательством продолжения, они возвращают подпись, и она едет в
+	// пакетах (DECISIONS п. 34). Независимо от URL: можно и то и другое.
+	Cosigners []Cosigner `json:"cosigners"`
 }
+
+// Cosigner — свидетель C2SP.
+type Cosigner struct {
+	// URL — адрес приёма свидетеля (submission prefix): хранилище шлёт
+	// POST <url>/add-checkpoint. Только http:// или https://.
+	URL string `json:"url"`
+	// Key — ключ проверки свидетеля (vkey: имя+номер ключа+ключ), как его
+	// печатает eswitness vkey. Берётся у владельца свидетеля: им хранилище
+	// проверяет каждую подпись до того, как положить её в журнал.
+	Key string `json:"key"`
+	// CA — сертификаты УЦ для HTTPS свидетеля (PEM). Пусто — системные.
+	CA string `json:"ca"`
+}
+
+// MaxCosigners — предел свидетелей C2SP: каждый — запрос на каждую голову.
+const MaxCosigners = 8
 
 // TLS — сертификаты приёма.
 type TLS struct {
@@ -238,6 +261,9 @@ func (c *Config) resolve(base string) {
 	for i := range c.TSA.Trust {
 		abs(&c.TSA.Trust[i])
 	}
+	for i := range c.Witness.Cosigners {
+		abs(&c.Witness.Cosigners[i].CA)
+	}
 }
 
 // Defaults подставляет значения по умолчанию.
@@ -344,6 +370,7 @@ func (c *Config) Validate() error {
 	if c.Witness.URL != "" && c.Witness.URL == c.Replica.URL {
 		errs = append(errs, errors.New("witness.url must not be replica.url: the witness keeps heads out of the store administrator's reach, the copy is the store's own"))
 	}
+	errs = append(errs, c.validateCosigners()...)
 	if !c.Demo && c.Keys.MinWait > 0 && c.Keys.MinWait.D() < MinWaitFloor {
 		errs = append(errs, fmt.Errorf("keys.min_wait %v is shorter than %v: the window to cancel a key destruction would be too short (set \"demo\": true for a demo stand)", c.Keys.MinWait.D(), MinWaitFloor))
 	}
@@ -396,6 +423,32 @@ func (c *Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// validateCosigners — свидетели C2SP: адрес http(s), ключ проверки
+// разбирается, имена не повторяются.
+func (c *Config) validateCosigners() []error {
+	var errs []error
+	if len(c.Witness.Cosigners) > MaxCosigners {
+		errs = append(errs, fmt.Errorf("witness.cosigners: %d witnesses, at most %d", len(c.Witness.Cosigners), MaxCosigners))
+	}
+	names := map[string]bool{}
+	for i, w := range c.Witness.Cosigners {
+		u, err := url.Parse(w.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: url %q must be http:// or https:// with a host, without a query: the store posts to <url>/add-checkpoint", i, w.URL))
+		}
+		v, err := cosign.ParseVerifier(w.Key)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: %w (eswitness vkey prints it)", i, err))
+			continue
+		}
+		if names[v.Name] {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: witness %s is listed twice", i, v.Name))
+		}
+		names[v.Name] = true
+	}
+	return errs
 }
 
 // nested — один каталог совпадает с другим или лежит внутри него.

@@ -51,6 +51,15 @@ func (s *Store) startBackground() {
 			}
 		})
 	}
+	if len(s.cosigners) > 0 {
+		s.loop(s.cfg.Witness.Every.D(), func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if err := s.CosignOnce(ctx); err != nil {
+				s.log.Error("cosigners", "err", err)
+			}
+		})
+	}
 	s.loop(time.Minute, func() { s.Maintain(s.nowTime()) })
 	s.loop(10*time.Second, func() {
 		now := s.nowTime()

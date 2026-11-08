@@ -413,6 +413,10 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	if b.Frontier, b.Checkpoint, err = s.bundleHead(links); err != nil {
 		return proof.SourceBundle{}, err
 	}
+	// Подписи свидетелей C2SP: голова не раньше звена токена верхнего края.
+	if b.Cosignatures, err = s.cosignaturesFor(links[0].Seq, links[len(links)-1].Seq, b.Upper.Token.LinkSeq); err != nil {
+		return proof.SourceBundle{}, err
+	}
 	return b, nil
 }
 

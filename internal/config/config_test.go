@@ -1,11 +1,16 @@
 package config
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 )
 
 // Путь сокета длиннее предела ловится при проверке конфига, а не
@@ -149,5 +154,53 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 	c.Chain.Tick = Duration(3 * time.Second)
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "chain.tick must be at most 2.5s") {
 		t.Fatalf("tick 3s: %v", err)
+	}
+}
+
+func TestValidateCosigners(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := cosign.NewSigner("witness.example/w1", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := signer.Verifier().String()
+	bad := map[string][]Cosigner{
+		"ftp":        {{URL: "ftp://w.example/", Key: key}},
+		"без хоста":  {{URL: "https:///x", Key: key}},
+		"с запросом": {{URL: "https://w.example/?a=1", Key: key}},
+		"не ключ":    {{URL: "https://w.example/", Key: "witness.example/w1"}},
+		"дважды":     {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: key}},
+		"девять":     slices.Repeat([]Cosigner{{URL: "https://w.example/", Key: key}}, MaxCosigners+1),
+	}
+	for name, cs := range bad {
+		c := Config{Witness: Witness{Cosigners: cs}}
+		if errs := c.validateCosigners(); len(errs) == 0 {
+			t.Errorf("%s: принято", name)
+		}
+	}
+	good := Config{Witness: Witness{Cosigners: []Cosigner{{URL: "https://w.example/sub/", Key: key}, {URL: "http://127.0.0.1:8444", Key: other(t)}}}}
+	if errs := good.validateCosigners(); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+}
+
+func other(t *testing.T) string {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	s, err := cosign.NewSigner("witness.example/w2", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Verifier().String()
+}
+
+// ca свидетеля C2SP — путь от каталога конфигурации, как у прочих файлов.
+func TestCosignerCAResolved(t *testing.T) {
+	c := Config{Witness: Witness{Cosigners: []Cosigner{{CA: "witness-ca.pem"}, {CA: "/etc/ca.pem"}, {}}}}
+	c.resolve("/etc/evidencestore")
+	if got := c.Witness.Cosigners; got[0].CA != "/etc/evidencestore/witness-ca.pem" || got[1].CA != "/etc/ca.pem" || got[2].CA != "" {
+		t.Fatalf("пути ca: %+v", got)
 	}
 }

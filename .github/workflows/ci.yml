@@ -46,6 +46,7 @@ jobs:
           subject-path: |
             dist/evidencestore-*
             dist/escollect-*
+            dist/eswitness-*
             dist/esverify-*
       - env:
           GH_TOKEN: ${{ github.token }}

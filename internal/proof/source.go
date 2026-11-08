@@ -129,6 +129,9 @@ type SourceBundle struct {
 	// только заметки, не вердикт (P-80).
 	WithKeys   bool       `json:"with_keys,omitempty"`
 	Checkpoint Checkpoint `json:"checkpoint"`
+	// Cosignatures — подписи свидетелей C2SP над головой не раньше звена
+	// токена верхнего края (cosigned.go).
+	Cosignatures []Cosignature `json:"cosignatures,omitempty"`
 }
 
 // ParseSource разбирает пакет по источнику.
@@ -221,6 +224,12 @@ type SourceReport struct {
 	// WitnessReceived, WitnessUntimed — как у пакета одной улики (P-21).
 	WitnessReceived time.Time
 	WitnessUntimed  bool
+	// CosignChecked, Cosigned, CosignUnknown, CosignCarried — как у пакета
+	// одной улики: закрепляется звено токена верхнего края.
+	CosignChecked bool
+	Cosigned      []CosignedHead
+	CosignUnknown int
+	CosignCarried int
 }
 
 // Withheld — сколько тел поломанных записей гейтвея не вскрыто нарочно.
@@ -365,6 +374,13 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 		checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
 		r.WitnessReceived, r.WitnessUntimed = wr.WitnessReceived, wr.WitnessUntimed
+	}
+	r.CosignCarried = len(b.Cosignatures)
+	if len(trust.Cosigners) > 0 {
+		r.CosignChecked = true
+		var err error
+		r.Cosigned, r.CosignUnknown, err = checkCosigned(b.Cosignatures, trust.Cosigners, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt)
+		add(cosignCheckName, err, cosignDetail(r.Cosigned))
 	}
 	return r
 }
@@ -970,10 +986,10 @@ func (r SourceReport) Notes() []string {
 		}
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after the link that holds the upper time-stamp's token yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
-	default:
-		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the chain: a rewrite after the lower time-stamp needs a fresh upper one, and a T2 more than an hour after the window is a sign of it; a witness (esverify -heads) catches one made sooner")
+	case len(r.Cosigned) == 0:
+		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the chain: a rewrite after the lower time-stamp needs a fresh upper one, and a T2 more than an hour after the window is a sign of it; a witness (esverify -heads or -witness-key) catches one made sooner")
 	}
-	return n
+	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this part")...)
 }
 
 // Text — отчёт человеческим языком, как у пакета за окно: всё из пакета —

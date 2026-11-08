@@ -3,8 +3,8 @@
 #
 #   scripts/release.sh OUTDIR
 #
-# Хранилище и сборщик — только linux (flock, statx); esverify — ещё macOS и
-# Windows: проверяющему не обязательно сидеть на Linux. Версию и коммит
+# Хранилище, сборщик и свидетель — только linux (flock, statx); esverify — ещё
+# macOS и Windows: проверяющему не обязательно сидеть на Linux. Версию и коммит
 # go build кладёт в бинарник сам (evidencestore version, esverify -version).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,7 +18,7 @@ build() { # ос арх команда
 }
 
 for arch in amd64 arm64; do
-	for cmd in evidencestore escollect esverify; do
+	for cmd in evidencestore escollect eswitness esverify; do
 		build linux "$arch" "$cmd"
 	done
 done

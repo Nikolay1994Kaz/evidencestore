@@ -156,6 +156,10 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	if b.Frontier, b.Checkpoint, err = s.bundleHeadLocked(links); err != nil {
 		return proof.Bundle{}, err
 	}
+	// Подписи свидетелей C2SP: голова не раньше звена улики.
+	if b.Cosignatures, err = s.cosignaturesFor(links[0].Seq, links[len(links)-1].Seq, n); err != nil {
+		return proof.Bundle{}, err
+	}
 
 	if withDEK {
 		sealed, err := evidence.Unmarshal(data)
@@ -273,6 +277,9 @@ type Status struct {
 	// RootsUnreachable — каталоги корней не перечисляются (зеркало на
 	// упавшей машине): сирот не видно, уничтожение не окончательно.
 	RootsUnreachable string `json:"roots_unreachable,omitempty"`
+	// Cosigners — свидетели C2SP: последняя подписанная голова, ошибки,
+	// отказ (cosign.go).
+	Cosigners []CosignerStatus `json:"cosigners,omitempty"`
 }
 
 func (s *Store) Status() Status {
@@ -311,6 +318,7 @@ func (s *Store) Status() Status {
 	} else {
 		out.OrphanRoots = orphans
 	}
+	out.Cosigners = s.cosignerStatus()
 	return out
 }
 

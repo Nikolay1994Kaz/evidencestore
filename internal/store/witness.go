@@ -44,6 +44,7 @@ type witnessHead struct {
 // свидетель недоступен, очередь растёт только ими. Зовётся под chainMu.
 func (s *Store) queueWitnessLocked(stamped bool) {
 	h := witnessHead{size: s.tree.size(), root: s.tree.root(), stamped: stamped}
+	s.queueCosignLocked(h) // свидетелям C2SP — те же головы (cosign.go)
 	if s.witnessRemote == nil || h.size == 0 {
 		return
 	}

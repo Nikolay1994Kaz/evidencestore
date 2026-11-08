@@ -75,6 +75,9 @@ func verifyWindow(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		out["witness_refused"] = win.WitnessRefused
 		out["witness_received"] = witnessReceived(win.WitnessReceived)
 	}
+	if win.CosignChecked {
+		out["cosigned"] = win.Cosigned
+	}
 	// Пакет -window не называет источник, тела которого несёт: что окно пусто,
 	// видно, только если в нём нет записей ни одного источника.
 	inWindow := 0
@@ -209,6 +212,9 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		out["witness_fork"] = src.WitnessFork
 		out["witness_refused"] = src.WitnessRefused
 		out["witness_received"] = witnessReceived(src.WitnessReceived)
+	}
+	if src.CosignChecked {
+		out["cosigned"] = src.Cosigned
 	}
 	return windowResult{valid: src.Valid(), text: src.Text(), json: out, bodies: src.Bodies, noBodies: noBodies, nothing: nothing, warn: warn}
 }

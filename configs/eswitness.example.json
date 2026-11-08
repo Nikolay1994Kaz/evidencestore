@@ -1,0 +1,9 @@
+{
+  "name": "witness.example/w1",
+  "listen": ":8444",
+  "data_dir": "/var/lib/eswitness",
+  "tls": {"cert": "/etc/eswitness/server.crt", "key": "/etc/eswitness/server.key"},
+  "logs": [
+    {"store_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+  ]
+}

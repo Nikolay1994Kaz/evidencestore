@@ -37,6 +37,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
@@ -237,6 +238,10 @@ type Bundle struct {
 	// обещания находит каждую метку перед уликой (CheckPromise: правило
 	// меток).
 	Stretch []StretchLeaf `json:"stretch,omitempty"`
+	// Cosignatures — подписи свидетелей C2SP (cosigned.go): у каждого
+	// свидетеля — голова, которую он подписал раньше всех не раньше звена
+	// улики. Поле необязательное: esverify прежних выпусков его не читает.
+	Cosignatures []Cosignature `json:"cosignatures,omitempty"`
 }
 
 // StretchLeaf — лист участка: целиком (Leaf) или только хешем листа (Hash,
@@ -319,6 +324,10 @@ type Trust struct {
 	// Witness — головы, которые проверяющий сам взял у свидетеля (heads.go).
 	// nil — сверки со свидетелем нет.
 	Witness *Witness
+	// Cosigners — ключи свидетелей C2SP, которые проверяющий взял у их
+	// владельцев (esverify -witness-key): каждый обязан подписать голову не
+	// раньше закрепляемого звена (cosigned.go). Пусто — подписи не сверяются.
+	Cosigners []cosign.Verifier
 }
 
 // Check — один пункт отчёта.
@@ -371,6 +380,14 @@ type Report struct {
 	// (WitnessUntimed, P-21).
 	WitnessReceived time.Time
 	WitnessUntimed  bool
+
+	// CosignChecked — подписи свидетелей сверялись (Trust.Cosigners);
+	// Cosigned — что закрепил каждый свидетель; CosignUnknown — подписей
+	// ключей, которых не дали; CosignCarried — сколько подписей в пакете.
+	CosignChecked bool
+	Cosigned      []CosignedHead
+	CosignUnknown int
+	CosignCarried int
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -415,9 +432,10 @@ func (r Report) Notes() []string {
 		}
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after this record yet: until it gets one, only a TSA time-stamp stands against the store's owner rewriting the chain")
-	default:
+	case len(r.Cosigned) == 0:
 		n = append(n, "the store's signature proves that THIS store signed the head; only a TSA time-stamp stands against its owner rewriting the whole chain")
 	}
+	n = append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this record")...)
 	n = append(n, "what is proven is that these bytes came from the source and have not changed, not that their content is true")
 	return n
 }
@@ -536,6 +554,15 @@ func Verify(b Bundle, trust Trust) Report {
 	// проверяющий сам взял у свидетеля.
 	if trust.Witness != nil {
 		checkWitness(trust.Witness, trust.StoreKey, b.Inclusion.LinkSeq, links, rootAt, &r, add)
+	}
+
+	// 12. Подписи свидетелей C2SP: каждый закреплённый свидетель подписал
+	// голову не раньше звена улики, и она сходится с цепью пакета.
+	r.CosignCarried = len(b.Cosignatures)
+	if len(trust.Cosigners) > 0 {
+		r.CosignChecked = true
+		r.Cosigned, r.CosignUnknown, err = checkCosigned(b.Cosignatures, trust.Cosigners, trust.StoreKey, b.Inclusion.LinkSeq, links, rootAt)
+		add(cosignCheckName, err, cosignDetail(r.Cosigned))
 	}
 	return r
 }
