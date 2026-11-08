@@ -211,10 +211,10 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	r *Report, add func(string, error, string) bool) {
 	r.WitnessChecked = true
 
-	// Время получения головы из S3 — по её версии в списке версий: та же
-	// голова (номер из ключа), ETag — MD5 файла или номер версии — в имени
-	// файла; из нескольких версий — самая ранняя (P-21). Версия, нашедшая файл,
-	// — не неизвестная, даже если файл не голова.
+	// Время получения головы из S3 — по версии её файла в списке версий: ETag
+	// — MD5 файла или номер версии — в имени файла; из нескольких версий —
+	// самая ранняя (P-21). Версия, нашедшая файл, — не неизвестная, даже если
+	// файл не голова: мусор, положенный поверх головы, сверку не ломает (P-93).
 	matched := make([]bool, len(w.Versions))
 	received := func(h PublishedHead) time.Time {
 		at := h.Received
@@ -222,7 +222,7 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			return at
 		}
 		for i, v := range w.Versions {
-			if v.Size != h.Checkpoint.Size || v.ETag != h.digest && (v.VersionID == "" || !strings.Contains(h.Name, v.VersionID)) {
+			if v.ETag != h.digest && (v.VersionID == "" || !strings.Contains(h.Name, v.VersionID)) {
 				continue
 			}
 			matched[i] = true

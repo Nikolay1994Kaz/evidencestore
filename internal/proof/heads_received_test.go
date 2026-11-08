@@ -199,6 +199,33 @@ func TestWitnessVersionsMatchFiles(t *testing.T) {
 	}
 }
 
+// P-93: поверх головы 5 положили мусор новой версией (Object Lock этого не
+// запрещает), и проверяющий скачал все версии. Версия, нашедшая свой файл, —
+// не неизвестная, хоть файл и не голова: честный пакет проходит. Не скачана —
+// неизвестна, и сверка просит её скачать.
+func TestWitnessJunkVersion(t *testing.T) {
+	w, honest := standard(t, nil)
+	tr := w.trust()
+	h4 := headObject(t, w.checkpoint(4), "v-4", w.now.Add(time.Minute))
+	h5 := headObject(t, w.checkpoint(5), "v-5", w.now.Add(2*time.Minute))
+	junk := s3Object{key: h5.key, vid: "j-5", file: "versions/j-5.json", data: []byte("not a head"), at: w.now.Add(time.Hour),
+		etag: "0123456789abcdef0123456789abcdef-kms"} // находит файл только по номеру версии в имени
+	tr.Witness = s3Witness(t, true, h4, h5, junk)
+	if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 || !r.WitnessReceived.Equal(h4.at) {
+		t.Fatalf("мусор поверх головы 5, файл по номеру версии:\n%s", r.Text())
+	}
+	junk.file, junk.etag = "junk.json", "" // только по ETag
+	tr.Witness = s3Witness(t, true, h4, h5, junk)
+	if r := Verify(honest, tr); !r.Valid() || r.WitnessHead != 4 {
+		t.Fatalf("мусор поверх головы 5, файл по ETag:\n%s", r.Text())
+	}
+	junk.data = nil
+	tr.Witness = s3Witness(t, true, h4, h5, junk)
+	if r := Verify(honest, tr); r.Valid() || !strings.Contains(r.Text(), `version "j-5"`) || !strings.Contains(r.Text(), "download every version of the heads") {
+		t.Fatalf("мусор поверх головы 5 не скачан:\n%s", r.Text())
+	}
+}
+
 // Журналы голов сборщиков несут received_at. Новый сборщик берёт первую
 // голову на веру и принял голову переписанной цепи через час; честный сборщик
 // получил головы 4 и 5 раньше — закрепляют они.
