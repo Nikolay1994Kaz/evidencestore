@@ -573,6 +573,13 @@ func TestSubjectBundleForged(t *testing.T) {
 		}
 		b.Subject.Labels[0].Scope = scope
 		sourceFailed(t, verify(b), opens)
+		// Лишняя метка за такой «месяц» рядом с настоящей, ключи на месте:
+		// записей она не помечает, а в отчёте рисовала бы что угодно. После P-82
+		// пакет без метки месяца с уликами отвергается и так, а эта сверка — одна
+		// на лишнюю метку.
+		b = clone()
+		b.Subject.Labels = append(b.Subject.Labels, proof.SubjectLabel{Scope: scope, Tag: b.Subject.Labels[0].Tag})
+		sourceFailed(t, verify(b), opens)
 	}
 
 	// Без ключа у единственной записи субъекта открытых тел нет: метку ничто не

@@ -861,10 +861,15 @@ const KeylessReasons = "the key was removed from this bundle, or the store held 
 // KeylessUnderLabel — то же для записи под меткой субъекта.
 const KeylessUnderLabel = KeylessReasons
 
-// ReceiptsPath — как проверить, что ключ месяца закрыло хранилище, а не кто-то
-// вынул улики месяца из пакета (P-84): квитанции ключей лежат в цепи, пакет за
-// окно несёт листья целиком, и esverify их перечисляет.
-const ReceiptsPath = "a window bundle over the time the key was closed (evidencestore proof -window -from -to) carries the store's key receipt, and esverify lists it: then the store closed the month, and nobody stripped it from this bundle; the receipt is the store's own statement"
+// ReceiptsPath — как отличить месяц, закрытый хранилищем, от вынутого из пакета
+// (P-84, P-90). Решает свежий пакет за то же окно: пока ключ жив, в нём улики
+// месяца. Ключ уничтожен — остаётся квитанция в цепи: пакет за окно несёт её
+// листом, esverify перечисляет со звеном и операцией. Закрывают месяц только
+// pending-destruction (до отмены) и destroyed; deactivated есть у любого
+// прошлого месяца. Времени выдачи в пакете нет, так что квитанция не говорит,
+// был ли месяц закрыт уже при выдаче, а пишется она, когда изменение дошло до
+// резерва ключей.
+const ReceiptsPath = "to tell a closed month from a stripped one, ask the store for the same bundle again: while the month key lives, a fresh bundle carries the month's evidence. Once the key is destroyed, only the store's key receipt speaks for it: a window bundle over the time the key was closed (evidencestore proof -window -from -to) carries it, and esverify lists it with its link and operation; pending-destruction or destroyed closes the month from that link on (a pending destruction until a later cancel: deactivated, op \"cancel-destroy\"), and deactivated does not close it, every past month gets one a few minutes after it ends. This bundle does not carry the time it was issued, so a receipt does not show that the month was closed already then; a receipt enters the chain once the change has reached the key backup, and it is the store's own statement"
 
 // noLabelWhy — что значит месяц, которому пакет не называет метки (С4, P-72):
 // уничтоженный ключ не даст метку никому, ждущий — не даёт, пока ждёт.

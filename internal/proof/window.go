@@ -357,9 +357,9 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 	// сверяется с ней: иначе запрос к TSA, затянутый ради того, чтобы
 	// спрятать запись окна за голову ВЕРХНЕЙ метки, не виден (E1-02).
 	r.Sources = summarize(leaves, stretch, len(certified), stamps, &r, add)
-	// Квитанции ключей на заверенной части участка: по ним видно, что месяц
-	// закрыло хранилище, а не кто-то вынул его улики из пакета (P-84).
-	r.KeyReceipts = keyReceipts(certLeaves)
+	// Квитанции ключей на заверенной части участка, со звеном каждой: по ним
+	// видно, с какого звена месяц закрыт, по слову хранилища (P-84, P-90).
+	r.KeyReceipts = keyReceipts(leaves, certified)
 
 	// 10. Приложенные улики — с заверенной части участка, тела вскрываются
 	// ключами записей.
@@ -664,22 +664,104 @@ func unexplained(seqs []uint64, gaps []SeqRange) []SeqRange {
 	return out
 }
 
-// KeyReceipt — квитанция ключа месяца в цепи: скоуп, состояние, время листа.
+// KeyReceipt — квитанция ключа месяца в цепи: скоуп, состояние, операция, время
+// листа и звено, где он лежит. Closes — состояние закрывает месяц с этого
+// звена: ключ ждёт уничтожения или уничтожен (Final — насовсем). deactivated
+// месяц не закрывает: прошлый месяц хранилище деактивирует само через
+// несколько минут после его конца, и отмена уничтожения возвращает ключ туда
+// же; ключ жив, и месяц идёт уликами (P-90).
 type KeyReceipt struct {
-	Scope string    `json:"scope"`
-	State string    `json:"state"`
-	At    time.Time `json:"at"`
+	Scope  string    `json:"scope"`
+	State  string    `json:"state"`
+	Op     string    `json:"op,omitempty"`
+	At     time.Time `json:"at"`
+	Link   uint64    `json:"link"`
+	Closes bool      `json:"closes"`
+	Final  bool      `json:"final"`
 }
 
-// keyReceipts — квитанции ключей среди листьев, по порядку цепи.
-func keyReceipts(leaves []auditchain.Leaf) []KeyReceipt {
+// keyReceipts — квитанции ключей на заверенной части участка, по порядку цепи.
+// Операция — из предмета квитанции, слова хранилища: без неё квитанция та же.
+func keyReceipts(leaves []auditchain.Leaf, certified []stretchLink) []KeyReceipt {
 	var out []KeyReceipt
-	for _, l := range leaves {
-		if l.Type == auditchain.EventKeyState {
-			out = append(out, KeyReceipt{Scope: l.Scope, State: l.Subject, At: time.Unix(0, l.UnixNano).UTC()})
+	for _, sl := range certified {
+		for _, l := range leaves[sl.at : sl.at+sl.count] {
+			if l.Type != auditchain.EventKeyState {
+				continue
+			}
+			var ev struct {
+				Op string `json:"op"`
+			}
+			_ = json.Unmarshal(l.Payload, &ev)
+			final := l.Subject == "destroyed" || l.Subject == "destroyed-effective"
+			out = append(out, KeyReceipt{Scope: l.Scope, State: l.Subject, Op: ev.Op, At: time.Unix(0, l.UnixNano).UTC(), Link: sl.seq,
+				Closes: final || l.Subject == "pending-destruction", Final: final})
 		}
 	}
 	return out
+}
+
+// receiptsNote — квитанции ключей участка: закрывающие — все, остальные — до
+// двадцати: закрывающую предел списка не прячет (R2-01).
+func receiptsNote(rs []KeyReceipt) string {
+	const show = 20
+	var closing, other []string
+	for _, kr := range rs {
+		s := fmt.Sprintf("%q %q", kr.Scope, kr.State)
+		if kr.Op != "" {
+			s += fmt.Sprintf(" (op %q)", kr.Op)
+		}
+		s += fmt.Sprintf(" at %s, link %d", fmtTime(kr.At), kr.Link)
+		if kr.Closes {
+			closing = append(closing, s)
+		} else {
+			other = append(other, s)
+		}
+	}
+	if len(other) > show {
+		other = append(other[:show], fmt.Sprintf("and %d more", len(other)-show))
+	}
+	text := `the stretch holds the store's key receipts, its own statements, in the chain under the time-stamps; a month is closed from its link on by pending-destruction or destroyed (destroyed for good, a pending destruction until a later cancel: deactivated, op "cancel-destroy"), and deactivated does not close it: the store deactivates every past month a few minutes after it ends, and its key lives`
+	if len(closing) > 0 {
+		text += "; closing: " + strings.Join(closing, ", ")
+	}
+	if len(other) > 0 {
+		text += "; not closing: " + strings.Join(other, ", ")
+	}
+	return text
+}
+
+// leafMonthsReceipts — что квитанции участка говорят о месяцах, пришедших в
+// этом пакете листом (R2-01): по последней квитанции месяца на участке. Нет
+// квитанций — пусто: о них говорит ReceiptsPath.
+func leafMonthsReceipts(rs []KeyReceipt, months []string) string {
+	last := map[string]KeyReceipt{}
+	for _, kr := range rs {
+		last[kr.Scope] = kr
+	}
+	var gone, pending, open []string
+	for _, m := range months {
+		switch kr, ok := last[m]; {
+		case !ok:
+		case kr.Final:
+			gone = append(gone, m)
+		case kr.Closes:
+			pending = append(pending, m)
+		default:
+			open = append(open, m)
+		}
+	}
+	var parts []string
+	if len(gone) > 0 {
+		parts = append(parts, fmt.Sprintf("the last receipt of %s in this stretch is destroyed: by the store's own word its key was gone for good before this bundle was issued", QuotedList(gone)))
+	}
+	if len(pending) > 0 {
+		parts = append(parts, fmt.Sprintf("the last receipt of %s in this stretch is pending-destruction: by the store's own word its key was closed then, and a destruction can be cancelled after this stretch", QuotedList(pending)))
+	}
+	if len(open) > 0 {
+		parts = append(parts, fmt.Sprintf("the last receipt of %s in this stretch does not close it: nothing here shows that the store closed the month, and its evidence may have been taken out of this bundle; if the store closed it later, the closing receipt lies later in the chain", QuotedList(open)))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // Keyless — улик окна без ключа записи: их тела не открыты, и -bodies о них
@@ -803,16 +885,10 @@ func (r WindowReport) Notes() []string {
 		n = append(n, LeafOnlyNote(r.LeafOnly, r.LeafOnlyMonths))
 	}
 	if len(r.KeyReceipts) > 0 {
-		const show = 20
-		var parts []string
-		for i, kr := range r.KeyReceipts {
-			if i == show {
-				parts = append(parts, fmt.Sprintf("and %d more", len(r.KeyReceipts)-show))
-				break
-			}
-			parts = append(parts, fmt.Sprintf("%q %q at %s", kr.Scope, kr.State, fmtTime(kr.At)))
+		n = append(n, receiptsNote(r.KeyReceipts))
+		if s := leafMonthsReceipts(r.KeyReceipts, r.LeafOnlyMonths); s != "" {
+			n = append(n, s)
 		}
-		n = append(n, "the stretch holds the store's key receipts — its own statements, in the chain under the time-stamps: "+strings.Join(parts, ", "))
 	}
 	if r.GatewayRecords > 0 {
 		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint signature) are in single-record bundles (evidencestore proof -source S -seq N)")

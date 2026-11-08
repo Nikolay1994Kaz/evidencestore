@@ -3124,14 +3124,14 @@
   {
    "name": "Z149 проверка пакета за окно не собирает квитанции ключей (P-84)",
    "file": "internal/proof/window.go",
-   "old": "\tr.KeyReceipts = keyReceipts(certLeaves)",
-   "new": "\tr.KeyReceipts = keyReceipts(nil)"
+   "old": "\tr.KeyReceipts = keyReceipts(leaves, certified)",
+   "new": "\tr.KeyReceipts = keyReceipts(leaves, nil)"
   },
   {
    "name": "Z150 отчёт пакета за окно молчит о квитанциях ключей (P-84)",
    "file": "internal/proof/window.go",
-   "old": "\tif len(r.KeyReceipts) > 0 {\n\t\tconst show = 20",
-   "new": "\tif false {\n\t\tconst show = 20"
+   "old": "\tif len(r.KeyReceipts) > 0 {\n\t\tn = append(n, receiptsNote(r.KeyReceipts))",
+   "new": "\tif false {\n\t\tn = append(n, receiptsNote(r.KeyReceipts))"
   },
   {
    "name": "Z151 все записи окна листом, а заметка обещает длины и метки (P-85)",
@@ -3246,6 +3246,42 @@
    "file": "cmd/esverify/main.go",
    "old": "it was asked without -dek (then request it with evidencestore proof -dek), the month key is destroyed or awaits destruction, the key was removed from this bundle, or the store held it back",
    "new": "(request it with evidencestore proof -dek) or the month key was destroyed"
+  },
+  {
+   "name": "Z173 квитанция deactivated закрывает месяц (P-90)",
+   "file": "internal/proof/window.go",
+   "old": "Closes: final || l.Subject == \"pending-destruction\", Final: final})",
+   "new": "Closes: final || l.Subject != \"\", Final: final})"
+  },
+  {
+   "name": "Z174 отчёт пакета за окно не сверяет месяцы листом с квитанциями участка (P-90)",
+   "file": "internal/proof/window.go",
+   "old": "\t\tif s := leafMonthsReceipts(r.KeyReceipts, r.LeafOnlyMonths); s != \"\" {",
+   "new": "\t\tif s := leafMonthsReceipts(r.KeyReceipts, nil); s != \"\" {"
+  },
+  {
+   "name": "Z175 закрывающие квитанции не отделены от прочих (P-90)",
+   "file": "internal/proof/window.go",
+   "old": "\t\tif kr.Closes {\n\t\t\tclosing = append(closing, s)",
+   "new": "\t\tif false {\n\t\t\tclosing = append(closing, s)"
+  },
+  {
+   "name": "Z176 у квитанции нет звена (P-90)",
+   "file": "internal/proof/window.go",
+   "old": "Link: sl.seq,",
+   "new": "Link: 0,"
+  },
+  {
+   "name": "Z177 у квитанции нет операции: отмена не видна (P-90)",
+   "file": "internal/proof/window.go",
+   "old": "\t\t\t_ = json.Unmarshal(l.Payload, &ev)",
+   "new": "\t\t\t_ = json.Unmarshal(nil, &ev)"
+  },
+  {
+   "name": "Z178 заметка снова зовёт квитанцию доказательством, что улик не вынимали (P-90)",
+   "file": "internal/proof/source.go",
+   "old": "to tell a closed month from a stripped one, ask the store for the same bundle again: while the month key lives, a fresh bundle carries the month's evidence. Once the key is destroyed, only the store's key receipt speaks for it: ",
+   "new": "then the store closed the month, and nobody stripped it from this bundle: "
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются. Q5 снята 07.11 как равносильная: ключи теперь только у записей окна, а запись из незаверенного хвоста легла после закрывающей метки, позже окна больше чем на WindowEdge, и в выдачу не попадёт; срез оставлен как явная граница. Z63 снята 07.11 вместе с веткой: тело без субъекта даёт пустое значение, а названное значение не пусто, поэтому сверка значений закрывает и этот случай. Z87 снята 07.11 как равносильная: перевод строки в любом тексте отказа гасит SourceReport.Text (Z99), а %q в отказе о теле оставлен ради читаемости значения."

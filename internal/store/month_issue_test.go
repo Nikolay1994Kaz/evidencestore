@@ -154,17 +154,101 @@ func TestWindowListsKeyReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := proof.VerifyWindow(roundTrip(t, win), trustOf(t, s), time.Time{}, time.Time{})
+	// Закрывают месяц только pending-destruction и destroyed (R2-01).
 	var states []string
 	for _, kr := range r.KeyReceipts {
-		if kr.Scope == "agent/2026-09" {
-			states = append(states, kr.State)
+		if kr.Scope != "agent/2026-09" {
+			continue
+		}
+		states = append(states, kr.State)
+		if want := kr.State == "pending-destruction" || strings.HasPrefix(kr.State, "destroyed"); kr.Closes != want || kr.Final != strings.HasPrefix(kr.State, "destroyed") {
+			t.Fatalf("квитанция %+v: closes %v, final %v", kr, kr.Closes, kr.Final)
 		}
 	}
-	if !r.Valid() || !slices.Contains(states, "pending-destruction") || !slices.ContainsFunc(states, func(s string) bool { return strings.HasPrefix(s, "destroyed") }) {
+	if !r.Valid() || !slices.Contains(states, "deactivated") || !slices.Contains(states, "pending-destruction") || !slices.ContainsFunc(states, func(s string) bool { return strings.HasPrefix(s, "destroyed") }) {
 		t.Fatalf("квитанции сентября: %v\n%s", states, r.Text())
 	}
-	if !strings.Contains(r.Text(), `the stretch holds the store's key receipts`) || !strings.Contains(r.Text(), `"agent/2026-09" "pending-destruction" at`) {
-		t.Fatalf("отчёт молчит о квитанциях:\n%s", r.Text())
+	text := r.Text()
+	closing, _, _ := strings.Cut(text[strings.Index(text, "; closing: "):], "; not closing: ")
+	if !strings.Contains(text, `the stretch holds the store's key receipts`) || !strings.Contains(text, "deactivated does not close it") ||
+		!strings.Contains(closing, `"agent/2026-09" "pending-destruction" (op "schedule-destroy") at`) || strings.Contains(closing, `"deactivated"`) ||
+		!strings.Contains(text, `; not closing: "agent/2026-09" "deactivated"`) {
+		t.Fatalf("отчёт молчит, какие квитанции закрывают месяц:\n%s", text)
+	}
+}
+
+// ⭐ R2-01: квитанция deactivated есть у любого прошлого месяца — хранилище
+// деактивирует его само через несколько минут после конца. Пакет за окно через
+// полночь, из которого вынули улики живого сентября, несёт и месяц листом, и эту
+// квитанцию; до правки отчёт перечислял её наравне с уничтожением, а заметка
+// звала квитанцию доказательством, что месяц закрыло хранилище. Теперь отчёт
+// говорит, что последняя квитанция сентября его не закрывает. Честный пакет над
+// заявкой на уничтожение говорит, что закрывает, — и что заявку можно отменить.
+func TestDeactivatedReceiptDoesNotCloseMonth(t *testing.T) {
+	c := newClock()
+	c.set(time.Date(2026, 9, 30, 23, 50, 0, 0, time.UTC))
+	s := openStore(t, testConfig(t, withSubjects), c)
+	in := func(seq uint64, body []byte) {
+		t.Helper()
+		if _, err := s.Ingest("agent", []Incoming{{Seq: seq, Body: body}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	in(1, subjectLine("a", "до окна"))
+	mustStamp(t, s)
+	c.add(5 * time.Minute) // 23:55
+	in(2, subjectLine("a", "сентябрь"))
+	in(3, subjectLine("b", "чужой диалог"))
+	c.add(10 * time.Minute) // 00:05
+	in(4, subjectLine("a", "октябрь"))
+	in(5, subjectLine("b", "чужой диалог в октябре"))
+	c.add(2 * time.Minute) // 00:07 — обслуживание деактивирует сентябрь
+	if err := s.deactivatePastMonths(c.now()); err != nil {
+		t.Fatal(err)
+	}
+	c.add(3 * time.Minute)
+	mustStamp(t, s)
+	mustStampNow(t, s)
+	from, to := time.Date(2026, 9, 30, 23, 54, 0, 0, time.UTC), time.Date(2026, 10, 1, 0, 6, 0, 0, time.UTC)
+	trust := trustOf(t, s)
+	win, err := s.ProofWindow(from, to, "agent", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(win.Records) != 4 {
+		t.Fatalf("честный пакет: %d улик", len(win.Records))
+	}
+	forged := roundTrip(t, win)
+	forged.Records = slices.DeleteFunc(forged.Records, func(rec proof.WindowRecord) bool {
+		sealed, err := evidence.Unmarshal(rec.Evidence)
+		return err == nil && sealed.Scope() == "agent/2026-09"
+	})
+	r := proof.VerifyWindow(roundTrip(t, forged), trust, time.Time{}, time.Time{})
+	// Вынуть весь месяц — признанный предел: пакет проходит, но отчёт не вправе
+	// выдать квитанцию deactivated за закрытие.
+	if !r.Valid() || r.LeafOnly != 2 || !strings.Contains(r.Text(), `the last receipt of "agent/2026-09" in this stretch does not close it`) ||
+		strings.Contains(r.Text(), `"agent/2026-09" in this stretch is pending-destruction`) {
+		t.Fatalf("вынутый живой сентябрь с квитанцией deactivated:\n%s", r.Text())
+	}
+
+	// Честно: заявка на уничтожение сентября — месяц листом, последняя квитанция
+	// участка закрывает его, и заявку можно отменить.
+	c.add(time.Minute)
+	if _, err := s.ScheduleDestroy(t.Context(), "agent/2026-09", time.Hour, []keyring.Approval{{Who: "operator"}, {Who: "security"}}); err != nil {
+		t.Fatal(err)
+	}
+	to2 := c.now()
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustStampNow(t, s)
+	honest, err := s.ProofWindow(from, to2, "agent", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = proof.VerifyWindow(roundTrip(t, honest), trust, time.Time{}, time.Time{})
+	if !r.Valid() || r.LeafOnly != 2 || !strings.Contains(r.Text(), `the last receipt of "agent/2026-09" in this stretch is pending-destruction`) ||
+		!strings.Contains(r.Text(), "a destruction can be cancelled after this stretch") {
+		t.Fatalf("честный пакет над заявкой:\n%s", r.Text())
 	}
 }
 
@@ -360,5 +444,93 @@ func TestSubjectValueAsWritten(t *testing.T) {
 	}
 	if _, err := s.ProofSubject("agent", strings.Repeat("x", evidence.MaxSubjectLen), from, to, 0); err != nil {
 		t.Fatalf("значение на пределе: %v", err)
+	}
+}
+
+// ⭐ P-90 (R1-01, R2-01, RT-01): квитанция не говорит, был ли месяц закрыт, когда
+// выдан пакет. (а) Пакет выдан, пока сентябрь открыт, ключ закрыли потом, а
+// держатель пакета вынул улики сентября: квитанция лежит в звене после головы
+// пакета. (б) Уничтожение отменили, пакет выдан после отмены, улики вынуты:
+// отмена — квитанция deactivated с операцией cancel-destroy, она месяц не
+// закрывает. До правки заметка звала квитанцию доказательством, что «никто не
+// вынимал»; теперь она говорит, что квитанция этого не датирует, и чем
+// проверить: свежим пакетом, пока ключ жив.
+func TestReceiptDoesNotDateTheBundle(t *testing.T) {
+	s, c, from, to := monthStore(t)
+	trust := trustOf(t, s)
+	approvals := []keyring.Approval{{Who: "operator"}, {Who: "security"}}
+	const sep = "agent/2026-09"
+	early, err := s.ProofSource("agent", from, to, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wFrom := c.now()
+	c.add(time.Minute)
+	if err := s.Deactivate(true, sep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ScheduleDestroy(t.Context(), sep, time.Hour, approvals); err != nil {
+		t.Fatal(err)
+	}
+	c.add(time.Minute)
+	if _, err := s.CancelDestroy(sep, approvals); err != nil {
+		t.Fatal(err)
+	}
+	wTo := c.now()
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustStampNow(t, s)
+	afterCancel, err := s.ProofSource("agent", from, to, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	win, err := s.ProofWindow(wFrom, wTo, "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rw := proof.VerifyWindow(roundTrip(t, win), trust, time.Time{}, time.Time{})
+	var got []string
+	var pendingLink uint64
+	for _, kr := range rw.KeyReceipts {
+		if kr.Scope != sep {
+			continue
+		}
+		got = append(got, kr.State+"/"+kr.Op)
+		if kr.State == "pending-destruction" {
+			pendingLink = kr.Link
+		}
+	}
+	if !rw.Valid() || !slices.Equal(got, []string{"deactivated/deactivate", "pending-destruction/schedule-destroy", "deactivated/cancel-destroy"}) {
+		t.Fatalf("квитанции сентября: %v\n%s", got, rw.Text())
+	}
+	// (а): заявка легла в цепь позже головы пакета, выданного до неё.
+	if pendingLink <= early.Checkpoint.Size {
+		t.Fatalf("квитанция в звене %d, голова раннего пакета %d", pendingLink, early.Checkpoint.Size)
+	}
+	// Отмена — среди незакрывающих, с операцией.
+	if _, notClosing, ok := strings.Cut(rw.Text(), "; not closing: "); !ok || !strings.Contains(notClosing, `"agent/2026-09" "deactivated" (op "cancel-destroy") at`) {
+		t.Fatalf("отмена в отчёте не названа:\n%s", rw.Text())
+	}
+
+	for name, b := range map[string]proof.SourceBundle{"выдан до закрытия": early, "выдан после отмены": afterCancel} {
+		f := sourceRoundTrip(t, b)
+		for i := range f.Records {
+			if len(f.Records[i].Evidence) > 0 && seqOf(t, f.Records[i]) <= 3 {
+				f.Records[i].Evidence, f.Records[i].DEK = nil, nil
+			}
+		}
+		r := proof.VerifySource(sourceRoundTrip(t, f), trust, time.Time{}, time.Time{})
+		// Вынуть весь месяц — признанный предел; заметка не выдаёт квитанцию за
+		// доказательство и говорит, как проверить.
+		if !r.Valid() || r.LeafOnly != 2 || strings.Contains(r.Text(), "nobody stripped") ||
+			!strings.Contains(r.Text(), "ask the store for the same bundle again: while the month key lives, a fresh bundle carries the month's evidence") ||
+			!strings.Contains(r.Text(), "This bundle does not carry the time it was issued, so a receipt does not show that the month was closed already then") {
+			t.Fatalf("%s, сентябрь вынут:\n%s", name, r.Text())
+		}
+	}
+	// Так проверка и решается: свежий пакет после отмены несёт улики сентября.
+	if r := proof.VerifySource(sourceRoundTrip(t, afterCancel), trust, time.Time{}, time.Time{}); !r.Valid() || r.LeafOnly != 0 || !slices.Equal(bodySeqs(r.Bodies), []uint64{2, 3, 4, 5}) {
+		t.Fatalf("свежий пакет после отмены:\n%s", r.Text())
 	}
 }
