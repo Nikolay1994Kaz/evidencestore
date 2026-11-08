@@ -283,6 +283,44 @@ func (s *Store) monthClosed(scope string) (bool, error) {
 	return false, nil
 }
 
+// recheckOpen — ключи месяцев, которые пакет отдаёт уликами, живы и в конце
+// выдачи. Решение принято по первой записи месяца, а ключ могли закрыть, пока
+// пакет собирался: тогда пакет унёс бы заголовки месяца, который уже закрыт
+// (P-86). Такой пакет не выдаётся: reissue собирает его заново, и месяц идёт
+// листом; пакет одной улики с меткой — отказ ErrLabelErased.
+func (s *Store) recheckOpen(scopes []string) error {
+	if s.issueHook != nil {
+		s.issueHook()
+	}
+	slices.Sort(scopes)
+	for _, scope := range scopes {
+		closed, err := s.monthClosed(scope)
+		if err != nil {
+			return err
+		}
+		if closed {
+			return fmt.Errorf("%w: %s: ask again, and the month comes as leaves", ErrReissue, scope)
+		}
+	}
+	return nil
+}
+
+// reissueAttempts — сколько раз собирается пакет, пока ключи его месяцев
+// меняются посреди сборки. Закрыть месяц оператор успевает раз за выдачу; не
+// хватило трёх — отказ ErrReissue, и запрос повторят.
+const reissueAttempts = 3
+
+// reissue собирает пакет заново, когда ключ месяца, отданного уликами, закрыли
+// посреди сборки (ErrReissue): со второго раза этот месяц идёт листом (P-86).
+func reissue[B any](build func() (B, error)) (B, error) {
+	for attempt := 1; ; attempt++ {
+		b, err := build()
+		if !errors.Is(err, ErrReissue) || attempt == reissueAttempts {
+			return b, err
+		}
+	}
+}
+
 // subjectLabel — метка субъекта в месяце источника (DECISIONS, п. 32). Ключ
 // меток у каждого месяца свой и выведен из ключа месяца: уничтожен ключ месяца —
 // уничтожен и ключ меток, и метки этого месяца больше не посчитает никто, само

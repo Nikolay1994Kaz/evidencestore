@@ -186,6 +186,9 @@ type WindowReport struct {
 	// — эти месяцы.
 	LeafOnly       int
 	LeafOnlyMonths []string
+	// KeyReceipts — квитанции ключей месяцев на заверенной части участка
+	// (P-84): слова хранилища, но лежат в цепи под метками TSA.
+	KeyReceipts []KeyReceipt
 	// GatewayRecords — приложенных улик из журнала гейтвея: их собственные
 	// проверки — в пакете одной улики.
 	GatewayRecords int
@@ -354,13 +357,16 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 	// сверяется с ней: иначе запрос к TSA, затянутый ради того, чтобы
 	// спрятать запись окна за голову ВЕРХНЕЙ метки, не виден (E1-02).
 	r.Sources = summarize(leaves, stretch, len(certified), stamps, &r, add)
+	// Квитанции ключей на заверенной части участка: по ним видно, что месяц
+	// закрыло хранилище, а не кто-то вынул его улики из пакета (P-84).
+	r.KeyReceipts = keyReceipts(certLeaves)
 
 	// 10. Приложенные улики — с заверенной части участка, тела вскрываются
 	// ключами записей.
 	if len(b.Records) > 0 || b.KeysFor != "" {
 		err := windowRecords(b.Records, certLeaves, &r)
 		if err == nil {
-			err = windowAttached(b.Records, b.KeysFor, certLeaves, &r)
+			err = windowAttached(b.Records, b.KeysFor, certLeaves, b.From, b.To, &r)
 		}
 		r.Bodies = slices.DeleteFunc(r.Bodies, func(body WindowBody) bool {
 			out := !InWindow(time.Unix(0, body.ReceivedAt), r.From, r.To)
@@ -658,10 +664,32 @@ func unexplained(seqs []uint64, gaps []SeqRange) []SeqRange {
 	return out
 }
 
+// KeyReceipt — квитанция ключа месяца в цепи: скоуп, состояние, время листа.
+type KeyReceipt struct {
+	Scope string    `json:"scope"`
+	State string    `json:"state"`
+	At    time.Time `json:"at"`
+}
+
+// keyReceipts — квитанции ключей среди листьев, по порядку цепи.
+func keyReceipts(leaves []auditchain.Leaf) []KeyReceipt {
+	var out []KeyReceipt
+	for _, l := range leaves {
+		if l.Type == auditchain.EventKeyState {
+			out = append(out, KeyReceipt{Scope: l.Scope, State: l.Subject, At: time.Unix(0, l.UnixNano).UTC()})
+		}
+	}
+	return out
+}
+
+// Keyless — улик окна без ключа записи: их тела не открыты, и -bodies о них
+// говорит (T-03).
+func (r WindowReport) Keyless() int { return r.Attached - len(r.Bodies) - r.outside }
+
 // windowAttached: у источника с приложенными уликами приложены все его записи
 // окна (P-46), как в пакете по источнику: снятая улика прятала бы тело неудобной
 // записи. Окно — аудитора: шире окна пакета — и улик не хватит.
-func windowAttached(records []WindowRecord, keysFor string, leaves []auditchain.Leaf, r *WindowReport) error {
+func windowAttached(records []WindowRecord, keysFor string, leaves []auditchain.Leaf, bundleFrom, bundleTo time.Time, r *WindowReport) error {
 	attached := map[string]bool{}
 	sources := map[string]bool{}
 	if keysFor != "" {
@@ -687,7 +715,10 @@ func windowAttached(records []WindowRecord, keysFor string, leaves []auditchain.
 		if l.Type != auditchain.EventEvidence || !sources[l.Scope] || attached[l.Scope+"\x00"+l.Subject] || !InWindow(time.Unix(0, l.UnixNano), r.From, r.To) {
 			continue
 		}
-		if scope := evidence.ScopeOf(l.Scope, l.UnixNano); !scopes[scope] {
+		// Листом — только запись из окна самого пакета: окно аудитора шире
+		// пакета, зашедшее в другой месяц, — недостача, а не закрытый месяц
+		// (P-81).
+		if scope := evidence.ScopeOf(l.Scope, l.UnixNano); !scopes[scope] && InWindow(time.Unix(0, l.UnixNano), bundleFrom, bundleTo) {
 			r.LeafOnly++
 			leafMonths[scope] = true
 			continue
@@ -696,7 +727,7 @@ func windowAttached(records []WindowRecord, keysFor string, leaves []auditchain.
 	}
 	r.LeafOnlyMonths = slices.Sorted(maps.Keys(leafMonths))
 	if missing > 0 {
-		return fmt.Errorf("%d records received in the window come without their evidence, in months whose other records the bundle does carry: ask for a bundle over this window", missing)
+		return fmt.Errorf("%d records received in the window come without their evidence: ask for a bundle over this window", missing)
 	}
 	return nil
 }
@@ -765,11 +796,23 @@ func (r WindowReport) Notes() []string {
 			n = append(n, fmt.Sprintf("%s: numbers %s are not in the stretch, and no gap is recorded for them in it: they entered the chain outside the window, or the store lost them — ask for their own bundles", s.Name, u))
 		}
 	}
-	if keyless := r.Attached - len(r.Bodies) - r.outside; keyless > 0 {
+	if keyless := r.Keyless(); keyless > 0 {
 		n = append(n, fmt.Sprintf("%d of the %d records attached carry no record key: %s", keyless, r.Attached, KeylessReasons))
 	}
 	if r.LeafOnly > 0 {
 		n = append(n, LeafOnlyNote(r.LeafOnly, r.LeafOnlyMonths))
+	}
+	if len(r.KeyReceipts) > 0 {
+		const show = 20
+		var parts []string
+		for i, kr := range r.KeyReceipts {
+			if i == show {
+				parts = append(parts, fmt.Sprintf("and %d more", len(r.KeyReceipts)-show))
+				break
+			}
+			parts = append(parts, fmt.Sprintf("%q %q at %s", kr.Scope, kr.State, fmtTime(kr.At)))
+		}
+		n = append(n, "the stretch holds the store's key receipts — its own statements, in the chain under the time-stamps: "+strings.Join(parts, ", "))
 	}
 	if r.GatewayRecords > 0 {
 		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint signature) are in single-record bundles (evidencestore proof -source S -seq N)")

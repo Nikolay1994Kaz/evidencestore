@@ -16,6 +16,11 @@ import (
 // ещё нет или листьев больше предела. Админка отвечает 400.
 var ErrWindow = errors.New("store: window")
 
+// ErrReissue — ключ месяца, отданного уликами, закрыли, пока пакет собирался:
+// пакет не выдан, и повторный запрос отдаст этот месяц листом (P-86). Админка
+// отвечает 409.
+var ErrReissue = errors.New("store: a month key was closed while the bundle was being issued")
+
 // maxWindowLeaves — предел листьев в пакете за окно: пакет собирается и
 // отдаётся целиком в памяти. Больше — окно просят разбить. Переменная —
 // чтобы тест проверил отказ без четверти миллиона записей.
@@ -146,7 +151,10 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 	}
 	if source != "" {
 		b.KeysFor = source
-		if b.Records, err = s.windowRecords(leaves[:certEnd-first], source, from, to); err != nil {
+		// Листья и звенья от ключей не зависят: заново — только улики (P-86).
+		if b.Records, err = reissue(func() ([]proof.WindowRecord, error) {
+			return s.windowRecords(leaves[:certEnd-first], source, from, to)
+		}); err != nil {
 			return proof.WindowBundle{}, err
 		}
 	}
@@ -200,6 +208,16 @@ func (s *Store) windowRecords(leaves []auditchain.Leaf, source string, from, to 
 			return nil, err
 		}
 		out = append(out, rec)
+	}
+	// Месяцы, отданные уликами, — открыты и сейчас (P-86).
+	var opened []string
+	for scope, ok := range open {
+		if ok {
+			opened = append(opened, scope)
+		}
+	}
+	if err := s.recheckOpen(opened); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

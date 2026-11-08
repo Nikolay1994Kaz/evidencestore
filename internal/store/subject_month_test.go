@@ -84,9 +84,16 @@ func TestSubjectLabelDiesWithMonthKey(t *testing.T) {
 			!slices.Equal(r.SubjectNoLabelMonths, []string{scope}) {
 			t.Fatalf("пакет стёртого месяца:\n%s", r.Text())
 		}
-		if !strings.Contains(r.Text(), "lie in months the bundle names no label for (\"agent/2026-09\")") ||
+		// Все записи окна — листьями: отчёт не обещает ни длин, ни меток (T-06) и
+		// не советует сравнить метки, которых нет.
+		if !strings.Contains(r.Text(), `5 records received in the window lie in months the bundle names no label for ("agent/2026-09") and come as leaves`) ||
 			!strings.Contains(r.Text(), "0 records under the label, the other 5 of the 5 in the window stay closed") ||
-			!strings.Contains(r.Text(), `5 records received in the window come without their evidence ("agent/2026-09")`) {
+			!strings.Contains(r.Text(), "the bundle shows the header of no record received in the window") ||
+			!strings.Contains(r.Text(), `the bundle names no label for any month of the window ("agent/2026-09")`) ||
+			strings.Contains(r.Text(), "length and subject label") || strings.Contains(r.Text(), "compare the labels") ||
+			// Заметка о листьях у пакета по субъекту — одна, о месяцах без метки:
+			// отметки with_keys и keys_for его не касаются.
+			strings.Contains(r.Text(), "with_keys") {
 			t.Fatalf("отчёт молчит, почему записи ничьи:\n%s", r.Text())
 		}
 	}
@@ -243,28 +250,45 @@ func TestSubjectMonthLabelNeedsItsOwnBody(t *testing.T) {
 	}
 }
 
-// Подделка 2: метка сентября убрана из заявления, ключи сентября сняты. Пакет
-// не доказывает, что ключ уничтожен, и отчёт не вправе так говорить.
+// Подделка 2: метка сентября убрана из заявления, ключи сентября сняты. С
+// уликами сентября пакет не проходит: честное хранилище месяц без метки отдаёт
+// листом, значит, метку вынули (P-82). Улики сентября сняты тоже — пакет как у
+// честного хранилища со стёртым месяцем; он не доказывает, что ключ уничтожен, и
+// отчёт не вправе так говорить.
 func TestSubjectMissingLabelIsNotProofOfErasure(t *testing.T) {
 	s, _, from, to := monthStore(t)
+	trust := trustOf(t, s)
 	b, err := s.ProofSubject("agent", "a", from, to, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := sourceRoundTrip(t, b)
-	for i := range f.Records {
-		if len(f.Records[i].Evidence) > 0 {
-			if sealed, _ := evidence.Unmarshal(f.Records[i].Evidence); sealed.Scope() == "agent/2026-09" {
-				f.Records[i].DEK = nil
+	strip := func(evidenceToo bool) proof.SourceBundle {
+		f := sourceRoundTrip(t, b)
+		for i := range f.Records {
+			if len(f.Records[i].Evidence) > 0 {
+				if sealed, _ := evidence.Unmarshal(f.Records[i].Evidence); sealed.Scope() == "agent/2026-09" {
+					f.Records[i].DEK = nil
+					if evidenceToo {
+						f.Records[i].Evidence = nil
+					}
+				}
 			}
 		}
+		f.Subject.Labels = f.Subject.Labels[1:]
+		return sourceRoundTrip(t, f)
 	}
-	f.Subject.Labels = f.Subject.Labels[1:]
-	r := proof.VerifySource(sourceRoundTrip(t, f), trustOf(t, s), time.Time{}, time.Time{})
+	r := proof.VerifySource(strip(false), trust, time.Time{}, time.Time{})
+	sourceFailed(t, r, "record keys come only with the records under the label")
+	if !strings.Contains(r.Text(), `the bundle names no label for its month "agent/2026-09": a store sends such a month as leaves, so a label was taken out of this bundle`) {
+		t.Fatalf("отказ не говорит, что метку вынули:\n%s", r.Text())
+	}
+
+	r = proof.VerifySource(strip(true), trust, time.Time{}, time.Time{})
 	text := r.Text()
 	if !r.Valid() || r.SubjectNoLabel != 2 || r.SubjectRecords != 1 ||
-		!strings.Contains(text, `2 records received in the window lie in months the bundle names no label for ("agent/2026-09")`) ||
-		!strings.Contains(text, "the bundle is not signed and does not show which, or whether a label was just taken out of it") ||
+		!strings.Contains(text, `2 records received in the window lie in months the bundle names no label for ("agent/2026-09") and come as leaves`) ||
+		!strings.Contains(text, "so the same is seen when someone takes a month's label and all its evidence out of the bundle, and this bundle cannot tell which") ||
+		!strings.Contains(text, proof.ReceiptsPath) ||
 		!strings.Contains(text, `no body of "a" is open in "agent/2026-09"`) ||
 		strings.Contains(text, "no one can compute the label, the store included") {
 		t.Fatalf("отчёт выдаёт отсутствие метки за доказанное стирание:\n%s", text)
@@ -466,8 +490,11 @@ func TestDekBundleMonthIsWholeOrLeaves(t *testing.T) {
 		}
 	}
 	r := proof.VerifySource(sourceRoundTrip(t, f), trust, time.Time{}, time.Time{})
+	// Отметки with_keys и keys_for не подписаны: отчёт не выдаёт месяц-лист за
+	// доказанное стирание и называет, чем его проверить (P-84).
 	if !r.Valid() || r.LeafOnly != 2 || !slices.Equal(r.LeafOnlyMonths, []string{"agent/2026-10"}) ||
-		!strings.Contains(r.Text(), "that the key is gone is the store's word") {
+		!strings.Contains(r.Text(), "anyone can take a month's evidence out of a bundle as well, and the with_keys and keys_for marks are not signed") ||
+		!strings.Contains(r.Text(), proof.ReceiptsPath) {
 		t.Fatalf("весь октябрь листом:\n%s", r.Text())
 	}
 

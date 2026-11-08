@@ -284,10 +284,13 @@ func TestBodyFlag(t *testing.T) {
 		t.Fatalf("тело записано из пакета, который не прошёл: %v", err)
 	}
 
-	// Ключа записи нет: пакет проходит, а тела нет — код 2, файла нет.
+	// Ключа записи нет: пакет проходит, а тела нет — код 2, файла нет. Причины —
+	// все, и ожидание уничтожения тоже (T-06): совет -dek — только если его не
+	// просили.
 	rewrite(nil)
 	none := filepath.Join(w.dir, "no-dek.bin")
-	if code, rep := w.run(t, "-body", none); code != exitUsage || !strings.Contains(rep, "no record key") {
+	if code, rep := w.run(t, "-body", none); code != exitUsage || !strings.Contains(rep, "no record key") ||
+		!strings.Contains(rep, "it was asked without -dek (then request it with evidencestore proof -dek), the month key is destroyed or awaits destruction") {
 		t.Fatalf("пакет без ключа записи: %d\n%s", code, rep)
 	}
 	if _, err := os.Stat(none); !os.IsNotExist(err) {

@@ -633,9 +633,13 @@ func TestBodiesClosedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, b := range map[string]any{"source": src, "window": win} {
-		code, _, errOut := w.run(t, w.file(t, name+".json", b), "-bodies", filepath.Join(w.dir, "bodies-"+name))
-		if code != exitUsage || !strings.Contains(errOut, "evidencestore proof -source S -dek") {
+	// Совет — с видом пакета: пакет за окно просят с -window (E4-08).
+	for name, c := range map[string]struct {
+		b      any
+		advice string
+	}{"source": {src, "evidencestore proof -source S -dek"}, "window": {win, "evidencestore proof -window -source S -dek"}} {
+		code, _, errOut := w.run(t, w.file(t, name+".json", c.b), "-bodies", filepath.Join(w.dir, "bodies-"+name))
+		if code != exitUsage || !strings.Contains(errOut, c.advice) || !strings.Contains(errOut, proof.KeylessReasons) {
 			t.Errorf("%s: код %d, %s", name, code, errOut)
 		}
 	}

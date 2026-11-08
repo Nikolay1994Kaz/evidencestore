@@ -632,7 +632,8 @@ func windowQuery(q url.Values) (from, to time.Time, head uint64, err error) {
 }
 
 // windowError — отказ пакета за окно или по источнику: окно задано неверно
-// или ещё не закрыто — 400, нет источника — 404.
+// или ещё не закрыто — 400, нет источника — 404, ключ месяца закрыли посреди
+// выдачи — 409.
 func windowError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	switch {
@@ -640,6 +641,9 @@ func windowError(w http.ResponseWriter, err error) {
 		code = http.StatusBadRequest
 	case errors.Is(err, store.ErrNotFound):
 		code = http.StatusNotFound
+	case errors.Is(err, store.ErrReissue):
+		// Ключ месяца закрыли посреди выдачи: повтор соберёт пакет заново.
+		code = http.StatusConflict
 	}
 	writeErr(w, code, err)
 }

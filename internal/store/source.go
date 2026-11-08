@@ -33,7 +33,7 @@ import (
 // тела — нет, поэтому улики с ключами идут только у записей окна (P-46); записи
 // вне окна — листом: номер, время, отпечаток.
 func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toHead uint64) (proof.SourceBundle, error) {
-	return s.proofSource(source, "", from, to, withDEK, toHead)
+	return reissue(func() (proof.SourceBundle, error) { return s.proofSource(source, "", from, to, withDEK, toHead) })
 }
 
 // ProofSubject — пакет по источнику, открывающий записи одного субъекта
@@ -41,10 +41,19 @@ func (s *Store) ProofSource(source string, from, to time.Time, withDEK bool, toH
 // окна идут уликой без ключа: по заголовку видно, что метка у них другая, а
 // тела закрыты. Цепочка источника та же, поэтому полнота та же.
 func (s *Store) ProofSubject(source, subject string, from, to time.Time, toHead uint64) (proof.SourceBundle, error) {
-	if subject == "" {
+	switch {
+	case subject == "":
 		return proof.SourceBundle{}, fmt.Errorf("%w: name the subject", ErrWindow)
+	case len(subject) > evidence.MaxSubjectLen:
+		// При приёме такое значение метки не получает: пакет искал бы метку,
+		// которой нет ни у одной записи (T-06).
+		return proof.SourceBundle{}, fmt.Errorf("%w: the subject is %d bytes: a value longer than %d gets no label at intake, so no record is under it", ErrWindow, len(subject), evidence.MaxSubjectLen)
+	case !evidence.ValidSubject(subject):
+		// Байты не UTF-8 или одиночный суррогат: такое поле при приёме метки не
+		// даёт (T-01).
+		return proof.SourceBundle{}, fmt.Errorf("%w: the subject is not valid UTF-8: a field whose value is not valid UTF-8 gets no label at intake, so no record is under it", ErrWindow)
 	}
-	return s.proofSource(source, subject, from, to, true, toHead)
+	return reissue(func() (proof.SourceBundle, error) { return s.proofSource(source, subject, from, to, true, toHead) })
 }
 
 func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK bool, toHead uint64) (proof.SourceBundle, error) {
@@ -375,6 +384,21 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	}
 	if _, err := proof.OpenTail(b.Upper.Tails.Chain(), source, b.Upper.Open); err != nil {
 		return proof.SourceBundle{}, fmt.Errorf("store: upper tails of %s: %w", source, err)
+	}
+	// Месяцы, отданные уликами, — открыты и сейчас (P-86).
+	var opened []string
+	for scope, ok := range openMonths {
+		if ok {
+			opened = append(opened, scope)
+		}
+	}
+	for scope, tag := range labels {
+		if tag != nil {
+			opened = append(opened, scope)
+		}
+	}
+	if err := s.recheckOpen(opened); err != nil {
+		return proof.SourceBundle{}, err
 	}
 	// Метки субъекта — тех месяцев окна, чей ключ жив, по порядку месяцев.
 	if claim != nil {

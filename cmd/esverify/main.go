@@ -193,7 +193,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// байт: Text экранирует управляющие символы, а журнал поднимают
 		// ровно из тех байтов, что прислал источник.
 		if !report.BodyOpened {
-			fmt.Fprintln(stderr, "error: -body: the bundle carries no record key (request it with evidencestore proof -dek) or the month key was destroyed: there is no body to write")
+			fmt.Fprintln(stderr, "error: -body: the bundle carries no record key, and there is no body to write: it was asked without -dek (then request it with evidencestore proof -dek), the month key is destroyed or awaits destruction, the key was removed from this bundle, or the store held it back")
 			return exitUsage
 		}
 		// Тело — содержимое улики: файл только владельцу.

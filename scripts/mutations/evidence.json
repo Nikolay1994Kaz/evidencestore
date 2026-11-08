@@ -99,6 +99,24 @@
    "file": "internal/evidence/record.go",
    "old": "\t\tbuf = appendField(buf, []byte(s.SubjectField))\n",
    "new": "\t\tbuf = appendField(buf, nil)\n"
+  },
+  {
+   "name": "Z170 значение субъекта с чужими байтами получает метку U+FFFD (T-01)",
+   "file": "internal/evidence/subject.go",
+   "old": "\tif !utf8.Valid(raw) {\n\t\treturn false\n\t}",
+   "new": "\tif false {\n\t\treturn false\n\t}"
+  },
+  {
+   "name": "Z171 одиночная старшая половина суррогата в конце строки получает метку (T-01)",
+   "file": "internal/evidence/subject.go",
+   "old": "\t\tif hi >= 0xDC00 || !ok || lo < 0xDC00 || lo >= 0xE000 {",
+   "new": "\t\tif hi >= 0xDC00 || ok && (lo < 0xDC00 || lo >= 0xE000) {"
+  },
+  {
+   "name": "Z172 значение субъекта сравнивается после разбора, а не как записано (T-01)",
+   "file": "internal/evidence/subject.go",
+   "old": "\t\t\tif !validRawString(raw) || json.Unmarshal(raw, &value) != nil {",
+   "new": "\t\t\tif json.Unmarshal(raw, &value) != nil {"
   }
  ]
 }

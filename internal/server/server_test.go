@@ -474,3 +474,19 @@ func TestAdminProofShowLabel(t *testing.T) {
 		t.Fatalf("с show_label: %d", resp.StatusCode)
 	}
 }
+
+// P-86: ключ месяца закрыли посреди выдачи, и три сборки подряд не сошлись —
+// 409 и причина: запрос повторят; не 400 («окно задано неверно») и не 500.
+func TestWindowErrorReissueIsConflict(t *testing.T) {
+	for err, want := range map[error]int{
+		fmt.Errorf("%w: agent/2026-09: ask again, and the month comes as leaves", store.ErrReissue): http.StatusConflict,
+		fmt.Errorf("%w: both ends of the window are required", store.ErrWindow):                     http.StatusBadRequest,
+		fmt.Errorf("%w: source x", store.ErrNotFound):                                               http.StatusNotFound,
+	} {
+		rec := httptest.NewRecorder()
+		windowError(rec, err)
+		if rec.Code != want || !strings.Contains(rec.Body.String(), err.Error()) {
+			t.Fatalf("%v: %d %s", err, rec.Code, rec.Body.String())
+		}
+	}
+}

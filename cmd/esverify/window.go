@@ -40,8 +40,9 @@ type windowResult struct {
 	// и скрипт, идущий окно за окном, не встаёт. Пусто — такого не доказано.
 	nothing string
 	// warn — что -bodies не записал и почему, при коде 0: месяцы окна, где не
-	// открыто ни одно тело субъекта (P-75).
-	warn string
+	// открыто ни одно тело субъекта (P-75), месяцы-листья (T-05), улики без
+	// ключа (T-03).
+	warn []string
 }
 
 // noRecords — в окне нет записей. Говорит только о том, что показывает пакет: окно
@@ -83,18 +84,49 @@ func verifyWindow(data []byte, trust proof.Trust, from, to time.Time) windowResu
 	if inWindow == 0 {
 		nothing = noRecords(win.FromBundle)
 	}
-	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), the source it was taken for has no records in the window, or the month keys were destroyed: there are no bodies to write"
+	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -window -source S -dek), the source it was taken for has no records in the window, or " + proof.KeylessReasons + ": there are no bodies to write"
+	if b.KeysFor != "" {
+		// Ключи уже просили: совет взять -dek вёл бы по кругу (E4-08). Пометка
+		// не подписана, и записи её источника в окне отчёт считает сам.
+		quiet := true
+		for _, s := range win.Sources {
+			if s.Name == b.KeysFor && s.InWindow > 0 {
+				quiet = false
+			}
+		}
+		noBodies = fmt.Sprintf("the bundle opens no bodies in the window: it says it carries the keys of %q, and that source has no records received in the window: there are no bodies to write", b.KeysFor)
+		if !quiet {
+			noBodies = fmt.Sprintf("the bundle opens no bodies in the window: it says it carries the keys of %q, and the records of that source in the window come without them: %s; there are no bodies to write", b.KeysFor, proof.KeylessReasons)
+		}
+	}
+	var warn []string
 	if win.LeafOnly > 0 {
 		noBodies = leafOnlyNoBodies(win.LeafOnlyMonths)
+		warn = append(warn, leafOnlyWarn(win.LeafOnlyMonths))
 	}
-	out["leaf_only"], out["leaf_only_months"] = win.LeafOnly, win.LeafOnlyMonths
-	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies, nothing: nothing, noBodies: noBodies}
+	if k := win.Keyless(); k > 0 {
+		warn = append(warn, keylessWarn(k))
+	}
+	out["leaf_only"], out["leaf_only_months"], out["key_receipts"] = win.LeafOnly, win.LeafOnlyMonths, win.KeyReceipts
+	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies, nothing: nothing, noBodies: noBodies, warn: warn}
+}
+
+// leafOnlyWarn — что -bodies не записал, когда часть тел записана, а месяцы
+// пришли листом (P-81, E1-02, T-05).
+func leafOnlyWarn(months []string) string {
+	return fmt.Sprintf("the bundle carries no evidence for %s: their records are not among the bodies written (the report says why)", proof.QuotedList(months))
+}
+
+// keylessWarn — улики окна без ключа записи: их тел среди записанных нет
+// (T-03).
+func keylessWarn(n int) string {
+	return fmt.Sprintf("%d records of the window come with their evidence and without their record key, and their bodies are not among those written: %s", n, proof.KeylessReasons)
 }
 
 // leafOnlyNoBodies — почему -bodies нечего писать, когда записи окна пришли
 // листом: их месяц пакет отдал без улик (P-80).
 func leafOnlyNoBodies(months []string) string {
-	return fmt.Sprintf("the records of the window lie in months the bundle carries no evidence for (%s): the store sends a month whose key is destroyed or awaits destruction that way, and there are no bodies to write; that the key is gone is the store's word: its key receipts in the chain show it", proof.QuotedList(months))
+	return fmt.Sprintf("the records of the window lie in months the bundle carries no evidence for (%s), and there are no bodies to write: the store sends a month whose key is destroyed or awaits destruction that way, but anyone can take a month's evidence out of a bundle, and the with_keys and keys_for marks are not signed; %s", proof.QuotedList(months), proof.ReceiptsPath)
 }
 
 // verifySource — пакет по одному источнику.
@@ -113,15 +145,20 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		"records": src.Records, "records_in_window": src.InWindow, "first_seq": src.FirstSeq, "last_seq": src.LastSeq,
 		"holes": src.Holes, "records_attached": src.Attached, "bodies_opened": len(src.Bodies),
 		"gateway_records": src.GatewayRecords, "gateway_broken": src.GatewayBroken}
-	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), or the month keys were destroyed: there are no bodies to write"
-	if src.LeafOnly > 0 {
+	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), or " + proof.KeylessReasons + ": there are no bodies to write"
+	var warn []string
+	if src.LeafOnly > 0 && src.Subject == "" {
 		noBodies = leafOnlyNoBodies(src.LeafOnlyMonths)
+		warn = append(warn, leafOnlyWarn(src.LeafOnlyMonths))
+	}
+	if k := src.Keyless(); k > 0 && src.Subject == "" {
+		warn = append(warn, keylessWarn(k))
 	}
 	out["leaf_only"], out["leaf_only_months"] = src.LeafOnly, src.LeafOnlyMonths
 	if src.Withheld() > 0 {
 		noBodies = "the bundle opens no bodies in the window: the store found its records broken at intake, and their bodies are not opened here: single-record bundles show what is wrong"
 	}
-	var nothing, warn string
+	var nothing string
 	if src.InWindow == 0 {
 		nothing = noRecords(src.FromBundle)
 	}
@@ -136,9 +173,11 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		// (ключ уничтожен или ждёт уничтожения, а может, метку сняли) пакет не
 		// показывает ничьих записей вовсе.
 		if src.UnderLabels() == 0 && src.InWindow > 0 {
-			nothing = "no bodies to write: no record of the window is under this label, which does not show that the subject has none: the report says why"
+			// Каждый месяц окна без открытого тела — по имени (P-75, E2-02), и
+			// отдельно те, которым пакет не называет метки.
+			nothing = fmt.Sprintf("no bodies to write: no record of the window is under this label, and no body of %q is open in %s, which does not show that the subject has none there: the report says why", src.Subject, proof.QuotedList(src.SubjectUnconfirmedMonths))
 			if src.SubjectNoLabel > 0 {
-				nothing = fmt.Sprintf("no bodies to write: the bundle names no label for %s, so whose the records of the window there are cannot be shown, and this does not show that the subject has none there: the report says why", proof.QuotedList(src.SubjectNoLabelMonths))
+				nothing += fmt.Sprintf(" (the bundle names no label for %s)", proof.QuotedList(src.SubjectNoLabelMonths))
 			}
 		}
 		// Одна разбивка с отчётом: records + unbound + others_closed = records_in_window.
@@ -149,7 +188,10 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 			"no_label": src.SubjectNoLabel, "no_label_months": src.SubjectNoLabelMonths,
 			"unconfirmed_months": src.SubjectUnconfirmedMonths}
 		if len(src.SubjectUnconfirmedMonths) > 0 {
-			warn = fmt.Sprintf("no body of %q is open in %s: its records there, if any, are not among the bodies written (the report says why)", src.Subject, proof.QuotedList(src.SubjectUnconfirmedMonths))
+			warn = append(warn, fmt.Sprintf("no body of %q is open in %s: its records there, if any, are not among the bodies written (the report says why)", src.Subject, proof.QuotedList(src.SubjectUnconfirmedMonths)))
+		}
+		if src.SubjectKeyless > 0 {
+			warn = append(warn, fmt.Sprintf("%d records under this label come without their record key, and their bodies are not among those written: %s", src.SubjectKeyless, proof.KeylessUnderLabel))
 		}
 	}
 	if src.WitnessChecked {
@@ -214,8 +256,8 @@ func runWindow(data []byte, kind string, a windowArgs, stdout, stderr io.Writer)
 		}
 		// Сообщение — в stderr: -json остаётся чистым JSON.
 		fmt.Fprintf(stderr, "%d bodies written to %s\n", len(res.bodies), a.bodies)
-		if res.warn != "" {
-			fmt.Fprintln(stderr, res.warn)
+		for _, w := range res.warn {
+			fmt.Fprintln(stderr, w)
 		}
 	}
 	return exitValid

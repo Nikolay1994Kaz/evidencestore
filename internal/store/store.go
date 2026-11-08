@@ -124,6 +124,10 @@ type Store struct {
 	chainSegment int64                // Options.chainSegment
 	replicaChunk int64                // Options.replicaChunk, без него — replicaChunk
 	wrapRoots    func(keyring.RootStore) keyring.RootStore
+	// issueHook (только тесты) зовётся перед повторной проверкой месяцев в
+	// конце выдачи пакета: тест закрывает здесь ключ месяца, как оператор
+	// посреди выдачи (P-86).
+	issueHook func()
 
 	keys     *keyring.Keyring
 	evlog    *evlog.Log
