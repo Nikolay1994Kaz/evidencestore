@@ -62,13 +62,16 @@ type PublishedHead struct {
 
 // HeadVersion — версия объекта головы у свидетеля S3: ключ, номер головы из
 // имени ключа («…heads/<номер>.json»), номер версии, ETag и время, когда S3
-// принял версию (LastModified: его ставит S3, а не тот, кто пишет).
+// принял версию (LastModified: его ставит S3, а не тот, кто пишет). list —
+// файл списка версий, откуда она: один список — один свидетель, где бы ни
+// лежали файлы его версий (P-99).
 type HeadVersion struct {
 	Key       string
 	Size      uint64
 	VersionID string
 	ETag      string
 	At        time.Time
+	list      string
 }
 
 // AddFile — файл из каталога голов: список версий S3 или головы (ParseHeads).
@@ -77,6 +80,9 @@ type HeadVersion struct {
 // не одна голова или мусор (P-96).
 func (w *Witness) AddFile(name string, data []byte) {
 	if vs, ok := parseHeadVersions(data); ok {
+		for i := range vs {
+			vs[i].list = name
+		}
 		w.Versions = append(w.Versions, vs...)
 		return
 	}
@@ -232,16 +238,19 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			byID[v.VersionID] = append(byID[v.VersionID], i)
 		}
 	}
-	fromS3 := func(h PublishedHead) (at time.Time) {
+	fromS3 := func(h PublishedHead) (at map[string]time.Time) {
 		if h.digest == "" {
-			return at
+			return nil
 		}
 		name := strings.TrimSuffix(filepath.ToSlash(h.file), ".json")
 		for _, i := range slices.Concat(byETag[h.digest], byID[name], byID[path.Base(name)]) {
 			v := w.Versions[i]
 			matched[i] = true
-			if at.IsZero() || v.At.Before(at) {
-				at = v.At
+			if at == nil {
+				at = map[string]time.Time{}
+			}
+			if t, ok := at[v.list]; !ok || v.At.Before(t) {
+				at[v.list] = v.At
 			}
 		}
 		return at
@@ -258,6 +267,12 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 	signed := 0
 	for _, h := range w.Heads {
 		s3 := fromS3(h)
+		if len(s3) > 0 {
+			// Файл из бакета: его содержимое пишет тот, у кого ключи записи, и
+			// «сборщик отверг» из него не в счёт (P-100), как и received_at
+			// (P-96, sightingsOf): только голова и время версии.
+			h.Refused = false
+		}
 		if VerifyCheckpoint(h.Checkpoint, key) != nil {
 			continue
 		}
@@ -266,7 +281,7 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			refused = append(refused, h)
 			continue
 		}
-		seen = append(seen, sightingOf(h, s3))
+		seen = append(seen, sightingsOf(h, s3)...)
 		seq, known := h.Checkpoint.Size, false
 		for _, v := range versions[seq] {
 			known = known || bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root)
@@ -355,29 +370,33 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 			pins[s.witness] = s
 		}
 	}
-	var fix uint64
-	var fixAt, s3At time.Time
-	untimed := false
+	// Самая дальняя голова; на равном номере время — у свидетеля со временем
+	// (у самого раннего). Обход — по именам свидетелей, чтобы отчёт не зависел
+	// от порядка.
 	names := make([]string, 0, len(pins))
-	for name, p := range pins {
+	for name := range pins {
 		names = append(names, name)
+	}
+	sort.Strings(names)
+	var fix uint64
+	var fixAt time.Time
+	untimed := false
+	for _, name := range names {
+		p := pins[name]
 		untimed = untimed || p.at.IsZero()
 		if p.seq > fix || p.seq == fix && !p.at.IsZero() && (fixAt.IsZero() || p.at.Before(fixAt)) {
 			fix, fixAt = p.seq, p.at
 		}
-		if p.s3 && p.at.After(s3At) {
-			s3At = p.at
-		}
 	}
-	sort.Strings(names)
 	// Версия из списка без файла: её голова неизвестна. Лежит она на участке
-	// пакета или получена не позже головы, которую S3 получил первой, —
-	// сверке её не хватает, и её надо скачать.
+	// пакета или получена не позже головы, которую этот свидетель S3 получил
+	// первой, — сверке её не хватает, и её надо скачать.
 	for i, v := range w.Versions {
 		if matched[i] || err != nil {
 			continue
 		}
-		if first <= v.Size && v.Size <= last || v.Size >= lo && (s3At.IsZero() || !v.At.After(s3At)) {
+		p, ok := pins[s3Name(v.list)]
+		if first <= v.Size && v.Size <= last || v.Size >= lo && (!ok || !v.At.After(p.at)) {
 			err = fmt.Errorf("the S3 versions list names %s version %q, received at %s, and no file in the heads directory is that version (its MD5 is the ETag of a single-part upload, or its name is the version ID with .json): download every version of the heads, each to a file named after its version ID (aws s3api get-object --version-id)", v.Key, v.VersionID, fmtTime(v.At))
 		}
 	}
@@ -416,35 +435,61 @@ func checkWitness(w *Witness, key ed25519.PublicKey, evLink uint64, links []audi
 }
 
 // sighting — голова, какой её видел один свидетель: witness — кто (откуда
-// время и в каком подкаталоге файл), at — когда он её получил (ноль — без
-// времени), s3 — время из списка версий S3.
+// время и где файл), at — когда он её получил (ноль — без времени).
 type sighting struct {
 	witness string
 	seq     uint64
 	at      time.Time
-	s3      bool
 }
 
-// sightingOf — свидетель головы h: у каждого свои часы. S3 — время версии из
-// списка версий, сборщик — received_at его журнала, иначе — без времени;
-// каждый — в своём подкаталоге каталога голов.
-func sightingOf(h PublishedHead, s3 time.Time) sighting {
+// sightingsOf — свидетели головы h, у каждого свои часы. S3 — каждый список
+// версий, где нашлась версия файла головы, с её временем (P-99: свидетель —
+// список, а не подкаталог: файлы версий раскладывают и по ключам). Иначе —
+// сборщик (received_at его журнала) или головы без времени, каждые в своём
+// подкаталоге каталога голов.
+func sightingsOf(h PublishedHead, s3 map[string]time.Time) []sighting {
+	seq := h.Checkpoint.Size
+	if len(s3) > 0 {
+		out := make([]sighting, 0, len(s3))
+		for list, at := range s3 {
+			out = append(out, sighting{s3Name(list), seq, at})
+		}
+		return out
+	}
 	file := h.file
 	if file == "" {
 		file = h.Name
 	}
-	dir := path.Dir(filepath.ToSlash(file))
+	file = filepath.ToSlash(file)
+	dir := path.Dir(file)
 	if dir == "." {
 		dir = "the heads directory"
 	}
-	switch {
-	case !s3.IsZero():
-		return sighting{"S3 (versions list) in " + dir, h.Checkpoint.Size, s3, true}
-	case !h.Received.IsZero():
-		return sighting{"the collector's journal in " + dir, h.Checkpoint.Size, h.Received, false}
+	if !h.Received.IsZero() {
+		return []sighting{{collectorOf(dir, path.Base(file)), seq, h.Received}}
 	}
-	return sighting{"heads without a time of receipt in " + dir, h.Checkpoint.Size, time.Time{}, false}
+	return []sighting{{"heads without a time of receipt in " + dir, seq, time.Time{}}}
 }
+
+// collectorOf — чей файл сборщика. Файлы одного сборщика — журнал, последняя
+// голова и расхождения (checkpoints.jsonl, checkpoint.json,
+// checkpoints-conflict.jsonl) в одном каталоге, можно с общей приставкой
+// имени. Файл с другим именем — свидетель сам по себе: сборщики, сложенные в
+// один каталог под своими именами, не сливаются в одного (P-101).
+func collectorOf(dir, base string) string {
+	for _, own := range []string{"checkpoints-conflict.jsonl", "checkpoints.jsonl", "checkpoint.json"} {
+		if prefix, ok := strings.CutSuffix(base, own); ok {
+			if prefix == "" {
+				return "the collector's journal in " + dir
+			}
+			return "the collector's journal " + prefix + "* in " + dir
+		}
+	}
+	return "the collector's journal " + base + " in " + dir
+}
+
+// s3Name — свидетель S3 по файлу его списка версий.
+func s3Name(list string) string { return "S3 (versions list " + filepath.ToSlash(list) + ")" }
 
 func (s sighting) String() string {
 	if s.at.IsZero() {
