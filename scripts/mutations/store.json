@@ -748,8 +748,8 @@
   {
    "name": "W2 под одним номером у свидетеля остаётся одна голова: развилка не видна",
    "file": "internal/proof/heads.go",
-   "old": "known = known || bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root)",
-   "new": "known = known || bytes.Equal(v.Checkpoint.Root[:0], h.Checkpoint.Root[:0])"
+   "old": "\t\t\tif !bytes.Equal(v.Checkpoint.Root, h.Checkpoint.Root) {",
+   "new": "\t\t\tif !bytes.Equal(v.Checkpoint.Root[:0], h.Checkpoint.Root[:0]) {"
   },
   {
    "name": "W3 головы под чужим ключом идут в счёт",
@@ -760,14 +760,14 @@
   {
    "name": "W4 пакет может кончаться раньше головы свидетеля",
    "file": "internal/proof/heads.go",
-   "old": "\tcase seqs[i] > last:",
-   "new": "\tcase false && seqs[i] > last:"
+   "old": "\tcase fix > last:",
+   "new": "\tcase false && fix > last:"
   },
   {
    "name": "W5 улику закрепляет голова свидетеля раньше её звена",
    "file": "internal/proof/heads.go",
-   "old": "return seqs[i] >= max(evLink, first)",
-   "new": "return seqs[i] >= 1"
+   "old": "\tlo := max(evLink, first)",
+   "new": "\tlo := uint64(1)"
   },
   {
    "name": "W6 голова под меткой не уходит свидетелю",
@@ -3282,6 +3282,72 @@
    "file": "internal/proof/source.go",
    "old": "to tell a closed month from a stripped one, ask the store for the same bundle again: while the month key lives, a fresh bundle carries the month's evidence. Once the key is destroyed, only the store's key receipt speaks for it: ",
    "new": "then the store closed the month, and nobody stripped it from this bundle: "
+  },
+  {
+   "name": "Z179 со временем получения закрепляет всё равно первая по номеру (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\t\tif seq < lo || h.Received.IsZero() {",
+   "new": "\t\t\tif seq < lo || true {"
+  },
+  {
+   "name": "Z180 при равном времени закрепляет меньший номер (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "h.Received.Equal(fixAt) && seq > fix {",
+   "new": "h.Received.Equal(fixAt) && seq < fix {"
+  },
+  {
+   "name": "Z181 версия из списка без файла не мешает сверке (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\tif matched[i] || err != nil {",
+   "new": "\t\tif !matched[i] || matched[i] || err != nil {"
+  },
+  {
+   "name": "Z182 версия не находит файл по номеру версии в имени (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "v.ETag != h.digest && (v.VersionID == \"\" || !strings.Contains(h.Name, v.VersionID))",
+   "new": "v.ETag != h.digest"
+  },
+  {
+   "name": "Z183 из версий одной головы берётся поздняя (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\t\tif at.IsZero() || v.At.Before(at) {",
+   "new": "\t\t\tif at.IsZero() || v.At.After(at) {"
+  },
+  {
+   "name": "Z184 одна голова из двух мест берёт время первого файла (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\t\tif !h.Received.IsZero() && (v.Received.IsZero() || h.Received.Before(v.Received)) {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "Z185 received_at сборщика не читается (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\t_ = json.Unmarshal(v[\"received_at\"], &received)",
+   "new": "\t\t_ = json.Unmarshal(nil, &received)"
+  },
+  {
+   "name": "Z186 ключ «xheads/…» считается головой (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\tif i < 0 || i > 0 && key[i-1] != '/' {",
+   "new": "\tif i < 0 {"
+  },
+  {
+   "name": "Z187 список версий S3 не узнаётся (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\tif json.Unmarshal(data, &probe) != nil || probe[\"Versions\"] == nil {",
+   "new": "\tif json.Unmarshal(data, &probe) != nil || probe[\"Versions\"] != nil {"
+  },
+  {
+   "name": "Z188 отчёт молчит, что у голов нет времени получения (P-21)",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tif r.WitnessUntimed {\n\t\t\tn = append(n, WitnessUntimedNote)",
+   "new": "\t\tif false {\n\t\t\tn = append(n, WitnessUntimedNote)"
+  },
+  {
+   "name": "Z189 голова из файла S3 не находит версию по ETag (P-21)",
+   "file": "internal/proof/heads.go",
+   "old": "\t\ths[0].digest = hex.EncodeToString(sum[:])",
+   "new": "\t\ths[0].digest = hex.EncodeToString(sum[:0])"
   }
  ],
  "note": "P12 (сверка номеров звеньев подряд) снят как равносильный: подделка с пропуском номера при целых PrevHash ловится сверкой хэшей и индексной арифметикой linkAt; проверка оставлена ради внятного сообщения. B2, B3, B8 (пакет за окно) сняты как равносильные: номера листьев между звеньями — указатель, а не содержимое (лист вне звеньев не входит в цепь; «с начала цепи» держит сверка первого звена, B4); первое звено против нижней головы — расхождение в одну сторону даёт лишние листья, в другую ловится проверкой метки; токен над головой, которая держит его самого, не подделать — хэш головы зависит от токена. Проверки оставлены ради внятных сообщений. B11, B12 (границы окна) слиты с U26, U27: проверка границ — одна функция windowBracket для пакетов за окно и по источнику. U14, U19–U23, U49, U57 сняты вместе с проверками, которых больше нет: верхний край пакета по источнику — хвосты перед запросом, как нижний (заход 26.10, Q-01). W11 снята вместе с веткой «пометить ждущую текущую голову как голову под меткой»: голова под меткой встаёт в очередь при создании хвостов перед запросом, раньше любой текущей (Q-06); Q13 слита с W6. Удержание звеньев во время первой метки (прежние X22, X23) снято вместе с кодом: приём открывает вторая метка процесса (заход 27.10, третий, Q-47). Мутация «якорь до листа токена» (прежняя X24) снята как равносильная: приём открывается в конце метки, чьи хвосты легли при якоре, и место якоря относительно листа токена на T1 записи не влияет. X7, X8, X20 (сверка обещания по времени звеньев) и X51 сняты 28.10 вместе с этой сверкой: пакет одной улики версии 3 сверяет обещание по меткам, версии 1 и 2 для -promise не принимаются. Q5 снята 07.11 как равносильная: ключи теперь только у записей окна, а запись из незаверенного хвоста легла после закрывающей метки, позже окна больше чем на WindowEdge, и в выдачу не попадёт; срез оставлен как явная граница. Z63 снята 07.11 вместе с веткой: тело без субъекта даёт пустое значение, а названное значение не пусто, поэтому сверка значений закрывает и этот случай. Z87 снята 07.11 как равносильная: перевод строки в любом тексте отказа гасит SourceReport.Text (Z99), а %q в отказе о теле оставлен ради читаемости значения."

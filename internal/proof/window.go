@@ -198,6 +198,9 @@ type WindowReport struct {
 	WitnessNone    bool
 	WitnessFork    uint64
 	WitnessRefused int
+	// WitnessReceived, WitnessUntimed — как у пакета одной улики (P-21).
+	WitnessReceived time.Time
+	WitnessUntimed  bool
 }
 
 // Valid — все проверки прошли.
@@ -385,6 +388,7 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 		var wr Report
 		checkWitness(trust.Witness, trust.StoreKey, b.StretchEnd, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
+		r.WitnessReceived, r.WitnessUntimed = wr.WitnessReceived, wr.WitnessUntimed
 	}
 	return r
 }
@@ -902,6 +906,9 @@ func (r WindowReport) Notes() []string {
 	switch {
 	case r.WitnessHead != 0:
 		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this stretch would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
+		if r.WitnessUntimed {
+			n = append(n, WitnessUntimedNote)
+		}
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after the end of this stretch yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
 	default:

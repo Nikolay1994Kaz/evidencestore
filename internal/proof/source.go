@@ -218,6 +218,9 @@ type SourceReport struct {
 	WitnessNone    bool
 	WitnessFork    uint64
 	WitnessRefused int
+	// WitnessReceived, WitnessUntimed — как у пакета одной улики (P-21).
+	WitnessReceived time.Time
+	WitnessUntimed  bool
 }
 
 // Withheld — сколько тел поломанных записей гейтвея не вскрыто нарочно.
@@ -361,6 +364,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 		var wr Report
 		checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
+		r.WitnessReceived, r.WitnessUntimed = wr.WitnessReceived, wr.WitnessUntimed
 	}
 	return r
 }
@@ -961,6 +965,9 @@ func (r SourceReport) Notes() []string {
 	switch {
 	case r.WitnessHead != 0:
 		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this part would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
+		if r.WitnessUntimed {
+			n = append(n, WitnessUntimedNote)
+		}
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after the link that holds the upper time-stamp's token yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
 	default:

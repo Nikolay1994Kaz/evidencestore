@@ -8,7 +8,10 @@
 //
 // -heads — каталог с подписанными головами, которые проверяющий сам взял у
 // свидетеля (канал witness.url, газета, копия в чужом хранилище с
-// блокировкой), все версии: цепь пакета обязана с ними сходиться.
+// блокировкой), все версии: цепь пакета обязана с ними сходиться. Рядом —
+// список версий S3 (aws s3api list-object-versions) или журнал голов
+// сборщика: тогда улику закрепляет голова, которую свидетель получил первой
+// (P-21).
 //
 // -body кладёт тело улики в файл байт в байт — только когда пакет прошёл
 // все проверки: так из хранилища поднимают сам журнал, а отчёт показывает
@@ -58,7 +61,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM)")
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
-	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them")
+	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them; with the S3 versions list next to them (aws s3api list-object-versions > DIR/versions.json) or a collector's head journal, the head the witness received first fixes the record")
 	allowNoTSA := fs.Bool("allow-no-tsa", false, "accept a bundle without a TSA time-stamp after the record (then only the store's own signature vouches for it)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	bodyPath := fs.String("body", "", "once the bundle verifies, write the record body to FILE exactly as the source sent it (the bundle must carry the record key: evidencestore proof -dek)")
@@ -177,6 +180,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			out["witness_head"] = report.WitnessHead
 			out["witness_fork"] = report.WitnessFork
 			out["witness_refused"] = report.WitnessRefused
+			out["witness_received"] = witnessReceived(report.WitnessReceived)
 		}
 		enc.Encode(out)
 	} else {
@@ -228,7 +232,7 @@ func readHeads(dir string) (*proof.Witness, error) {
 			return err
 		}
 		name, _ := filepath.Rel(dir, path)
-		w.Heads = append(w.Heads, proof.ParseHeads(name, data)...)
+		w.AddFile(name, data)
 		return nil
 	})
 	return w, err

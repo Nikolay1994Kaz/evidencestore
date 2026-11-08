@@ -351,8 +351,9 @@ type Report struct {
 	GatewayUnsigned bool
 
 	// WitnessChecked — пакет сверялся с головами свидетеля (Trust.Witness);
-	// WitnessHead — голова свидетеля, которая закрепляет улику: первая не
-	// раньше её звена; WitnessNone — такой головы у свидетеля ещё нет.
+	// WitnessHead — голова свидетеля, которая закрепляет улику: первая
+	// полученная из голов не раньше её звена; WitnessNone — такой головы у
+	// свидетеля ещё нет.
 	// Сверка не прошла — ни того, ни другого.
 	WitnessChecked bool
 	WitnessHead    uint64
@@ -365,6 +366,11 @@ type Report struct {
 	// (файл расхождений): пакет с ними не сходится, но хранилище показывало
 	// сборщику вторую историю.
 	WitnessRefused int
+	// WitnessReceived — когда свидетель получил закрепляющую голову; ноль —
+	// времени получения у голов нет, и закрепила первая по номеру
+	// (WitnessUntimed, P-21).
+	WitnessReceived time.Time
+	WitnessUntimed  bool
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -404,6 +410,9 @@ func (r Report) Notes() []string {
 	switch {
 	case r.WitnessHead != 0:
 		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this record would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
+		if r.WitnessUntimed {
+			n = append(n, WitnessUntimedNote)
+		}
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after this record yet: until it gets one, only a TSA time-stamp stands against the store's owner rewriting the chain")
 	default:
