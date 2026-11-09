@@ -238,7 +238,7 @@ func TestRevocationSameKeyTaintsOwnStamps(t *testing.T) {
 	}
 	tr.TSARevocations = compromised(t, main, w.now.Add(time.Hour), w.now.Add(48*time.Hour))
 	r := Verify(b, tr)
-	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, fmt.Sprintf("time-stamp T2 over head %d rests on certificate", h3)) || !strings.Contains(c.Detail, `(serial 2) issued by "CN=evidencestore demo TSA root" with the same key`) {
+	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, fmt.Sprintf("time-stamp T2 over head %d rests on certificate", h3)) || !strings.Contains(c.Detail, fmt.Sprintf(`(serial %s) issued by %q with the same key`, main.Cert().SerialNumber, main.Root().Subject.String())) {
 		t.Fatalf("T2 того же ключа под перевыпущенным сертификатом:\n%s", r.Text())
 	}
 }

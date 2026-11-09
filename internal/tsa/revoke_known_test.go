@@ -98,7 +98,7 @@ func TestRevocationsC2bTKnownRevokedInRekeyedCRL(t *testing.T) {
 		r.AddCRL(caOld.crlOf(t, dir, "old-key.crl", day(2026, 9, 15), day(2026, 12, 15), nil))
 		r.AddCRL(crl)
 		a := r.NewAssessment()
-		a.Known(caNew.cert, x1r.cert) // всё, что советует bundles.md, — в -tsa-trust
+		a.KnownTrusted(caNew.cert, x1r.cert) // всё, что советует bundles.md, — в -tsa-trust
 		i, err := a.Add(stamp.Chains, stamp.GenTime)
 		if err != nil {
 			t.Fatal(err)

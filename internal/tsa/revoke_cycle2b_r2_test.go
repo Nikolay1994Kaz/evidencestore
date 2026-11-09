@@ -73,7 +73,7 @@ func TestC2bR2RekeyedListingStillUnchecked(t *testing.T) {
 		x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: day(2026, 10, 20), ReasonCode: ReasonSuperseded}))
 	r.AddCRL(root.crlOf(t, dir, "root.crl", day(2026, 11, 1), day(2026, 12, 1), nil))
 	a := r.NewAssessment()
-	a.Known(caB.cert)
+	a.KnownTrusted(caB.cert)
 	i, err := a.Add(info.Chains, info.GenTime)
 	if err != nil {
 		t.Fatal(err)

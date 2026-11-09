@@ -226,13 +226,13 @@
   {
    "name": "R50 удержание не снимается новым CRL",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif e.Reason == ReasonCertificateHold && slices.ContainsFunc(",
-   "new": "\t\tif false && e.Reason == ReasonCertificateHold && slices.ContainsFunc("
+   "old": "\t\t\tif e.Reason == ReasonCertificateHold && slices.ContainsFunc(own[:i],",
+   "new": "\t\t\tif false && e.Reason == ReasonCertificateHold && slices.ContainsFunc(own[:i],"
   },
   {
    "name": "R53 на тот же ключ переходит и отзыв без компрометации",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif keepsEarlier(e.Reason) || chainOnly(ci.c, ci.signer || !ci.inChain && !ci.c.IsCA, e) {\n\t\t\t\tcontinue\n\t\t\t}",
+   "old": "\t\t\tif keepsEarlier(e.Reason) || chainOnly(ci.c, signerKeys[k], e) {\n\t\t\t\tcontinue\n\t\t\t}",
    "new": "\t\t\tif false {\n\t\t\t\tcontinue\n\t\t\t}"
   },
   {
@@ -472,8 +472,8 @@
   {
    "name": "R88 CRL с именем центра под другим ключом, называющий сертификат, — не в счёт",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\tif ci.st.cur != nil && g.newer(ci.st.cur) && !future(g) {",
-   "new": "\t\t\t\tif _ = future; false {"
+   "old": "\t\t\tcase ci.st.cur != nil && g.newer(ci.st.cur) && !future(g):",
+   "new": "\t\t\tcase ci.st.cur != nil && g.newer(ci.st.cur) && !future(g) && false:"
   },
   {
    "name": "R110 CRL с именем центра под другим ключом — «не проверено» и без записи",
@@ -592,7 +592,7 @@
   {
    "name": "R117 обломки границы блока вне блоков приняты",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tcase brokenBoundary(outside):",
+   "old": "\t\tcase brokenBoundary(outside) != \"\":",
    "new": "\t\tcase false:"
   },
   {
@@ -604,20 +604,20 @@
   {
    "name": "R119 запись CRL нового ключа центра не в счёт",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\tci.st.entries = append(ci.st.entries, es...)\n\t\t\t\tci.st.notes = append(ci.st.notes, fmt.Sprintf(\"%s is signed with another key",
-   "new": "\t\t\t\t_ = es\n\t\t\t\tci.st.notes = append(ci.st.notes, fmt.Sprintf(\"%s is signed with another key"
+   "old": "\t\t\t\t\tci.st.entries = append(ci.st.entries, e)",
+   "new": "\t\t\t\t\t_ = e"
   },
   {
    "name": "R120 CRL нового ключа — путь к тому же корню не нужен",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif _, err := x.Verify(x509.VerifyOptions{Roots: anchor, Intermediates: inter, CurrentTime: g.rl.ThisUpdate, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err == nil {",
-   "new": "\t\t\tif anchor != nil {"
+   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]bool{}) {",
+   "new": "\t\tif r.checkSig(g, x).key == nil {"
   },
   {
    "name": "R121 CRL нового ключа — подпись не сверяется",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif r.checkSig(g, x).key != nil {\n\t\t\tcontinue\n\t\t}\n\t\tfor _, root := range roots {",
-   "new": "\t\tif false {\n\t\t\tcontinue\n\t\t}\n\t\tfor _, root := range roots {"
+   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]bool{}) {",
+   "new": "\t\tif p.under(x, as, 0, map[*x509.Certificate]bool{}) {"
   },
   {
    "name": "R122 вывод из работы по CRL нового ключа — метка в силе",
@@ -646,8 +646,8 @@
   {
    "name": "R126 сертификаты токенов второй службы не в оценке",
    "file": "internal/proof/revoked.go",
-   "old": "\t\tsc.as.Known(info.Certs...)\n\t\tid, err := sc.as.Add(info.Chains, info.GenTime)",
-   "new": "\t\tid, err := sc.as.Add(info.Chains, info.GenTime)"
+   "old": "\t\tsc.as.Known(info.Certs...)\n\t\tif carried != nil {",
+   "new": "\t\tif carried != nil {"
   },
   {
    "name": "R127 сертификаты токена не в Info",
@@ -658,8 +658,8 @@
   {
    "name": "R128 Known: сертификат вне цепочек — без сверки, кем выпущен",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\tif vouched(x) && !bytes.Equal(x.Raw, k.Raw) && x.CheckSignature(k.SignatureAlgorithm, k.RawTBSCertificate, k.Signature) == nil {",
-   "new": "\t\t\t\tif vouched(x) && !bytes.Equal(x.Raw, k.Raw) {"
+   "old": "\t\t\t\tif !bytes.Equal(x.Raw, k.Raw) && x.CheckSignature(k.SignatureAlgorithm, k.RawTBSCertificate, k.Signature) == nil {",
+   "new": "\t\t\t\tif !bytes.Equal(x.Raw, k.Raw) {"
   },
   {
    "name": "R129 Known не в счёт",
@@ -704,40 +704,34 @@
    "new": "\t\t\tcase false && chainOnly(c, i == 0, e):\n\t\t\t\te.From +="
   },
   {
-   "name": "R136 сертификат вне цепочек — центр из токена",
+   "name": "R136 сертификаты из токенов строят путь (центр, ключ нового центра)",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\tif vouched(x) && !bytes.Equal(x.Raw, k.Raw) && x.CheckSignature(k.SignatureAlgorithm, k.RawTBSCertificate, k.Signature) == nil {",
-   "new": "\t\t\t\tif !bytes.Equal(x.Raw, k.Raw) && x.CheckSignature(k.SignatureAlgorithm, k.RawTBSCertificate, k.Signature) == nil {"
+   "old": "\t\tif a.trusted[sha256.Sum256(c.Raw)] {\n\t\t\tp.add(c)\n\t\t}",
+   "new": "\t\tp.add(c)"
   },
   {
-   "name": "R137 тёзка — и сертификат из токена",
+   "name": "R137 корень — только имя, без ключа",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tnamesake = namesake || vouched(x)",
-   "new": "\t\tnamesake = true"
+   "old": "\treturn anchor{string(c.RawSubject), string(c.RawSubjectPublicKeyInfo)}",
+   "new": "\treturn anchor{string(c.RawSubject), \"\"}"
   },
   {
-   "name": "R138 тёзка не распознаётся",
+   "name": "R138 путь — без сверки подписи центра",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tnamesake = namesake || vouched(x)",
-   "new": "\t\tnamesake = namesake && vouched(x)"
+   "old": "\t\tok = c.CheckSignatureFrom(parent) == nil",
+   "new": "\t\tok = bytes.Equal(c.RawIssuer, parent.RawSubject)"
   },
   {
-   "name": "R139 CRL нового ключа — только путь, без выпуска ключом корня",
+   "name": "R139 путь — только прямой выпуск ключом корня",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif bytes.Equal(x.RawIssuer, root.RawSubject) && root.CheckSignature(x.SignatureAlgorithm, x.RawTBSCertificate, x.Signature) == nil && x.IsCA &&",
-   "new": "\t\t\tif false && bytes.Equal(x.RawIssuer, root.RawSubject) && root.CheckSignature(x.SignatureAlgorithm, x.RawTBSCertificate, x.Signature) == nil && x.IsCA &&"
-  },
-  {
-   "name": "R140 CRL нового ключа — выпуск ключом корня без сверки подписи",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif bytes.Equal(x.RawIssuer, root.RawSubject) && root.CheckSignature(x.SignatureAlgorithm, x.RawTBSCertificate, x.Signature) == nil && x.IsCA &&",
-   "new": "\t\t\tif bytes.Equal(x.RawIssuer, root.RawSubject) && x.IsCA &&"
+   "old": "\t\tif parent != c && !bytes.Equal(parent.Raw, c.Raw) && p.issued(c, parent) && p.under(parent, as, depth+1, seen) {",
+   "new": "\t\tif parent != c && !bytes.Equal(parent.Raw, c.Raw) && p.issued(c, parent) && as[anchorOf(parent)] && seen != nil {"
   },
   {
    "name": "R141 сертификаты вне цепочек — без снятия удержания (только записи)",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tci.st = a.r.judge(ci.c, ci.issuers)\n\t\t// CRL под другим ключом центра",
-   "new": "\t\tci.st = a.r.judge(ci.c, ci.issuers)\n\t\tif !ci.inChain {\n\t\t\tfor _, x := range ci.issuers {\n\t\t\t\tci.st.entries = append(ci.st.entries, a.r.signed(ci.c, x)...)\n\t\t\t}\n\t\t}\n\t\t// CRL под другим ключом центра"
+   "old": "\t\tci.st = a.r.judge(ci.c, ci.issuers)\n\t\tif !ci.inChain && len(ci.issuers) == 0",
+   "new": "\t\tci.st = a.r.judge(ci.c, ci.issuers)\n\t\tif !ci.inChain {\n\t\t\tfor _, x := range ci.issuers {\n\t\t\t\tci.st.entries = append(ci.st.entries, a.r.signed(ci.c, x)...)\n\t\t\t}\n\t\t}\n\t\tif !ci.inChain && len(ci.issuers) == 0"
   },
   {
    "name": "R142 предел Known — и для данных проверяющим",
@@ -762,6 +756,126 @@
    "file": "internal/proof/revoked.go",
    "old": "\t\tsc.as.KnownTrusted(sc.trust.RootCerts...)",
    "new": "\t\t_ = sc.trust.RootCerts"
+  },
+  {
+   "name": "R146 удержание из CRL нового ключа не снимается",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\t\t\tif e.Reason == ReasonCertificateHold && slices.ContainsFunc(a.r.crlsNaming(ci.c), func(h *crlFile) bool {",
+   "new": "\t\t\t\t\tif false && e.Reason == ReasonCertificateHold && slices.ContainsFunc(a.r.crlsNaming(ci.c), func(h *crlFile) bool {"
+  },
+  {
+   "name": "R147 удержание из CRL нового ключа снимает CRL любого ключа",
+   "file": "internal/tsa/revoke.go",
+   "old": "len(h.bySN[sn]) == 0 && a.r.checkSig(h, by).auth == nil",
+   "new": "len(h.bySN[sn]) == 0 && by != nil"
+  },
+  {
+   "name": "R148 удержание из CRL нового ключа снимает и более старый",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\t\t\t\treturn h.newer(g) && !future(h) && h.speaks(ci.c) && len(h.bySN[sn]) == 0",
+   "new": "\t\t\t\t\t\treturn h != g && !future(h) && h.speaks(ci.c) && len(h.bySN[sn]) == 0"
+  },
+  {
+   "name": "R149 CRL под неизвестным ключом о сертификате вне цепочек — не о ключе",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\t\t\tunknownKey[k] = append(unknownKey[k], ask+\": that certificate has the same key\")",
+   "new": "\t\t\t\t\t_ = k"
+  },
+  {
+   "name": "R150 ключ с неизвестным статусом — статус сертификатов цепочек цел",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif ci.st.cur != nil {\n\t\t\t\tci.st.notes = append(ci.st.notes, fmt.Sprintf(\"the revocation of certificate %q was not checked: a CRL newer than",
+   "new": "\t\t\tif ci.st.cur != nil && false {\n\t\t\t\tci.st.notes = append(ci.st.notes, fmt.Sprintf(\"the revocation of certificate %q was not checked: a CRL newer than"
+  },
+  {
+   "name": "R151 сертификат вне цепочек без центра — не судится",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif !ci.inChain && len(ci.issuers) == 0 && a.trusted[sha256.Sum256(ci.c.Raw)] && !bytes.Equal(ci.c.RawIssuer, ci.c.RawSubject) {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "R152 сертификат вне цепочек без центра — и из токена",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif !ci.inChain && len(ci.issuers) == 0 && a.trusted[sha256.Sum256(ci.c.Raw)] && !bytes.Equal(ci.c.RawIssuer, ci.c.RawSubject) {",
+   "new": "\t\tif !ci.inChain && len(ci.issuers) == 0 && !bytes.Equal(ci.c.RawIssuer, ci.c.RawSubject) {"
+  },
+  {
+   "name": "R153 сертификат службы вне цепочек с флагом центра — как центр",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif keepsEarlier(e.Reason) || chainOnly(ci.c, signerKeys[k], e) {",
+   "new": "\t\t\tif keepsEarlier(e.Reason) || chainOnly(ci.c, signerKeys[k] && (ci.inChain || !ci.c.IsCA), e) {"
+  },
+  {
+   "name": "R154 имя субъекта — только байты",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tfor _, c := range p.by[k[1]] {",
+   "new": "\tfor _, c := range p.by[k[1]][:0] {"
+  },
+  {
+   "name": "R155 обломок границы: метка X509 CRL без тире принята",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif bytes.Contains(bytes.Join(bytes.Fields(l), []byte(\" \")), []byte(\"X509 CRL\")) {",
+   "new": "\t\tif bytes.HasPrefix(l, []byte(\"--\")) && bytes.Contains(l, []byte(\"X509 CRL\")) {"
+  },
+  {
+   "name": "R156 обломок границы: довольно двух тире",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif !bytes.HasPrefix(l, []byte(\"-----\")) && !bytes.HasSuffix(l, []byte(\"-----\")) {",
+   "new": "\t\tif !bytes.HasPrefix(l, []byte(\"--\")) && !bytes.HasSuffix(l, []byte(\"--\")) {"
+  },
+  {
+   "name": "R157 обломок границы: слово подстрокой",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif string(w) == \"BEGIN\" || string(w) == \"END\" {",
+   "new": "\t\t\tif bytes.Contains(w, []byte(\"BEGIN\")) || bytes.Contains(w, []byte(\"END\")) {"
+  },
+  {
+   "name": "R158 подписант: подпись у каждого кандидата SID",
+   "file": "internal/tsa/tsa.go",
+   "old": "\t\tif err == nil {\n\t\t\terr = checkSignature(c, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature)\n\t\t}",
+   "new": "\t\tif sigErr := checkSignature(c, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature); err == nil {\n\t\t\terr = sigErr\n\t\t}"
+  },
+  {
+   "name": "R159 пакет не несёт сертификат второй службы",
+   "file": "internal/store/archive.go",
+   "old": "st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token, Cert: rec.Cert}",
+   "new": "st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token}"
+  },
+  {
+   "name": "R160 сертификат второй службы из пакета не в доверии метки",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\t\ttrust.Intermediates = append(slices.Clone(trust.Intermediates), c)",
+   "new": "\t\t\t_ = slices.Clone(trust.Intermediates)"
+  },
+  {
+   "name": "R161 испорченный сертификат второй службы — без отказа",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\t\t\tout = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf(\"the archive time-stamp over head %d carries a certificate that does not parse (%v): not used\", a.HeadSeq, err)})\n\t\t\t\tcontinue",
+   "new": "\t\t\t\t_ = err"
+  },
+  {
+   "name": "R162 подсказка о сертификате второй службы — всегда о корне",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\t\tif errors.Is(err, tsa.ErrNoSigner) {",
+   "new": "\t\t\tif errors.Is(err, tsa.ErrNoSigner) && false {"
+  },
+  {
+   "name": "R163 демо-службы с одним именем",
+   "file": "internal/tsa/local.go",
+   "old": "\tname := \"evidencestore demo TSA \" + hex.EncodeToString(id[:])",
+   "new": "\tname := \"evidencestore demo TSA\" + hex.EncodeToString(id[:0])"
+  },
+  {
+   "name": "R164 демо-службы с одним номером",
+   "file": "internal/tsa/local.go",
+   "old": "\t\treturn n.Add(n, big.NewInt(1)), nil",
+   "new": "\t\treturn n.SetInt64(2), nil"
+  },
+  {
+   "name": "R165 отброшенный сверх предела считается при каждом повторе",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif !a.gone[fp] {\n\t\t\t\ta.gone[fp] = true\n\t\t\t\ta.dropped++\n\t\t\t}",
+   "new": "\t\t\ta.gone[fp] = true\n\t\t\ta.dropped++"
   }
  ]
 }

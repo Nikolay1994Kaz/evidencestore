@@ -12,6 +12,7 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -50,6 +51,40 @@ func newRevWorld(t *testing.T) *revWorld {
 		t.Fatalf("цепочки токена: %d", len(info.Chains))
 	}
 	return &revWorld{t: t, a: a, info: info, gen: gen, dir: t.TempDir()}
+}
+
+// twinOf — служба с тем же именем корня и тем же номером сертификата, что у
+// a, но со своими ключами: центр-тёзка. RFC 5280 (4.1.2.2) этого не
+// допускает — имя издателя и номер называют один сертификат, — а
+// встречается: два центра одного имени с номерами по порядку. Демо-службы
+// (NewAuthority) так больше не совпадают.
+func twinOf(t *testing.T, a *Authority) *Authority {
+	t.Helper()
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &x509.Certificate{SerialNumber: a.root.SerialNumber, RawSubject: a.root.RawSubject, NotBefore: a.root.NotBefore, NotAfter: a.root.NotAfter,
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true}
+	der, err := x509.CreateCertificate(rand.Reader, rt, rt, rootKey.Public(), rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := x509.ParseCertificate(der)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lt := &x509.Certificate{SerialNumber: a.cert.SerialNumber, RawSubject: a.cert.RawSubject, NotBefore: a.cert.NotBefore, NotAfter: a.cert.NotAfter,
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping}}
+	if der, err = x509.CreateCertificate(rand.Reader, lt, root, key.Public(), rootKey); err != nil {
+		t.Fatal(err)
+	}
+	cert, _ := x509.ParseCertificate(der)
+	if !bytes.Equal(root.RawSubject, a.root.RawSubject) || !bytes.Equal(cert.RawIssuer, a.cert.RawIssuer) || cert.SerialNumber.Cmp(a.cert.SerialNumber) != 0 {
+		t.Fatal("тёзка не совпал по имени или номеру")
+	}
+	return &Authority{key: key, cert: cert, root: root, rootKey: rootKey, policy: demoPolicy}
 }
 
 // crl пишет CRL корня службы с записями и отдаёт путь.
@@ -197,10 +232,7 @@ func TestRevocationsCompromiseNeedsPOE(t *testing.T) {
 func TestRevocationsCRLItself(t *testing.T) {
 	w := newRevWorld(t)
 	now := w.gen.Add(48 * time.Hour)
-	other, err := NewAuthority(false) // корень с тем же именем, другой ключ
-	if err != nil {
-		t.Fatal(err)
-	}
+	other := twinOf(t, w.a) // корень с тем же именем, другой ключ
 	der, err := other.RevocationList(w.gen, now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -258,7 +290,7 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(newer); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "no CRL signed with the key of its issuer") || !hasNote(v, "lists certificate \"CN=evidencestore demo TSA\" as revoked") {
+	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "no CRL signed with the key of its issuer") || !hasNote(v, fmt.Sprintf("lists certificate %q (serial %s) as revoked", w.a.Cert().Subject.String(), w.a.Cert().SerialNumber)) {
 		t.Fatalf("только CRL центра под другим ключом, с записью: %+v %v", v, err)
 	}
 

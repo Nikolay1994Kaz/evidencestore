@@ -2,6 +2,7 @@ package proof
 
 import (
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -38,11 +39,17 @@ import (
 // ко времени метки. Голова может лежать дальше конца пакета: тогда её корень
 // сверяется доказательством продолжения от последнего звена пакета (Proof),
 // без звеньев между ними.
+//
+// Cert — сертификат, которым подписан токен (DER), когда служба не кладёт его
+// в токен: журнал второй службы его хранит. Не подписан, как и поле
+// certificates в токене: подпись токена сверяется с ним, а путь — до корня
+// проверяющего.
 type ArchiveStamp struct {
 	HeadSeq uint64   `json:"head_seq"`
 	Root    []byte   `json:"root"`
 	Proof   [][]byte `json:"proof,omitempty"`
 	Token   []byte   `json:"token"`
+	Cert    []byte   `json:"cert,omitempty"`
 }
 
 // revocationCheckName — пункт отчёта об отзыве.
@@ -354,12 +361,30 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 			continue
 		}
 		root := [32]byte(a.Root)
-		info, err := tsa.Verify(a.Token, HeadImprint(a.HeadSeq, root), sc.trust)
+		trust := sc.trust
+		var carried *x509.Certificate
+		if len(a.Cert) > 0 {
+			c, err := x509.ParseCertificate(a.Cert)
+			if err != nil {
+				out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d carries a certificate that does not parse (%v): not used", a.HeadSeq, err)})
+				continue
+			}
+			carried = c
+			trust.Intermediates = append(slices.Clone(trust.Intermediates), c)
+		}
+		info, err := tsa.Verify(a.Token, HeadImprint(a.HeadSeq, root), trust)
 		if err != nil {
-			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d was not used: %v (is the root of that TSA in -tsa-trust?)", a.HeadSeq, err)})
+			hint := "is the root of that TSA in -tsa-trust?"
+			if errors.Is(err, tsa.ErrNoSigner) {
+				hint = "that TSA does not put its certificate in its time-stamps, and the bundle does not carry it: pass that certificate in -tsa-trust"
+			}
+			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d was not used: %v (%s)", a.HeadSeq, err, hint)})
 			continue
 		}
 		sc.as.Known(info.Certs...)
+		if carried != nil {
+			sc.as.Known(carried)
+		}
 		id, err := sc.as.Add(info.Chains, info.GenTime)
 		if err != nil {
 			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d was not used: %v", a.HeadSeq, err)})

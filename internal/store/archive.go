@@ -352,7 +352,7 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 				continue
 			}
 			seen[ref.off] = true
-			st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token}
+			st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token, Cert: rec.Cert}
 			if rec.Size > last {
 				pr, err := tlog.ProveTree(int64(rec.Size), int64(last), s.tree)
 				if err != nil {

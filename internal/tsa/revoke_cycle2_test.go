@@ -235,7 +235,7 @@ func TestRevocationsRekeyedCA(t *testing.T) {
 		r.AddCRL(caB.crlOf(t, dir, "new-key.crl", day(2026, 11, 1), day(2026, 12, 1), nil,
 			x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: at, ReasonCode: reason}))
 		a := r.NewAssessment()
-		a.Known(known...)
+		a.KnownTrusted(known...) // сертификат нового ключа — в -tsa-trust
 		i, err := a.Add(info.Chains, info.GenTime)
 		if err != nil {
 			t.Fatal(err)

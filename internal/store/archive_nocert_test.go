@@ -4,6 +4,7 @@ package store
 // сертификата в токене.
 
 import (
+	"bytes"
 	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
@@ -124,6 +125,8 @@ func TestArchiveTokenWithoutCert(t *testing.T) {
 	}
 	if len(b.Archive) == 0 {
 		t.Errorf("после перезапуска метка второй службы в пакет не идёт")
+	} else if !bytes.Equal(b.Archive[0].Cert, a.Cert().Raw) {
+		t.Errorf("токен без сертификата службы, а пакет его не несёт: проверяющему нужен сертификат в -tsa-trust")
 	}
 	s2.Close()
 

@@ -11,7 +11,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -52,7 +51,7 @@ func TestRevocationsC2bKnownRenewedCertRevokedByRekeyedCA(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := r.NewAssessment()
-	a.Known(caOld.cert, caNew.cert, x2.cert)
+	a.KnownTrusted(caOld.cert, caNew.cert, x2.cert)
 	i, err := a.Add(info.Chains, info.GenTime)
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +61,7 @@ func TestRevocationsC2bKnownRenewedCertRevokedByRekeyedCA(t *testing.T) {
 	// Для сравнения: X2 в цепочке (метка под X2) — тот же CRL в счёт.
 	info2 := renewedStamp(t, x2, root, day(2026, 10, 1), Trust{Roots: pool, Intermediates: []*x509.Certificate{caOld.cert}})
 	a2 := r.NewAssessment()
-	a2.Known(caOld.cert, caNew.cert)
+	a2.KnownTrusted(caOld.cert, caNew.cert)
 	j, err := a2.Add(info2.Chains, info2.GenTime)
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +158,7 @@ func TestRevocationsC2bRekeyedListingSupersededLeavesUnchecked(t *testing.T) {
 		x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: gen.Add(24 * time.Hour), ReasonCode: ReasonSuperseded}))
 	r.AddCRL(root.crlOf(t, dir, "root.crl", day(2026, 11, 1), day(2026, 12, 1), nil))
 	a := r.NewAssessment()
-	a.Known(caB.cert)
+	a.KnownTrusted(caB.cert)
 	i, err := a.Add(info.Chains, info.GenTime)
 	if err != nil {
 		t.Fatal(err)
@@ -171,15 +170,13 @@ func TestRevocationsC2bRekeyedListingSupersededLeavesUnchecked(t *testing.T) {
 	}
 }
 
-// H5. Центры-тёзки с одинаковыми номерами (так у демо-служб: имя корня и
-// номера одни): CRL чужого тёзки новее своего и называет тот же номер — свой
-// сертификат «не проверен». До P-160 это была заметка; теперь метка такой
-// службы — не POE.
+// H5, пересмотр 10.11. Центры-тёзки с одинаковыми номерами: CRL тёзки новее
+// своего и называет тот же номер — свой сертификат «не проверен», дан ли
+// корень тёзки проверяющим или принесён токеном: имя издателя и номер
+// называют один сертификат (RFC 5280, 4.1.2.2), и CRL, которого не связать с
+// корнем сертификата, мог выпустить и сам центр под новым ключом. Демо-службы
+// так не совпадают: имя и номера у каждой свои.
 func TestRevocationsC2bNamesakeCRLMakesUnchecked(t *testing.T) {
-	a, err := NewAuthority(false)
-	if err != nil {
-		t.Fatal(err)
-	}
 	b, err := NewAuthority(false)
 	if err != nil {
 		t.Fatal(err)
@@ -191,42 +188,50 @@ func TestRevocationsC2bNamesakeCRLMakesUnchecked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := x509.NewCertPool()
-	pool.AddCert(a.Root())
-	pool.AddCert(b.Root())
-	info, err := Verify(token, imprint, Trust{Roots: pool})
+	dir := t.TempDir()
+	now := gen.Add(48 * time.Hour)
+	// Своя служба (b) — CRL своего корня, пустой; служба a (тёзка или нет)
+	// отозвана по компрометации в CRL своего корня, выпущенном позже.
+	check := func(a *Authority, trusted bool) Verdict {
+		t.Helper()
+		pool := x509.NewCertPool()
+		pool.AddCert(a.Root())
+		pool.AddCert(b.Root())
+		info, err := Verify(token, imprint, Trust{Roots: pool})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := NewRevocations(now)
+		bder, _ := b.RevocationList(gen.Add(time.Hour), now.Add(time.Hour))
+		ader, _ := a.RevocationList(gen.Add(2*time.Hour), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: a.Cert().SerialNumber, RevocationTime: gen.Add(30 * time.Minute), ReasonCode: ReasonKeyCompromise})
+		os.WriteFile(filepath.Join(dir, "b.crl"), bder, 0o600)
+		os.WriteFile(filepath.Join(dir, "a.crl"), ader, 0o600)
+		r.AddCRL(filepath.Join(dir, "b.crl"))
+		r.AddCRL(filepath.Join(dir, "a.crl"))
+		as := r.NewAssessment()
+		if trusted {
+			as.KnownTrusted(a.Root(), b.Root()) // корни из -tsa-trust
+		} else {
+			as.Known(a.Root()) // корень принёс токен
+		}
+		i, err := as.Add(info.Chains, info.GenTime)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return as.Verdicts()[i]
+	}
+	other, err := NewAuthority(false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
-	now := gen.Add(48 * time.Hour)
-	r := NewRevocations(now)
-	// Своя служба (b) — CRL своего корня, пустой; основная (a) отозвана по
-	// компрометации в CRL своего корня, выпущенном позже.
-	bder, _ := b.RevocationList(gen.Add(time.Hour), now.Add(time.Hour))
-	ader, _ := a.RevocationList(gen.Add(2*time.Hour), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: a.Cert().SerialNumber, RevocationTime: gen.Add(30 * time.Minute), ReasonCode: ReasonKeyCompromise})
-	os.WriteFile(filepath.Join(dir, "b.crl"), bder, 0o600)
-	os.WriteFile(filepath.Join(dir, "a.crl"), ader, 0o600)
-	r.AddCRL(filepath.Join(dir, "b.crl"))
-	r.AddCRL(filepath.Join(dir, "a.crl"))
-	// Корень тёзки, которого принёс токен (подложить его может кто угодно —
-	// открытый ключ не секрет), тёзкой не делает: статус не известен.
-	as := r.NewAssessment()
-	as.Known(a.Root())
-	i, _ := as.Add(info.Chains, info.GenTime)
-	if v := as.Verdicts()[i]; len(v.Unchecked) == 0 {
-		t.Fatalf("тёзка из токена снял «не проверено»: %+v", v)
+	if v := check(other, true); len(v.Unchecked) != 0 || v.NeedPOE {
+		t.Fatalf("две демо-службы: CRL одной называет сертификат другой: %+v", v)
 	}
-	as = r.NewAssessment()
-	as.KnownTrusted(a.Root(), b.Root()) // корни из -tsa-trust
-	i, err = as.Add(info.Chains, info.GenTime)
-	v := as.Verdicts()[i]
-	t.Logf("namesake: err=%v NeedPOE=%v Unchecked=%d notes=%q", err, v.NeedPOE, len(v.Unchecked), v.Notes)
-	if err == nil && len(v.Unchecked) > 0 {
-		for _, n := range v.Notes {
-			if strings.Contains(n, "newer than") {
-				t.Errorf("служба b проверена своим CRL, но CRL тёзки (другой корень, тот же номер) делает её непроверенной: %s", n)
-			}
+	twin := twinOf(t, b)
+	for _, trusted := range []bool{false, true} {
+		v := check(twin, trusted)
+		if len(v.Unchecked) != 1 || v.NeedPOE || !hasNote(v, "newer than") || !hasNote(v, "did the CA change its key?") {
+			t.Errorf("тёзка (корень дал проверяющий: %v): CRL тёзки новее своего и называет тот же номер, а статус не «не проверен»: %+v", trusted, v)
 		}
 	}
 }
@@ -302,7 +307,7 @@ func TestRevocationsC2bRekeyedCAAfterRootRenewedSameKey(t *testing.T) {
 	r.AddCRL(caNew.crlOf(t, dir, "new-key.crl", day(2027, 3, 1), day(2027, 4, 1), nil,
 		x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: day(2027, 2, 20), ReasonCode: ReasonKeyCompromise}))
 	a := r.NewAssessment()
-	a.Known(caOld.cert, caNew.cert)
+	a.KnownTrusted(caOld.cert, caNew.cert)
 	i, err := a.Add(info.Chains, info.GenTime)
 	if err != nil {
 		t.Fatal(err)

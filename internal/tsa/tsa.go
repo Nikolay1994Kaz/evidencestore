@@ -61,6 +61,10 @@ var (
 var (
 	ErrRejected = errors.New("tsa: request rejected")
 	ErrInvalid  = errors.New("tsa: invalid token")
+	// ErrNoSigner — сертификата, которым подписан токен, нет ни в токене, ни
+	// среди данных (служба может не класть его в токен). Всегда вместе с
+	// ErrInvalid.
+	ErrNoSigner = errors.New("signer certificate not found")
 )
 
 // MaxTokenSize — предел ответа TSA и токена в цепи.
@@ -277,7 +281,8 @@ type Trust struct {
 	Roots         *x509.CertPool
 	Intermediates []*x509.Certificate
 	// RootCerts — те же корни списком (LoadTrust): оценке отзыва нужны и
-	// корни, через которые цепочки не идут (центр-тёзка под другим корнем).
+	// корни, через которые цепочки не идут (путь сертификата нового ключа
+	// центра к корню, продлённому на тот же ключ).
 	RootCerts []*x509.Certificate
 }
 
@@ -476,20 +481,24 @@ func verifySigned(token []byte, imprint [32]byte, intermediates []*x509.Certific
 	// годен тот, кого называет атрибут.
 	candidates := findSigners(p.signer.SID, pool)
 	if len(candidates) == 0 {
-		return fail(fmt.Errorf("%w: signer certificate not found", ErrInvalid))
+		return fail(fmt.Errorf("%w: %w", ErrInvalid, ErrNoSigner))
 	}
 	var signer *x509.Certificate
 	var firstErr error
+	// Сначала атрибут (хэш сертификата), потом подпись: поле certificates не
+	// подписано, и сертификатов с тем же SID можно подложить сколько угодно, а
+	// подпись сверяется только у названного атрибутом.
 	for _, c := range candidates {
-		err := checkSignature(c, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature)
+		var err error
+		if raw, ok := p.attr(oidSigningCertV2); ok {
+			err = checkSigningCert(raw, c)
+		} else if raw, ok := p.attr(oidSigningCertV1); ok {
+			err = checkSigningCertV1(raw, c)
+		} else {
+			err = fmt.Errorf("%w: no signing-certificate attribute", ErrInvalid)
+		}
 		if err == nil {
-			if raw, ok := p.attr(oidSigningCertV2); ok {
-				err = checkSigningCert(raw, c)
-			} else if raw, ok := p.attr(oidSigningCertV1); ok {
-				err = checkSigningCertV1(raw, c)
-			} else {
-				err = fmt.Errorf("%w: no signing-certificate attribute", ErrInvalid)
-			}
+			err = checkSignature(c, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature)
 		}
 		if err == nil {
 			signer = c
@@ -556,7 +565,7 @@ func findSigner(sid asn1.RawValue, pool []*x509.Certificate) (*x509.Certificate,
 	if cs := findSigners(sid, pool); len(cs) > 0 {
 		return cs[0], nil
 	}
-	return nil, fmt.Errorf("%w: signer certificate not found", ErrInvalid)
+	return nil, fmt.Errorf("%w: %w", ErrInvalid, ErrNoSigner)
 }
 
 // findSigners — все сертификаты pool, которые называет SID, по порядку.

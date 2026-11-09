@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -65,13 +66,36 @@ func NewAuthority(rsaKey bool) (*Authority, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Имя и номера — свои у каждой службы: имя издателя и номер называют один
+	// сертификат (RFC 5280, 4.1.2.2), и CRL одной демо-службы не должен
+	// называть сертификат другой.
+	var id [4]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, err
+	}
+	name := "evidencestore demo TSA " + hex.EncodeToString(id[:])
+	serial := func() (*big.Int, error) {
+		n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 63))
+		if err != nil {
+			return nil, err
+		}
+		return n.Add(n, big.NewInt(1)), nil
+	}
+	rootSerial, err := serial()
+	if err != nil {
+		return nil, err
+	}
+	tsaSerial, err := serial()
+	if err != nil {
+		return nil, err
+	}
 	// Срок действия широкий: службе всё равно не доверяют, а тесты и демо
 	// гоняют часы в прошлое и будущее.
 	now := time.Now()
 	notBefore := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	rootTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "evidencestore demo TSA root"},
+		SerialNumber:          rootSerial,
+		Subject:               pkix.Name{CommonName: name + " root"},
 		NotBefore:             notBefore,
 		NotAfter:              now.AddDate(20, 0, 0),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
@@ -88,8 +112,8 @@ func NewAuthority(rsaKey bool) (*Authority, error) {
 		return nil, err
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "evidencestore demo TSA"},
+		SerialNumber: tsaSerial,
+		Subject:      pkix.Name{CommonName: name},
 		NotBefore:    notBefore,
 		NotAfter:     now.AddDate(20, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
