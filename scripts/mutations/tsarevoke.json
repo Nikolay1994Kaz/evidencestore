@@ -563,7 +563,7 @@
    "name": "R113 поле key строки журнала не сверяется",
    "file": "internal/store/archive.go",
    "old": "\tif err == nil && sha256.Sum256(signer.RawSubjectPublicKeyInfo) != ref.key {",
-   "new": "\tif false {"
+   "new": "\tif _ = signer; false {"
   },
   {
    "name": "R58 -tsa-revoked: только последний флаг",
