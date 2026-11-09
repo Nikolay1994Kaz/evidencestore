@@ -265,7 +265,8 @@ func TestRevocationCompromiseWithoutPOE(t *testing.T) {
 	tr.TSARevocations = compromised(t, w.tsa, w.now.Add(2*time.Hour), w.now.Add(48*time.Hour))
 	r := Verify(b, tr)
 	c := revocationCheck(t, r.Checks)
-	if r.Valid() || c.OK || !strings.Contains(c.Detail, "time-stamp T1 in link 2") || !strings.Contains(c.Detail, "does not show where its token lies") {
+	// Причина — свой отозванный сертификат метки, а не «ключ под подозрением».
+	if r.Valid() || c.OK || !strings.Contains(c.Detail, "time-stamp T1 in link 2 rests on certificate") || !strings.Contains(c.Detail, "does not show where its token lies") || strings.Contains(c.Detail, "under suspicion in this bundle") {
 		t.Fatalf("компрометация без POE:\n%s", r.Text())
 	}
 	b.Upper.Inclusion = ptr(w.inclusion(5, 0)) // где лежит T2 — всё равно нечем показать
