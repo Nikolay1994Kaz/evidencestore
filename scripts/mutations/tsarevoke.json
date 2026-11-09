@@ -689,7 +689,7 @@
    "name": "R133 ключ подписанта строки журнала — без доверия второй службы",
    "file": "internal/store/archive.go",
    "old": "\t\t\tkey := signerKey(rec.Token, inter...)",
-   "new": "\t\t\tkey := signerKey(rec.Token)"
+   "new": "\t\t\tkey, _ := signerKey(rec.Token), inter"
   },
   {
    "name": "R134 ключ подписанта строки журнала — без доверия при выдаче",
