@@ -40,7 +40,7 @@
   {
    "name": "R6 подпись CRL не сверяется",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif err := f.rl.CheckSignatureFrom(issuer); err != nil {",
+   "old": "\t\tif err := r.checkSig(f, issuer); err != nil {",
    "new": "\t\tif err := error(nil); err != nil {"
   },
   {
@@ -76,14 +76,14 @@
   {
    "name": "R13 POE позже отсечки",
    "file": "internal/proof/revoked.go",
-   "old": "m.head >= p.link && at(m).Before(p.cutoff) && ",
-   "new": "m.head >= p.link && !m.at.IsZero() && "
+   "old": "\t\tif at(m).Before(p.cutoff) && (best == nil",
+   "new": "\t\tif !m.at.IsZero() && (best == nil"
   },
   {
    "name": "R14 POE над головой раньше токена",
    "file": "internal/proof/revoked.go",
-   "old": "m.head >= p.link && ",
-   "new": "m.head+1 > 0 && "
+   "old": "\t\tcase m.head < p.link:\n\t\t\tcontinue",
+   "new": "\t\tcase false:\n\t\t\tcontinue"
   },
   {
    "name": "R15 метка второй службы — того же скомпрометированного ключа",
@@ -142,8 +142,8 @@
   {
    "name": "R30 голова дальше конца пакета — без доказательства продолжения",
    "file": "internal/store/archive.go",
-   "old": "\t\t\t\tif rec.Size > last {",
-   "new": "\t\t\t\tif false {"
+   "old": "\t\t\tif rec.Size > last {",
+   "new": "\t\t\tif false {"
   },
   {
    "name": "R32 оборванная строка журнала второй службы не отрезается",
@@ -274,8 +274,8 @@
   {
    "name": "R49 записи берутся только из самого свежего CRL центра",
    "file": "internal/tsa/revoke.go",
-   "old": "\tfor i, f := range own {\n\t\te, ok := f.bySN[sn]",
-   "new": "\tfor i, f := range own[:min(1, len(own))] {\n\t\te, ok := f.bySN[sn]"
+   "old": "\tfor i, f := range own {\n\t\tfor _, e := range f.bySN[sn] {",
+   "new": "\tfor i, f := range own[:min(1, len(own))] {\n\t\tfor _, e := range f.bySN[sn] {"
   },
   {
    "name": "R50 удержание не снимается новым CRL",
@@ -292,8 +292,8 @@
   {
    "name": "R53 на тот же ключ переходит и отзыв без компрометации",
    "file": "internal/tsa/revoke.go",
-   "old": "\treturn r == ReasonKeyCompromise || r == ReasonCACompromise || r == ReasonAACompromise",
-   "new": "\treturn r != ReasonAbsent"
+   "old": "\treturn !keepsEarlier(r)\n}",
+   "new": "\treturn true\n}"
   },
   {
    "name": "R54 второй CRL файла не читается",
@@ -334,8 +334,8 @@
   {
    "name": "R61 подпись свидетеля дальше конца пакета не названа",
    "file": "internal/proof/revoked.go",
-   "old": "\t\t\t\tsc.beyond = append(sc.beyond, fmt.Sprintf(",
-   "new": "\t\t\t\t_ = append(sc.beyond, fmt.Sprintf("
+   "old": "\t\t\t\tsc.beyond = append(sc.beyond, beyondCosig{t, fmt.Sprintf(",
+   "new": "\t\t\t\t_ = append(sc.beyond, beyondCosig{t, fmt.Sprintf("
   },
   {
    "name": "R62 лист T2 не в пакете при свидетеле",
@@ -358,13 +358,13 @@
   {
    "name": "R65 строка журнала сверяется текущим доверием второй службы",
    "file": "internal/store/archive.go",
-   "old": "\t\t\t\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root))",
+   "old": "\t\t\t\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
    "new": "\t\t\t\t\t_, err = tsa.Verify(rec.Token, proof.HeadImprint(rec.Size, root), s.archiver.trust)"
   },
   {
    "name": "R66 подпись токена строки журнала не сверяется",
    "file": "internal/store/archive.go",
-   "old": "\t\t\t\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root))",
+   "old": "\t\t\t\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
    "new": "\t\t\t\t\terr = nil"
   },
   {
@@ -380,10 +380,10 @@
    "new": "\t\t\t\ttsaRevoked = []string{p}"
   },
   {
-   "name": "R69 хвост после PEM принят",
+   "name": "R69 мусор вне блоков PEM принят",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif len(bytes.TrimSpace(rest)) != 0 {",
-   "new": "\t\tif false {"
+   "old": "\t\t\tif !bytes.HasPrefix(rest, []byte(\"-----BEGIN \")) {",
+   "new": "\t\t\tif false {"
   },
   {
    "name": "R70 повтор поля в перечне принят",
@@ -418,8 +418,110 @@
   {
    "name": "R73 вторая служба — та же по ключу",
    "file": "internal/store/archive.go",
-   "old": "; err == nil && bytes.Equal(mainKey, info.Signer.RawSubjectPublicKeyInfo) {",
-   "new": "; false && err == nil && bytes.Equal(mainKey, info.Signer.RawSubjectPublicKeyInfo) {"
+   "old": "\tif mainKey != nil && *mainKey == key {",
+   "new": "\tif false && mainKey != nil && *mainKey == key {"
+  },
+  {
+   "name": "R76 отсутствие причины не переходит на тот же ключ",
+   "file": "internal/tsa/revoke.go",
+   "old": "\treturn !keepsEarlier(r)\n}",
+   "new": "\treturn r != ReasonAbsent && !keepsEarlier(r)\n}"
+  },
+  {
+   "name": "R77 испорченный блок PEM пропускается молча",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\t\tif n := bytes.Count(data, []byte(\"-----BEGIN\")); n != len(out) {",
+   "new": "\t\t\t\tif n := bytes.Count(data, []byte(\"-----BEGIN\")); false && n != len(out) {"
+  },
+  {
+   "name": "R78 проверенный в одной цепочке сертификат не проверен в другой",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tcase st.from != \"\" && a.from == \"\":",
+   "new": "\t\t\tcase false:"
+  },
+  {
+   "name": "R85 удержание снимает CRL из будущего",
+   "file": "internal/tsa/revoke.go",
+   "old": " && !g.rl.ThisUpdate.After(r.Now.Add(futureSlack)) && !held(g)",
+   "new": " && !held(g)"
+  },
+  {
+   "name": "R88 CRL центра под другим ключом новее статусного — не в счёт",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tif foreign != nil && foreign.newer(cur) && !foreign.rl.ThisUpdate.After(r.Now.Add(futureSlack)) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "R89 номер дважды в CRL — последняя запись",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tf.bySN[e.SerialNumber.String()] = append(f.bySN[e.SerialNumber.String()], rev)",
+   "new": "\t\tf.bySN[e.SerialNumber.String()] = []Revocation{rev}"
+  },
+  {
+   "name": "R90 поле области не по порядку принято",
+   "file": "internal/tsa/revoke.go",
+   "old": "e.Tag <= last || e.Tag > 5",
+   "new": "e.Tag < 0 || e.Tag > 5"
+  },
+  {
+   "name": "R91 перечень называет сертификат — заметка «не называет»",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif r.lists > 0 && len(r.listed[sha256.Sum256(c.Raw)]) == 0 {",
+   "new": "\t\tif r.lists > 0 {"
+  },
+  {
+   "name": "R94 URI области с другим именем не покрывает",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tcase len(sc.uris) == 0 && !sc.otherDP:\n\t\treturn true\n\t}",
+   "new": "\tcase len(sc.uris) == 0 && !sc.otherDP:\n\t\treturn true\n\tcase sc.otherDP:\n\t\treturn false\n\t}"
+  },
+  {
+   "name": "R95 DER с переводом строки в конце отвергается",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tfor rest := data; len(bytes.TrimLeft(rest, \" \\t\\r\\n\")) > 0; {",
+   "new": "\tfor rest := data; len(rest) > 0; {"
+  },
+  {
+   "name": "R96 BOM перед PEM отвергается",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\trest := bytes.TrimPrefix(data, []byte(\"\\xef\\xbb\\xbf\"))",
+   "new": "\t\trest := data"
+  },
+  {
+   "name": "R80 своя метка того же ключа под другим сертификатом — чистая",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tif m.own == nil || sc.clean(m) {",
+   "new": "\t\tif true {"
+  },
+  {
+   "name": "R81 POE тем же ключом под другим сертификатом засчитана",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tcase !sc.clean(m):",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "R82 POE раньше метки больше минуты засчитана",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tcase m.at.Before(p.gen.Add(-poeSlack)):",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "R83 в пакете — метка только одной второй службы",
+   "file": "internal/store/archive.go",
+   "old": "i < len(refs) && len(found) < want;",
+   "new": "i < len(refs) && len(found) < 1;"
+  },
+  {
+   "name": "R86 та же служба — без порта",
+   "file": "internal/config/config.go",
+   "old": " && port(ua) == port(ub) &&",
+   "new": " && port(ua) == port(ua) &&"
+  },
+  {
+   "name": "R87 та же служба — без запроса",
+   "file": "internal/config/config.go",
+   "old": " && ua.RawQuery == ub.RawQuery",
+   "new": ""
   }
  ]
 }

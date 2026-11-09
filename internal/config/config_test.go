@@ -256,13 +256,21 @@ func TestTSAArchive(t *testing.T) {
 	if err := base().Validate(); err != nil {
 		t.Fatal(err)
 	}
+	// Разные службы на одном хосте — другой порт или запрос — не одна служба.
+	for _, u := range []string{"http://tsa.one.example:8002/", "http://tsa.one.example/?svc=b", "https://tsa.one.example/"} {
+		c := base()
+		c.TSA.Archive.URL = u
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: %v", u, err)
+		}
+	}
 	for name, spoil := range map[string]func(*Config){
 		"ftp":          func(c *Config) { c.TSA.Archive.URL = "ftp://tsa.two.example/" },
 		"local":        func(c *Config) { c.TSA.Archive.URL = "local" },
 		"та же служба": func(c *Config) { c.TSA.Archive.URL = c.TSA.URL + "/" },
-		"та же по https и с портом": func(c *Config) { c.TSA.Archive.URL = "https://TSA.one.example:8443/" },
-		"без основной":              func(c *Config) { c.TSA.URL, c.TSA.Trust = "", nil },
-		"без доверия":               func(c *Config) { c.TSA.Archive.Trust = nil },
+		"та же: регистр, порт по умолчанию": func(c *Config) { c.TSA.Archive.URL = "http://TSA.one.example:80/" },
+		"без основной":                      func(c *Config) { c.TSA.URL, c.TSA.Trust = "", nil },
+		"без доверия":                       func(c *Config) { c.TSA.Archive.Trust = nil },
 	} {
 		c := base()
 		spoil(c)

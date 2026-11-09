@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -398,6 +399,8 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	if err != nil {
 		return 0, gen, fmt.Errorf("store: TSA token rejected: %w", err)
 	}
+	mainKey := sha256.Sum256(info.Signer.RawSubjectPublicKeyInfo)
+	s.tsaKey.Store(&mainKey) // ключ основной службы — для tsa.archive (archive.go)
 	// Время TSA позже окна по якорю: монотонные часы стояли (сон хоста,
 	// пауза ВМ), и время приёма отставало на всю паузу. Запись, принятая,
 	// пока шёл запрос, легла после заверенного звена со временем внутри окна,

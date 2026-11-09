@@ -71,6 +71,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	})
 	var tsaCRLs []string
 	fs.Func("tsa-crl", "CRL (DER or PEM) of a CA that issued a TSA certificate in -tsa-trust or in the bundle's time-stamps, fetched by you; repeat the flag (or separate with commas) for more CAs: a time-stamp whose TSA certificate was revoked for key compromise (or with no reason) counts only if the bundle shows it existed before (RFC 3161, 4)", func(v string) error {
+		if strings.TrimSpace(v) == "" {
+			return errors.New("an empty path")
+		}
 		for _, p := range strings.Split(v, ",") {
 			if p = strings.TrimSpace(p); p != "" {
 				tsaCRLs = append(tsaCRLs, p)
@@ -80,6 +83,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	})
 	var tsaRevoked []string
 	fs.Func("tsa-revoked", "your own list of revoked TSA (or CA) certificates (JSON: [{\"cert_sha256\": HEX, \"revoked\": RFC3339, \"reason\": \"keyCompromise\", \"invalidity\": RFC3339}]), for a TSA that publishes no CRL or a compromise you learned of yourself; repeat the flag (or separate with commas) for more lists", func(v string) error {
+		if strings.TrimSpace(v) == "" {
+			return errors.New("an empty path")
+		}
 		for _, p := range strings.Split(v, ",") {
 			if p = strings.TrimSpace(p); p != "" {
 				tsaRevoked = append(tsaRevoked, p)

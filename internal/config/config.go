@@ -544,14 +544,25 @@ func CertFingerprint(der []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// sameService — две ссылки на одну службу меток: схема, порт, регистр имени
-// и косая черта в конце службу не меняют (http и https одной службы — одна
-// служба).
+// sameService — две ссылки на одну службу меток: тот же хост (без учёта
+// регистра), порт (явный или по умолчанию для схемы), путь (без косой черты
+// в конце) и запрос. Та же служба под другим именем или портом — забота
+// ArchiveOnce: он сверяет ключ, которым подписаны метки.
 func sameService(a, b string) bool {
 	ua, errA := url.Parse(a)
 	ub, errB := url.Parse(b)
 	if errA != nil || errB != nil {
 		return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
 	}
-	return strings.EqualFold(ua.Hostname(), ub.Hostname()) && strings.TrimRight(ua.EscapedPath(), "/") == strings.TrimRight(ub.EscapedPath(), "/")
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if u.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	return strings.EqualFold(ua.Hostname(), ub.Hostname()) && port(ua) == port(ub) &&
+		strings.TrimRight(ua.EscapedPath(), "/") == strings.TrimRight(ub.EscapedPath(), "/") && ua.RawQuery == ub.RawQuery
 }

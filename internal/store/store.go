@@ -251,6 +251,12 @@ type Store struct {
 	archiveLog *os.File
 	archiveEnd int64        // конец последней целой строки журнала
 	archiveIdx []archiveRef // по возрастанию размера
+	// archiveKeys — службы журнала (SHA-256 ключа подписи) и наибольшая
+	// голова, заверенная каждой.
+	archiveKeys map[[32]byte]uint64
+	// tsaKey — SHA-256 ключа основной службы по её последней метке: вторая
+	// служба с тем же ключом — та же служба.
+	tsaKey atomic.Pointer[[32]byte]
 	// archiveOn — журнал меток второй службы открыт (с tsa.archive или
 	// оставшийся после неё); не меняется после открытия.
 	archiveOn bool

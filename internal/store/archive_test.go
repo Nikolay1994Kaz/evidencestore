@@ -452,4 +452,68 @@ func TestArchiveSameTSARefused(t *testing.T) {
 	if b, err := s.Proof("abs-core", 2, false); err != nil || len(b.Archive) != 0 {
 		t.Fatalf("метка той же службы в пакете: %v %d", err, len(b.Archive))
 	}
+	// После перезапуска, до новой метки основной: её ключ — из последнего
+	// токена цепи.
+	s.Close()
+	s2, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	same.Store(s2.tsaLocal)
+	ingest(t, s2, "abs-core", 4, 4)
+	if err := s2.ArchiveOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "same TSA") {
+		t.Fatalf("та же служба после перезапуска: %v", err)
+	}
+}
+
+// Вторую службу сменили, потому что прежняя стала негодной: проверяющий
+// больше не верит её корню (или её ключ отозван). Пакет записи до смены
+// несёт от каждой службы её самую раннюю метку не раньше звена токена — и
+// проходит по метке новой, хотя первая по журналу — метка прежней.
+func TestArchiveEveryServiceInBundle(t *testing.T) {
+	c := newClock()
+	x := newArchiveTSA(t)
+	cfg := testConfig(t, x.option())
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	c.add(5 * time.Minute)
+	ingest(t, s, "abs-core", 4, 6)
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustArchive(t, s)
+	s.Close()
+
+	y := newArchiveTSA(t)
+	cfg.TSA.Archive = config.TSAArchive{URL: y.ts.URL, Trust: []string{y.root}}
+	s2, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	c.add(time.Minute)
+	ingest(t, s2, "abs-core", 7, 7)
+	mustStamp(t, s2)
+	mustArchive(t, s2)
+	b, err := s2.Proof("abs-core", 5, false)
+	if err != nil || len(b.Archive) != 2 || b.Archive[0].HeadSeq >= b.Archive[1].HeadSeq {
+		t.Fatalf("метки второй службы в пакете: %v, %d (ждали прежней и новой)", err, len(b.Archive))
+	}
+	// Проверяющий верит основной и новой службе, основная скомпрометирована.
+	tr := trustOf(t, s2)
+	pool := x509.NewCertPool()
+	pool.AddCert(s2.tsaLocal.Root())
+	pool.AddCert(y.a.Root())
+	tr.TSA = tsa.Trust{Roots: pool}
+	list, _ := json.Marshal([]map[string]string{{"cert_sha256": tsa.Fingerprint(s2.tsaLocal.Cert()), "revoked": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339), "reason": "keyCompromise"}})
+	p := filepath.Join(t.TempDir(), "revoked.json")
+	os.WriteFile(p, list, 0o600)
+	tr.TSARevocations = tsa.NewRevocations(time.Now())
+	if err := tr.TSARevocations.AddList(p); err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b, tr); !r.Valid() {
+		t.Fatalf("пакет по метке новой службы:\n%s", r.Text())
+	}
 }

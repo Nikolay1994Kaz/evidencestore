@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,19 +48,33 @@ import (
 // как журнал подписей свидетелей.
 const archiveFile = "tsa/archive.jsonl"
 
-// archiveRecord — строка журнала: голова и токен второй службы над ней.
+// archiveRecord — строка журнала: голова и токен второй службы над ней; Key —
+// SHA-256 ключа (SubjectPublicKeyInfo), которым токен подписан: службы
+// различаются по нему (у строк без него — ключ из токена).
 type archiveRecord struct {
 	Size  uint64 `json:"size"`
 	Root  []byte `json:"root"`
 	Token []byte `json:"token"`
+	Key   []byte `json:"key,omitempty"`
 }
 
-// archiveRef — метка в журнале: размер головы и где строка; ok — токен
-// проверен и голова сверена с цепью; bad — не сошлось: в пакеты не идёт.
+// signerKey — SHA-256 ключа, которым подписан токен (нули — не разобрать).
+func signerKey(token []byte) [32]byte {
+	k, err := tsa.SignerKey(token)
+	if err != nil {
+		return [32]byte{}
+	}
+	return sha256.Sum256(k)
+}
+
+// archiveRef — метка в журнале: размер головы, где строка и чьим ключом
+// подписан токен; ok — токен проверен и голова сверена с цепью; bad — не
+// сошлось: в пакеты не идёт.
 type archiveRef struct {
 	size    uint64
 	off     int64
 	n       int
+	key     [32]byte
 	ok, bad bool
 }
 
@@ -107,6 +123,7 @@ func (s *Store) openArchive() error {
 		return fmt.Errorf("tsa archive: %w", err)
 	}
 	n := s.chainSize()
+	s.archiveKeys = map[[32]byte]uint64{}
 	r := bufio.NewReaderSize(f, 64<<10)
 	var off int64
 	for {
@@ -134,7 +151,12 @@ func (s *Store) openArchive() error {
 		case rec.Size > n:
 			s.log.Error("tsa archive: a line is not used: its head is beyond the end of this chain (the store lost the end of its chain, or the file comes from another chain)", "offset", off, "head", rec.Size, "chain", n)
 		default:
-			s.archiveIdx = append(s.archiveIdx, archiveRef{size: rec.Size, off: off, n: len(line)})
+			key := signerKey(rec.Token)
+			if len(rec.Key) == 32 {
+				key = [32]byte(rec.Key)
+			}
+			s.archiveIdx = append(s.archiveIdx, archiveRef{size: rec.Size, off: off, n: len(line), key: key})
+			s.archiveKeys[key] = max(s.archiveKeys[key], rec.Size)
 		}
 		off += int64(len(line))
 	}
@@ -177,13 +199,22 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 			a.lastErr.Store(&msg)
 		}
 	}()
+	// Ключ основной службы — из её последней проверенной метки (Stamp); после
+	// запуска, до первой метки, — раз из последнего токена цепи.
+	mainKey := s.tsaKey.Load()
 	s.chainMu.Lock()
 	h, ok, err := s.shippedHeadLocked()
-	var mainToken []byte // последняя метка основной службы: чей у неё ключ
-	if n := len(s.tokens); err == nil && ok && n > 0 {
+	var mainToken []byte
+	if n := len(s.tokens); mainKey == nil && err == nil && ok && n > 0 {
 		mainToken, _ = s.leafPayloadLocked(s.tokens[n-1].leaf)
 	}
 	s.chainMu.Unlock()
+	if mainKey == nil && mainToken != nil {
+		if k := signerKey(mainToken); k != ([32]byte{}) {
+			mainKey = &k
+			s.tsaKey.CompareAndSwap(nil, mainKey)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("the head to time-stamp: %w", err)
 	}
@@ -201,10 +232,11 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	}
 	// Та же служба под другим адресом: её метки после компрометации ключа
 	// ничего не покажут, а хранилище иначе молчало бы.
-	if mainKey, err := tsa.SignerKey(mainToken); err == nil && bytes.Equal(mainKey, info.Signer.RawSubjectPublicKeyInfo) {
+	key := sha256.Sum256(info.Signer.RawSubjectPublicKeyInfo)
+	if mainKey != nil && *mainKey == key {
 		return fmt.Errorf("%s signs with the key of tsa.url (%q): it is the same TSA, and its time-stamps show nothing once that key is compromised; point tsa.archive at a TSA of another operator", a.url, info.Signer.Subject.String())
 	}
-	line, err := json.Marshal(archiveRecord{Size: h.size, Root: h.root[:], Token: token})
+	line, err := json.Marshal(archiveRecord{Size: h.size, Root: h.root[:], Token: token, Key: key[:]})
 	if err != nil {
 		return err
 	}
@@ -227,7 +259,8 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	}
 	s.archiveEnd = off + int64(len(line))
 	if k := len(s.archiveIdx); k == 0 || h.size > s.archiveIdx[k-1].size {
-		s.archiveIdx = append(s.archiveIdx, archiveRef{size: h.size, off: off, n: len(line), ok: true})
+		s.archiveIdx = append(s.archiveIdx, archiveRef{size: h.size, off: off, n: len(line), key: key, ok: true})
+		s.archiveKeys[key] = max(s.archiveKeys[key], h.size)
 	}
 	a.head.Store(h.size)
 	a.okAt.Store(time.Now().UnixNano())
@@ -236,11 +269,14 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 }
 
 // archiveForLocked — метки второй службы для пакета, чьи токены лежат в
-// звеньях tokenLinks: для каждого — самая ранняя метка над головой не раньше
-// его звена, которая сходится с цепью и проходит проверку; голова дальше
-// last (последнего звена пакета) — с доказательством продолжения от него.
-// Строка, которая идёт в пакет впервые, проверяется; не сошлась — помечается
-// и громко в журнал процесса, в пакет идёт следующая. Звать под chainMu
+// звеньях tokenLinks: для каждого — от каждой службы (по ключу подписи), чьи
+// метки есть в журнале, самая ранняя метка над головой не раньше его звена,
+// которая сходится с цепью и проходит проверку. Службу меняют, когда прежняя
+// стала негодной (её корень не принимают, её ключ отозван): тогда POE даёт
+// метка новой, и выбирает её аудитор. Голова дальше last (последнего звена
+// пакета) — с доказательством продолжения от него. Строка, которая идёт в
+// пакет впервые, проверяется; не сошлась — помечается и громко в журнал
+// процесса, в пакет идёт следующая той же службы. Звать под chainMu
 // (порядок: chainMu раньше archiveMu).
 func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.ArchiveStamp, error) {
 	if !s.archiveOn || len(tokenLinks) == 0 {
@@ -251,13 +287,24 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 	if s.archiveLog == nil {
 		return nil, nil // хранилище закрывается
 	}
+	var inter []*x509.Certificate
+	if s.archiver != nil {
+		inter = s.archiver.trust.Intermediates
+	}
 	var out []proof.ArchiveStamp
-	seen := map[uint64]bool{}
+	seen := map[int64]bool{} // строки, уже взятые в пакет
 	for _, l := range tokenLinks {
+		want := 0 // службы, у которых есть метки не раньше звена l
+		for _, top := range s.archiveKeys {
+			if top >= l {
+				want++
+			}
+		}
+		found := map[[32]byte]bool{}
 		refs := s.archiveIdx
-		for i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= l }); i < len(refs); i++ {
+		for i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= l }); i < len(refs) && len(found) < want; i++ {
 			ref := &refs[i]
-			if ref.bad {
+			if ref.bad || found[ref.key] {
 				continue
 			}
 			rec, err := s.readArchiveLocked(*ref)
@@ -273,7 +320,7 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 					err = fmt.Errorf("its root is not the root of this chain at head %d: the line comes from another history of this store, or tree.hashes is damaged", rec.Size)
 				}
 				if err == nil {
-					err = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root))
+					err = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)
 				}
 				if err != nil {
 					s.log.Error("tsa archive: a line is not used", "head", rec.Size, "offset", ref.off, "err", err)
@@ -282,21 +329,22 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 				}
 				ref.ok = true
 			}
-			if !seen[rec.Size] {
-				seen[rec.Size] = true
-				st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token}
-				if rec.Size > last {
-					p, err := tlog.ProveTree(int64(rec.Size), int64(last), s.tree)
-					if err != nil {
-						return nil, err
-					}
-					for _, h := range p {
-						st.Proof = append(st.Proof, h[:])
-					}
-				}
-				out = append(out, st)
+			found[ref.key] = true
+			if seen[ref.off] {
+				continue
 			}
-			break
+			seen[ref.off] = true
+			st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token}
+			if rec.Size > last {
+				p, err := tlog.ProveTree(int64(rec.Size), int64(last), s.tree)
+				if err != nil {
+					return nil, err
+				}
+				for _, h := range p {
+					st.Proof = append(st.Proof, h[:])
+				}
+			}
+			out = append(out, st)
 		}
 	}
 	return out, nil

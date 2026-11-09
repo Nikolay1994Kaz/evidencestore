@@ -119,6 +119,32 @@ func (a *Authority) RevocationList(thisUpdate, nextUpdate time.Time, revoked ...
 	}, a.root, a.rootKey)
 }
 
+// Reissue — та же служба (тот же ключ) с новым сертификатом от того же
+// корня: номер serial, срок до notAfter. Тесты отзыва: перевыпуск на тот же
+// ключ. Только у службы, созданной в этом процессе.
+func (a *Authority) Reissue(serial int64, notAfter time.Time) (*Authority, error) {
+	if a.rootKey == nil {
+		return nil, errors.New("tsa: the root key is not in this process")
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(serial),
+		Subject:      a.cert.Subject,
+		NotBefore:    a.cert.NotBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, a.root, a.key.Public(), a.rootKey)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, err
+	}
+	return &Authority{key: a.key, cert: cert, root: a.root, rootKey: a.rootKey, policy: a.policy}, nil
+}
+
 // Trust — доверие к этой службе для Verify.
 func (a *Authority) Trust() Trust {
 	pool := x509.NewCertPool()

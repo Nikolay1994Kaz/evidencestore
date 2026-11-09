@@ -2,6 +2,7 @@ package proof
 
 import (
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -57,16 +58,111 @@ type stampCheck struct {
 	revoked   []string // метки, отозванные без компрометации не позже их времени
 	crls      []string
 	unchecked []string        // отпечатки сертификатов, чей отзыв не проверен
-	beyond    []string        // подписи свидетелей дальше конца пакета: куда его продлить
+	beyond    []beyondCosig   // подписи свидетелей дальше конца пакета: куда его продлить
 	named     map[string]bool // CRL, которые назвал центр в цепочке какой-то метки
-	notes     []string
+	// suspect — ключи (SubjectPublicKeyInfo) под подозрением в каком-либо
+	// вердикте пакета, с отсечкой и причиной: метка, подписанная таким
+	// ключом под другим сертификатом (перевыпуск на тот же ключ, другой
+	// центр), сама ждёт POE и POE не даёт.
+	suspect map[string]suspicion
+	notes   []string
+}
+
+// suspicion — почему ключ под подозрением и с какого момента.
+type suspicion struct {
+	cutoff time.Time
+	why    string
 }
 
 // poeMark — что показывает существование всего до головы head ко времени at.
+// keys — ключи цепочек метки-POE (у подписи свидетеля — нет): POE в силе,
+// если хоть одна её цепочка без ключа под подозрением. Своя метка пакета
+// (own) помнит, где лежит её токен и как называется: если её ключ под
+// подозрением, она сама ждёт POE.
 type poeMark struct {
 	head uint64
 	at   time.Time
 	what string
+	keys [][]string
+	own  *pendingMark
+}
+
+// beyondCosig — подпись свидетеля над головой дальше конца пакета.
+type beyondCosig struct {
+	at   time.Time
+	text string
+}
+
+// poeSlack — насколько POE может быть датирована раньше метки, которую она
+// подкрепляет (часы двух служб; точность метки — до минуты): в этих пределах
+// её время — время метки. Раньше — POE не в счёт: её часы отстают, или она не
+// то, чем названа.
+const poeSlack = time.Minute
+
+// chainKeys — ключи сертификатов каждой цепочки.
+func chainKeys(chains [][]*x509.Certificate) [][]string {
+	out := make([][]string, len(chains))
+	for i, ch := range chains {
+		for _, c := range ch {
+			out[i] = append(out[i], string(c.RawSubjectPublicKeyInfo))
+		}
+	}
+	return out
+}
+
+// markSuspect — ключи вердикта под подозрением.
+func (sc *stampCheck) markSuspect(v tsa.Verdict) {
+	if sc.suspect == nil {
+		sc.suspect = map[string]suspicion{}
+	}
+	for _, c := range v.Suspect {
+		k := string(c.RawSubjectPublicKeyInfo)
+		if old, ok := sc.suspect[k]; !ok || v.Cutoff.Before(old.cutoff) {
+			sc.suspect[k] = suspicion{v.Cutoff, revokedWhy(v)}
+		}
+	}
+}
+
+// clean — у метки-POE есть цепочка без ключа под подозрением.
+func (sc *stampCheck) clean(m poeMark) bool {
+	if m.keys == nil {
+		return true
+	}
+	return slices.ContainsFunc(m.keys, func(ks []string) bool {
+		return !slices.ContainsFunc(ks, func(k string) bool { _, bad := sc.suspect[k]; return bad })
+	})
+}
+
+// taintOwn — свои метки пакета, чей ключ под подозрением в другом вердикте
+// пакета (тот же ключ под другим сертификатом): они ждут POE, как и метки
+// отозванного сертификата. Отсечка — поздняя из отсечек ключей их цепочек,
+// которые все под подозрением (лучшая цепочка).
+func (sc *stampCheck) taintOwn() {
+	var keep []poeMark
+	for _, m := range sc.poe {
+		if m.own == nil || sc.clean(m) {
+			keep = append(keep, m)
+			continue
+		}
+		var cut time.Time
+		var why string
+		for _, ks := range m.keys {
+			var c time.Time
+			var w string
+			for _, k := range ks {
+				if s, bad := sc.suspect[k]; bad && (c.IsZero() || s.cutoff.Before(c)) {
+					c, w = s.cutoff, s.why
+				}
+			}
+			if cut.IsZero() || c.After(cut) {
+				cut, why = c, w
+			}
+		}
+		p := *m.own
+		p.cutoff, p.why = cut, "a key under suspicion in this bundle — "+why
+		sc.pending = append(sc.pending, p)
+	}
+	sc.poe = keep
 }
 
 // pendingMark — метка отозванного по компрометации сертификата: ей нужна
@@ -98,6 +194,7 @@ func (sc *stampCheck) verify(token []byte, head uint64, root [32]byte, link uint
 		return info, nil
 	}
 	v, err := sc.revs.Check(info.Chains, info.GenTime)
+	sc.markNamed(v)
 	if err != nil {
 		// Пункт, где метка нужна, не проходит; пункт об отзыве — тоже, чтобы
 		// не говорить «ни одна метка не на отозванном».
@@ -105,10 +202,12 @@ func (sc *stampCheck) verify(token []byte, head uint64, root [32]byte, link uint
 		return tsa.Info{}, err
 	}
 	sc.record(v)
+	sc.markSuspect(v)
 	if v.NeedPOE {
 		sc.pending = append(sc.pending, pendingMark{link: link, head: head, gen: info.GenTime.UTC(), cutoff: v.Cutoff, what: what, why: revokedWhy(v)})
 	} else {
-		sc.poe = append(sc.poe, poeMark{head: head, at: info.GenTime.UTC(), what: fmt.Sprintf("the time-stamp of %q over head %d at %s", info.Signer.Subject.CommonName, head, fmtTime(info.GenTime))})
+		sc.poe = append(sc.poe, poeMark{head: head, at: info.GenTime.UTC(), keys: chainKeys(info.Chains), own: &pendingMark{link: link, head: head, gen: info.GenTime.UTC(), what: what},
+			what: fmt.Sprintf("the time-stamp of %q over head %d at %s", info.Signer.Subject.CommonName, head, fmtTime(info.GenTime))})
 	}
 	return info, nil
 }
@@ -163,23 +262,36 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 		}
 		return
 	}
+	sc.taintOwn()
 	if len(sc.pending) > 0 {
 		sc.archived(archive, last, rootAt)
 		sc.cosigned(cs, keys, storeKey, last, rootAt)
+		sc.taintOwn() // метки второй службы могли назвать ещё ключи
+	} else {
+		sc.nameArchived(archive)
 	}
 	failed := slices.Clone(sc.revoked)
 	var shown []string
 	for _, p := range sc.pending {
-		m, ok := sc.poeFor(p)
+		m, ok, rejected := sc.poeFor(p)
 		switch {
 		case ok:
-			shown = append(shown, fmt.Sprintf("%s rests on %s, and %s shows it existed before %s", p.what, p.why, m.what, fmtTime(p.cutoff)))
+			f := fmt.Sprintf("%s rests on %s, and %s shows it existed before %s", p.what, p.why, m.what, fmtTime(p.cutoff))
+			if m.at.Before(p.gen) {
+				f += fmt.Sprintf(" (dated %s before the time-stamp: its clock is behind, and it counts from the time of the time-stamp)", p.gen.Sub(m.at).Round(time.Second))
+			}
+			shown = append(shown, f)
 		case p.link == 0:
 			failed = append(failed, fmt.Sprintf("%s rests on %s: its time proves nothing, and the bundle does not show where its token lies in the chain, so nothing can show it existed earlier (a bundle from a store of this release with a second TSA or a cosigning witness carries it)", p.what, p.why))
 		default:
 			f := fmt.Sprintf("%s rests on %s: its time proves nothing, and nothing in the bundle shows it existed before %s — a time-stamp of another TSA or a cosignature of a witness given with -witness-key, over a head at or after link %d and dated earlier", p.what, p.why, fmtTime(p.cutoff), p.link)
-			if len(sc.beyond) > 0 {
-				f += "; " + strings.Join(sc.beyond, "; ")
+			for _, r := range rejected {
+				f += "; " + r
+			}
+			for _, b := range sc.beyond {
+				if b.at.Before(p.cutoff) {
+					f += "; " + b.text
+				}
 			}
 			failed = append(failed, f)
 		}
@@ -201,19 +313,37 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 	add(revocationCheckName, err, detail)
 	for _, l := range sc.revs.CRLs() {
 		if !sc.named[l] {
-			sc.notes = append(sc.notes, l+" is of no CA in the chains of the time-stamps in this bundle: not used")
+			sc.notes = append(sc.notes, l+" is of no CA in the chains of the time-stamps checked in this bundle: not used")
 		}
 	}
 }
 
-// poeFor — самая ранняя POE для метки p: голова не раньше звена её токена и
-// время раньше отсечки. Время POE не раньше времени самой метки: голова с
-// её токеном не могла быть заверена раньше, чем токен выдан, и POE с
-// отстающими часами сдвигается к нему.
-func (sc *stampCheck) poeFor(p pendingMark) (poeMark, bool) {
+// nameArchived — CRL центров второй службы, когда её метки не понадобились
+// (POE не нужна): только чтобы не назвать их CRL посторонними.
+func (sc *stampCheck) nameArchived(archive []ArchiveStamp) {
+	for _, a := range archive {
+		if len(a.Root) != 32 {
+			continue
+		}
+		info, err := tsa.Verify(a.Token, HeadImprint(a.HeadSeq, [32]byte(a.Root)), sc.trust)
+		if err != nil {
+			continue
+		}
+		v, _ := sc.revs.Check(info.Chains, info.GenTime)
+		sc.markNamed(v)
+	}
+}
+
+// poeFor — самая ранняя POE для метки p: голова не раньше звена её токена,
+// время раньше отсечки, цепочка без ключа под подозрением. Голову с токеном
+// не заверить раньше, чем токен выдан: POE с часами, отстающими от метки в
+// пределах poeSlack, считается со времени метки, а датированная ещё раньше —
+// не в счёт. rejected — что не засчитано и почему, для отчёта.
+func (sc *stampCheck) poeFor(p pendingMark) (poeMark, bool, []string) {
 	var best *poeMark
+	var rejected []string
 	if p.link == 0 {
-		return poeMark{}, false
+		return poeMark{}, false, nil
 	}
 	at := func(m poeMark) time.Time {
 		if m.at.Before(p.gen) {
@@ -222,14 +352,24 @@ func (sc *stampCheck) poeFor(p pendingMark) (poeMark, bool) {
 		return m.at
 	}
 	for i, m := range sc.poe {
-		if m.head >= p.link && at(m).Before(p.cutoff) && (best == nil || at(m).Before(at(*best))) {
+		switch {
+		case m.head < p.link:
+			continue
+		case !sc.clean(m):
+			rejected = append(rejected, fmt.Sprintf("%s is signed with a key under suspicion in this bundle: not used", m.what))
+			continue
+		case m.at.Before(p.gen.Add(-poeSlack)):
+			rejected = append(rejected, fmt.Sprintf("%s is dated before %s itself (%s): its clock is behind, or it is not what it claims; not used", m.what, p.what, fmtTime(p.gen)))
+			continue
+		}
+		if at(m).Before(p.cutoff) && (best == nil || at(m).Before(at(*best))) {
 			best = &sc.poe[i]
 		}
 	}
 	if best == nil {
-		return poeMark{}, false
+		return poeMark{}, false, rejected
 	}
-	return *best, true
+	return *best, true, nil
 }
 
 // archived — метки второй службы как POE: голова сходится с пакетом
@@ -270,6 +410,7 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 		}
 		v, err := sc.revs.Check(info.Chains, info.GenTime)
 		sc.markNamed(v)
+		sc.markSuspect(v)
 		switch {
 		case err != nil:
 			sc.notes = append(sc.notes, fmt.Sprintf("the archive time-stamp over head %d was not used: %v", a.HeadSeq, err))
@@ -279,7 +420,7 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 			continue
 		}
 		sc.record(v)
-		sc.poe = append(sc.poe, poeMark{head: a.HeadSeq, at: info.GenTime.UTC(), what: fmt.Sprintf("the archive time-stamp of %q over head %d at %s", info.Signer.Subject.CommonName, a.HeadSeq, fmtTime(info.GenTime))})
+		sc.poe = append(sc.poe, poeMark{head: a.HeadSeq, at: info.GenTime.UTC(), keys: chainKeys(info.Chains), what: fmt.Sprintf("the archive time-stamp of %q over head %d at %s", info.Signer.Subject.CommonName, a.HeadSeq, fmtTime(info.GenTime))})
 	}
 }
 
@@ -311,7 +452,7 @@ func (sc *stampCheck) cosigned(cs []Cosignature, keys []cosign.Verifier, storeKe
 			if c.Size > last {
 				// Корень дальше конца пакета не сверить: подсказка, до какой
 				// головы просить пакет.
-				sc.beyond = append(sc.beyond, fmt.Sprintf("witness %s cosigned head %d at %s, past the end of the bundle: ask for one up to it (evidencestore proof … -to-head %d)", k.Name, c.Size, fmtTime(t), c.Size))
+				sc.beyond = append(sc.beyond, beyondCosig{t, fmt.Sprintf("witness %s cosigned head %d at %s, past the end of the bundle: ask for one up to it (evidencestore proof … -to-head %d)", k.Name, c.Size, fmtTime(t), c.Size)})
 				continue
 			}
 			sc.poe = append(sc.poe, poeMark{head: c.Size, at: t, what: fmt.Sprintf("witness %s (key %08x), which cosigned head %d at %s", k.Name, k.ID, c.Size, fmtTime(t))})

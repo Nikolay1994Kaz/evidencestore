@@ -404,11 +404,12 @@ func Verify(token []byte, imprint [32]byte, trust Trust) (Info, error) {
 }
 
 // Signed — токен цел: разбирается, заверяет imprint и подписан сертификатом
-// службы меток, который несёт сам. До какого корня ведёт сертификат, не
-// сверяется: для журнала, чьи токены проверены доверием, когда были
-// записаны, — доверие с тех пор могли сменить, а проверит его аудитор.
-func Signed(token []byte, imprint [32]byte) error {
-	_, _, _, err := verifySigned(token, imprint, nil)
+// службы меток, который несёт сам (или из intermediates). До какого корня
+// ведёт сертификат, не сверяется: для журнала, чьи токены проверены доверием,
+// когда были записаны, — доверие с тех пор могли сменить, а проверит его
+// аудитор.
+func Signed(token []byte, imprint [32]byte, intermediates ...*x509.Certificate) error {
+	_, _, _, err := verifySigned(token, imprint, intermediates)
 	return err
 }
 

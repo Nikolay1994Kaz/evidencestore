@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -147,15 +148,16 @@ func TestRevocationSuperseded(t *testing.T) {
 	tr.TSARevocations = revocations(t, w.tsa, t2.Add(48*time.Hour), x509.RevocationListEntry{SerialNumber: w.tsa.Cert().SerialNumber, RevocationTime: t2, ReasonCode: tsa.ReasonSuperseded})
 	r := Verify(b, tr)
 	// Пункт об отзыве не говорит «ни одна метка не на отозванном».
-	if c := revocationCheck(t, r.Checks); r.Valid() || c.OK || !strings.Contains(c.Detail, "time-stamp T2 over head 4") || !strings.Contains(c.Detail, "not earlier") {
+	if c := revocationCheck(t, r.Checks); r.Valid() || c.OK || !strings.Contains(c.Detail, "time-stamp T2 over head 4") || !strings.Contains(c.Detail, "not earlier") || strings.Contains(r.Text(), "is of no CA") {
 		t.Fatalf("выведена из работы во время T2:\n%s", r.Text())
 	}
 }
 
 // POE не раньше времени самой метки: голову с её токеном не заверить
-// раньше, чем токен выдан. Метка второй службы с отстающими часами
-// («раньше» T2) не показывает, что T2 существовала до отсечки, которая
-// после её времени по часам второй службы, но раньше времени T2.
+// раньше, чем токен выдан. Метка второй службы с часами, отстающими в
+// пределах минуты, считается со времени метки: T1 раньше отсечки — спасена,
+// T2 позже — нет. Датированная на час раньше — не POE ни для одной, и отчёт
+// говорит почему.
 func TestRevocationPOENotBeforeToken(t *testing.T) {
 	w, b := standard(t, nil)
 	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
@@ -163,10 +165,79 @@ func TestRevocationPOENotBeforeToken(t *testing.T) {
 	other, tr := otherTSA(t, w)
 	cut := r0.Upper.Add(-time.Second) // T1 раньше отсечки, T2 — нет
 	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
-	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, r0.Lower.Add(-time.Hour))}
+	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, r0.Lower.Add(-30*time.Second))}
 	r := Verify(b, tr)
 	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "time-stamp T2 over head 4 rests") || strings.Contains(c.Detail, "time-stamp T1 in link 2 rests") {
-		t.Fatalf("POE с отстающими часами:\n%s", r.Text())
+		t.Fatalf("POE с часами, отстающими на полминуты:\n%s", r.Text())
+	}
+	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, r0.Lower.Add(-time.Hour))}
+	r = Verify(b, tr)
+	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "time-stamp T1 in link 2 rests") || !strings.Contains(c.Detail, "is dated before time-stamp T1 in link 2 itself") {
+		t.Fatalf("POE на час раньше метки:\n%s", r.Text())
+	}
+	// Отсечка после обеих: POE на полминуты раньше T1 спасает обе, и отчёт
+	// говорит, что её часы отстают.
+	tr.TSARevocations = compromised(t, w.tsa, r0.Upper.Add(time.Hour), w.now.Add(48*time.Hour))
+	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, r0.Lower.Add(-30*time.Second))}
+	if r := Verify(b, tr); !r.Valid() || !strings.Contains(revocationCheck(t, r.Checks).Detail, "its clock is behind") {
+		t.Fatalf("POE с отстающими часами, обе метки до отсечки:\n%s", r.Text())
+	}
+}
+
+// Тот же ключ под двумя сертификатами в одном пакете: T1 — под отозванным по
+// компрометации, T2 — под перевыпущенным, которого нет ни в одном CRL. T2
+// подписана ключом под подозрением: сама ждёт POE и T1 не спасает.
+func TestRevocationSameKeyTaintsOwnStamps(t *testing.T) {
+	w := newWorld(t)
+	main := w.tsa
+	reissued, err := main.Reissue(77, w.now.Add(240*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reissued.Now = func() time.Time { return w.now }
+	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
+	h1, t1 := w.stamp()
+	w.now = w.now.Add(time.Second)
+	w.wlink(tokenLeaf(h1, t1))
+	e2 := sealedBytes(t, 2, w.now.Add(time.Second), "second")
+	w.now = w.now.Add(3 * time.Second)
+	w.wlink(evLeaf(t, e2, 1))
+	w.now = w.now.Add(time.Second)
+	w.tsa = reissued
+	h3, t2 := w.stamp()
+	w.tsa = main
+	w.wlink(tokenLeaf(h3, t2))
+	b := w.bundle(e2, 3, 0, h3, t2, 2)
+	b.Upper.Inclusion = ptr(w.inclusion(4, 0))
+	tr := w.trust()
+	if r := Verify(b, tr); !r.Valid() {
+		t.Fatalf("контроль, без отзыва:\n%s", r.Text())
+	}
+	tr.TSARevocations = compromised(t, main, w.now.Add(time.Hour), w.now.Add(48*time.Hour))
+	r := Verify(b, tr)
+	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, fmt.Sprintf("time-stamp T2 over head %d rests on a key under suspicion in this bundle", h3)) {
+		t.Fatalf("T2 того же ключа под перевыпущенным сертификатом:\n%s", r.Text())
+	}
+}
+
+// Сертификат службы перевыпущен на тот же ключ: CRL отзывает новый по
+// компрометации, прежний не назван нигде. Метка «второй службы», подписанная
+// тем же ключом под прежним сертификатом, — не POE: ключ под подозрением в
+// этом же пакете.
+func TestRevocationPOESameKeyOtherCert(t *testing.T) {
+	w, b := standard(t, nil)
+	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
+	cut := w.now.Add(2 * time.Hour)
+	tr := w.trust()
+	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
+	old, err := w.tsa.Reissue(77, w.now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Archive = []ArchiveStamp{archiveOver(t, w, old, 5, w.now)}
+	r := Verify(b, tr)
+	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "signed with a key under suspicion") {
+		t.Fatalf("POE тем же ключом под другим сертификатом:\n%s", r.Text())
 	}
 }
 
