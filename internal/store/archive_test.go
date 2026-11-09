@@ -312,3 +312,144 @@ func TestArchiveJournalRemovedCopyGoesOn(t *testing.T) {
 		t.Fatalf("копия %d → %d, тревога журнала второй службы %v, журнала подписей %v", before, after, s2.archiveSkipped.Load(), s2.cosignSkipped.Load())
 	}
 }
+
+// Сертификат службы отозван по компрометации, второй службы нет, есть
+// свидетель C2SP: его подпись над головой звена токена T2 (хранилище отдаёт
+// её свидетелю вместе с головой под меткой) — POE для T2. Пакет одной улики
+// несёт лист T2 и эту подпись и проходит без -to-head, как и пакеты за окно
+// и по источнику.
+func TestWitnessRescuesCompromisedT2(t *testing.T) {
+	c := newClock()
+	w := newLiveWitness(t, "witness.example/w1")
+	s := openStore(t, testConfig(t, w.option()), c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	mustCosign(t, s)
+	c.add(5 * time.Minute)
+	ingest(t, s, "abs-core", 4, 6)
+	mustCosign(t, s) // обход свидетеля между записью и меткой: подпись раньше звена токена T2
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustCosign(t, s)
+	c.add(time.Minute)
+	ingest(t, s, "abs-core", 7, 8)
+	mustStamp(t, s)
+	mustCosign(t, s)
+
+	tr := w.trust(t, s)
+	list, _ := json.Marshal([]map[string]string{{"cert_sha256": tsa.Fingerprint(s.tsaLocal.Cert()), "revoked": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339), "reason": "keyCompromise"}})
+	p := filepath.Join(t.TempDir(), "revoked.json")
+	os.WriteFile(p, list, 0o600)
+	tr.TSARevocations = tsa.NewRevocations(time.Now())
+	if err := tr.TSARevocations.AddList(p); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Proof("abs-core", 5, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Upper == nil || b.Upper.Inclusion == nil || len(b.Cosignatures) != 2 || b.Cosignatures[1].Size != b.Upper.Inclusion.LinkSeq {
+		t.Fatalf("в пакете нет листа T2 или подписи над головой его звена: %+v", b.Cosignatures)
+	}
+	if r := proof.Verify(b, tr); !r.Valid() || !strings.Contains(r.Text(), "cosigned head") {
+		t.Fatalf("пакет одной улики:\n%s", r.Text())
+	}
+	// Без подписи над звеном T2 — не проходит, и отчёт говорит почему.
+	cut := b
+	cut.Cosignatures = cut.Cosignatures[:1]
+	if r := proof.Verify(cut, tr); r.Valid() || !strings.Contains(r.Text(), "time-stamp T2") {
+		t.Fatalf("без подписи над звеном T2:\n%s", r.Text())
+	}
+	from, to := clockAt(10, 4, 0), clockAt(10, 6, 0)
+	wb, err := s.ProofWindow(from, to, "", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.VerifyWindow(roundTrip(t, wb), tr, time.Time{}, time.Time{}); !r.Valid() {
+		t.Fatalf("за окно:\n%s", r.Text())
+	}
+	sb, err := s.ProofSource("abs-core", from, to, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.VerifySource(sb, tr, time.Time{}, time.Time{}); !r.Valid() {
+		t.Fatalf("по источнику:\n%s", r.Text())
+	}
+}
+
+// Вторую службу сменили (другая служба, другой корень) или убрали из
+// конфигурации: её прежние метки по-прежнему идут в пакеты — их токены
+// проверены, когда записаны, а проверяющий верит той службе. Испорченная
+// подпись токена строку по-прежнему выводит из оборота (TestArchiveJournal).
+func TestArchiveServiceChanged(t *testing.T) {
+	c := newClock()
+	x := newArchiveTSA(t)
+	cfg := testConfig(t, x.option())
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	c.add(5 * time.Minute)
+	ingest(t, s, "abs-core", 4, 6)
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustArchive(t, s)
+	before, err := s.Proof("abs-core", 5, false)
+	if err != nil || len(before.Archive) == 0 {
+		t.Fatalf("до смены: %v, меток %d", err, len(before.Archive))
+	}
+	s.Close()
+	tr := x.trust(t, s, time.Now().Add(24*time.Hour))
+
+	y := newArchiveTSA(t)
+	for name, archive := range map[string]config.TSAArchive{"другая служба": {URL: y.ts.URL, Trust: []string{y.root}}, "без второй службы": {}} {
+		cfg.TSA.Archive = archive
+		s2, err := reopen(cfg, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after, err := s2.Proof("abs-core", 5, false)
+		if err != nil || len(after.Archive) != len(before.Archive) || after.Upper.Inclusion == nil {
+			s2.Close()
+			t.Fatalf("%s: %v, меток второй службы %d, было %d", name, err, len(after.Archive), len(before.Archive))
+		}
+		if r := proof.Verify(after, tr); !r.Valid() {
+			s2.Close()
+			t.Fatalf("%s:\n%s", name, r.Text())
+		}
+		if st := s2.Status(); (st.TSAArchive == nil) != (archive.URL == "") {
+			t.Errorf("%s: status %+v", name, st.TSAArchive)
+		}
+		s2.Close()
+	}
+}
+
+// tsa.archive — та же служба под другим адресом (тот же ключ подписи): после
+// компрометации её метки ничего не покажут. Метка не пишется, ошибка видна в
+// status.
+func TestArchiveSameTSARefused(t *testing.T) {
+	c := newClock()
+	var same atomic.Pointer[tsa.Authority]
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a := same.Load(); a != nil {
+			a.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "not yet", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(ts.Close)
+	cfg := testConfig(t, func(cfg *config.Config) {
+		cfg.TSA.Archive = config.TSAArchive{URL: ts.URL, Trust: []string{filepath.Join(cfg.DataDir, "tsa-local", "root.crt")}}
+	})
+	s := openStore(t, cfg, c)
+	same.Store(s.tsaLocal)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	err := s.ArchiveOnce(context.Background())
+	if st := s.Status().TSAArchive; err == nil || !strings.Contains(err.Error(), "same TSA") || st.Errors != 1 || st.Head != 0 || !strings.Contains(st.LastError, "same TSA") {
+		t.Fatalf("та же служба: %v, status %+v", err, st)
+	}
+	if b, err := s.Proof("abs-core", 2, false); err != nil || len(b.Archive) != 0 {
+		t.Fatalf("метка той же службы в пакете: %v %d", err, len(b.Archive))
+	}
+}

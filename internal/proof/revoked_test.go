@@ -1,7 +1,11 @@
 package proof
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -111,8 +115,23 @@ func TestRevocationNotRevoked(t *testing.T) {
 	tr := w.trust()
 	tr.TSARevocations = revocations(t, w.tsa, w.now.Add(48*time.Hour), x509.RevocationListEntry{SerialNumber: big.NewInt(777), RevocationTime: w.now})
 	r = Verify(b, tr)
-	if c := revocationCheck(t, r.Checks); !r.Valid() || !c.OK || !strings.Contains(c.Detail, "2 time-stamps, none rests on a revoked certificate") || strings.Contains(r.Text(), RevocationNotChecked) {
+	if c := revocationCheck(t, r.Checks); !r.Valid() || !c.OK || !strings.Contains(c.Detail, "2 time-stamps, none found revoked") || strings.Contains(r.Text(), RevocationNotChecked) {
 		t.Fatalf("CRL без службы:\n%s", r.Text())
+	}
+	// CRL центра, которого нет в цепочках меток пакета, назван: не тот файл.
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "unrelated CA"}, NotBefore: w.now.Add(-time.Hour), NotAfter: w.now.Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true}
+	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
+	ca, _ := x509.ParseCertificate(der)
+	crl, _ := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(1), ThisUpdate: w.now, NextUpdate: w.now.Add(time.Hour)}, ca, k)
+	p := filepath.Join(t.TempDir(), "unrelated.crl")
+	os.WriteFile(p, crl, 0o600)
+	if err := tr.TSARevocations.AddCRL(p); err != nil {
+		t.Fatal(err)
+	}
+	if r := Verify(b, tr); !r.Valid() || !strings.Contains(r.Text(), "unrelated.crl") || !strings.Contains(r.Text(), "is of no CA in the chains") {
+		t.Fatalf("посторонний CRL не назван:\n%s", r.Text())
 	}
 }
 
@@ -126,8 +145,44 @@ func TestRevocationSuperseded(t *testing.T) {
 		t.Fatalf("выведена из работы после меток:\n%s", r.Text())
 	}
 	tr.TSARevocations = revocations(t, w.tsa, t2.Add(48*time.Hour), x509.RevocationListEntry{SerialNumber: w.tsa.Cert().SerialNumber, RevocationTime: t2, ReasonCode: tsa.ReasonSuperseded})
-	if r := Verify(b, tr); r.Valid() || !strings.Contains(r.Text(), "not earlier") {
+	r := Verify(b, tr)
+	// Пункт об отзыве не говорит «ни одна метка не на отозванном».
+	if c := revocationCheck(t, r.Checks); r.Valid() || c.OK || !strings.Contains(c.Detail, "time-stamp T2 over head 4") || !strings.Contains(c.Detail, "not earlier") {
 		t.Fatalf("выведена из работы во время T2:\n%s", r.Text())
+	}
+}
+
+// POE не раньше времени самой метки: голову с её токеном не заверить
+// раньше, чем токен выдан. Метка второй службы с отстающими часами
+// («раньше» T2) не показывает, что T2 существовала до отсечки, которая
+// после её времени по часам второй службы, но раньше времени T2.
+func TestRevocationPOENotBeforeToken(t *testing.T) {
+	w, b := standard(t, nil)
+	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
+	r0 := Verify(b, w.trust())
+	other, tr := otherTSA(t, w)
+	cut := r0.Upper.Add(-time.Second) // T1 раньше отсечки, T2 — нет
+	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
+	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, r0.Lower.Add(-time.Hour))}
+	r := Verify(b, tr)
+	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "time-stamp T2 over head 4 rests") || strings.Contains(c.Detail, "time-stamp T1 in link 2 rests") {
+		t.Fatalf("POE с отстающими часами:\n%s", r.Text())
+	}
+}
+
+// Подпись свидетеля над головой дальше конца пакета корнем не сверить, но
+// отчёт называет её: до какой головы просить пакет.
+func TestRevocationWitnessBeyondBundle(t *testing.T) {
+	w, b := standard(t, nil)
+	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
+	w.wlink(auditchain.Leaf{Type: auditchain.EventGap, Scope: "abs-core"})
+	s := cosigner(t, "witness.example/w1")
+	tr := cosignTrust(w, s)
+	cut := w.now.Add(2 * time.Hour)
+	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
+	b.Cosignatures = []Cosignature{w.cosigned(s, 6, w.root(6), cut.Add(-time.Hour))}
+	if c := revocationCheck(t, Verify(b, tr).Checks); c.OK || !strings.Contains(c.Detail, "-to-head 6") {
+		t.Fatalf("подпись дальше конца пакета не названа: %+v", c)
 	}
 }
 

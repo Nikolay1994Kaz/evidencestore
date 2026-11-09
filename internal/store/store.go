@@ -249,7 +249,11 @@ type Store struct {
 	archiver   *archiver
 	archiveMu  sync.Mutex
 	archiveLog *os.File
+	archiveEnd int64        // конец последней целой строки журнала
 	archiveIdx []archiveRef // по возрастанию размера
+	// archiveOn — журнал меток второй службы открыт (с tsa.archive или
+	// оставшийся после неё); не меняется после открытия.
+	archiveOn bool
 	// servedHead — последняя голова, подписанная для сборщиков и statement
 	// (servedHeadLocked), под chainMu: подпись не повторяется на каждый
 	// ответ.

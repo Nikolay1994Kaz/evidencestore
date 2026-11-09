@@ -78,7 +78,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return nil
 	})
-	tsaRevoked := fs.String("tsa-revoked", "", "your own list of revoked TSA (or CA) certificates (JSON: [{\"cert_sha256\": HEX, \"revoked\": RFC3339, \"reason\": \"keyCompromise\", \"invalidity\": RFC3339}]), for a TSA that publishes no CRL or a compromise you learned of yourself")
+	var tsaRevoked []string
+	fs.Func("tsa-revoked", "your own list of revoked TSA (or CA) certificates (JSON: [{\"cert_sha256\": HEX, \"revoked\": RFC3339, \"reason\": \"keyCompromise\", \"invalidity\": RFC3339}]), for a TSA that publishes no CRL or a compromise you learned of yourself; repeat the flag (or separate with commas) for more lists", func(v string) error {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				tsaRevoked = append(tsaRevoked, p)
+			}
+		}
+		return nil
+	})
 	allowNoTSA := fs.Bool("allow-no-tsa", false, "accept a bundle without a TSA time-stamp after the record (then only the store's own signature vouches for it)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	bodyPath := fs.String("body", "", "once the bundle verifies, write the record body to FILE exactly as the source sent it (the bundle must carry the record key: evidencestore proof -dek)")
@@ -87,8 +95,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	windowTo := fs.String("to", "", "bundle over a window of time: the end of your window (RFC 3339)")
 	bodiesDir := fs.String("bodies", "", "bundle over a window of time: once it verifies, write every opened body to DIR/<source>-<seq> exactly as the source sent it")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE] [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
-		fmt.Fprintln(stderr, "       esverify -proof WINDOW -store-key KEY -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE] [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
+		fmt.Fprintln(stderr, "       esverify -proof WINDOW -store-key KEY -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
 		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
@@ -118,7 +126,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return usageErr(err)
 	}
 	pt := proof.Trust{StoreKey: key, TSA: trust, AllowNoTSA: *allowNoTSA}
-	if len(tsaCRLs) > 0 || *tsaRevoked != "" {
+	if len(tsaCRLs) > 0 || len(tsaRevoked) > 0 {
 		// Свежесть CRL — на момент проверки: отзыв, случившийся после
 		// thisUpdate, в старом CRL не виден.
 		pt.TSARevocations = tsa.NewRevocations(time.Now())
@@ -127,8 +135,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return usageErr(err)
 			}
 		}
-		if *tsaRevoked != "" {
-			if err := pt.TSARevocations.AddList(*tsaRevoked); err != nil {
+		for _, p := range tsaRevoked {
+			if err := pt.TSARevocations.AddList(p); err != nil {
 				return usageErr(err)
 			}
 		}

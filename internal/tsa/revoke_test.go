@@ -1,6 +1,9 @@
 package tsa
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -66,6 +69,16 @@ func (w *revWorld) check(r *Revocations) (Verdict, error) {
 	return r.Check(w.info.Chains, w.info.GenTime)
 }
 
+// hasNote — есть ли у вердикта заметка с sub.
+func hasNote(v Verdict, sub string) bool {
+	for _, n := range v.Notes {
+		if strings.Contains(n, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 func ext(t *testing.T, id asn1.ObjectIdentifier, v any, params string) pkix.Extension {
 	b, err := asn1.MarshalWithParams(v, params)
 	if err != nil {
@@ -89,7 +102,7 @@ func TestRevocationsNotRevoked(t *testing.T) {
 		t.Fatal(err)
 	}
 	v, err = w.check(r)
-	if err != nil || v.NeedPOE || v.Revoked != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || len(v.Stale) != 0 {
+	if err != nil || v.NeedPOE || v.Revoked != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || len(v.Notes) != 0 {
 		t.Fatalf("CRL без записи о службе: %+v %v", v, err)
 	}
 }
@@ -197,14 +210,14 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(p); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || len(v.Unchecked) != 1 || len(v.Foreign) != 1 || !strings.Contains(v.Foreign[0], "does not verify") {
+	if v, err := w.check(r); err != nil || len(v.Unchecked) != 1 || !hasNote(v, "does not verify") || !hasNote(v, "no CRL of its issuer") {
 		t.Fatalf("чужой CRL: %+v %v", v, err)
 	}
 	// Есть и свой — берётся он.
 	if err := r.AddCRL(w.crl("own.crl", now.Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 {
+	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || !hasNote(v, "does not verify") {
 		t.Fatalf("свой CRL рядом с чужим: %+v %v", v, err)
 	}
 
@@ -216,7 +229,7 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(pemPath); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || len(v.Stale) != 1 || len(v.CRLs) != 1 {
+	if v, err := w.check(r); err != nil || !hasNote(v, "past its next update") || len(v.CRLs) != 1 {
 		t.Fatalf("несвежий CRL в PEM: %+v %v", v, err)
 	}
 	notCRL := filepath.Join(w.dir, "cert.pem")
@@ -263,5 +276,449 @@ func TestRevocationsList(t *testing.T) {
 		if err := NewRevocations(now).AddList(write(body)); err == nil {
 			t.Errorf("%s: принято", name)
 		}
+	}
+}
+
+// crlAt — CRL корня службы с thisUpdate this и расширениями CRL extra.
+func (w *revWorld) crlAt(name string, this, next time.Time, extra []pkix.Extension, entries ...x509.RevocationListEntry) string {
+	w.t.Helper()
+	der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{
+		Number: big.NewInt(this.Unix()), ThisUpdate: this, NextUpdate: next,
+		RevokedCertificateEntries: entries, ExtraExtensions: extra,
+	}, w.a.root, w.a.rootKey)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	p := filepath.Join(w.dir, name)
+	if err := os.WriteFile(p, der, 0o600); err != nil {
+		w.t.Fatal(err)
+	}
+	return p
+}
+
+// Записи всех CRL центра действуют вместе: центр убрал истёкший отозванный
+// сертификат из нового CRL — запись старого в силе, а не «не отозван» по
+// самому свежему.
+func TestRevocationsAllCRLsOfIssuer(t *testing.T) {
+	w := newRevWorld(t)
+	now := w.gen.Add(48 * time.Hour)
+	serial := w.a.Cert().SerialNumber
+	revoked := w.gen.Add(10 * time.Hour)
+	r := NewRevocations(now)
+	if err := r.AddCRL(w.crlAt("old.crl", w.gen.Add(11*time.Hour), w.gen.Add(12*time.Hour), nil,
+		x509.RevocationListEntry{SerialNumber: serial, RevocationTime: revoked, ReasonCode: ReasonKeyCompromise})); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AddCRL(w.crlAt("new.crl", w.gen.Add(24*time.Hour), now.Add(time.Hour), nil)); err != nil {
+		t.Fatal(err)
+	}
+	v, err := w.check(r)
+	if err != nil || !v.NeedPOE || !v.Cutoff.Equal(revoked) || len(v.CRLs) != 1 || !strings.Contains(v.CRLs[0], "new.crl") || len(v.Notes) != 0 {
+		t.Fatalf("отзыв в старом CRL, нет в новом: %+v %v", v, err)
+	}
+}
+
+// Дельта-CRL, косвенный CRL и CRL с непонятным критичным расширением — отказ
+// при чтении: по ним отсутствие записи ничего не значит (RFC 5280, 5.2).
+func TestRevocationsCRLExtensions(t *testing.T) {
+	w := newRevWorld(t)
+	now := w.gen.Add(48 * time.Hour)
+	serial := w.a.Cert().SerialNumber
+	base, _ := asn1.Marshal(big.NewInt(5))
+	crit := func(id asn1.ObjectIdentifier, v []byte) []pkix.Extension {
+		return []pkix.Extension{{Id: id, Critical: true, Value: v}}
+	}
+	idp := func(content ...[]byte) []byte {
+		var b []byte
+		for _, c := range content {
+			b = append(b, c...)
+		}
+		return tlv(0x30, b)
+	}
+	uri := func(u string) []byte { return tlv(0xA0, tlv(0xA0, tlv(0x86, []byte(u)))) }
+	for name, c := range map[string]struct {
+		extra []pkix.Extension
+		entry []pkix.Extension
+		want  string
+	}{
+		"дельта":                     {extra: crit(oidDeltaCRL, base), want: "delta CRL"},
+		"косвенный":                  {extra: crit(oidIssuingDP, idp(tlv(0x84, []byte{0xff}))), want: "indirect CRL"},
+		"чужой центр в записи":       {entry: crit(oidCertIssuer, tlv(0x30, nil)), want: "indirect CRL"},
+		"критичное расширение":       {extra: crit(asn1.ObjectIdentifier{1, 2, 3, 4}, []byte{0x05, 0x00}), want: "critical extension 1.2.3.4"},
+		"критичное в записи":         {entry: crit(asn1.ObjectIdentifier{1, 2, 3, 5}, []byte{0x05, 0x00}), want: "critical extension 1.2.3.5"},
+		"негодная точка":             {extra: crit(oidIssuingDP, []byte{0x30, 0x03, 0x81}), want: "does not parse"},
+		"точка с URI — в порядке":    {extra: crit(oidIssuingDP, idp(uri("http://crl.example/a.crl")))},
+		"только сертификаты центров": {extra: crit(oidIssuingDP, idp(tlv(0x82, []byte{0xff})))},
+	} {
+		p := w.crlAt(strings.ReplaceAll(name, " ", "_")+".crl", w.gen.Add(24*time.Hour), now.Add(time.Hour), c.extra,
+			x509.RevocationListEntry{SerialNumber: serial, RevocationTime: w.gen.Add(10 * time.Hour), ReasonCode: ReasonKeyCompromise, ExtraExtensions: c.entry})
+		err := NewRevocations(now).AddCRL(p)
+		if c.want == "" && err != nil || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// CRL с issuingDistributionPoint проверяет только свою часть: CRL только
+// сертификатов центров или точки, которой нет в сертификате службы, его
+// не покрывает — «не проверено» с заметкой, но запись в нём в силе.
+func TestRevocationsCRLScope(t *testing.T) {
+	w := newRevWorld(t)
+	now := w.gen.Add(48 * time.Hour)
+	serial := w.a.Cert().SerialNumber
+	idp := func(content []byte) []pkix.Extension {
+		return []pkix.Extension{{Id: oidIssuingDP, Critical: true, Value: tlv(0x30, content)}}
+	}
+	onlyCA := idp(tlv(0x82, []byte{0xff}))
+	onlyUser := idp(tlv(0x81, []byte{0xff}))
+	someReasons := idp(tlv(0x83, []byte{0x07, 0x80}))
+	dp := idp(tlv(0xA0, tlv(0xA0, tlv(0x86, []byte("http://crl.example/a.crl")))))
+	for name, c := range map[string]struct {
+		extra  []pkix.Extension
+		covers bool
+	}{
+		"только центры":   {onlyCA, false},
+		"только конечные": {onlyUser, true},
+		"не все причины":  {someReasons, false},
+		"точка не та":     {dp, false},
+	} {
+		r := NewRevocations(now)
+		if err := r.AddCRL(w.crlAt("empty.crl", w.gen.Add(24*time.Hour), now.Add(time.Hour), c.extra)); err != nil {
+			t.Fatal(err)
+		}
+		v, err := w.check(r)
+		if err != nil || v.NeedPOE || (len(v.Unchecked) == 0) != c.covers || hasNote(v, "issuing distribution point") == c.covers {
+			t.Errorf("%s, пустой CRL: %+v %v", name, v, err)
+		}
+		r = NewRevocations(now)
+		if err := r.AddCRL(w.crlAt("listed.crl", w.gen.Add(24*time.Hour), now.Add(time.Hour), c.extra,
+			x509.RevocationListEntry{SerialNumber: serial, RevocationTime: w.gen.Add(10 * time.Hour), ReasonCode: ReasonKeyCompromise})); err != nil {
+			t.Fatal(err)
+		}
+		if v, err := w.check(r); err != nil || !v.NeedPOE {
+			t.Errorf("%s, запись в CRL: %+v %v", name, v, err)
+		}
+	}
+	// Сертификат с точкой распространения из CRL — покрыт.
+	leaf := &x509.Certificate{CRLDistributionPoints: []string{"http://crl.example/a.crl"}}
+	sc, indirect, err := parseScope(tlv(0x30, tlv(0xA0, tlv(0xA0, tlv(0x86, []byte("http://crl.example/a.crl"))))))
+	if err != nil || indirect || !sc.covers(leaf) || sc.covers(&x509.Certificate{CRLDistributionPoints: []string{"http://other/b.crl"}}) {
+		t.Fatalf("точка распространения: %+v %v %v", sc, indirect, err)
+	}
+}
+
+// pki — свой УЦ для тестов отзыва: сертификаты с нужными сроками, ключами и
+// перекрёстными выпусками.
+type pki struct {
+	cert *x509.Certificate
+	key  crypto.Signer
+}
+
+func newKey(t *testing.T) crypto.Signer {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// issue выпускает сертификат tmpl с ключом key подписью ca (nil —
+// самоподписанный).
+func issue(t *testing.T, tmpl *x509.Certificate, key crypto.Signer, ca *pki) *pki {
+	t.Helper()
+	parent, signer := tmpl, key
+	if ca != nil {
+		parent, signer = ca.cert, ca.key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, key.Public(), signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &pki{cert: c, key: key}
+}
+
+func caTmpl(serial int64, cn string) *x509.Certificate {
+	return &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: cn},
+		NotBefore: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC),
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true}
+}
+
+// tsaUnder — служба меток с сертификатом от ca, сроком до notAfter; её токен
+// на момент gen, проверенный корнями roots с промежуточными inter.
+func tsaUnder(t *testing.T, ca *pki, notAfter, gen time.Time, roots []*x509.Certificate, inter ...*x509.Certificate) (*pki, Info) {
+	t.Helper()
+	leaf := issue(t, &x509.Certificate{SerialNumber: big.NewInt(77), Subject: pkix.Name{CommonName: "test TSA"},
+		NotBefore: time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: notAfter,
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping}}, newKey(t), ca)
+	a := &Authority{key: leaf.key, cert: leaf.cert, root: ca.cert, policy: demoPolicy, Now: func() time.Time { return gen }}
+	imprint := sha256.Sum256([]byte("head"))
+	token, err := a.Sign(imprint[:], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	for _, r := range roots {
+		pool.AddCert(r)
+	}
+	info, err := Verify(token, imprint, Trust{Roots: pool, Intermediates: inter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return leaf, info
+}
+
+// crlOf — CRL центра ca в каталоге dir.
+func (ca *pki) crlOf(t *testing.T, dir, name string, this, next time.Time, extra []pkix.Extension, entries ...x509.RevocationListEntry) string {
+	t.Helper()
+	der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(this.Unix()), ThisUpdate: this, NextUpdate: next,
+		RevokedCertificateEntries: entries, ExtraExtensions: extra}, ca.cert, ca.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, der, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Сертификат службы отозван по компрометации и истёк; центр убрал его из
+// CRL, выпущенного после истечения (RFC 5280, 3.3). Такой CRL о нём не
+// говорит: «не проверено» с заметкой, а не «не отозван». С CRL того времени
+// — компрометация видна; CRL с expiredCertsOnCRL говорит и об истёкших.
+func TestRevocationsAfterExpiry(t *testing.T) {
+	dir := t.TempDir()
+	root := issue(t, caTmpl(1, "expiry CA"), newKey(t), nil)
+	expires := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+	gen := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	leaf, info := tsaUnder(t, root, expires, gen, []*x509.Certificate{root.cert})
+	now := time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)
+	entry := x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC), ReasonCode: ReasonKeyCompromise}
+	old := root.crlOf(t, dir, "old.crl", time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC), nil, entry)
+	fresh := root.crlOf(t, dir, "fresh.crl", time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC), now.Add(24*time.Hour), nil)
+	keeps, _ := asn1.MarshalWithParams(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), "generalized")
+	held := root.crlOf(t, dir, "keeps.crl", time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC), now.Add(24*time.Hour), []pkix.Extension{{Id: oidExpiredCerts, Value: keeps}})
+
+	r := NewRevocations(now)
+	r.AddCRL(fresh)
+	v, err := r.Check(info.Chains, info.GenTime)
+	if err != nil || v.NeedPOE || len(v.Unchecked) != 1 || len(v.CRLs) != 0 || !hasNote(v, "expired on 2026-10-15") {
+		t.Fatalf("только CRL после истечения: %+v %v", v, err)
+	}
+	r.AddCRL(old)
+	if v, err := r.Check(info.Chains, info.GenTime); err != nil || !v.NeedPOE || len(v.Unchecked) != 0 || !strings.Contains(v.CRLs[0], "old.crl") || !hasNote(v, "past its next update") {
+		t.Fatalf("и CRL того времени: %+v %v", v, err)
+	}
+	r = NewRevocations(now)
+	r.AddCRL(held)
+	if v, err := r.Check(info.Chains, info.GenTime); err != nil || v.NeedPOE || len(v.Unchecked) != 0 || len(v.Notes) != 0 {
+		t.Fatalf("CRL держит истёкшие: %+v %v", v, err)
+	}
+}
+
+// Удержание (certificateHold) обратимо: его снимает более новый CRL, где
+// записи нет. Удержание в самом новом — в силе (POE), а компрометация из
+// любого CRL — тоже.
+func TestRevocationsHold(t *testing.T) {
+	w := newRevWorld(t)
+	now := w.gen.Add(48 * time.Hour)
+	serial := w.a.Cert().SerialNumber
+	hold := x509.RevocationListEntry{SerialNumber: serial, RevocationTime: w.gen.Add(2 * time.Hour), ReasonCode: ReasonCertificateHold}
+	early, late := w.gen.Add(3*time.Hour), w.gen.Add(24*time.Hour)
+	held := w.crlAt("held.crl", early, now.Add(time.Hour), nil, hold)
+	released := w.crlAt("released.crl", late, now.Add(time.Hour), nil)
+	compromised := w.crlAt("compromised.crl", late, now.Add(time.Hour), nil, x509.RevocationListEntry{SerialNumber: serial, RevocationTime: w.gen.Add(20 * time.Hour), ReasonCode: ReasonKeyCompromise})
+	for name, c := range map[string]struct {
+		files []string
+		poe   bool
+	}{
+		"удержание":           {[]string{held}, true},
+		"снято новым CRL":     {[]string{held, released}, false},
+		"снято, порядок иной": {[]string{released, held}, false},
+		"затем компрометация": {[]string{held, compromised}, true},
+	} {
+		r := NewRevocations(now)
+		for _, f := range c.files {
+			if err := r.AddCRL(f); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if v, err := w.check(r); err != nil || v.NeedPOE != c.poe {
+			t.Errorf("%s: %+v %v", name, v, err)
+		}
+	}
+}
+
+// Компрометация — свойство ключа: промежуточный центр выпущен двумя корнями
+// с одним ключом; корень A отозвал свой выпуск по cACompromise, CRL корня B
+// не дан — цепочка через B не прячет компрометацию. Отзыв без компрометации
+// (superseded) на другой выпуск не переходит.
+func TestRevocationsSameKeyCrossCert(t *testing.T) {
+	dir := t.TempDir()
+	rootA := issue(t, caTmpl(1, "root A"), newKey(t), nil)
+	rootB := issue(t, caTmpl(1, "root B"), newKey(t), nil)
+	kI := newKey(t)
+	interA := issue(t, caTmpl(10, "TSA CA"), kI, rootA)
+	interB := issue(t, caTmpl(11, "TSA CA"), kI, rootB)
+	gen := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	now := gen.Add(48 * time.Hour)
+	_, info := tsaUnder(t, interA, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), gen, []*x509.Certificate{rootA.cert, rootB.cert}, interA.cert, interB.cert)
+	if len(info.Chains) != 2 {
+		t.Fatalf("цепочек %d, ждали двух", len(info.Chains))
+	}
+	inter := interA.crlOf(t, dir, "inter.crl", gen.Add(time.Hour), now.Add(time.Hour), nil)
+	for reason, poe := range map[int]bool{ReasonCACompromise: true, ReasonSuperseded: false} {
+		r := NewRevocations(now)
+		r.AddCRL(inter)
+		r.AddCRL(rootA.crlOf(t, dir, "rootA.crl", gen.Add(time.Hour), now.Add(time.Hour), nil,
+			x509.RevocationListEntry{SerialNumber: interA.cert.SerialNumber, RevocationTime: gen.Add(-time.Hour), ReasonCode: reason}))
+		v, err := r.Check(info.Chains, info.GenTime)
+		if err != nil || v.NeedPOE != poe {
+			t.Errorf("%s: %+v %v", ReasonName(reason), v, err)
+		}
+	}
+}
+
+// Файлы: несколько CRL в одном PEM или подряд в DER — все в деле; мусор после
+// DER — отказ. Перечень: второй список в том же файле — отказ, записи одного
+// сертификата — все в силе.
+func TestRevocationsFiles(t *testing.T) {
+	w := newRevWorld(t)
+	now := w.gen.Add(48 * time.Hour)
+	serial := w.a.Cert().SerialNumber
+	a, _ := os.ReadFile(w.crlAt("a.crl", w.gen.Add(time.Hour), now.Add(time.Hour), nil,
+		x509.RevocationListEntry{SerialNumber: serial, RevocationTime: w.gen.Add(10 * time.Hour), ReasonCode: ReasonKeyCompromise}))
+	b, _ := os.ReadFile(w.crlAt("b.crl", w.gen.Add(24*time.Hour), now.Add(time.Hour), nil))
+	write := func(name string, data []byte) string {
+		p := filepath.Join(w.dir, name)
+		os.WriteFile(p, data, 0o600)
+		return p
+	}
+	for name, data := range map[string][]byte{
+		"PEM": append(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: a}), pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: b})...),
+		"DER": append(append([]byte(nil), a...), b...),
+	} {
+		r := NewRevocations(now)
+		if err := r.AddCRL(write("two."+name, data)); err != nil {
+			t.Fatal(err)
+		}
+		if v, err := w.check(r); err != nil || !v.NeedPOE || len(v.CRLs) != 1 || !strings.Contains(v.CRLs[0], "(#2)") {
+			t.Errorf("%s из двух CRL: %+v %v", name, v, err)
+		}
+	}
+	if err := NewRevocations(now).AddCRL(write("tail.der", append(append([]byte(nil), a...), 0xff, 0xff))); err == nil {
+		t.Error("мусор после CRL принят")
+	}
+	fp := Fingerprint(w.a.Cert())
+	if err := NewRevocations(now).AddList(write("two.json", []byte(`[]`+"\n"+`[{"cert_sha256": "`+fp+`", "revoked": "2026-10-03T00:00:00Z", "reason": "keyCompromise"}]`))); err == nil {
+		t.Error("второй список в файле принят")
+	}
+	r := NewRevocations(now)
+	if err := r.AddList(write("dup.json", []byte(`[{"cert_sha256": "`+fp+`", "revoked": "2026-10-03T00:00:00Z", "reason": "keyCompromise"}, {"cert_sha256": "`+fp+`", "revoked": "2026-10-04T00:00:00Z", "reason": "superseded"}]`))); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := w.check(r); err != nil || !v.NeedPOE {
+		t.Fatalf("две записи одного сертификата: %+v %v", v, err)
+	}
+}
+
+// Строгий ввод: хвост после PEM — отказ; в перечне повтор поля, имя не в том
+// регистре, null вместо списка — отказ (encoding/json взял бы последнее
+// значение и потерял бы компрометацию). CRL из будущего (позже момента
+// проверки) о статусе не говорит, но его записи в силе.
+func TestRevocationsStrictInput(t *testing.T) {
+	w := newRevWorld(t)
+	now := w.gen.Add(48 * time.Hour)
+	der, _ := os.ReadFile(w.crlAt("a.crl", w.gen.Add(time.Hour), now.Add(time.Hour), nil))
+	write := func(name string, data []byte) string {
+		p := filepath.Join(w.dir, name)
+		os.WriteFile(p, data, 0o600)
+		return p
+	}
+	if err := NewRevocations(now).AddCRL(write("tail.pem", append(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), "garbage"...))); err == nil {
+		t.Error("хвост после PEM принят")
+	}
+	fp := Fingerprint(w.a.Cert())
+	for name, body := range map[string]string{
+		"повтор поля":  `[{"cert_sha256": "` + fp + `", "revoked": "2026-10-03T00:00:00Z", "reason": "keyCompromise", "reason": "superseded"}]`,
+		"иной регистр": `[{"cert_sha256": "` + fp + `", "revoked": "2026-10-03T00:00:00Z", "reason": "keyCompromise", "Reason": "superseded"}]`,
+		"null":         `null`,
+		"не объект":    `["` + fp + `"]`,
+	} {
+		if err := NewRevocations(now).AddList(write("l.json", []byte(body))); err == nil {
+			t.Errorf("%s: принято", name)
+		}
+	}
+	// Полный CRL, что называет дельта-CRL (freshestCRL): отзыв, который есть
+	// только в дельте, не виден — и отчёт это говорит.
+	fresh, _ := asn1.Marshal([]asn1.RawValue{{FullBytes: tlv(0x30, tlv(0xA0, tlv(0xA0, tlv(0x86, []byte("http://crl.example/delta.crl")))))}})
+	r := NewRevocations(now)
+	r.AddCRL(w.crlAt("full.crl", w.gen.Add(24*time.Hour), now.Add(time.Hour), []pkix.Extension{{Id: oidFreshestCRL, Value: fresh}}))
+	if v, err := w.check(r); err != nil || len(v.CRLs) != 1 || !hasNote(v, "delta CRL") {
+		t.Fatalf("CRL с дельтами: %+v %v", v, err)
+	}
+	r = NewRevocations(now)
+	r.AddCRL(w.crlAt("cur.crl", w.gen.Add(24*time.Hour), now.Add(time.Hour), nil,
+		x509.RevocationListEntry{SerialNumber: w.a.Cert().SerialNumber, RevocationTime: w.gen.Add(10 * time.Hour), ReasonCode: ReasonKeyCompromise}))
+	r.AddCRL(w.crlAt("future.crl", now.Add(240*time.Hour), now.Add(300*time.Hour), nil))
+	if v, err := w.check(r); err != nil || !v.NeedPOE || len(v.CRLs) != 1 || !strings.Contains(v.CRLs[0], "cur.crl") || !hasNote(v, "dated after the time of this check") {
+		t.Fatalf("CRL из будущего: %+v %v", v, err)
+	}
+	// Только он — не проверено, и причина — дата, а не истечение сертификата.
+	r = NewRevocations(now)
+	r.AddCRL(w.crlAt("future2.crl", now.Add(240*time.Hour), now.Add(300*time.Hour), nil))
+	if v, err := w.check(r); err != nil || len(v.Unchecked) != 1 || !hasNote(v, "dated after the time of this check") || hasNote(v, "expired") {
+		t.Fatalf("только CRL из будущего: %+v %v", v, err)
+	}
+}
+
+// CRL, записанный openssl (не Go): причины, отсутствие причины и явный
+// unspecified, invalidityDate, удержание с инструкцией, issuingDistributionPoint
+// и подпись центра читаются так, как их понимает RFC 5280.
+func TestRevocationsOpenSSLCRL(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "openssl", "ca.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := pem.Decode(data)
+	ca, err := x509.ParseCertificate(b.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRevocations(time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC))
+	if err := r.AddCRL(filepath.Join("testdata", "openssl", "fixture.crl")); err != nil {
+		t.Fatal(err)
+	}
+	f := r.crls[0]
+	if err := f.rl.CheckSignatureFrom(ca); err != nil {
+		t.Fatal(err)
+	}
+	day := func(d, h int) time.Time { return time.Date(2026, 10, d, h, 0, 0, 0, time.UTC) }
+	want := map[string]Revocation{
+		"16": {Time: day(5, 12), Reason: ReasonKeyCompromise, Invalidity: day(1, 9)},
+		"17": {Time: day(6, 12), Reason: ReasonSuperseded},
+		"18": {Time: day(7, 12), Reason: ReasonAbsent},
+		"19": {Time: day(8, 12), Reason: ReasonCertificateHold},
+		"20": {Time: day(9, 12), Reason: ReasonUnspecified},
+		"21": {Time: day(10, 12), Reason: ReasonCessationOfOperation},
+		"22": {Time: day(11, 12), Reason: ReasonCACompromise, Invalidity: day(2, 9)},
+	}
+	if len(f.bySN) != len(want) {
+		t.Fatalf("записей %d, ждали %d", len(f.bySN), len(want))
+	}
+	for sn, w := range want {
+		g := f.bySN[sn]
+		if !g.Time.Equal(w.Time) || g.Reason != w.Reason || !g.Invalidity.Equal(w.Invalidity) {
+			t.Errorf("серийный %s: %+v, ждали %+v", sn, g, w)
+		}
+	}
+	leaf := &x509.Certificate{CRLDistributionPoints: []string{"http://crl.example/fixture.crl"}}
+	if sc := f.scope; sc == nil || !sc.onlyUser || !sc.covers(leaf) || sc.covers(&x509.Certificate{IsCA: true, CRLDistributionPoints: leaf.CRLDistributionPoints}) {
+		t.Fatalf("область CRL: %+v", f.scope)
 	}
 }

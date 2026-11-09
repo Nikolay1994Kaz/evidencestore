@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -76,22 +77,30 @@ type archiver struct {
 
 // openArchive заводит вторую службу из конфигурации и поднимает её журнал
 // построчно: строка разбирается (голова не длиннее цепи, корень в 32 байта,
-// токен не длиннее tsa.MaxTokenSize), токен и сверка с цепью — когда строка
-// впервые идёт в пакет. Оборванная последняя строка отрезается; битая или за
-// концом цепи — громко в журнал процесса.
+// токен не длиннее tsa.MaxTokenSize), сверка с цепью и подпись токена —
+// когда строка впервые идёт в пакет. Оборванная последняя строка
+// отрезается; битая или за концом цепи — громко в журнал процесса. Журнал
+// поднимается и без tsa.archive, если он есть: службу сменили или убрали, а
+// её прежние метки — POE для записей своего времени — идут в пакеты и
+// копию по-прежнему.
 func (s *Store) openArchive() error {
 	a := s.cfg.TSA.Archive
-	if a.URL == "" {
-		return nil
-	}
-	trust, err := tsa.LoadTrust(joinPaths(a.Trust))
-	if err != nil {
-		return fmt.Errorf("tsa.archive: %w", err)
-	}
-	s.archiver = &archiver{url: a.URL, trust: trust, client: s.tsaHTTP}
 	path := filepath.Join(s.cfg.DataDir, filepath.FromSlash(archiveFile))
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("tsa archive: %w", err)
+	if a.URL == "" {
+		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("tsa archive: %w", err)
+		}
+	} else {
+		trust, err := tsa.LoadTrust(joinPaths(a.Trust))
+		if err != nil {
+			return fmt.Errorf("tsa.archive: %w", err)
+		}
+		s.archiver = &archiver{url: a.URL, trust: trust, client: s.tsaHTTP}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("tsa archive: %w", err)
+		}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -130,12 +139,8 @@ func (s *Store) openArchive() error {
 		off += int64(len(line))
 	}
 	slices.SortStableFunc(s.archiveIdx, func(a, b archiveRef) int { return cmp.Compare(a.size, b.size) })
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		f.Close()
-		return err
-	}
-	s.archiveLog = f
-	if k := len(s.archiveIdx); k > 0 {
+	s.archiveLog, s.archiveEnd, s.archiveOn = f, off, true
+	if k := len(s.archiveIdx); k > 0 && s.archiver != nil {
 		s.archiver.head.Store(s.archiveIdx[k-1].size)
 	}
 	return nil
@@ -147,7 +152,7 @@ func (s *Store) startArchiveLoop() {
 	if s.archiver == nil {
 		return
 	}
-	s.loop(s.cfg.TSA.Every.D(), func() {
+	s.loopNow(s.cfg.TSA.Every.D(), func() {
 		ctx, cancel := s.stopCtx(time.Minute)
 		defer cancel()
 		if err := s.ArchiveOnce(ctx); err != nil {
@@ -174,6 +179,10 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	}()
 	s.chainMu.Lock()
 	h, ok, err := s.shippedHeadLocked()
+	var mainToken []byte // последняя метка основной службы: чей у неё ключ
+	if n := len(s.tokens); err == nil && ok && n > 0 {
+		mainToken, _ = s.leafPayloadLocked(s.tokens[n-1].leaf)
+	}
 	s.chainMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("the head to time-stamp: %w", err)
@@ -186,8 +195,14 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	if _, err := tsa.Verify(token, imprint, a.trust); err != nil {
+	info, err := tsa.Verify(token, imprint, a.trust)
+	if err != nil {
 		return fmt.Errorf("the token of %s: %w", a.url, err)
+	}
+	// Та же служба под другим адресом: её метки после компрометации ключа
+	// ничего не покажут, а хранилище иначе молчало бы.
+	if mainKey, err := tsa.SignerKey(mainToken); err == nil && bytes.Equal(mainKey, info.Signer.RawSubjectPublicKeyInfo) {
+		return fmt.Errorf("%s signs with the key of tsa.url (%q): it is the same TSA, and its time-stamps show nothing once that key is compromised; point tsa.archive at a TSA of another operator", a.url, info.Signer.Subject.String())
 	}
 	line, err := json.Marshal(archiveRecord{Size: h.size, Root: h.root[:], Token: token})
 	if err != nil {
@@ -196,17 +211,21 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	line = append(line, '\n')
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
-	off, err := s.archiveLog.Seek(0, io.SeekEnd)
-	if err != nil {
-		return fmt.Errorf("tsa archive: %w", err)
+	if s.archiveLog == nil {
+		return errors.New("tsa archive: the store is closing")
 	}
-	if _, err = s.archiveLog.Write(line); err == nil {
+	// Пишем с конца последней целой строки: недописанная прежняя (отрезать
+	// её не вышло) затирается и со следующей не склеится, а копия наружу
+	// берёт только целые строки (archiveLogSize).
+	off := s.archiveEnd
+	if _, err = s.archiveLog.WriteAt(line, off); err == nil {
 		err = s.archiveLog.Sync()
 	}
 	if err != nil {
-		s.archiveLog.Truncate(off) // недописанная строка не склеится со следующей
+		s.archiveLog.Truncate(off)
 		return fmt.Errorf("tsa archive: %w", err)
 	}
+	s.archiveEnd = off + int64(len(line))
 	if k := len(s.archiveIdx); k == 0 || h.size > s.archiveIdx[k-1].size {
 		s.archiveIdx = append(s.archiveIdx, archiveRef{size: h.size, off: off, n: len(line), ok: true})
 	}
@@ -224,11 +243,14 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 // и громко в журнал процесса, в пакет идёт следующая. Звать под chainMu
 // (порядок: chainMu раньше archiveMu).
 func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.ArchiveStamp, error) {
-	if s.archiver == nil || len(tokenLinks) == 0 {
+	if !s.archiveOn || len(tokenLinks) == 0 {
 		return nil, nil
 	}
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
+	if s.archiveLog == nil {
+		return nil, nil // хранилище закрывается
+	}
 	var out []proof.ArchiveStamp
 	seen := map[uint64]bool{}
 	for _, l := range tokenLinks {
@@ -243,10 +265,15 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 				return nil, err
 			}
 			if !ref.ok {
+				// Подпись токена проверена, когда строка записана; доверие к
+				// службе с тех пор могли сменить, а проверит его аудитор.
 				root := [32]byte(rec.Root)
 				err := s.tree.agreesLocked(rec.Size, root)
+				if errors.Is(err, errTreeFile) {
+					err = fmt.Errorf("its root is not the root of this chain at head %d: the line comes from another history of this store, or tree.hashes is damaged", rec.Size)
+				}
 				if err == nil {
-					_, err = tsa.Verify(rec.Token, proof.HeadImprint(rec.Size, root), s.archiver.trust)
+					err = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root))
 				}
 				if err != nil {
 					s.log.Error("tsa archive: a line is not used", "head", rec.Size, "offset", ref.off, "err", err)
@@ -278,7 +305,7 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 // archiveFor — archiveForLocked под chainMu: для пакетов за окно и по
 // источнику, которые собираются без него.
 func (s *Store) archiveFor(tokenLinks []uint64, last uint64) ([]proof.ArchiveStamp, error) {
-	if s.archiver == nil {
+	if !s.archiveOn {
 		return nil, nil
 	}
 	s.chainMu.Lock()
@@ -289,7 +316,7 @@ func (s *Store) archiveFor(tokenLinks []uint64, last uint64) ([]proof.ArchiveSta
 // archiveForStretch — метки второй службы для токенов основной в звеньях
 // (lo, hi] — участка пакета за окно.
 func (s *Store) archiveForStretch(lo, hi, last uint64) ([]proof.ArchiveStamp, error) {
-	if s.archiver == nil {
+	if !s.archiveOn {
 		return nil, nil
 	}
 	s.chainMu.Lock()
@@ -340,19 +367,15 @@ func (s *Store) archiveStatus() *ArchiveStatus {
 	return st
 }
 
-// archiveLogSize — размер журнала для копии наружу: под archiveMu в файле
-// только целые строки, уже на диске. ok = false — журнала нет.
+// archiveLogSize — размер журнала для копии наружу: конец последней целой
+// строки, уже на диске. ok = false — журнала нет.
 func (s *Store) archiveLogSize() (int64, bool, error) {
 	if s.archiveLog == nil {
 		return 0, false, nil
 	}
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
-	fi, err := s.archiveLog.Stat()
-	if err != nil {
-		return 0, false, err
-	}
-	return fi.Size(), true, nil
+	return s.archiveEnd, true, nil
 }
 
 // archiveRange — байты from…end журнала для копии: из открытого файла, как

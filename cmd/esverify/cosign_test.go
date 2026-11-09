@@ -85,7 +85,9 @@ func cosignedWorld(t *testing.T) (bundle, key, trust, vkey string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(b.Cosignatures) != 1 {
+	// Подпись головы не раньше записи и подпись головы звена токена T2 (POE
+	// для T2 при отзыве сертификата службы).
+	if len(b.Cosignatures) != 2 || b.Upper == nil || b.Upper.Inclusion == nil || b.Cosignatures[1].Size != b.Upper.Inclusion.LinkSeq {
 		t.Fatalf("в пакете %d подписей свидетеля", len(b.Cosignatures))
 	}
 	write := func(name string, data []byte) string {

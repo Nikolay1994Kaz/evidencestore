@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -250,7 +251,7 @@ func TestCosignJournalAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after.Cosignatures) != 1 || string(after.Cosignatures[0].Sig) != string(before.Cosignatures[0].Sig) {
+	if !sameCosigs(after.Cosignatures, before.Cosignatures) {
 		t.Fatalf("после перезапуска подписи в пакете: %+v, до: %+v", after.Cosignatures, before.Cosignatures)
 	}
 	if r := proof.Verify(after, w.trust(t, s2)); !r.Valid() {
@@ -715,7 +716,7 @@ func TestCosignJournalDamage(t *testing.T) {
 	}
 	// Пакет закрепляет та же ранняя подпись, что до порчи: испорченные строки
 	// того же размера её не спрятали.
-	if r := proof.Verify(b, w.trust(t, s2)); !r.Valid() || len(b.Cosignatures) != 1 || b.Cosignatures[0].Size != rec.Size || !bytes.Equal(b.Cosignatures[0].Sig, rec.Sig) {
+	if r := proof.Verify(b, w.trust(t, s2)); !r.Valid() || len(b.Cosignatures) == 0 || b.Cosignatures[0].Size != rec.Size || !bytes.Equal(b.Cosignatures[0].Sig, rec.Sig) {
 		t.Fatalf("пакет после порчи журнала:\n%s", r.Text())
 	}
 	if st := s2.Status(); st.Cosigners[0].Head != lastGood || s2.lastCosigned(w.key.Verifier()) != lastGood {
@@ -901,7 +902,7 @@ func TestCosignJournalInCopy(t *testing.T) {
 	}
 	mustCosign(t, s)
 	before, err := s.Proof("abs-core", 2, false)
-	if err != nil || len(before.Cosignatures) != 1 {
+	if err != nil || len(before.Cosignatures) == 0 {
 		t.Fatalf("до потери диска: %v %+v", err, before.Cosignatures)
 	}
 	if _, err := s.ShipOnce(ctx, remote); err != nil { // журнал подписей — в копию
@@ -917,7 +918,7 @@ func TestCosignJournalInCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after.Cosignatures) != 1 || !bytes.Equal(after.Cosignatures[0].Sig, before.Cosignatures[0].Sig) {
+	if !sameCosigs(after.Cosignatures, before.Cosignatures) {
 		t.Fatalf("после подъёма подписи в пакете: %+v, до: %+v", after.Cosignatures, before.Cosignatures)
 	}
 	if r := proof.Verify(after, w.trust(t, s2)); !r.Valid() {
@@ -1057,8 +1058,8 @@ func TestCosignOldKeyStaysInBundles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after.Cosignatures) != 2 {
-		t.Fatalf("в пакете записи 2 подписей %d, ждали прежнего и нового ключа", len(after.Cosignatures))
+	if cosigKeys(after.Cosignatures) != 2 {
+		t.Fatalf("в пакете записи 2 подписи %d ключей, ждали прежнего и нового", cosigKeys(after.Cosignatures))
 	}
 	if r := proof.Verify(after, oldTrust); !r.Valid() || len(r.Cosigned) != 1 || r.Cosigned[0].Key != fmt.Sprintf("%08x", w.key.Verifier().ID) {
 		t.Fatalf("пакет записи 2 с прежним ключом:\n%s", r.Text())
@@ -1068,7 +1069,7 @@ func TestCosignOldKeyStaysInBundles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := proof.Verify(b4, w2.trust(t, s2)); !r.Valid() || len(b4.Cosignatures) != 1 {
+	if r := proof.Verify(b4, w2.trust(t, s2)); !r.Valid() || cosigKeys(b4.Cosignatures) != 1 {
 		t.Fatalf("пакет записи 4 с новым ключом (подписей %d):\n%s", len(b4.Cosignatures), r.Text())
 	}
 	s2.Close()
@@ -1084,7 +1085,7 @@ func TestCosignOldKeyStaysInBundles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(b.Cosignatures) != 1 || proof.Verify(b, oldTrust).Valid() {
+	if cosigKeys(b.Cosignatures) != 1 || proof.Verify(b, oldTrust).Valid() {
 		t.Fatalf("без old_keys в пакете записи 2 подписей %d", len(b.Cosignatures))
 	}
 }
@@ -1271,4 +1272,24 @@ func TestCosignRecosignRefusalIsAlarm(t *testing.T) {
 	if st := s.Status().Cosigners[0]; err == nil || !st.Refused {
 		t.Fatalf("свидетель держит другую историю (422 на повторный запрос головы %d), а тревоги refused нет: %v, %+v", wsize, err, st)
 	}
+}
+
+// sameCosigs — те же подписи в том же порядке. В пакете одной улики у ключа
+// их до двух: над головой не раньше звена улики и над головой звена токена
+// T2 (POE для T2, proof.revoked).
+func sameCosigs(a, b []proof.Cosignature) bool {
+	return len(a) > 0 && slices.EqualFunc(a, b, func(x, y proof.Cosignature) bool {
+		return x.Name == y.Name && x.Size == y.Size && bytes.Equal(x.Sig, y.Sig)
+	})
+}
+
+// cosigKeys — сколько разных ключей свидетелей подписали головы пакета.
+func cosigKeys(cs []proof.Cosignature) int {
+	keys := map[string]bool{}
+	for _, c := range cs {
+		if len(c.Sig) >= 4 {
+			keys[c.Name+"/"+string(c.Sig[:4])] = true
+		}
+	}
+	return len(keys)
 }

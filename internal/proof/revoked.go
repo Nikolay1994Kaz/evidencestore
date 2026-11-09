@@ -54,10 +54,11 @@ type stampCheck struct {
 	tokens    int
 	poe       []poeMark
 	pending   []pendingMark
+	revoked   []string // метки, отозванные без компрометации не позже их времени
 	crls      []string
-	unchecked []string
-	stale     []string
-	foreign   []string
+	unchecked []string        // отпечатки сертификатов, чей отзыв не проверен
+	beyond    []string        // подписи свидетелей дальше конца пакета: куда его продлить
+	named     map[string]bool // CRL, которые назвал центр в цепочке какой-то метки
 	notes     []string
 }
 
@@ -69,10 +70,12 @@ type poeMark struct {
 }
 
 // pendingMark — метка отозванного по компрометации сертификата: ей нужна
-// POE раньше cutoff. link — звено с её токеном (0 — пакет его не показывает).
+// POE раньше cutoff. link — звено с её токеном (0 — пакет его не показывает),
+// gen — её собственное время.
 type pendingMark struct {
 	link   uint64
 	head   uint64 // голова, которую заверяет метка
+	gen    time.Time
 	cutoff time.Time
 	what   string
 	why    string
@@ -96,11 +99,14 @@ func (sc *stampCheck) verify(token []byte, head uint64, root [32]byte, link uint
 	}
 	v, err := sc.revs.Check(info.Chains, info.GenTime)
 	if err != nil {
+		// Пункт, где метка нужна, не проходит; пункт об отзыве — тоже, чтобы
+		// не говорить «ни одна метка не на отозванном».
+		sc.revoked = append(sc.revoked, fmt.Sprintf("%s: %v", what, err))
 		return tsa.Info{}, err
 	}
 	sc.record(v)
 	if v.NeedPOE {
-		sc.pending = append(sc.pending, pendingMark{link: link, head: head, cutoff: v.Cutoff, what: what, why: revokedWhy(v)})
+		sc.pending = append(sc.pending, pendingMark{link: link, head: head, gen: info.GenTime.UTC(), cutoff: v.Cutoff, what: what, why: revokedWhy(v)})
 	} else {
 		sc.poe = append(sc.poe, poeMark{head: head, at: info.GenTime.UTC(), what: fmt.Sprintf("the time-stamp of %q over head %d at %s", info.Signer.Subject.CommonName, head, fmtTime(info.GenTime))})
 	}
@@ -116,7 +122,7 @@ func revokedWhy(v tsa.Verdict) string {
 	return s
 }
 
-// record — по каким CRL проверено, что не проверено и что устарело.
+// record — по каким CRL проверено, что не проверено, заметки.
 func (sc *stampCheck) record(v tsa.Verdict) {
 	add := func(list *[]string, s string) {
 		if !slices.Contains(*list, s) {
@@ -127,13 +133,21 @@ func (sc *stampCheck) record(v tsa.Verdict) {
 		add(&sc.crls, s)
 	}
 	for _, c := range v.Unchecked {
-		add(&sc.unchecked, c.Subject.String())
+		add(&sc.unchecked, tsa.Fingerprint(c))
 	}
-	for _, s := range v.Stale {
-		add(&sc.stale, s)
+	for _, s := range v.Notes {
+		add(&sc.notes, s)
 	}
-	for _, s := range v.Foreign {
-		add(&sc.foreign, s)
+	sc.markNamed(v)
+}
+
+// markNamed — CRL, к которым относится хоть один сертификат меток пакета.
+func (sc *stampCheck) markNamed(v tsa.Verdict) {
+	if sc.named == nil {
+		sc.named = map[string]bool{}
+	}
+	for _, s := range v.Named {
+		sc.named[s] = true
 	}
 }
 
@@ -153,50 +167,62 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 		sc.archived(archive, last, rootAt)
 		sc.cosigned(cs, keys, storeKey, last, rootAt)
 	}
-	var failed, shown []string
+	failed := slices.Clone(sc.revoked)
+	var shown []string
 	for _, p := range sc.pending {
 		m, ok := sc.poeFor(p)
 		switch {
 		case ok:
 			shown = append(shown, fmt.Sprintf("%s rests on %s, and %s shows it existed before %s", p.what, p.why, m.what, fmtTime(p.cutoff)))
 		case p.link == 0:
-			failed = append(failed, fmt.Sprintf("%s rests on %s: its time proves nothing, and the bundle does not show where its token lies in the chain, so nothing can show it existed earlier: ask for a bundle that reaches the link holding it (evidencestore proof … -to-head a head after %d, from a store of this release)", p.what, p.why, p.head))
+			failed = append(failed, fmt.Sprintf("%s rests on %s: its time proves nothing, and the bundle does not show where its token lies in the chain, so nothing can show it existed earlier (a bundle from a store of this release with a second TSA or a cosigning witness carries it)", p.what, p.why))
 		default:
-			failed = append(failed, fmt.Sprintf("%s rests on %s: its time proves nothing, and nothing in the bundle shows it existed before %s — a time-stamp of another TSA or a cosignature of a witness given with -witness-key, over a head at or after link %d and dated earlier", p.what, p.why, fmtTime(p.cutoff), p.link))
+			f := fmt.Sprintf("%s rests on %s: its time proves nothing, and nothing in the bundle shows it existed before %s — a time-stamp of another TSA or a cosignature of a witness given with -witness-key, over a head at or after link %d and dated earlier", p.what, p.why, fmtTime(p.cutoff), p.link)
+			if len(sc.beyond) > 0 {
+				f += "; " + strings.Join(sc.beyond, "; ")
+			}
+			failed = append(failed, f)
 		}
 	}
 	var err error
 	if len(failed) > 0 {
 		err = errors.New(strings.Join(failed, "; "))
 	}
-	detail := fmt.Sprintf("%d time-stamps, none rests on a revoked certificate", sc.tokens)
+	detail := fmt.Sprintf("%d time-stamps, none found revoked", sc.tokens)
 	if len(shown) > 0 {
 		detail = strings.Join(shown, "; ")
+	}
+	if n := len(sc.unchecked); n > 0 {
+		detail += fmt.Sprintf("; the revocation of %d certificates was not checked (see the notes)", n)
 	}
 	if len(sc.crls) > 0 {
 		detail += "; checked against " + strings.Join(sc.crls, ", ")
 	}
 	add(revocationCheckName, err, detail)
-	for _, s := range sc.unchecked {
-		sc.notes = append(sc.notes, fmt.Sprintf("the revocation of certificate %q was not checked: no CRL of its issuer was given (-tsa-crl)", s))
-	}
-	for _, s := range sc.stale {
-		sc.notes = append(sc.notes, fmt.Sprintf("%s is past its next update: a revocation after it is not seen; fetch a fresh one", s))
-	}
-	for _, s := range sc.foreign {
-		sc.notes = append(sc.notes, s+": not used")
+	for _, l := range sc.revs.CRLs() {
+		if !sc.named[l] {
+			sc.notes = append(sc.notes, l+" is of no CA in the chains of the time-stamps in this bundle: not used")
+		}
 	}
 }
 
 // poeFor — самая ранняя POE для метки p: голова не раньше звена её токена и
-// время раньше отсечки.
+// время раньше отсечки. Время POE не раньше времени самой метки: голова с
+// её токеном не могла быть заверена раньше, чем токен выдан, и POE с
+// отстающими часами сдвигается к нему.
 func (sc *stampCheck) poeFor(p pendingMark) (poeMark, bool) {
 	var best *poeMark
 	if p.link == 0 {
 		return poeMark{}, false
 	}
+	at := func(m poeMark) time.Time {
+		if m.at.Before(p.gen) {
+			return p.gen
+		}
+		return m.at
+	}
 	for i, m := range sc.poe {
-		if m.head >= p.link && m.at.Before(p.cutoff) && (best == nil || m.at.Before(best.at)) {
+		if m.head >= p.link && at(m).Before(p.cutoff) && (best == nil || at(m).Before(at(*best))) {
 			best = &sc.poe[i]
 		}
 	}
@@ -243,6 +269,7 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 			continue
 		}
 		v, err := sc.revs.Check(info.Chains, info.GenTime)
+		sc.markNamed(v)
 		switch {
 		case err != nil:
 			sc.notes = append(sc.notes, fmt.Sprintf("the archive time-stamp over head %d was not used: %v", a.HeadSeq, err))
@@ -258,17 +285,18 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 
 // cosigned — подписи закреплённых свидетелей как POE: голова в пакете, её
 // корень сходится, подпись проходит. Подписи дальше конца пакета не в счёт:
-// их корень пакету не сверить.
+// их корень пакету не сверить, — но называют голову, до которой продлить
+// пакет.
 func (sc *stampCheck) cosigned(cs []Cosignature, keys []cosign.Verifier, storeKey ed25519.PublicKey, last uint64, rootAt func(uint64) ([32]byte, bool)) {
 	if len(storeKey) != ed25519.PublicKeySize {
 		return
 	}
 	origin := OriginFor(storeKey)
 	for _, c := range cs {
-		if len(c.Root) != 32 || len(c.Sig) < 4 || c.Size == 0 || c.Size > last {
+		if len(c.Root) != 32 || len(c.Sig) < 4 || c.Size == 0 {
 			continue
 		}
-		if r, ok := rootAt(c.Size); !ok || r != [32]byte(c.Root) {
+		if r, ok := rootAt(c.Size); c.Size <= last && (!ok || r != [32]byte(c.Root)) {
 			continue
 		}
 		for _, k := range keys {
@@ -280,6 +308,12 @@ func (sc *stampCheck) cosigned(cs []Cosignature, keys []cosign.Verifier, storeKe
 				continue
 			}
 			t := time.Unix(int64(at), 0).UTC()
+			if c.Size > last {
+				// Корень дальше конца пакета не сверить: подсказка, до какой
+				// головы просить пакет.
+				sc.beyond = append(sc.beyond, fmt.Sprintf("witness %s cosigned head %d at %s, past the end of the bundle: ask for one up to it (evidencestore proof … -to-head %d)", k.Name, c.Size, fmtTime(t), c.Size))
+				continue
+			}
 			sc.poe = append(sc.poe, poeMark{head: c.Size, at: t, what: fmt.Sprintf("witness %s (key %08x), which cosigned head %d at %s", k.Name, k.ID, c.Size, fmtTime(t))})
 		}
 	}

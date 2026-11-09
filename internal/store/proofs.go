@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -151,9 +153,10 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	}
 	// Лист токена T2 — где лежит токен (proof.revoked): по нему метку
 	// отозванного по компрометации сертификата спасает поздняя метка второй
-	// службы. Пакет доходит до его звена, только если вторая служба есть или
-	// пакет и так туда доходит: без неё лист нечем было бы подкрепить.
-	if b.Upper != nil && (s.archiver != nil || to >= upperLeaf.LinkSeq) {
+	// службы или подпись свидетеля над головой его звена. Пакет доходит до
+	// этого звена, только если есть то или другое или пакет и так туда
+	// доходит: иначе лист нечем было бы подкрепить.
+	if b.Upper != nil && (s.archiveOn || len(s.cosigners) > 0 || to >= upperLeaf.LinkSeq) {
 		b.Upper.Inclusion = &upperLeaf
 		to = max(to, upperLeaf.LinkSeq)
 	}
@@ -169,9 +172,23 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	if b.Frontier, b.Checkpoint, err = s.bundleHeadLocked(links); err != nil {
 		return proof.Bundle{}, err
 	}
-	// Подписи свидетелей C2SP: голова не раньше звена улики.
+	// Подписи свидетелей C2SP: голова не раньше звена улики — и не раньше
+	// звена токена T2: подпись над ней — POE для T2, если сертификат службы
+	// отзовут по компрометации (proof.revoked). Хранилище отдаёт свидетелям
+	// голову звена каждого токена, так что обычно это она и есть.
 	if b.Cosignatures, err = s.cosignaturesForLocked(links[0].Seq, links[len(links)-1].Seq, n); err != nil {
 		return proof.Bundle{}, err
+	}
+	if b.Upper != nil && b.Upper.Inclusion != nil {
+		more, err := s.cosignaturesForLocked(links[0].Seq, links[len(links)-1].Seq, b.Upper.Inclusion.LinkSeq)
+		if err != nil {
+			return proof.Bundle{}, err
+		}
+		for _, c := range more {
+			if !slices.ContainsFunc(b.Cosignatures, func(o proof.Cosignature) bool { return o.Name == c.Name && bytes.Equal(o.Sig, c.Sig) }) {
+				b.Cosignatures = append(b.Cosignatures, c)
+			}
+		}
 	}
 	// Метки второй службы над головами не раньше токенов T1 и T2.
 	var tokens []uint64

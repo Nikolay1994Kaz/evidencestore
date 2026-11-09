@@ -260,8 +260,9 @@ func TestTSAArchive(t *testing.T) {
 		"ftp":          func(c *Config) { c.TSA.Archive.URL = "ftp://tsa.two.example/" },
 		"local":        func(c *Config) { c.TSA.Archive.URL = "local" },
 		"та же служба": func(c *Config) { c.TSA.Archive.URL = c.TSA.URL + "/" },
-		"без основной": func(c *Config) { c.TSA.URL, c.TSA.Trust = "", nil },
-		"без доверия":  func(c *Config) { c.TSA.Archive.Trust = nil },
+		"та же по https и с портом": func(c *Config) { c.TSA.Archive.URL = "https://TSA.one.example:8443/" },
+		"без основной":              func(c *Config) { c.TSA.URL, c.TSA.Trust = "", nil },
+		"без доверия":               func(c *Config) { c.TSA.Archive.Trust = nil },
 	} {
 		c := base()
 		spoil(c)

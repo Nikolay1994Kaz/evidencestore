@@ -2,10 +2,17 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -111,5 +118,50 @@ func TestTSARevocationFlags(t *testing.T) {
 	errb.Reset()
 	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-tsa-crl", trust}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "crl") {
 		t.Fatalf("сертификат вместо CRL: %d %s", code, errb.String())
+	}
+}
+
+// Перечни -tsa-revoked копятся (флаг повторяется или через запятую), как
+// -tsa-crl, а не «последний побеждает»; второй список в одном файле и
+// дельта-CRL — неверный вызов, а не молча неполная проверка.
+func TestTSARevocationListsAndDelta(t *testing.T) {
+	bundle, key, trust, _, revoked := archivedWorld(t)
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty.json")
+	os.WriteFile(empty, []byte(`[]`), 0o600)
+	var out, errb bytes.Buffer
+	for _, args := range [][]string{
+		{"-tsa-revoked", revoked, "-tsa-revoked", empty},
+		{"-tsa-revoked", empty + "," + revoked},
+	} {
+		out.Reset()
+		if code := run(append([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust}, args...), &out, &errb); code != exitInvalid {
+			t.Fatalf("%v: %d\n%s", args, code, out.String())
+		}
+	}
+	data, _ := os.ReadFile(revoked)
+	both := filepath.Join(dir, "both.json")
+	os.WriteFile(both, append([]byte("[]\n"), data...), 0o600)
+	errb.Reset()
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-tsa-revoked", both}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "data after the list") {
+		t.Fatalf("два списка в файле: %d %s", code, errb.String())
+	}
+	// Дельта-CRL любого центра: отказ ещё при разборе.
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "delta CA"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true}
+	caDER, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
+	ca, _ := x509.ParseCertificate(caDER)
+	base, _ := asn1.Marshal(big.NewInt(1))
+	der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(2), ThisUpdate: time.Now(), NextUpdate: time.Now().Add(time.Hour),
+		ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 27}, Critical: true, Value: base}}}, ca, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta := filepath.Join(dir, "delta.crl")
+	os.WriteFile(delta, der, 0o600)
+	errb.Reset()
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-tsa-crl", delta}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "delta CRL") {
+		t.Fatalf("дельта-CRL: %d %s", code, errb.String())
 	}
 }

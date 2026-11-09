@@ -410,7 +410,7 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("tsa.archive.url %q must be http:// or https:// with a host", a.URL))
 		case c.TSA.URL == "":
 			errs = append(errs, errors.New("tsa.archive needs tsa.url: the second TSA vouches for the time-stamps of the first"))
-		case strings.TrimRight(a.URL, "/") == strings.TrimRight(c.TSA.URL, "/"):
+		case sameService(a.URL, c.TSA.URL):
 			errs = append(errs, errors.New("tsa.archive.url must not be tsa.url: a time-stamp of the same TSA shows nothing once its key is compromised"))
 		case len(a.Trust) == 0:
 			errs = append(errs, errors.New("tsa.archive.trust is required: its tokens are verified before they are kept"))
@@ -542,4 +542,16 @@ func (c *Config) Source(name string) (Source, bool) {
 func CertFingerprint(der []byte) string {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:])
+}
+
+// sameService — две ссылки на одну службу меток: схема, порт, регистр имени
+// и косая черта в конце службу не меняют (http и https одной службы — одна
+// служба).
+func sameService(a, b string) bool {
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	if errA != nil || errB != nil {
+		return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
+	}
+	return strings.EqualFold(ua.Hostname(), ub.Hostname()) && strings.TrimRight(ua.EscapedPath(), "/") == strings.TrimRight(ub.EscapedPath(), "/")
 }
