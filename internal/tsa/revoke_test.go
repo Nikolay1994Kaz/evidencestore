@@ -296,6 +296,14 @@ func TestRevocationsList(t *testing.T) {
 	if _, err := w.check(r); !errors.Is(err, ErrRevoked) {
 		t.Fatalf("корень выведен до метки: %v", err)
 	}
+	// Ключ корня скомпрометирован (по перечню): под подозрением всё под ним.
+	r = NewRevocations(now)
+	if err := r.AddList(write(`[{"cert_sha256": "` + Fingerprint(w.a.Root()) + `", "revoked": "2026-10-03T00:00:00Z", "reason": "keyCompromise"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := w.check(r); err != nil || !v.NeedPOE || v.Revoked == nil || !bytes.Equal(v.Revoked.Raw, w.a.Root().Raw) {
+		t.Fatalf("компрометация корня по перечню: %+v %v", v, err)
+	}
 	for name, body := range map[string]string{
 		"не hex":        `[{"cert_sha256": "xyz", "revoked": "2026-09-01T00:00:00Z"}]`,
 		"без времени":   `[{"cert_sha256": "` + Fingerprint(w.a.Root()) + `"}]`,
@@ -887,9 +895,11 @@ func TestRevocationsEntriesWithoutCRLSign(t *testing.T) {
 	}
 	// Тот же токен с обоими выпусками центра: статус по выпуску с cRLSign, и
 	// он же снимает удержание.
-	_, info2 := tsaUnder(t, interA, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), gen, []*x509.Certificate{rootA.cert, rootB.cert}, interA.cert, interB.cert)
-	if v, err := r.Check(info2.Chains, info2.GenTime); err != nil || v.NeedPOE || hasNote(v, "may sign CRLs") {
-		t.Fatalf("удержание при выпуске с cRLSign в другой цепочке: %+v %v", v, err)
+	for _, order := range [][]*x509.Certificate{{interA.cert, interB.cert}, {interB.cert, interA.cert}} {
+		_, info2 := tsaUnder(t, interA, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), gen, []*x509.Certificate{rootA.cert, rootB.cert}, order...)
+		if v, err := r.Check(info2.Chains, info2.GenTime); err != nil || v.NeedPOE || hasNote(v, "may sign CRLs") {
+			t.Fatalf("удержание при выпуске с cRLSign в другой цепочке (первым — %s): %+v %v", order[0].Subject, v, err)
+		}
 	}
 }
 
