@@ -73,14 +73,17 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 		return nil
 	}
 	s.chainMu.Lock()
-	h, ok, err := s.shippedHeadLocked()
+	h, ok, headErr := s.shippedHeadLocked()
 	if ok {
 		s.queueWitnessHeadLocked(h)
 	}
 	queue := append([]witnessHead(nil), s.witnessQueue...)
 	s.chainMu.Unlock()
-	if err != nil {
-		return err
+	if headErr != nil {
+		// Голову копии не снять (tree.hashes) — очередь (головы под метками,
+		// с корнями из памяти) всё равно уходит; ошибка — в счётчик.
+		s.witnessErrors.Add(1)
+		headErr = fmt.Errorf("witness: the head of the copy: %w", headErr)
 	}
 	limit := ^uint64(0)
 	if s.replicaRemote != nil {
@@ -105,7 +108,7 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 		s.chainMu.Unlock()
 		s.witnessOK.Store(time.Now().UnixNano())
 	}
-	return nil
+	return headErr
 }
 
 // shippedHeadLocked — текущая голова для свидетелей: с копией наружу — не

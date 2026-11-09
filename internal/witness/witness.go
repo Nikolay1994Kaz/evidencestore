@@ -149,7 +149,8 @@ func New(signer cosign.Signer, logs []Log, dir string, log *slog.Logger) (*Serve
 		}
 		s.state[origin] = &st
 	}
-	last, err := readLedger(filepath.Join(dir, cosignedFile))
+	ledgerPath := filepath.Join(dir, cosignedFile)
+	last, whole, err := readLedger(ledgerPath)
 	if err != nil {
 		return nil, err
 	}
@@ -165,8 +166,20 @@ func New(signer cosign.Signer, logs []Log, dir string, log *slog.Logger) (*Serve
 			return nil, fmt.Errorf("witness: the state of %s holds head %d, older than head %d this witness has cosigned (%s): it was restored from an older copy; going on would cosign a second history under this key: %s", origin, st.Size, rec.Size, cosignedFile, newKeyAdvice)
 		}
 	}
-	if s.ledger, err = os.OpenFile(filepath.Join(dir, cosignedFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err != nil {
+	if s.ledger, err = os.OpenFile(ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err != nil {
 		return nil, err
+	}
+	// Оборванная последняя строка (падение посреди записи) отрезается: иначе
+	// следующая строка приклеилась бы к ней, и следующий старт не прошёл бы.
+	if fi, err := s.ledger.Stat(); err != nil {
+		s.ledger.Close()
+		return nil, err
+	} else if fi.Size() > whole {
+		log.Warn("witness: a torn last line of the journal of cosigned heads is cut", "file", ledgerPath, "bytes", fi.Size()-whole)
+		if err := s.ledger.Truncate(whole); err != nil {
+			s.ledger.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -175,34 +188,36 @@ func New(signer cosign.Signer, logs []Log, dir string, log *slog.Logger) (*Serve
 const newKeyAdvice = "start a new witness with a new key (eswitness init with a new data_dir) and give its verifier key to the store and to auditors; cosignatures of this key stay valid for the history they cover"
 
 // readLedger — последняя подписанная голова каждого журнала по журналу
-// подписанного. Оборванная последняя строка (падение посреди записи)
-// пропускается: её голова есть в состоянии, записанном раньше.
-func readLedger(path string) (map[string]cosignedRecord, error) {
+// подписанного и длина его целых строк. Оборванная последняя строка (падение
+// посреди записи) не в счёт: её голова есть в состоянии, записанном раньше.
+func readLedger(path string) (map[string]cosignedRecord, int64, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
 	last := map[string]cosignedRecord{}
 	r := bufio.NewReaderSize(f, 64<<10)
+	var whole int64
 	for {
 		line, err := r.ReadBytes('\n')
 		if errors.Is(err, io.EOF) {
-			return last, nil
+			return last, whole, nil
 		}
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		var rec cosignedRecord
 		if err := json.Unmarshal(line, &rec); err != nil || len(rec.Root) != 32 {
-			return nil, fmt.Errorf("witness: %s: a line does not parse: %v", path, err)
+			return nil, 0, fmt.Errorf("witness: %s: the line at offset %d does not parse (%v): the journal is damaged; if it cannot be repaired, %s", path, whole, err, newKeyAdvice)
 		}
 		if prev, ok := last[rec.Origin]; !ok || rec.Size >= prev.Size {
 			last[rec.Origin] = rec
 		}
+		whole += int64(len(line))
 	}
 }
 
@@ -334,6 +349,15 @@ func (s *Server) addCheckpoint(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "the checkpoint has the size of the last cosigned one and another root", http.StatusUnprocessableEntity)
 			return
 		}
+		// Та же голова снова (её заметку отдаёт GET …/checkpoint кому угодно):
+		// ответ — уже данная подпись, без записи на диск. Иначе повтор
+		// публичной заметки писал бы состояние и журнал подписанного без
+		// предела.
+		if line := ownSigLine(cur.Note, s.signer); line != "" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			io.WriteString(w, line)
+			return
+		}
 	default:
 		p := make(tlog.TreeProof, len(proof))
 		for i, h := range proof {
@@ -461,8 +485,17 @@ func (s *Server) refuse(ev refusal) {
 	}
 	f, err := os.OpenFile(filepath.Join(s.dir, refusedFile), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err == nil {
-		_, err = f.Write(append(line, '\n'))
-		err = errors.Join(err, f.Sync(), f.Close())
+		var size int64
+		if fi, serr := f.Stat(); serr == nil {
+			size = fi.Size()
+		}
+		if _, err = f.Write(append(line, '\n')); err == nil {
+			err = f.Sync()
+		}
+		if err != nil {
+			f.Truncate(size) // недописанная строка не склеится со следующей
+		}
+		err = errors.Join(err, f.Close())
 	}
 	if err != nil {
 		s.log.Error("witness: writing the refusal journal", "err", err)
@@ -483,15 +516,39 @@ func (s *Server) warnProof(origin string, old, size uint64) {
 }
 
 // appendLedger дописывает строку в журнал подписанного с fsync. Звать под mu.
+// Недописанная строка (диск полон) отрезается: следующая не приклеится к ней.
 func (s *Server) appendLedger(rec cosignedRecord) error {
 	line, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	if _, err := s.ledger.Write(append(line, '\n')); err != nil {
+	fi, err := s.ledger.Stat()
+	if err != nil {
 		return err
 	}
-	return s.ledger.Sync()
+	if _, err = s.ledger.Write(append(line, '\n')); err == nil {
+		err = s.ledger.Sync()
+	}
+	if err != nil {
+		s.ledger.Truncate(fi.Size())
+	}
+	return err
+}
+
+// ownSigLine — строка подписи этого свидетеля в хранимой заметке (с переводом
+// строки), "" — её нет.
+func ownSigLine(note string, signer cosign.Signer) string {
+	_, sigs, err := cosign.SplitNote([]byte(note))
+	if err != nil {
+		return ""
+	}
+	for _, l := range sigs {
+		name, sig, err := cosign.ParseSigLine(l)
+		if err == nil && name == signer.Name && binary.BigEndian.Uint32(sig) == signer.ID {
+			return l + "\n"
+		}
+	}
+	return ""
 }
 
 // logSigLine — первая строка подписи журнала с его именем и номером ключа, как

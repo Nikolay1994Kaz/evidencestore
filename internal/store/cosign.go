@@ -3,6 +3,7 @@ package store
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -38,15 +39,17 @@ import (
 // последней головы, которую подписал свидетель, доказательство продолжения от
 // неё и заметка точки. Ответ — подпись свидетеля. Хранилище проверяет её
 // ключом из конфигурации и только тогда кладёт в журнал подписей
-// (data_dir/cosignatures.jsonl, fsync на каждую), а из журнала подписи идут в
-// пакеты: у каждого свидетеля — подписанная раньше всех голова не раньше
-// закрепляемого звена.
+// (data_dir/cosign/cosignatures.jsonl, fsync на каждую), а из журнала подписи
+// идут в пакеты: у каждого свидетеля — подписанная раньше всех голова не
+// раньше закрепляемого звена.
 //
 // 409 — свидетель называет размер своей последней головы: после запуска
-// хранилище его не знает и спрашивает с old 0, как велит tlog-witness. 422 —
-// доказательство не сошлось: свидетель держит другую историю этого
-// хранилища. Это тревога (evidencestore_cosigner_refused), голова остаётся в
-// очереди, решает человек: так свидетель и ловит переписанную цепь.
+// хранилище спрашивает его с последней головы этого свидетеля в журнале
+// подписей (с нуля — только если подписей ещё нет), и 409 с размером младше
+// значит, что свидетель потерял состояние (P-115). 422 — доказательство не
+// сошлось: свидетель держит другую историю этого хранилища. Это тревога
+// (evidencestore_cosigner_refused), голова остаётся в очереди, решает
+// человек: так свидетель и ловит переписанную цепь.
 //
 // Журнал подписей уезжает в копию наружу вместе с журналом улик и цепью и
 // возвращается при подъёме: свидетель хранит только последнюю голову, и
@@ -163,17 +166,17 @@ func (s *Store) openCosigners() error {
 			s.log.Error("cosignatures: a line is not used", "offset", off, "err", err)
 		case c != nil:
 			ref.off, ref.n = off, len(line)
-			refs := s.cosignIdx[c.v.Name]
-			// Подписи одного свидетеля — по размеру: следующая не меньше
-			// прежней (tlog-cosignature). Повтор того же размера остаётся за
-			// первым: первая выдача в пакет проверяет их по порядку, и
-			// испорченная первая не прячет верную.
-			if len(refs) == 0 || ref.size >= refs[len(refs)-1].size {
-				s.cosignIdx[c.v.Name] = append(refs, ref)
-				c.head.Store(ref.size)
-			}
+			s.cosignIdx[c.v.Name] = append(s.cosignIdx[c.v.Name], ref)
 		}
 		off += int64(len(line))
+	}
+	// Подписи одного свидетеля идут по размеру (tlog-cosignature), но строка
+	// с завышенным размером (порча) не должна прятать верные после неё:
+	// индекс сортируется, повторы одного размера остаются в порядке файла —
+	// первая выдача в пакет проверяет их по очереди.
+	for name, refs := range s.cosignIdx {
+		slices.SortStableFunc(refs, func(a, b cosigRef) int { return cmp.Compare(a.size, b.size) })
+		s.cosignIdx[name] = refs
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		f.Close()
@@ -293,19 +296,26 @@ func (s *Store) CosignOnce(ctx context.Context) error {
 		return nil
 	}
 	s.chainMu.Lock()
-	h, ok, err := s.shippedHeadLocked()
+	h, ok, headErr := s.shippedHeadLocked()
 	if ok {
 		s.queueCosignLocked(h)
 	}
 	s.chainMu.Unlock()
-	if err != nil {
-		return err
-	}
 	limit := ^uint64(0)
 	if s.replicaRemote != nil {
 		limit = s.replicaShipped.Load()
 	}
-	errs := make([]error, len(s.cosigners))
+	// Голову копии не снять (tree.hashes) — очередь всё равно уходит: головы
+	// под метками в ней уже с корнями; ошибка видна у каждого свидетеля.
+	errs := make([]error, len(s.cosigners)+1)
+	if headErr != nil {
+		errs[len(s.cosigners)] = fmt.Errorf("the head for the witnesses: %w", headErr)
+		for _, c := range s.cosigners {
+			c.errors.Add(1)
+			msg := errs[len(s.cosigners)].Error()
+			c.lastErr.Store(&msg)
+		}
+	}
 	var wg sync.WaitGroup
 	for i, c := range s.cosigners {
 		wg.Go(func() {
@@ -407,6 +417,9 @@ func (s *Store) cosignHead(ctx context.Context, c *cosigner, h witnessHead) erro
 				// (падение между его ответом и записью): она нужна пакетам,
 				// которые на ней кончаются, — просим её снова.
 				if err := s.recosign(ctx, c, size); err != nil {
+					// В следующем обходе — снова с журнала: 409 вернёт к этой
+					// голове, и её подпись будет запрошена ещё раз.
+					c.known = false
 					return fmt.Errorf("head %d the witness has cosigned, again: %w", size, err)
 				}
 			}
@@ -466,10 +479,14 @@ func (s *Store) recosign(ctx context.Context, c *cosigner, m uint64) error {
 	if err != nil {
 		return err
 	}
-	if code != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", code, strings.TrimSpace(string(answer)))
+	switch code {
+	case http.StatusOK:
+		return s.keepCosignature(c, h, answer)
+	case http.StatusUnprocessableEntity:
+		c.refused.Store(true)
+		return errCosignRefused
 	}
-	return s.keepCosignature(c, h, answer)
+	return fmt.Errorf("HTTP %d: %s", code, strings.TrimSpace(string(answer)))
 }
 
 func (s *Store) chainSize() uint64 {

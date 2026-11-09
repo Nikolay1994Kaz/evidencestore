@@ -522,3 +522,59 @@ func TestBodyLimit(t *testing.T) {
 		t.Fatalf("тело больше предела: %d %q", code, body)
 	}
 }
+
+// Оборванная последняя строка журнала подписанного (падение посреди записи)
+// отрезается при запуске: следующая подпись ложится целой строкой, и
+// следующий запуск проходит.
+func TestWitnessLedgerTornTail(t *testing.T) {
+	c := newChain(t)
+	dir := t.TempDir()
+	r := newRig(t, dir, c)
+	c.grow(4)
+	r.mustCosign(c, 0, 2)
+	r.w.Close()
+	ledger := filepath.Join(dir, cosignedFile)
+	f, err := os.OpenFile(ledger, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(`{"origin":"` + c.origin() + `","si`)
+	f.Close()
+	r2 := reopen(t, dir, r.key, c)
+	r2.mustCosign(c, 2, 4)
+	r2.w.Close()
+	if _, err := New(r.key, []Log{{Origin: c.origin(), Key: c.signer.PublicKey()}}, dir, nil); err != nil {
+		t.Fatalf("после оборванной строки свидетель не стартует: %v", err)
+	}
+	data, _ := os.ReadFile(ledger)
+	if bytes.Contains(data, []byte(`"si{`)) || !bytes.HasSuffix(data, []byte("\n")) {
+		t.Fatalf("журнал подписанного: %q", data)
+	}
+}
+
+// Та же голова снова (публичная заметка из GET …/checkpoint): ответ — уже
+// данная подпись, на диск ничего не пишется.
+func TestWitnessReplayWritesNothing(t *testing.T) {
+	c := newChain(t)
+	dir := t.TempDir()
+	r := newRig(t, dir, c)
+	now := time.Unix(1_800_000_000, 0)
+	r.w.Now = func() time.Time { return now }
+	c.grow(3)
+	t1 := r.mustCosign(c, 0, 3)
+	ledger := filepath.Join(dir, cosignedFile)
+	before, _ := os.ReadFile(ledger)
+	statePath := filepath.Join(dir, stateDir, OriginHash(c.origin())+".json")
+	stateBefore, _ := os.ReadFile(statePath)
+	now = now.Add(time.Hour)
+	for range 20 {
+		if t2 := r.mustCosign(c, 3, 3); t2 != t1 {
+			t.Fatalf("повтор той же головы — новая подпись: время %d, было %d", t2, t1)
+		}
+	}
+	after, _ := os.ReadFile(ledger)
+	stateAfter, _ := os.ReadFile(statePath)
+	if !bytes.Equal(before, after) || !bytes.Equal(stateBefore, stateAfter) {
+		t.Fatalf("повторы той же головы писали на диск: журнал %d → %d байт", len(before), len(after))
+	}
+}

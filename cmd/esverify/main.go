@@ -109,6 +109,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	pt := proof.Trust{StoreKey: key, TSA: trust, AllowNoTSA: *allowNoTSA}
 	if *gatewayKey != "" {
 		// Сначала — как ключ: файл с именем, равным ключу, его не подменяет.
+		if err := notAlsoFile("-gateway-key", *gatewayKey, func(v string) bool { _, err := gateway.ParseKey(v); return err == nil }); err != nil {
+			return usageErr(err)
+		}
 		if pt.GatewayKey, err = gateway.ParseKey(*gatewayKey); err != nil {
 			b, ferr := os.ReadFile(*gatewayKey)
 			if ferr != nil {
@@ -129,6 +132,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// Сначала — как ключ проверки: в нём всегда есть «/», и файл по пути,
 		// равному настоящему ключу (подложенный в каталог аудитора), его не
 		// подменяет. Не ключ — тогда путь к файлу с ключом.
+		if err := notAlsoFile("-witness-key", raw, func(v string) bool { _, err := cosign.ParseVerifier(v); return err == nil }); err != nil {
+			return usageErr(err)
+		}
 		v, err := cosign.ParseVerifier(raw)
 		if err != nil {
 			b, ferr := os.ReadFile(raw)
@@ -276,6 +282,9 @@ func readHeads(dir string) (*proof.Witness, error) {
 // readKey — ключ хранилища: сначала как ключ (файл с именем, равным ключу,
 // его не подменяет), иначе — файл с ключом.
 func readKey(v string) (ed25519.PublicKey, error) {
+	if err := notAlsoFile("-store-key", v, func(v string) bool { _, ok := parseStoreKey(v); return ok }); err != nil {
+		return nil, err
+	}
 	if key, ok := parseStoreKey(v); ok {
 		return key, nil
 	}
@@ -285,6 +294,19 @@ func readKey(v string) (ed25519.PublicKey, error) {
 		}
 	}
 	return nil, errors.New("store key must be a base64 Ed25519 public key")
+}
+
+// notAlsoFile — значение флага разбирается как ключ и при этом есть файл с
+// таким путём: какой из двух имел в виду аудитор, не угадать (путь из 43
+// знаков base64 разбирается как ключ хранилища) — неверный вызов.
+func notAlsoFile(flag, v string, isKey func(string) bool) error {
+	if !isKey(v) {
+		return nil
+	}
+	if _, err := os.Stat(v); err == nil {
+		return fmt.Errorf("%s %q is both a key and the name of a file: pass the key itself, or the file as ./%s", flag, v, v)
+	}
+	return nil
 }
 
 func parseStoreKey(v string) (ed25519.PublicKey, bool) {

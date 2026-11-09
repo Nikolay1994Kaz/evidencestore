@@ -172,8 +172,27 @@ func TestWitnessKeyNotShadowedByFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errb bytes.Buffer
+	// Строка — и ключ, и путь к файлу: какой имел в виду аудитор, не угадать,
+	// и подложенный ключ не берётся молча — неверный вызов.
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-witness-key", vkey}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "both a key and the name of a file") {
+		t.Fatalf("ключ при подложенном файле: %d\n%s%s", code, out.String(), errb.String())
+	}
+	os.RemoveAll(filepath.Join(dir, strings.SplitN(filepath.FromSlash(vkey), string(filepath.Separator), 2)[0]))
+	errb.Reset()
 	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-witness-key", vkey}, &out, &errb); code != exitValid {
-		t.Fatalf("ключ подменён подложенным файлом: %d\n%s%s", code, out.String(), errb.String())
+		t.Fatalf("ключ без подложенного файла: %d\n%s%s", code, out.String(), errb.String())
+	}
+	// Ключ хранилища в файле, чьё имя — 43 знака base64: имя разбирается и
+	// как ключ — неверный вызов, а с «./» — файл.
+	pub, _ := os.ReadFile(key)
+	keyName := strings.Repeat("A", 43)
+	os.WriteFile(filepath.Join(dir, keyName), pub, 0o600)
+	errb.Reset()
+	if code := run([]string{"-proof", bundle, "-store-key", keyName, "-tsa-trust", trust, "-witness-key", vkey}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "both a key and the name of a file") {
+		t.Fatalf("-store-key — имя файла в виде ключа: %d %s", code, errb.String())
+	}
+	if code := run([]string{"-proof", bundle, "-store-key", "./" + keyName, "-tsa-trust", trust, "-witness-key", vkey}, &out, &errb); code != exitValid {
+		t.Fatalf("-store-key ./файл: %d %s", code, errb.String())
 	}
 	v, _ := cosign.ParseVerifier(vkey)
 	twin := strings.Replace(vkey, "witness.example/w1+", "witness.example/w2+", 1)

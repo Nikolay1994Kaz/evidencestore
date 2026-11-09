@@ -57,6 +57,10 @@ type replicaState struct {
 	Prefix  string // поколение, в которое пишет хранилище: "" (первое) или gen/<номер>/
 	Offsets map[string]int64
 	Head    uint64
+	// SkipCosign — журнал подписей в data_dir не продолжает скопированный
+	// (его удалили или заменили): он больше не копируется, а журнал улик и
+	// цепь — копируются (P-121 R2).
+	SkipCosign bool
 }
 
 // replicaSnapshot — что можно копировать сейчас: размер каждого
@@ -126,10 +130,11 @@ func (s *Store) loadReplicaState(ctx context.Context, r ship.Remote) error {
 	if err != nil {
 		return err
 	}
-	if err := s.checkReplicaTail(ctx, r, files); err != nil {
+	skipCosign, err := s.checkReplicaTail(ctx, r, files)
+	if err != nil {
 		return err
 	}
-	st := &replicaState{Prefix: prefix, Offsets: map[string]int64{}}
+	st := &replicaState{Prefix: prefix, Offsets: map[string]int64{}, SkipCosign: skipCosign}
 	for name, chunks := range files {
 		for _, c := range chunks {
 			st.Offsets[name] = max(st.Offsets[name], c.end)
@@ -150,7 +155,7 @@ const divergedHint = "data_dir lost data after it was copied (a disk that lied a
 // checkReplicaTail сверяет с data_dir последний кусок новейшего файла
 // каждого вида в копии. Разойтись файлы могли только в хвосте: закрытые
 // сегменты не меняются.
-func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[string][]chunk) error {
+func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[string][]chunk) (skipCosign bool, err error) {
 	newest := map[string]string{}
 	for name := range files {
 		kind := name
@@ -170,18 +175,24 @@ func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[s
 		}
 		sealed, err := r.Get(ctx, last.key)
 		if err != nil {
-			return err
+			return false, err
 		}
 		copied, err := openCopy(s.copyKey, last.key, sealed)
 		if err != nil {
-			return fmt.Errorf("%w: %v; another installation wrote this copy, or copy.key is not this store's: point replica.url at a new location (the old copy stays as evidence), or put the right copy.key back from keys.backup_dir", ErrReplicaDiverged, err)
+			return false, fmt.Errorf("%w: %v; another installation wrote this copy, or copy.key is not this store's: point replica.url at a new location (the old copy stays as evidence), or put the right copy.key back from keys.backup_dir", ErrReplicaDiverged, err)
 		}
 		local, err := readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(name)), last.start, last.end)
 		if err != nil || !bytes.Equal(local, copied) {
-			return fmt.Errorf("%w: its %s holds bytes %d-%d that data_dir lacks or has otherwise; %s", ErrReplicaDiverged, name, last.start, last.end, divergedHint)
+			if name == cosignFile {
+				// Журнал подписей не повод останавливать копию улик.
+				s.log.Error("replica: data_dir/"+cosignFile+" does not continue the one in the copy (removed or replaced?): it is not copied any more until replica.url points at a new location; the evidence log and the chain still are", "copy holds", last.end)
+				skipCosign = true
+				continue
+			}
+			return false, fmt.Errorf("%w: its %s holds bytes %d-%d that data_dir lacks or has otherwise; %s", ErrReplicaDiverged, name, last.start, last.end, divergedHint)
 		}
 	}
-	return nil
+	return skipCosign, nil
 }
 
 // headSeqOf — номер головы из имени …heads/<номер>.json.
@@ -277,6 +288,13 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 	var total int64
 	for _, name := range names {
 		size, from := snap.sizes[name], s.replica.Offsets[name]
+		if name == cosignFile && (s.replica.SkipCosign || size < from) {
+			if !s.replica.SkipCosign {
+				s.log.Error("replica: data_dir/"+cosignFile+" is shorter than what the copy holds (removed or truncated?): it is not copied any more until replica.url points at a new location; the evidence log and the chain still are", "size", size, "copied", from)
+				s.replica.SkipCosign = true
+			}
+			continue
+		}
 		if size < from {
 			// Файл стал короче отправленного: так бывает, только если его
 			// обрезали. Молча догонять нельзя — кусок в копии уже другой.

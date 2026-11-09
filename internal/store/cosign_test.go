@@ -679,7 +679,9 @@ func TestCosignJournalDamage(t *testing.T) {
 		json.Unmarshal(l, &r)
 		lastGood = max(lastGood, r.Size)
 	}
-	damaged := `{"name":"witness.example/w1","size":1,"root":"AAAA","sig":"AAAA"}` + "\n" +
+	// Первой — та же испорченная голова длины цепи: завышенный размер в
+	// начале не прячет верные строки после неё.
+	damaged := line(tail) + `{"name":"witness.example/w1","size":1,"root":"AAAA","sig":"AAAA"}` + "\n" +
 		`not json` + "\n" + line(forged) + line(foreign) + line(beyond) + string(good) + line(tail) + `{"name":"witness.example/w1","si`
 	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
 		t.Fatal(err)
@@ -902,5 +904,85 @@ func TestCosignJournalInCopy(t *testing.T) {
 	}
 	if r := proof.Verify(after, w.trust(t, s2)); !r.Valid() {
 		t.Fatalf("пакет после подъёма:\n%s", r.Text())
+	}
+}
+
+// Подпись головы, которую свидетель держит, не пришла с первой попытки
+// (испорченный ответ): в следующем обходе она запрашивается снова.
+func TestCosignRecosignRetried(t *testing.T) {
+	c := newClock()
+	w := newLiveWitness(t, "witness.example/w1")
+	cfg := testConfig(t, w.option())
+	s := openStore(t, cfg, c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	mustCosign(t, s)
+	origin := proof.OriginFor(w.trust(t, s).StoreKey)
+	latest, _ := w.srv.Load().Latest(origin)
+	s.Close()
+	path := filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile))
+	data, _ := os.ReadFile(path)
+	var keep []byte
+	for line := range bytes.Lines(data) {
+		var r cosigRecord
+		json.Unmarshal(line, &r)
+		if r.Size < latest {
+			keep = append(keep, line...)
+		}
+	}
+	os.WriteFile(path, keep, 0o600)
+	s2, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	ingest(t, s2, "abs-core", 4, 4)
+	mustStamp(t, s2)
+	w.corrupt.Store(true)
+	if err := s2.CosignOnce(context.Background()); err == nil {
+		t.Fatal("испорченный ответ на повторный запрос подписи принят")
+	}
+	w.corrupt.Store(false)
+	mustCosign(t, s2)
+	if !s2.hasCosig(w.key.Name, latest) {
+		t.Fatalf("подпись головы %d после неудачной попытки не запрошена снова", latest)
+	}
+}
+
+// Журнал подписей в data_dir удалён, а копия его уже держит: журнал больше
+// не копируется, но журнал улик и цепь копируются дальше.
+func TestCosignJournalRemovedCopyGoesOn(t *testing.T) {
+	c := newClock()
+	ctx := context.Background()
+	w := newLiveWitness(t, "witness.example/w1")
+	cfg, remote := replicaConfig(t)
+	w.option()(cfg)
+	s := openStore(t, cfg, c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	mustCosign(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	os.Remove(filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile)))
+	s2, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	ingest(t, s2, "abs-core", 4, 6)
+	mustStamp(t, s2)
+	before := s2.replicaShipped.Load()
+	if _, err := s2.ShipOnce(ctx, remote); err != nil {
+		t.Fatalf("копия встала из-за журнала подписей: %v", err)
+	}
+	if after := s2.replicaShipped.Load(); after <= before {
+		t.Fatalf("копия не пошла дальше: %d → %d", before, after)
 	}
 }
