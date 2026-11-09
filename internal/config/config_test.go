@@ -167,6 +167,7 @@ func TestValidateCosigners(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := signer.Verifier().String()
+	twice := rekey(t, "witness.example/w1-before")
 	bad := map[string][]Cosigner{
 		"ftp":        {{URL: "ftp://w.example/", Key: key}},
 		"без хоста":  {{URL: "https:///x", Key: key}},
@@ -181,6 +182,10 @@ func TestValidateCosigners(t *testing.T) {
 		"прежний = текущий":   {{URL: "https://w.example/", Key: key, OldKeys: []string{key}}},
 		"прежний у другого":   {{URL: "https://a.example/", Key: other(t)}, {URL: "https://b.example/", Key: rekey(t, "witness.example/w3"), OldKeys: []string{key}}, {URL: "https://c.example/", Key: key}},
 		"прежних больше пяти": {{URL: "https://w.example/", Key: key, OldKeys: []string{rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1")}}},
+		// Прежний ключ сам повторяет уже названный: текущий ключ раньше в
+		// списке или такой же прежний.
+		"прежний = текущий выше": {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: rekey(t, "witness.example/w3"), OldKeys: []string{key}}},
+		"прежний дважды":         {{URL: "https://a.example/", Key: rekey(t, "witness.example/w1"), OldKeys: []string{twice, twice}}},
 	}
 	// Девять разных свидетелей — больше предела, даже без повторов.
 	var nine []Cosigner
