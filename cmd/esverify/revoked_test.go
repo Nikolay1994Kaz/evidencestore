@@ -115,7 +115,7 @@ func TestTSARevocationFlags(t *testing.T) {
 		t.Fatalf("компрометация, вторая служба в доверии: %d\n%s%s", code, out.String(), errb.String())
 	}
 	out.Reset()
-	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-tsa-revoked", revoked}, &out, &errb); code != exitInvalid || !strings.Contains(out.String(), "is the root of that TSA in -tsa-trust?") {
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-tsa-revoked", revoked}, &out, &errb); code != exitInvalid || !strings.Contains(out.String(), "is the root of that TSA in -tsa-trust") {
 		t.Fatalf("компрометация, второй службе не верят: %d\n%s%s", code, out.String(), errb.String())
 	}
 	bad := filepath.Join(t.TempDir(), "bad.json")

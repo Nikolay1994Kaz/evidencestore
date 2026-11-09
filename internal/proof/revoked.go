@@ -40,16 +40,16 @@ import (
 // сверяется доказательством продолжения от последнего звена пакета (Proof),
 // без звеньев между ними.
 //
-// Cert — сертификат, которым подписан токен (DER), когда служба не кладёт его
-// в токен: журнал второй службы его хранит. Не подписан, как и поле
-// certificates в токене: подпись токена сверяется с ним, а путь — до корня
-// проверяющего.
+// Certs — сертификаты цепочки токена ниже корня (DER: подписавший токен и его
+// центры), которых служба не кладёт в токен: журнал второй службы их хранит.
+// Не подписаны, как и поле certificates в токене: подпись токена сверяется с
+// подписавшим, а путь — до корня проверяющего.
 type ArchiveStamp struct {
 	HeadSeq uint64   `json:"head_seq"`
 	Root    []byte   `json:"root"`
 	Proof   [][]byte `json:"proof,omitempty"`
 	Token   []byte   `json:"token"`
-	Cert    []byte   `json:"cert,omitempty"`
+	Certs   [][]byte `json:"certs,omitempty"`
 }
 
 // revocationCheckName — пункт отчёта об отзыве.
@@ -362,22 +362,29 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 		}
 		root := [32]byte(a.Root)
 		trust := sc.trust
-		var carried *x509.Certificate
-		if len(a.Cert) > 0 {
-			c, err := x509.ParseCertificate(a.Cert)
+		var carried []*x509.Certificate
+		var bad error
+		for _, der := range a.Certs {
+			c, err := x509.ParseCertificate(der)
 			if err != nil {
-				out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d carries a certificate that does not parse (%v): not used", a.HeadSeq, err)})
-				continue
+				bad = err
+				break
 			}
-			carried = c
-			trust.Intermediates = append(slices.Clone(trust.Intermediates), c)
+			carried = append(carried, c)
+		}
+		if bad != nil {
+			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d carries a certificate that does not parse (%v): not used", a.HeadSeq, bad)})
+			continue
+		}
+		if len(carried) > 0 {
+			trust.Intermediates = append(slices.Clone(trust.Intermediates), carried...)
 		}
 		info, err := tsa.Verify(a.Token, HeadImprint(a.HeadSeq, root), trust)
 		if err != nil {
-			hint := "is the root of that TSA in -tsa-trust?"
+			hint := "is the root of that TSA in -tsa-trust, and its CAs below the root, unless the time-stamp or the bundle carries them?"
 			switch {
-			case errors.Is(err, tsa.ErrNoSigner) && carried != nil:
-				hint = "the certificate the bundle carries beside it is not the one that signed it: pass the certificate of that TSA in -tsa-trust"
+			case errors.Is(err, tsa.ErrNoSigner) && len(carried) > 0:
+				hint = "the certificates the bundle carries beside it do not include the one that signed it: pass the certificate of that TSA in -tsa-trust"
 			case errors.Is(err, tsa.ErrNoSigner):
 				hint = "that TSA does not put its certificate in its time-stamps, and the bundle does not carry it: pass that certificate in -tsa-trust"
 			}
@@ -385,9 +392,7 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 			continue
 		}
 		sc.as.Known(info.Certs...)
-		if carried != nil {
-			sc.as.Known(carried)
-		}
+		sc.as.Known(carried...)
 		id, err := sc.as.Add(info.Chains, info.GenTime)
 		if err != nil {
 			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d was not used: %v", a.HeadSeq, err)})

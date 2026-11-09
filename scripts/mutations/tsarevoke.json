@@ -610,14 +610,14 @@
   {
    "name": "R120 CRL нового ключа — путь к тому же корню не нужен",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]bool{}) {",
+   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]int{}) {",
    "new": "\t\tif r.checkSig(g, x).key == nil {"
   },
   {
    "name": "R121 CRL нового ключа — подпись не сверяется",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]bool{}) {",
-   "new": "\t\tif p.under(x, as, 0, map[*x509.Certificate]bool{}) {"
+   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]int{}) {",
+   "new": "\t\tif p.under(x, as, 0, map[*x509.Certificate]int{}) {"
   },
   {
    "name": "R122 вывод из работы по CRL нового ключа — метка в силе",
@@ -646,8 +646,8 @@
   {
    "name": "R126 сертификаты токенов второй службы не в оценке",
    "file": "internal/proof/revoked.go",
-   "old": "\t\tsc.as.Known(info.Certs...)\n\t\tif carried != nil {",
-   "new": "\t\tif carried != nil {"
+   "old": "\t\tsc.as.Known(info.Certs...)\n\t\tsc.as.Known(carried...)",
+   "new": "\t\tsc.as.Known(carried...)"
   },
   {
    "name": "R127 сертификаты токена не в Info",
@@ -742,8 +742,8 @@
   {
    "name": "R143 журнал второй службы: сертификат подписанта не пишется",
    "file": "internal/store/archive.go",
-   "old": "\t\trec.Cert = info.Signer.Raw",
-   "new": "\t\t_ = rec"
+   "old": "\t\t\t\trec.Cert = c.Raw",
+   "new": "\t\t\t\t_ = c"
   },
   {
    "name": "R144 подписант — первый с тем же SID, без сверки атрибутом",
@@ -766,8 +766,8 @@
   {
    "name": "R147 удержание из CRL нового ключа снимает CRL любого ключа",
    "file": "internal/tsa/revoke.go",
-   "old": "len(h.bySN[sn]) == 0 && a.r.checkSig(h, by).auth == nil",
-   "new": "len(h.bySN[sn]) == 0 && by != nil"
+   "old": "slices.ContainsFunc(bys, func(x *x509.Certificate) bool { return a.r.checkSig(h, x).auth == nil })",
+   "new": "len(bys) > 0"
   },
   {
    "name": "R148 удержание из CRL нового ключа снимает и более старый",
@@ -778,14 +778,14 @@
   {
    "name": "R149 CRL под неизвестным ключом о сертификате вне цепочек — не о ключе",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\t\tunknownKey[k] = append(unknownKey[k], ask+\": that certificate has the same key\")",
-   "new": "\t\t\t\t\t_ = k"
+   "old": "\t\t\t\t\tif !keepsEarlier(e.Reason) && !chainOnly(ci.c, signerKeys[k], e) {",
+   "new": "\t\t\t\t\tif false {"
   },
   {
    "name": "R150 ключ с неизвестным статусом — статус сертификатов цепочек цел",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif ci.st.cur != nil {\n\t\t\t\tci.st.notes = append(ci.st.notes, fmt.Sprintf(\"the revocation of certificate %q was not checked: a CRL newer than",
-   "new": "\t\t\tif ci.st.cur != nil && false {\n\t\t\t\tci.st.notes = append(ci.st.notes, fmt.Sprintf(\"the revocation of certificate %q was not checked: a CRL newer than"
+   "old": "\t\t}\n\t\tci.st.from, ci.st.cur = \"\", nil\n\t}\n\tstatus := func",
+   "new": "\t\t}\n\t}\n\tstatus := func"
   },
   {
    "name": "R151 сертификат вне цепочек без центра — не судится",
@@ -814,8 +814,8 @@
   {
    "name": "R155 обломок границы: метка X509 CRL без тире принята",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif bytes.Contains(bytes.Join(bytes.Fields(l), []byte(\" \")), []byte(\"X509 CRL\")) {",
-   "new": "\t\tif bytes.HasPrefix(l, []byte(\"--\")) && bytes.Contains(l, []byte(\"X509 CRL\")) {"
+   "old": "\t\tif bytes.Contains(bytes.Join(bytes.Fields(l), []byte(\" \")), []byte(\"X509 CRL\")) || base64Body(t) {",
+   "new": "\t\tif bytes.HasPrefix(l, []byte(\"--\")) && bytes.Contains(l, []byte(\"X509 CRL\")) || base64Body(t) {"
   },
   {
    "name": "R156 обломок границы: довольно двух тире",
@@ -836,28 +836,28 @@
    "new": "\t\tif sigErr := checkSignature(c, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature); err == nil {\n\t\t\terr = sigErr\n\t\t}"
   },
   {
-   "name": "R159 пакет не несёт сертификат второй службы",
+   "name": "R159 пакет не несёт сертификаты второй службы",
    "file": "internal/store/archive.go",
-   "old": "st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token, Cert: rec.Cert}",
+   "old": "st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token, Certs: rec.certs()}",
    "new": "st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token}"
   },
   {
-   "name": "R160 сертификат второй службы из пакета не в доверии метки",
+   "name": "R160 сертификаты второй службы из пакета не в доверии метки",
    "file": "internal/proof/revoked.go",
-   "old": "\t\t\ttrust.Intermediates = append(slices.Clone(trust.Intermediates), c)",
+   "old": "\t\t\ttrust.Intermediates = append(slices.Clone(trust.Intermediates), carried...)",
    "new": "\t\t\t_ = slices.Clone(trust.Intermediates)"
   },
   {
    "name": "R161 испорченный сертификат второй службы — без отказа",
    "file": "internal/proof/revoked.go",
-   "old": "\t\t\t\tout = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf(\"the archive time-stamp over head %d carries a certificate that does not parse (%v): not used\", a.HeadSeq, err)})\n\t\t\t\tcontinue",
-   "new": "\t\t\t\t_ = err"
+   "old": "\t\t\tout = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf(\"the archive time-stamp over head %d carries a certificate that does not parse (%v): not used\", a.HeadSeq, bad)})\n\t\t\tcontinue",
+   "new": "\t\t\t_ = bad"
   },
   {
    "name": "R162 подсказка о сертификате второй службы — всегда о корне",
    "file": "internal/proof/revoked.go",
-   "old": "\t\t\tif errors.Is(err, tsa.ErrNoSigner) {",
-   "new": "\t\t\tif errors.Is(err, tsa.ErrNoSigner) && false {"
+   "old": "\t\t\tcase errors.Is(err, tsa.ErrNoSigner):",
+   "new": "\t\t\tcase errors.Is(err, tsa.ErrNoSigner) && false:"
   },
   {
    "name": "R163 демо-службы с одним именем",
@@ -876,6 +876,48 @@
    "file": "internal/tsa/revoke.go",
    "old": "\t\t\tif !a.gone[fp] {\n\t\t\t\ta.gone[fp] = true\n\t\t\t\ta.dropped++\n\t\t\t}",
    "new": "\t\t\ta.gone[fp] = true\n\t\t\ta.dropped++"
+  },
+  {
+   "name": "R166 корни проверяющего не в счёт для CRL нового ключа",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tanchors[anchorOf(c)] = true",
+   "new": "\t\t\t_ = c"
+  },
+  {
+   "name": "R167 корни только цепочек самого сертификата",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tas := anchors\n",
+   "new": "\t\tas := anchorsOf(ci.roots)\n"
+  },
+  {
+   "name": "R168 обход пути: узел не обходится снова и ближе к началу",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tif d, ok := seen[c]; depth == maxPath || ok && d <= depth {",
+   "new": "\tif _, ok := seen[c]; depth == maxPath || ok {"
+  },
+  {
+   "name": "R169 журнал второй службы: центры ниже корня не пишутся",
+   "file": "internal/store/archive.go",
+   "old": "\t\t\t\trec.Chain = append(rec.Chain, c.Raw)",
+   "new": "\t\t\t\t_ = c"
+  },
+  {
+   "name": "R170 центры строки журнала не в поиске подписанта и пакете",
+   "file": "internal/store/archive.go",
+   "old": "\treturn append(out, rec.Chain...)",
+   "new": "\treturn out"
+  },
+  {
+   "name": "R171 тело блока PEM без границ принято",
+   "file": "internal/tsa/revoke.go",
+   "old": "[]byte(\"X509 CRL\")) || base64Body(t) {",
+   "new": "[]byte(\"X509 CRL\")) || false && base64Body(t) {"
+  },
+  {
+   "name": "R172 тело блока: отпечаток шестнадцатеричными цифрами — обломок",
+   "file": "internal/tsa/revoke.go",
+   "old": "\treturn !hex\n",
+   "new": "\treturn hex || !hex\n"
   }
  ]
 }

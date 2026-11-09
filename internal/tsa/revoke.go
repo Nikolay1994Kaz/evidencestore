@@ -449,7 +449,7 @@ func crlBlocks(data []byte) ([][]byte, error) {
 		case !isText(outside):
 			return nil, fmt.Errorf("control characters outside the PEM blocks (after block #%d): a DER CRL beside PEM ones? pass it in a file of its own, or remove them", blocks)
 		case brokenBoundary(outside) != "":
-			return nil, fmt.Errorf("a broken PEM boundary outside the PEM blocks (after block #%d): %q names X509 CRL, or is a line of dashes with BEGIN or END, but no whole -----BEGIN line starts a block there; is a block damaged?", blocks, brokenBoundary(outside))
+			return nil, fmt.Errorf("a broken PEM boundary outside the PEM blocks (after block #%d): %q names X509 CRL, is a line of dashes with BEGIN or END, or is base64 like the body of a block, but no whole -----BEGIN line starts a block there; is a block damaged?", blocks, brokenBoundary(outside))
 		}
 		if i < 0 {
 			break
@@ -475,28 +475,50 @@ func crlBlocks(data []byte) ([][]byte, error) {
 	return out, nil
 }
 
-// brokenBoundary — строка, похожая на границу блока PEM, но не начало блока
-// (пусто — такой нет): с меткой блока «X509 CRL» или с пятью тире с краю и
-// словом BEGIN или END. Так выглядят строки блока с испорченной границей, а с
-// ним пропала бы и запись о компрометации. Разделители «---------- CRL 1 of 2
-// ----------», «-- CRL of NCA RK --», вывод openssl crl -text для центра
-// «CN=-- Test CRL CA --» — текст.
+// brokenBoundary — строка, похожая на границу или тело блока PEM, но не блок
+// (пусто — такой нет): с меткой блока «X509 CRL», с пятью тире с краю и
+// словом BEGIN или END, или строка base64 длиной с тело блока. Так выглядят
+// строки блока с испорченными границами, а с ним пропала бы и запись о
+// компрометации. Разделители «---------- CRL 1 of 2 ----------», «-- CRL of
+// NCA RK --», вывод openssl crl -text (байты через двоеточие), отпечатки
+// шестнадцатеричными цифрами — текст.
 func brokenBoundary(text []byte) string {
 	for _, line := range bytes.Split(text, []byte("\n")) {
-		l := bytes.ToUpper(bytes.TrimSpace(line))
-		if bytes.Contains(bytes.Join(bytes.Fields(l), []byte(" ")), []byte("X509 CRL")) {
-			return string(bytes.TrimSpace(line))
+		t := bytes.TrimSpace(line)
+		l := bytes.ToUpper(t)
+		if bytes.Contains(bytes.Join(bytes.Fields(l), []byte(" ")), []byte("X509 CRL")) || base64Body(t) {
+			return string(t)
 		}
 		if !bytes.HasPrefix(l, []byte("-----")) && !bytes.HasSuffix(l, []byte("-----")) {
 			continue
 		}
 		for _, w := range bytes.FieldsFunc(l, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
 			if string(w) == "BEGIN" || string(w) == "END" {
-				return string(bytes.TrimSpace(line))
+				return string(t)
 			}
 		}
 	}
 	return ""
+}
+
+// base64Body — строка тела блока PEM: не короче 40 знаков, только алфавит
+// base64 и хотя бы один знак не из шестнадцатеричных цифр (отпечаток SHA-256
+// — тоже 64 знака из алфавита).
+func base64Body(t []byte) bool {
+	if len(t) < 40 {
+		return false
+	}
+	hex := true
+	for _, c := range t {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		case c >= 'g' && c <= 'z', c >= 'G' && c <= 'Z', c == '+', c == '/', c == '=':
+			hex = false
+		default:
+			return false
+		}
+	}
+	return !hex
 }
 
 // derCRLs — элементы DER подряд (пробелы между ними и по краям допустимы:

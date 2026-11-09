@@ -51,27 +51,38 @@ const archiveFile = "tsa/archive.jsonl"
 // archiveRecord — строка журнала: голова и токен второй службы над ней; Key —
 // SHA-256 ключа (SubjectPublicKeyInfo), которым токен подписан: службы
 // различаются по нему (у строк без него — ключ из токена). Cert — сертификат
-// подписанта, когда токен его не несёт (он был в tsa.archive.trust): строка
-// годна и после того, как tsa.archive сменили или убрали.
+// подписанта, Chain — сертификаты центров ниже корня его цепочки, когда токен
+// их не несёт (они были в tsa.archive.trust): строка годна и после того, как
+// tsa.archive сменили или убрали, а пакет несёт их рядом с токеном —
+// проверяющему довольно корня.
 type archiveRecord struct {
-	Size  uint64 `json:"size"`
-	Root  []byte `json:"root"`
-	Token []byte `json:"token"`
-	Key   []byte `json:"key,omitempty"`
-	Cert  []byte `json:"cert,omitempty"`
+	Size  uint64   `json:"size"`
+	Root  []byte   `json:"root"`
+	Token []byte   `json:"token"`
+	Key   []byte   `json:"key,omitempty"`
+	Cert  []byte   `json:"cert,omitempty"`
+	Chain [][]byte `json:"chain,omitempty"`
+}
+
+// certs — Cert и Chain строки: что пакет несёт рядом с токеном.
+func (rec archiveRecord) certs() [][]byte {
+	var out [][]byte
+	if len(rec.Cert) > 0 {
+		out = append(out, rec.Cert)
+	}
+	return append(out, rec.Chain...)
 }
 
 // signerCerts — сертификаты, которыми искать подписанта строки: доверие
-// второй службы и Cert строки.
+// второй службы, Cert и Chain строки.
 func (rec archiveRecord) signerCerts(inter []*x509.Certificate) []*x509.Certificate {
-	if len(rec.Cert) == 0 {
-		return inter
+	out := inter
+	for _, der := range rec.certs() {
+		if c, err := x509.ParseCertificate(der); err == nil {
+			out = append(slices.Clone(out), c)
+		}
 	}
-	c, err := x509.ParseCertificate(rec.Cert)
-	if err != nil {
-		return inter
-	}
-	return append(slices.Clone(inter), c)
+	return out
 }
 
 // signerKey — SHA-256 ключа, которым подписан токен (нули — не разобрать).
@@ -260,8 +271,18 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 		return fmt.Errorf("%s signs with the key of tsa.url (%q): it is the same TSA, and its time-stamps show nothing once that key is compromised; point tsa.archive at a TSA of another operator", a.url, info.Signer.Subject.String())
 	}
 	rec := archiveRecord{Size: h.size, Root: h.root[:], Token: token, Key: key[:]}
-	if !slices.ContainsFunc(info.Certs, func(c *x509.Certificate) bool { return bytes.Equal(c.Raw, info.Signer.Raw) }) {
-		rec.Cert = info.Signer.Raw
+	// Сертификаты цепочки ниже корня, которых токен не несёт: служба может
+	// класть только свой или ни одного.
+	if ch := info.Chains[0]; len(ch) > 1 {
+		for i, c := range ch[:len(ch)-1] {
+			switch {
+			case slices.ContainsFunc(info.Certs, func(x *x509.Certificate) bool { return bytes.Equal(x.Raw, c.Raw) }):
+			case i == 0:
+				rec.Cert = c.Raw
+			default:
+				rec.Chain = append(rec.Chain, c.Raw)
+			}
+		}
 	}
 	line, err := json.Marshal(rec)
 	if err != nil {
@@ -352,7 +373,7 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 				continue
 			}
 			seen[ref.off] = true
-			st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token, Cert: rec.Cert}
+			st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token, Certs: rec.certs()}
 			if rec.Size > last {
 				pr, err := tlog.ProveTree(int64(rec.Size), int64(last), s.tree)
 				if err != nil {

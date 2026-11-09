@@ -221,6 +221,8 @@ func TestRevocationsPEMTextAround(t *testing.T) {
 		"метка в тексте":      {"see the X509  CRL below\n", "broken PEM boundary"},
 		"конец пересланного":  {"---------- End of forwarded message ----------\n", "broken PEM boundary"},
 		"граница с пробелами": {"----- BEGIN -----\n", "broken PEM boundary"},
+		"отпечаток":           {"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n", ""},
+		"тело без границ":     {strings.Join(strings.Split(strings.TrimSpace(good), "\n")[1:3], "\n") + "\n", "broken PEM boundary"},
 	} {
 		p := filepath.Join(w.dir, "text.pem")
 		os.WriteFile(p, []byte(c.pre+good), 0o600)

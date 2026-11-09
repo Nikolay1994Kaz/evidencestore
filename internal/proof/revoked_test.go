@@ -338,7 +338,7 @@ func TestRevocationPOEFromArchive(t *testing.T) {
 	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
 	notTrusted := w.trust()
 	notTrusted.TSARevocations = tr.TSARevocations
-	if r := Verify(b, notTrusted); r.Valid() || !strings.Contains(r.Text(), "is the root of that TSA in -tsa-trust?") {
+	if r := Verify(b, notTrusted); r.Valid() || !strings.Contains(r.Text(), "is the root of that TSA in -tsa-trust") {
 		t.Fatalf("вторая служба без доверия:\n%s", r.Text())
 	}
 }
