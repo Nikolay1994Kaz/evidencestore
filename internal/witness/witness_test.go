@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -116,11 +117,17 @@ func newRig(t *testing.T, dir string, chains ...*chain) *rig {
 
 func reopen(t *testing.T, dir string, key cosign.Signer, chains ...*chain) *rig {
 	t.Helper()
+	return reopenLog(t, dir, key, nil, chains...)
+}
+
+// reopenLog — reopen с журналом процесса log.
+func reopenLog(t *testing.T, dir string, key cosign.Signer, log *slog.Logger, chains ...*chain) *rig {
+	t.Helper()
 	var logs []Log
 	for _, c := range chains {
 		logs = append(logs, Log{Origin: c.origin(), Key: c.signer.PublicKey()})
 	}
-	w, err := New(key, logs, dir, nil)
+	w, err := New(key, logs, dir, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,5 +586,118 @@ func TestWitnessReplayWritesNothing(t *testing.T) {
 	stateAfter, _ := os.ReadFile(statePath)
 	if !bytes.Equal(before, after) || !bytes.Equal(stateBefore, stateAfter) {
 		t.Fatalf("повторы той же головы писали на диск: журнал %d → %d байт", len(before), len(after))
+	}
+}
+
+// syncBuf — журнал процесса в памяти для нескольких горутин.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+// Повтор одной развилки — 422 каждый раз, но строка в журнал процесса и в
+// журнал отказов одна: пару голов пришлёт кто угодно, у кого она есть, и
+// залить журнал процесса свидетеля нельзя (T).
+func TestWitnessForkLoggedOnce(t *testing.T) {
+	c, forged := newChain(t), newChain(t)
+	c.grow(4)
+	forged.grow(4)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	key, err := cosign.NewSigner("witness.example/w1", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out syncBuf
+	r := reopenLog(t, t.TempDir(), key, slog.New(slog.NewTextHandler(&out, nil)), c)
+	r.mustCosign(c, 0, 4)
+	for range 5 {
+		if code, _, _ := r.add(cosign.AddCheckpoint(4, nil, sameKey(t, c, forged, 4))); code != http.StatusUnprocessableEntity {
+			t.Fatalf("развилка: %d", code)
+		}
+	}
+	if n := strings.Count(out.String(), "refused a checkpoint"); n != 1 || len(readRefusals(t, r.dir)) != 1 {
+		t.Fatalf("пять повторов одной развилки: %d строк в журнале процесса, %d в журнале отказов", n, len(readRefusals(t, r.dir)))
+	}
+}
+
+// Журнал подписанного больше предела при старте сжимается до последней
+// головы каждого журнала: старт не читает годами растущий файл, а защита от
+// забывания остаётся (T).
+func TestWitnessLedgerCompacted(t *testing.T) {
+	defer func(v int64) { compactLedgerAbove = v }(compactLedgerAbove)
+	compactLedgerAbove = 1
+	c, other := newChain(t), newChain(t)
+	dir := t.TempDir()
+	r := newRig(t, dir, c, other)
+	c.grow(6)
+	other.grow(2)
+	r.mustCosign(other, 0, 2)
+	r.mustCosign(c, 0, 2)
+	r.mustCosign(c, 2, 4)
+	statePath := filepath.Join(dir, stateDir, OriginHash(c.origin())+".json")
+	old, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.mustCosign(c, 4, 6)
+	r.w.Close()
+
+	r2 := reopen(t, dir, r.key, c, other)
+	data, err := os.ReadFile(filepath.Join(dir, cosignedFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := bytes.Count(data, []byte("\n")); n != 2 || !bytes.Contains(data, []byte(`"size":6`)) {
+		t.Fatalf("после сжатия в журнале %d строк: %s", n, data)
+	}
+	if _, err := os.Stat(filepath.Join(dir, cosignedFile+".tmp")); !os.IsNotExist(err) {
+		t.Fatalf("временный файл сжатия остался: %v", err)
+	}
+	c.grow(7)
+	r2.mustCosign(c, 6, 7) // дописывается после сжатия целой строкой
+	r2.w.Close()
+
+	// Состояние подняли из старой копии: сжатый журнал помнит голову 7.
+	if err := os.WriteFile(statePath, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := []Log{{Origin: c.origin(), Key: c.signer.PublicKey()}, {Origin: other.origin(), Key: other.signer.PublicKey()}}
+	if _, err := New(r.key, logs, dir, nil); err == nil || !strings.Contains(err.Error(), "older than head 7") {
+		t.Fatalf("откат состояния после сжатия: %v", err)
+	}
+}
+
+// Граница правила времени: ровно 10 минут назад — прежнее время подписи, на
+// секунду больше (и после перезапуска, по состоянию) — текущее (T).
+func TestWitnessTimeRuleBoundary(t *testing.T) {
+	c := newChain(t)
+	dir := t.TempDir()
+	r := newRig(t, dir, c)
+	now := time.Unix(1_800_000_000, 0)
+	r.w.Now = func() time.Time { return now }
+	c.grow(4)
+	t1 := r.mustCosign(c, 0, 2)
+	now = now.Add(-maxClockStepBack)
+	if t2 := r.mustCosign(c, 2, 3); t2 != t1 {
+		t.Fatalf("ровно 10 минут назад: %d, прежняя %d", t2, t1)
+	}
+	r.w.Close()
+	r2 := reopen(t, dir, r.key, c)
+	now = time.Unix(int64(t1), 0).Add(-maxClockStepBack - time.Second)
+	r2.w.Now = func() time.Time { return now }
+	if t3 := r2.mustCosign(c, 3, 4); t3 != uint64(now.Unix()) {
+		t.Fatalf("на 10 минут и секунду назад после перезапуска: %d, сейчас %d, прежняя %d", t3, now.Unix(), t1)
 	}
 }

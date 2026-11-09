@@ -153,6 +153,16 @@ func TestWitnessKeyFlag(t *testing.T) {
 	if code := run(append(base, "-witness-key", "witness.example/w1"), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "-witness-key") {
 		t.Fatalf("не ключ: %d %s", code, errb.String())
 	}
+
+	// Ключ хранилища под видом свидетеля — неверный вызов: его подписи держит
+	// администратор хранилища.
+	raw, _ := os.ReadFile(key)
+	pub, _ := base64.RawStdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+	self := cosign.Verifier{Name: "witness.example/self", ID: cosign.KeyID("witness.example/self", cosign.TypeCosignatureV1, pub), Key: pub}
+	errb.Reset()
+	if code := run(append(base, "-witness-key", self.String()), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "the store's own key") {
+		t.Fatalf("ключ хранилища как ключ свидетеля: %d %s", code, errb.String())
+	}
 }
 
 // Ключ в -witness-key разбирается как ключ раньше, чем как путь: файл по пути,

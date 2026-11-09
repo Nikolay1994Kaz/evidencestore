@@ -70,14 +70,16 @@ type cosigner struct {
 	old    []cosign.Verifier
 	url    string // <url>/add-checkpoint
 	client *http.Client
+	// busy — обход этого свидетеля идёт: у каждого свой цикл, а CosignOnce
+	// обходит всех; поля ниже меняет только тот, кто держит busy.
+	busy sync.Mutex
 
 	// Очередь голов — под chainMu, как у свидетеля S3 (queueCosignLocked).
 	queue  []witnessHead
 	queued uint64
 
 	// size — размер последней головы, которую подписал свидетель; known —
-	// размер узнан (из подписи или ответа 409). Меняются только в CosignOnce:
-	// обход один.
+	// размер узнан (из подписи или ответа 409). Меняются только под busy.
 	size  uint64
 	known bool
 
@@ -320,15 +322,43 @@ func (s *Store) queueCosignLocked(h witnessHead) {
 	}
 }
 
-// CosignOnce ставит в очередь текущую голову и отправляет каждому свидетелю
-// его очередь по порядку, не дальше копии наружу. Свидетели — параллельно:
-// медленный или зависший не съедает время обхода у остальных, и ошибка одного
-// других не держит. Поля cosigner меняет только его горутина; очередь — под
-// chainMu, журнал — под cosignMu.
+// CosignOnce обходит всех свидетелей разом (cosignWitness), параллельно:
+// медленный или зависший не съедает время у остальных, и ошибка одного других
+// не держит.
 func (s *Store) CosignOnce(ctx context.Context) error {
-	if len(s.cosigners) == 0 {
-		return nil
+	errs := make([]error, len(s.cosigners))
+	var wg sync.WaitGroup
+	for i, c := range s.cosigners {
+		wg.Go(func() { errs[i] = s.cosignWitness(ctx, c) })
 	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// startCosignLoops — фоновый обход: у каждого свидетеля свой цикл раз в
+// witness.every, и зависший (до 30 с на запрос) не задаёт ритм остальным.
+// Обход бросается, когда хранилище закрывается.
+func (s *Store) startCosignLoops() {
+	for _, c := range s.cosigners {
+		s.loop(s.cfg.Witness.Every.D(), func() {
+			ctx, cancel := s.stopCtx(time.Minute)
+			defer cancel()
+			if err := s.cosignWitness(ctx, c); err != nil {
+				s.log.Error("cosigners", "err", err)
+			}
+		})
+	}
+}
+
+// cosignWitness ставит в очередь текущую голову копии и отправляет свидетелю
+// c его очередь по порядку, не дальше копии наружу. Очередь — под chainMu,
+// журнал — под cosignMu, поля c — под c.busy. Голову копии не снять
+// (tree.hashes) — очередь всё равно уходит, пока доказательства продолжения
+// строятся (головы под метками в ней уже с корнями); ошибка — в счётчик и
+// last_error свидетеля.
+func (s *Store) cosignWitness(ctx context.Context, c *cosigner) error {
+	c.busy.Lock()
+	defer c.busy.Unlock()
 	s.chainMu.Lock()
 	h, ok, headErr := s.shippedHeadLocked()
 	if ok {
@@ -339,31 +369,20 @@ func (s *Store) CosignOnce(ctx context.Context) error {
 	if s.replicaRemote != nil {
 		limit = s.replicaShipped.Load()
 	}
-	// Голову копии не снять (tree.hashes) — очередь всё равно уходит, пока
-	// доказательства продолжения строятся (головы под метками в ней уже с
-	// корнями); ошибка видна у каждого свидетеля.
-	errs := make([]error, len(s.cosigners)+1)
+	var err error
 	if headErr != nil {
-		errs[len(s.cosigners)] = fmt.Errorf("the head for the witnesses: %w", headErr)
-		for _, c := range s.cosigners {
-			c.errors.Add(1)
-			msg := errs[len(s.cosigners)].Error()
-			c.lastErr.Store(&msg)
-		}
+		err = fmt.Errorf("the head for the witnesses: %w", headErr)
 	}
-	var wg sync.WaitGroup
-	for i, c := range s.cosigners {
-		wg.Go(func() {
-			if err := s.cosignQueue(ctx, c, limit); err != nil {
-				c.errors.Add(1)
-				msg := err.Error()
-				c.lastErr.Store(&msg)
-				errs[i] = fmt.Errorf("witness %s: %w", c.v.Name, err)
-			}
-		})
+	if qerr := s.cosignQueue(ctx, c, limit); qerr != nil {
+		err = errors.Join(err, qerr)
 	}
-	wg.Wait()
-	return errors.Join(errs...)
+	if err != nil {
+		c.errors.Add(1)
+		msg := err.Error()
+		c.lastErr.Store(&msg)
+		return fmt.Errorf("witness %s: %w", c.v.Name, err)
+	}
+	return nil
 }
 
 // cosignQueue отправляет свидетелю c его очередь: голова за головой, каждая
@@ -782,6 +801,23 @@ func (s *Store) cosignLogSize() (int64, bool, error) {
 		return 0, false, err
 	}
 	return fi.Size(), true, nil
+}
+
+// cosignRange — байты from…end журнала подписей для копии наружу: из
+// открытого файла (его размер даёт cosignLogSize), а не по пути. Журнал,
+// удалённый на ходу, хранилище дописывает и копия дочитывает, и проход копии
+// не падает (T). Журнал не открыт (свидетели не настроены) — по пути.
+func (s *Store) cosignRange(from, end int64) ([]byte, error) {
+	s.cosignMu.Lock()
+	defer s.cosignMu.Unlock()
+	if s.cosignLog == nil {
+		return readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(cosignFile)), from, end)
+	}
+	buf := make([]byte, end-from)
+	if _, err := s.cosignLog.ReadAt(buf, from); err != nil {
+		return nil, fmt.Errorf("replica: read %s: %w", cosignFile, err)
+	}
+	return buf, nil
 }
 
 // closeCosignLog закрывает журнал подписей (closeFiles).

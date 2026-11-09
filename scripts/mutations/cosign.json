@@ -396,8 +396,8 @@
   {
    "name": "S21 свидетели по очереди: медленный держит остальных",
    "file": "internal/store/cosign.go",
-   "old": "\t\twg.Go(func() {\n\t\t\tif err := s.cosignQueue(ctx, c, limit); err != nil {\n\t\t\t\tc.errors.Add(1)\n\t\t\t\tmsg := err.Error()\n\t\t\t\tc.lastErr.Store(&msg)\n\t\t\t\terrs[i] = fmt.Errorf(\"witness %s: %w\", c.v.Name, err)\n\t\t\t}\n\t\t})",
-   "new": "\t\tfunc() {\n\t\t\tif err := s.cosignQueue(ctx, c, limit); err != nil {\n\t\t\t\tc.errors.Add(1)\n\t\t\t\tmsg := err.Error()\n\t\t\t\tc.lastErr.Store(&msg)\n\t\t\t\terrs[i] = fmt.Errorf(\"witness %s: %w\", c.v.Name, err)\n\t\t\t}\n\t\t}()"
+   "old": "\t\twg.Go(func() { errs[i] = s.cosignWitness(ctx, c) })",
+   "new": "\t\tfunc() { errs[i] = s.cosignWitness(ctx, c) }()"
   },
   {
    "name": "S22 строка с завышенным размером прячет верные: индекс не сортируется",
@@ -498,14 +498,44 @@
   {
    "name": "S38 ошибка головы копии не в счётчиках свидетелей C2SP",
    "file": "internal/store/cosign.go",
-   "old": "\t\tfor _, c := range s.cosigners {\n\t\t\tc.errors.Add(1)",
-   "new": "\t\tfor _, c := range s.cosigners[:0] {\n\t\t\tc.errors.Add(1)"
+   "old": "\t\terr = fmt.Errorf(\"the head for the witnesses: %w\", headErr)",
+   "new": "\t\t_ = fmt.Errorf(\"the head for the witnesses: %w\", headErr)"
   },
   {
    "name": "S39 удалённый журнал подписей останавливает копию",
    "file": "internal/store/replica.go",
    "old": "\t\tif name == cosignFile && (s.replica.SkipCosign || size < from) {",
    "new": "\t\tif false && name == cosignFile && (s.replica.SkipCosign || size < from) {"
+  },
+  {
+   "name": "S40 один фоновый обход на всех: зависший задаёт ритм",
+   "file": "internal/store/cosign.go",
+   "old": "\tfor _, c := range s.cosigners {\n\t\ts.loop(s.cfg.Witness.Every.D(), func() {\n\t\t\tctx, cancel := s.stopCtx(time.Minute)\n\t\t\tdefer cancel()\n\t\t\tif err := s.cosignWitness(ctx, c); err != nil {",
+   "new": "\tfor range s.cosigners[:1] {\n\t\ts.loop(s.cfg.Witness.Every.D(), func() {\n\t\t\tctx, cancel := s.stopCtx(time.Minute)\n\t\t\tdefer cancel()\n\t\t\tif err := s.CosignOnce(ctx); err != nil {"
+  },
+  {
+   "name": "S41 копия читает журнал подписей по пути: удалённый на ходу её останавливает",
+   "file": "internal/store/replica.go",
+   "old": "\t\tif name == cosignFile {\n\t\t\tread = s.cosignRange\n\t\t}\n",
+   "new": ""
+  },
+  {
+   "name": "S42 журнал подписей не едет в копию без тревоги",
+   "file": "internal/store/replica.go",
+   "old": "\t\t\t\tskipCosign = true\n\t\t\t\ts.cosignSkipped.Store(true)",
+   "new": "\t\t\t\tskipCosign = true"
+  },
+  {
+   "name": "S43 ошибка головы копии не в счётчике свидетеля S3",
+   "file": "internal/store/witness.go",
+   "old": "\t\ts.witnessErrors.Add(1)\n\t\theadErr = fmt.Errorf(\"witness: the head of the copy: %w\", headErr)",
+   "new": "\t\theadErr = fmt.Errorf(\"witness: the head of the copy: %w\", headErr)"
+  },
+  {
+   "name": "S44 ошибка головы копии останавливает очередь свидетеля S3",
+   "file": "internal/store/witness.go",
+   "old": "\tif headErr != nil {\n\t\t// Голову копии не снять (tree.hashes)",
+   "new": "\tif headErr != nil {\n\t\treturn headErr\n\t}\n\tif headErr != nil {\n\t\t// Голову копии не снять (tree.hashes)"
   },
   {
    "name": "P1 корень подписанной головы не сверяется с пакетом",
@@ -698,6 +728,30 @@
    "file": "cmd/esverify/main.go",
    "old": "\tif err := notAlsoFile(\"-store-key\", v, func(v string) bool { _, ok := parseStoreKey(v); return ok }); err != nil {",
    "new": "\tif err := notAlsoFile(\"-store-key\", v, func(v string) bool { _, ok := parseStoreKey(v); return ok }); false && err != nil {"
+  },
+  {
+   "name": "W31 журнал подписанного не сжимается",
+   "file": "internal/witness/witness.go",
+   "old": "\tif fi, err := os.Stat(ledgerPath); err == nil && fi.Size() > compactLedgerAbove {",
+   "new": "\tif fi, err := os.Stat(ledgerPath); false && err == nil && fi.Size() > compactLedgerAbove {"
+  },
+  {
+   "name": "W32 повтор развилки — строка в журнал процесса каждый раз",
+   "file": "internal/witness/witness.go",
+   "old": "\ts.refusedMu.Lock()\n\tdefer s.refusedMu.Unlock()\n\tif s.refused[key] {",
+   "new": "\ts.refusedMu.Lock()\n\tdefer s.refusedMu.Unlock()\n\ts.log.Error(\"witness: refused a checkpoint signed by the log\")\n\tif s.refused[key] {"
+  },
+  {
+   "name": "W33 ровно 10 минут назад — уже текущее время",
+   "file": "internal/witness/witness.go",
+   "old": "\t\tif cur.Time-now <= uint64(maxClockStepBack/time.Second) {",
+   "new": "\t\tif cur.Time-now < uint64(maxClockStepBack/time.Second) {"
+  },
+  {
+   "name": "E7 ключ хранилища принят как ключ свидетеля",
+   "file": "cmd/esverify/main.go",
+   "old": "\t\tif v.Key.Equal(key) {",
+   "new": "\t\tif false {"
   },
   {
    "name": "X1 ключ свидетеля читается всем",

@@ -145,6 +145,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return usageErr(fmt.Errorf("-witness-key %s: %w", raw, err))
 			}
 		}
+		// Ключ хранилища свидетелем не бывает: его подписи держит
+		// администратор хранилища, от которого свидетель и защищает (T).
+		if v.Key.Equal(key) {
+			return usageErr(fmt.Errorf("-witness-key %s: it is the store's own key (-store-key): a witness is someone else, out of the store administrator's reach", v.Name))
+		}
 		// Имя в подписи cosignature/v1 не подписано: один ключ под двумя
 		// именами был бы двумя «свидетелями» с одной подписью.
 		if name, ok := seenKey[string(v.Key)]; ok && name != v.Name {

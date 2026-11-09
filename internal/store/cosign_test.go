@@ -993,6 +993,10 @@ func TestCosignJournalRemovedCopyGoesOn(t *testing.T) {
 	if after := s2.replicaShipped.Load(); after <= before {
 		t.Fatalf("копия не пошла дальше: %d → %d", before, after)
 	}
+	// Журнал больше не едет в копию — это видно тревогой.
+	if !s2.cosignSkipped.Load() {
+		t.Fatal("журнал подписей не едет в копию, а evidencestore_replica_cosign_journal_skipped молчит")
+	}
 }
 
 // Свидетель начат заново с новым ключом (потерял data_dir), прежний ключ — в
@@ -1146,10 +1150,75 @@ func TestCosignTreeFileFailureQueueGoesOn(t *testing.T) {
 	}
 	werr, cerr := s.WitnessOnce(ctx), s.CosignOnce(ctx)
 	st := s.Status().Cosigners[0]
-	if werr == nil || cerr == nil || s.witnessErrors.Load() == 0 || st.Errors == 0 || st.LastError == "" {
+	if werr == nil || cerr == nil || s.witnessErrors.Load() == 0 || st.Errors == 0 || !strings.Contains(st.LastError, "the head for the witnesses") {
 		t.Fatalf("ошибка головы копии не видна: %v / %v, witness_errors %d, cosigner %+v", werr, cerr, s.witnessErrors.Load(), st)
 	}
 	if got := len(witnessHeads(t, wdir).Heads); got == sent {
 		t.Fatalf("головы под меткой свидетелю S3 не ушли: %d -> %d", sent, got)
+	}
+}
+
+// Фоновый обход: у каждого свидетеля свой цикл, и зависший (запрос до 30 с)
+// не задаёт ритм остальным — честный получает новые головы каждый
+// witness.every, а не раз в таймаут зависшего.
+func TestCosignHungWitnessDoesNotSetPace(t *testing.T) {
+	c := newClock()
+	hung, honest := newLiveWitness(t, "witness.example/hung"), newLiveWitness(t, "witness.example/w1")
+	cfg := testConfig(t, hung.option(), honest.option())
+	cfg.Witness.Every = config.Duration(20 * time.Millisecond)
+	s := openStore(t, cfg, c)
+	hung.attach(s)
+	honest.attach(s)
+	hung.hang.Store(true)
+	s.startCosignLoops()
+	before := honest.hits.Load()
+	for q := uint64(1); q <= 15; q++ {
+		ingest(t, s, "abs-core", q, q)
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if n := honest.hits.Load() - before; n < 5 {
+		t.Fatalf("честному свидетелю за 15 новых голов ушло %d запросов: зависший задаёт ритм", n)
+	}
+}
+
+// Журнал подписей удалён, пока хранилище работает: копия дочитывает его из
+// открытого файла и идёт дальше, головы — свидетелям и сборщикам (T).
+func TestCosignJournalRemovedWhileRunning(t *testing.T) {
+	c := newClock()
+	ctx := context.Background()
+	w := newLiveWitness(t, "witness.example/w1")
+	cfg, remote := replicaConfig(t)
+	w.option()(cfg)
+	s := openStore(t, cfg, c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	mustCosign(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(cfg.DataDir, filepath.FromSlash(cosignFile))); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, s, "abs-core", 4, 6)
+	mustStamp(t, s)
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	mustCosign(t, s) // строка ложится в удалённый файл: он ещё открыт
+	ingest(t, s, "abs-core", 7, 8)
+	mustStamp(t, s)
+	before := s.replicaShipped.Load()
+	if _, err := s.ShipOnce(ctx, remote); err != nil {
+		t.Fatalf("копия встала из-за журнала подписей, удалённого на ходу: %v", err)
+	}
+	if after := s.replicaShipped.Load(); after <= before || s.cosignSkipped.Load() {
+		t.Fatalf("копия не пошла дальше (%d → %d) или журнал подписей в неё больше не едет (%v)", before, after, s.cosignSkipped.Load())
 	}
 }

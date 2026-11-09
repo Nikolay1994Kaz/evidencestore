@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -166,6 +167,15 @@ func New(signer cosign.Signer, logs []Log, dir string, log *slog.Logger) (*Serve
 			return nil, fmt.Errorf("witness: the state of %s holds head %d, older than head %d this witness has cosigned (%s): it was restored from an older copy; going on would cosign a second history under this key: %s", origin, st.Size, rec.Size, cosignedFile, newKeyAdvice)
 		}
 	}
+	// Журнал растёт на строку за каждую подпись (полмиллиона в год на
+	// хранилище) и читается при каждом старте: больший предела сжимается до
+	// последней головы каждого журнала — только её и сверяет старт (T).
+	if fi, err := os.Stat(ledgerPath); err == nil && fi.Size() > compactLedgerAbove {
+		if whole, err = compactLedger(ledgerPath, last); err != nil {
+			return nil, fmt.Errorf("witness: compacting %s: %w", cosignedFile, err)
+		}
+		log.Info("witness: the journal of cosigned heads is cut down to the last head of each log", "file", ledgerPath, "bytes", fi.Size(), "now", whole)
+	}
 	if s.ledger, err = os.OpenFile(ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err != nil {
 		return nil, err
 	}
@@ -188,6 +198,46 @@ func New(signer cosign.Signer, logs []Log, dir string, log *slog.Logger) (*Serve
 		return nil, err
 	}
 	return s, nil
+}
+
+// compactLedgerAbove — с какого размера журнал подписанного сжимается при
+// старте (переменная — для тестов).
+var compactLedgerAbove int64 = 64 << 20
+
+// compactLedger переписывает журнал подписанного последними головами
+// журналов (last) — во временный файл, fsync, на место, fsync каталога: при
+// падении остаётся прежний журнал или новый целиком. Отдаёт новый размер.
+func compactLedger(path string, last map[string]cosignedRecord) (int64, error) {
+	origins := make([]string, 0, len(last))
+	for o := range last {
+		origins = append(origins, o)
+	}
+	sort.Strings(origins)
+	var buf bytes.Buffer
+	for _, o := range origins {
+		line, err := json.Marshal(last[o])
+		if err != nil {
+			return 0, err
+		}
+		buf.Write(append(line, '\n'))
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = f.Write(buf.Bytes()); err == nil {
+		err = f.Sync()
+	}
+	if err = errors.Join(err, f.Close()); err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	return int64(buf.Len()), syncDir(filepath.Dir(path))
 }
 
 // newKeyAdvice — что делать свидетелю, который не помнит, что подписал.
@@ -474,16 +524,18 @@ type refusal struct {
 	Cosigned string    `json:"cosigned"`
 }
 
-// refuse записывает отказ в журнал отказов (refused.jsonl) один раз на
-// развилку и в журнал процесса. Отказ записи журнала отказа не отменяет.
+// refuse записывает отказ в журнал отказов (refused.jsonl) и в журнал
+// процесса один раз на развилку: повтор той же пары голов (их пришлёт кто
+// угодно, у кого они есть) журнал процесса не заливает. Отказ записи журнала
+// отказа не отменяет.
 func (s *Server) refuse(ev refusal) {
-	s.log.Error("witness: refused a checkpoint signed by the log: it has the size of the one cosigned before and another root, the log shows a second history", "origin", ev.Origin, "size", ev.Size)
 	key := ev.Origin + "/" + strconv.FormatUint(ev.Size, 10) + "/" + hex.EncodeToString(ev.Root)
 	s.refusedMu.Lock()
 	defer s.refusedMu.Unlock()
 	if s.refused[key] {
 		return
 	}
+	s.log.Error("witness: refused a checkpoint signed by the log: it has the size of the one cosigned before and another root, the log shows a second history", "origin", ev.Origin, "size", ev.Size)
 	ev.At = s.Now().UTC()
 	line, err := json.Marshal(ev)
 	if err != nil {

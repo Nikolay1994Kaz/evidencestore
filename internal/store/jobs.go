@@ -51,17 +51,7 @@ func (s *Store) startBackground() {
 			}
 		})
 	}
-	if len(s.cosigners) > 0 {
-		s.loop(s.cfg.Witness.Every.D(), func() {
-			// Зависший свидетель не держит остановку хранилища: обход
-			// бросается, когда хранилище закрывается.
-			ctx, cancel := s.stopCtx(time.Minute)
-			defer cancel()
-			if err := s.CosignOnce(ctx); err != nil {
-				s.log.Error("cosigners", "err", err)
-			}
-		})
-	}
+	s.startCosignLoops()
 	s.loop(time.Minute, func() { s.Maintain(s.nowTime()) })
 	s.loop(10*time.Second, func() {
 		now := s.nowTime()

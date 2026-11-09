@@ -181,12 +181,18 @@ func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[s
 		if err != nil {
 			return false, fmt.Errorf("%w: %v; another installation wrote this copy, or copy.key is not this store's: point replica.url at a new location (the old copy stays as evidence), or put the right copy.key back from keys.backup_dir", ErrReplicaDiverged, err)
 		}
-		local, err := readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(name)), last.start, last.end)
+		var local []byte
+		if name == cosignFile {
+			local, err = s.cosignRange(last.start, last.end)
+		} else {
+			local, err = readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(name)), last.start, last.end)
+		}
 		if err != nil || !bytes.Equal(local, copied) {
 			if name == cosignFile {
 				// Журнал подписей не повод останавливать копию улик.
 				s.log.Error("replica: data_dir/"+cosignFile+" does not continue the one in the copy (removed or replaced?): it is not copied any more until replica.url points at a new location; the evidence log and the chain still are", "copy holds", last.end)
 				skipCosign = true
+				s.cosignSkipped.Store(true)
 				continue
 			}
 			return false, fmt.Errorf("%w: its %s holds bytes %d-%d that data_dir lacks or has otherwise; %s", ErrReplicaDiverged, name, last.start, last.end, divergedHint)
@@ -292,6 +298,7 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 			if !s.replica.SkipCosign {
 				s.log.Error("replica: data_dir/"+cosignFile+" is shorter than what the copy holds (removed or truncated?): it is not copied any more until replica.url points at a new location; the evidence log and the chain still are", "size", size, "copied", from)
 				s.replica.SkipCosign = true
+				s.cosignSkipped.Store(true)
 			}
 			continue
 		}
@@ -301,9 +308,13 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 			return total, fmt.Errorf("%w: %s is %d bytes, %d already copied — file was truncated; %s", ErrReplicaDiverged, name, size, from, divergedHint)
 		}
 		local := filepath.Join(s.cfg.DataDir, filepath.FromSlash(name))
+		read := func(from, end int64) ([]byte, error) { return readRange(local, from, end) }
+		if name == cosignFile {
+			read = s.cosignRange
+		}
 		for from < size {
 			end := min(size, from+s.replicaChunk)
-			data, err := readRange(local, from, end)
+			data, err := read(from, end)
 			if err != nil {
 				return total, err
 			}

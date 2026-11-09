@@ -237,6 +237,9 @@ type Store struct {
 	cosignMu  sync.Mutex
 	cosignLog *os.File
 	cosignIdx map[cosigKey][]cosigRef // по ключу свидетеля, по возрастанию размера
+	// cosignSkipped — журнал подписей больше не едет в копию наружу: в
+	// data_dir он не продолжает скопированный (replicaState.SkipCosign).
+	cosignSkipped atomic.Bool
 	// servedHead — последняя голова, подписанная для сборщиков и statement
 	// (servedHeadLocked), под chainMu: подпись не повторяется на каждый
 	// ответ.
