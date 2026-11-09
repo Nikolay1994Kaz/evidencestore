@@ -359,13 +359,13 @@
    "name": "R65 строка журнала сверяется текущим доверием второй службы",
    "file": "internal/store/archive.go",
    "old": "\t\t\t\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
-   "new": "\t\t\t\t\t_, err = tsa.Verify(rec.Token, proof.HeadImprint(rec.Size, root), s.archiver.trust)"
+   "new": "\t\t\t\t\t_, err = tsa.Verify(rec.Token, proof.HeadImprint(rec.Size, root), tsa.Trust{Roots: s.archiver.trust.Roots, Intermediates: inter})"
   },
   {
    "name": "R66 подпись токена строки журнала не сверяется",
    "file": "internal/store/archive.go",
    "old": "\t\t\t\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
-   "new": "\t\t\t\t\terr = nil"
+   "new": "\t\t\t\t\terr, _ = error(nil), inter"
   },
   {
    "name": "R68 та же служба по другому порту — другая",
