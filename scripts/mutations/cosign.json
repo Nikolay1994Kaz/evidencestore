@@ -336,8 +336,8 @@
   {
    "name": "S11 409 без типа размера принят",
    "file": "internal/store/cosign.go",
-   "old": "\t\t\tif err != nil || !strings.HasPrefix(ctype, \"text/x.tlog.size\") {",
-   "new": "\t\t\tif err != nil {"
+   "old": "!strings.HasPrefix(ctype, \"text/x.tlog.size\")",
+   "new": "!strings.HasPrefix(ctype, \"\")"
   },
   {
    "name": "S12 422 не тревога",

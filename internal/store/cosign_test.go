@@ -628,6 +628,12 @@ func TestCosignJournalDamage(t *testing.T) {
 	ingest(t, s, "abs-core", 1, 3)
 	mustStamp(t, s)
 	mustCosign(t, s)
+	// Цепь уходит дальше последней подписанной головы: строка «голова длины
+	// цепи» ниже — не повтор последней верной.
+	ingest(t, s, "abs-core", 4, 4)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
 	pub, _ := base64.RawStdEncoding.DecodeString(s.PublicKey())
 	chainLen := s.Head().Seq
 	s.Close()
@@ -674,7 +680,7 @@ func TestCosignJournalDamage(t *testing.T) {
 		lastGood = max(lastGood, r.Size)
 	}
 	damaged := `{"name":"witness.example/w1","size":1,"root":"AAAA","sig":"AAAA"}` + "\n" +
-		`not json` + "\n" + line(forged) + line(foreign) + string(good) + line(beyond) + line(tail) + `{"name":"witness.example/w1","si`
+		`not json` + "\n" + line(forged) + line(foreign) + line(beyond) + string(good) + line(tail) + `{"name":"witness.example/w1","si`
 	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
 		t.Fatal(err)
 	}

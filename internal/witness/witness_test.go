@@ -493,6 +493,13 @@ func TestWitnessDamagedStateStops(t *testing.T) {
 	if _, err := New(r.key, []Log{{Origin: c.origin(), Key: c.signer.PublicKey()}}, dir, nil); err == nil {
 		t.Fatal("свидетель стартовал с испорченным состоянием")
 	}
+	// И без журнала подписанного (каталог прежней версии): испорченное
+	// состояние — не «ещё не подписывали».
+	r.w.Close()
+	os.Remove(filepath.Join(dir, cosignedFile))
+	if _, err := New(r.key, []Log{{Origin: c.origin(), Key: c.signer.PublicKey()}}, dir, nil); err == nil || !strings.Contains(err.Error(), "does not parse") {
+		t.Fatalf("без журнала подписанного свидетель стартовал с испорченным состоянием: %v", err)
+	}
 }
 
 func TestLockIsExclusive(t *testing.T) {

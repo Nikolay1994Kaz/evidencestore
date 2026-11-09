@@ -12,13 +12,49 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Nikolay1994Kaz/evidencestore" alt="License"></a>
 </p>
 
-A log is written by the system it describes and usually lies on the same machine, so whoever controls the machine controls the log. An intruder cleans `auth.log`; an administrator, or an AI agent that did something it shouldn't have, often has the same access. evidencestore is a witness that lives elsewhere: a collector next to the log sends every line to a store on another machine, and the store can later prove any of those lines to an auditor.
+<p align="center"><b>Tamper-evident storage for audit logs, with proofs an auditor checks offline.</b></p>
 
-It takes any line-based log: system logs, application and core banking audit logs, a copy of the SIEM stream, the flight recorder of an AI agent gateway such as [Pipelock](https://github.com/luckyPipewrench/pipelock), whose own hash chain and signatures the store also checks at intake.
+A log usually lies on the machine it describes, so whoever controls that machine controls its log: an intruder cleans `auth.log`, an administrator or an AI agent edits away what it did. evidencestore keeps every line where they cannot reach it. A collector next to the log sends each line to a store on another machine, and for any line the store gives a proof bundle that the auditor checks with `esverify`, offline and without trusting the store.
 
-Every record is accepted over mutual TLS, encrypted with its own key, written to disk (the store answers "accepted" only after `fsync`) and chained by hash. The chain head is time-stamped by an external RFC 3161 authority, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). For any record the store produces a proof bundle. An auditor checks it **offline**, without access to the store and without trusting it: the record bytes, a Merkle path into the chain, the chain up to a signed head (a checkpoint: the number of links and the root of a Merkle tree over all of them), and time-stamps from before and after the record. Of the other records in the store it shows only how many there were and when, not whose or what. The chain heads can also go to a witness of their own, out of reach of the store's administrator, and every collector checks that each head the store gives it extends the last one and keeps one every few minutes, so that a rewrite by that administrator shows as well ([Witness of the chain heads](docs/copy-and-witness.md#witness-of-the-chain-heads), [Collectors as witnesses](docs/copy-and-witness.md#collectors-as-witnesses)).
+```mermaid
+flowchart LR
+  C["log file + escollect<br/>(source host)"] -- "every line, mTLS" --> S["evidencestore<br/>encrypts, fsyncs, chains by hash"]
+  S -. "signed promise" .-> C
+  T["RFC 3161 TSA"] -- "time-stamps" --> S
+  S -- "signed chain heads" --> W["witnesses<br/>eswitness · S3 Object Lock · collectors"]
+  S -- "proof bundle" --> A["auditor: esverify, offline"]
+```
 
-Retention is enforced by destroying keys (crypto-erasure). Every record of a source for a month is encrypted under that month's key. Destroying the key needs a waiting period and two named approvals, which the chain records but the store does not authenticate ([Known limitations](docs/limitations.md)), and it makes those bodies unreadable in every copy (log segments, backups). The chain and the proofs stay intact: you can still prove that record #42 from `abs-core` existed, was received at a given time and was never altered. You can no longer read it.
+- **Deleted lines come back.** The store keeps every record byte for byte, each encrypted under its own key, and `esverify -body` writes a verified record out exactly as the source sent it.
+- **Proof, not trust.** A bundle carries the record, its Merkle path into the hash chain, a head signed by the store and RFC 3161 time-stamps from before and after it. One changed byte fails the check.
+- **Nothing left out.** A bundle over a window of time, for one source, for every source or for one subject inside a source, proves that it holds every record the store put into its chain in that window.
+- **The store's administrator is checked too.** Signed chain heads go to witnesses out of that administrator's reach: an `eswitness` that cosigns only heads that extend the last one it cosigned, an S3 bucket with Object Lock, the collectors themselves. A history rewritten after they saw it contradicts what they hold.
+- **Retention by destroying keys.** The records of a source for a month share that month's key. Destroying it, after a waiting period and two named approvals, makes those bodies unreadable in every copy, while the proofs that the records existed and never changed stay valid.
+
+What the auditor sees (`esverify` on a bundle from a store with a witness, abridged):
+
+```
+$ esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt -witness-key "$WITNESS"
+VERIFIED
+
+Record: source app, number 2, type "text"
+Received by the store: 2026-11-08 21:11:33 UTC (by its clock)
+Entered the chain between T1 = 2026-11-08 21:11:30 UTC and T2 = 2026-11-08 21:11:37 UTC (TSA time-stamps)
+
+Checks:
+  ✔ the chain leaf describes this very record — position 2
+  ✔ the links are chained by hash with no gaps — 5 links
+  ✔ the head is signed with the store key — head 8
+  ✔ the record is in a chain link (Merkle path) — link 7
+  ✔ a TSA time-stamp over the chain after the record (not later than T2) — T2 = 2026-11-08 21:11:37 UTC, head 8
+  ✔ the body opens with the record key in the bundle, the key is bound to the digest, the GCM tag matches — 74 bytes
+  ✔ every witness given with -witness-key cosigned a head at or after this point, and the chain in the bundle agrees with it — witness.example/w1 (key 2bbc0e6e): head 7, cosigned at 2026-11-08 21:11:36 UTC
+
+Body:
+2026-11-09T02:11:34+05:00 user=alice action=export table=clients rows=1200
+```
+
+It takes any line-based log: system logs, application and core banking audit logs, a copy of the SIEM stream, the flight recorder of an AI agent gateway such as [Pipelock](https://github.com/luckyPipewrench/pipelock), whose own hash chain and signatures the store also checks at intake. Time-stamps come from any RFC 3161 service, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). What a bundle proves and what it does not, exactly: [What is proven, and what is not](#what-is-proven-and-what-is-not).
 
 ## Try it
 
@@ -111,6 +147,14 @@ esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt
 
 `esverify` ends with `VERIFIED` (exit code 0); `evidencestore status -config store.json` shows how many records each source has. A real installation also needs certificates from your own PKI, a real TSA, `keys.backup_dir` and `keys.roots_mirror_dir` on other disks, and the store on another machine than its sources ([Install](#install)). To start over, stop the store and remove `~/es-try`.
 
+## How it works
+
+Every record is accepted over mutual TLS, encrypted with its own key, written to disk (the store answers "accepted" only after `fsync`, with a signed promise the collector keeps) and chained by hash. The chain head is time-stamped by an external RFC 3161 authority. For any record the store produces a proof bundle, and an auditor checks it **offline**, without access to the store and without trusting it: the record bytes, a Merkle path into the chain, the chain up to a signed head (a checkpoint: the number of links and the root of a Merkle tree over all of them), and time-stamps from before and after the record. Of the other records in the store the bundle shows only how many there were and when, not whose or what.
+
+Whoever holds the store's signing key could sign a second version of the chain, so the heads also go where that administrator cannot reach: to witnesses that cosign a head only if it extends the last one they cosigned (`eswitness`, C2SP), to an S3 bucket with Object Lock, and to every collector, which checks that each head the store gives it extends the last one and keeps one every few minutes. A rewrite then contradicts what they hold ([Cosigning witnesses](docs/copy-and-witness.md#cosigning-witnesses-c2sp), [Witness of the chain heads](docs/copy-and-witness.md#witness-of-the-chain-heads), [Collectors as witnesses](docs/copy-and-witness.md#collectors-as-witnesses)).
+
+Retention is enforced by destroying keys (crypto-erasure). Every record of a source for a month is encrypted under that month's key. Destroying the key needs a waiting period and two named approvals, which the chain records but the store does not authenticate ([Known limitations](docs/limitations.md)), and it makes those bodies unreadable in every copy (log segments, backups). The chain and the proofs stay intact: you can still prove that record #42 from `abs-core` existed, was received at a given time and was never altered. You can no longer read it.
+
 ## Components
 
 | Binary | Role |
@@ -192,11 +236,11 @@ Root on the store host can delete or rewrite the store's files, and whoever hold
 
 ## How it was tested
 
-The test gate with the race detector runs on every push. On the code of v0.4.0, 650 bugs were injected one at a time, and every one of them made a test fail; the set has since grown to 873, and those have not all been run together since. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each on the code of v0.4.0, with shorter runs on the code after it, and none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on MinIO with Object Lock, not yet on AWS. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
+The test gate with the race detector runs on every push. On the code of v0.4.0, 650 bugs were injected one at a time, and every one of them made a test fail; the set has since grown to 975, and those have not all been run together since. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each on the code of v0.4.0, with shorter runs on the code after it, and none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on MinIO with Object Lock, not yet on AWS. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
 
 ## Known limitations
 
-Each with its cause, in [docs/limitations.md](docs/limitations.md): a file the collector never saw, a file closed after a minute of quiet, long lines, `copytruncate` rotation, the collector epoch is not a secret, gateway receipts inside entries, a gap event lost in a crash, an unreachable key backup at restart, approvals recorded but not enforced, bulk proof export, a stalled `keys.backup_dir`, receive times shifted by up to two minutes, a held-back record shown only by the collector's promise, the heartbeat of a stopped collector, indexes in memory, the witness check by number without receipt times, the witness queue in memory, the witness following the copy, cosignatures not in the copy, Ed25519 cosignatures only, a cosigning witness trusted for its clock and key, the store's pace seen by collectors, a collector's head saved every few minutes, heads of different lengths not compared, a head past the copy, a bundle that names its own source, a changed record that stops the start, file-only input, failure paths checked only by reading. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
+Each with its cause, in [docs/limitations.md](docs/limitations.md): a file the collector never saw, a file closed after a minute of quiet, long lines, `copytruncate` rotation, the collector epoch is not a secret, gateway receipts inside entries, a gap event lost in a crash, an unreachable key backup at restart, approvals recorded but not enforced, bulk proof export, a stalled `keys.backup_dir`, receive times shifted by up to two minutes, a held-back record shown only by the collector's promise, the heartbeat of a stopped collector, indexes in memory, the witness check by number without receipt times, the witness queue in memory, the witness following the copy, cosignatures after the last copy pass, Ed25519 cosignatures only, a cosigning witness pushed ahead of the copy, a cosigning witness trusted for its clock and key, the store's pace seen by collectors, a collector's head saved every few minutes, heads of different lengths not compared, a head past the copy, a bundle that names its own source, a changed record that stops the start, file-only input, failure paths checked only by reading. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
 
 ## Development
 
