@@ -39,6 +39,8 @@ type Authority struct {
 	essV1   int                   // тесты: 1 — атрибут signingCertificate (v1, SHA-1) вместо v2, -1 — никакого
 	acc     accuracy              // тесты: точность метки
 	carry   []*x509.Certificate   // Carry: сертификаты в токене помимо своего
+	byKeyID bool                  // тесты: SID — номер ключа (subjectKeyIdentifier), SignerInfo v3
+	noCert  bool                  // тесты: свой сертификат в токен не кладётся
 
 	mu     sync.Mutex
 	serial int64
@@ -147,6 +149,14 @@ func (a *Authority) Reissue(serial int64, notAfter time.Time) (*Authority, error
 	return &Authority{key: a.key, cert: cert, root: a.root, rootKey: a.rootKey, policy: a.policy}, nil
 }
 
+// SignByKeyID — тесты: подписант в токене назван номером ключа
+// (subjectKeyIdentifier), а не издателем и номером.
+func (a *Authority) SignByKeyID() { a.byKeyID = true }
+
+// WithoutCert — тесты: токены не несут сертификат службы (его берут из
+// доверия, как у служб, что его не кладут).
+func (a *Authority) WithoutCert() { a.noCert = true }
+
 // Carry — сертификаты, которые токены службы несут помимо её собственного
 // (служба может класть всю цепочку и прежние сертификаты ключа): тесты.
 func (a *Authority) Carry(certs ...*x509.Certificate) { a.carry = append(a.carry, certs...) }
@@ -229,16 +239,24 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 	if _, ok := a.key.(*ecdsa.PrivateKey); ok {
 		sigAlg = x509.ECDSAWithSHA256
 	}
+	sid, err := asn1.Marshal(issuerAndSerial{Issuer: asn1.RawValue{FullBytes: a.cert.RawIssuer}, Serial: a.cert.SerialNumber})
+	if err != nil {
+		return nil, err
+	}
+	siVersion, sidRaw := 1, asn1.RawValue{FullBytes: sid}
+	if a.byKeyID {
+		siVersion, sidRaw = 3, asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, Bytes: a.cert.SubjectKeyId}
+	}
 	si, err := asn1.Marshal(struct {
 		Version            int
-		SID                issuerAndSerial
+		SID                asn1.RawValue
 		DigestAlgorithm    pkix.AlgorithmIdentifier
 		SignedAttrs        asn1.RawValue
 		SignatureAlgorithm pkix.AlgorithmIdentifier
 		Signature          []byte
 	}{
-		Version:            1,
-		SID:                issuerAndSerial{Issuer: asn1.RawValue{FullBytes: a.cert.RawIssuer}, Serial: a.cert.SerialNumber},
+		Version:            siVersion,
+		SID:                sidRaw,
 		DigestAlgorithm:    pkix.AlgorithmIdentifier{Algorithm: oidSHA256},
 		SignedAttrs:        asn1.RawValue{FullBytes: append([]byte{0xA0}, attrs[1:]...)}, // [0] IMPLICIT
 		SignatureAlgorithm: pkix.AlgorithmIdentifier{Algorithm: sigAlgOID(sigAlg)},
@@ -258,11 +276,16 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 	sd = append(sd, version...)
 	sd = append(sd, tlv(0x31, digestAlgs)...)
 	sd = append(sd, encap...)
-	certs := slices.Clone(a.cert.Raw)
+	var certs []byte
+	if !a.noCert {
+		certs = slices.Clone(a.cert.Raw)
+	}
 	for _, c := range a.carry {
 		certs = append(certs, c.Raw...)
 	}
-	sd = append(sd, tlv(0xA0, certs)...) // certificates [0] IMPLICIT
+	if len(certs) > 0 {
+		sd = append(sd, tlv(0xA0, certs)...) // certificates [0] IMPLICIT
+	}
 	sd = append(sd, tlv(0x31, si)...)
 	sdType, _ := asn1.Marshal(oidSignedData)
 	return tlv(0x30, append(sdType, tlv(0xA0, tlv(0x30, sd))...)), nil

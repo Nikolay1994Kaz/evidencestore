@@ -337,6 +337,20 @@ func TestRevocationsNoReasonSignerMarkedCA(t *testing.T) {
 	if v, err := r.Check(info.Chains, info.GenTime); err != nil || !v.NeedPOE {
 		t.Fatalf("служба с флагом центра, отозвана без причины: %+v %v", v, err)
 	}
+	// И её ключ: метка того же ключа под другим сертификатом ждёт POE.
+	other := *leafT
+	other.SerialNumber = big.NewInt(6)
+	twin := issue(t, &other, leaf.key, ca)
+	i2 := renewedStamp(t, twin, root, day(2026, 10, 2), Trust{Roots: pool, Intermediates: []*x509.Certificate{ca.cert}})
+	a := r.NewAssessment()
+	a.Add(info.Chains, info.GenTime)
+	id, err := a.Add(i2.Chains, i2.GenTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := a.Verdicts()[id]; !v.NeedPOE || !strings.Contains(v.Entry.From, "with the same key") {
+		t.Fatalf("тот же ключ под другим сертификатом: %+v", v)
+	}
 }
 
 // R76. Сертификат службы, отозванный без причины, ставит под подозрение ключ
