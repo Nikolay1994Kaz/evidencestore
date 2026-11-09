@@ -81,14 +81,14 @@
   {
    "name": "X13 подпись не сверяется",
    "file": "internal/tsa/seal.go",
-   "old": "\t\terr := checkSignature(c, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature)",
-   "new": "\t\terr := error(nil); _ = attrsSet"
+   "old": "\t\t\terr = checkSignature(c, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature)",
+   "new": "\t\t\terr = nil; _ = attrsSet"
   },
   {
    "name": "X14 signingCertificateV2 не сверяется",
    "file": "internal/tsa/seal.go",
-   "old": "\t\t\t\terr = checkSigningCert(a, c)",
-   "new": "\t\t\t\terr, _ = nil, a"
+   "old": "\t\t\terr = checkSigningCert(a, c)",
+   "new": "\t\t\terr, _ = nil, a"
   },
   {
    "name": "X15 keyUsage подписанта не сверяется",

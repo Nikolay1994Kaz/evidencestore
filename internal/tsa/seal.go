@@ -154,14 +154,19 @@ func OpenSeal(der []byte, intermediates ...*x509.Certificate) (Sealed, error) {
 	}
 	var signer *x509.Certificate
 	var firstErr error
+	// Сначала атрибут signingCertificate (хэш сертификата), потом подпись:
+	// поле certificates не подписано, и сертификатов с тем же SID можно
+	// подложить сколько угодно. Без атрибута (в CMS он не обязателен) подпись
+	// сверяется у каждого, их число держит MaxSealSize.
 	for _, c := range candidates {
-		err := checkSignature(c, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature)
+		var err error
+		if a, ok := attrOf(si, oidSigningCertV2); ok {
+			err = checkSigningCert(a, c)
+		} else if a, ok := attrOf(si, oidSigningCertV1); ok {
+			err = checkSigningCertV1(a, c)
+		}
 		if err == nil {
-			if a, ok := attrOf(si, oidSigningCertV2); ok {
-				err = checkSigningCert(a, c)
-			} else if a, ok := attrOf(si, oidSigningCertV1); ok {
-				err = checkSigningCertV1(a, c)
-			}
+			err = checkSignature(c, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature)
 		}
 		if err == nil {
 			signer = c
