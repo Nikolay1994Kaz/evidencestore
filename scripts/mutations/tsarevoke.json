@@ -695,7 +695,7 @@
    "name": "R134 ключ подписанта строки журнала — без доверия при выдаче",
    "file": "internal/tsa/tsa.go",
    "old": "\tc, err := findSigner(p.signer.SID, append(slices.Clone(p.certs), intermediates...))",
-   "new": "\tc, err := findSigner(p.signer.SID, p.certs)"
+   "new": "\tc, err := findSigner(p.signer.SID, append(slices.Clone(p.certs), intermediates[:0]...))"
   }
  ]
 }
