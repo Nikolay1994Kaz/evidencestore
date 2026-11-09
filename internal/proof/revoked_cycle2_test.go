@@ -268,3 +268,36 @@ func TestRevocationTokenCarriesRenewedCert(t *testing.T) {
 		}
 	}
 }
+
+// P-178, корни -tsa-trust. Центр-тёзка, которого нет ни в одной цепочке, а
+// только среди корней проверяющего: его более новый CRL с тем же номером
+// сертификата не делает метку второй службы «не проверенной».
+func TestRevocationNamesakeRootOnlyInTrust(t *testing.T) {
+	w, b := standard(t, nil)
+	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
+	other, tr := otherTSA(t, w)
+	cut := w.now.Add(2 * time.Hour)
+	now := w.now.Add(48 * time.Hour)
+	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
+	twin, err := tsa.NewAuthority(false) // тот же корень по имени, номер службы тот же
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.TSA.Roots.AddCert(twin.Root())
+	tr.TSA.RootCerts = append(tr.TSA.RootCerts, twin.Root())
+	tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, cut, now), other)
+	der, err := twin.RevocationList(now.Add(-30*time.Minute), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: other.Cert().SerialNumber, RevocationTime: w.now, ReasonCode: tsa.ReasonKeyCompromise})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "twin.crl")
+	if err := os.WriteFile(p, der, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.TSARevocations.AddCRL(p); err != nil {
+		t.Fatal(err)
+	}
+	if r := Verify(b, tr); !r.Valid() || !strings.Contains(r.Text(), "of another CA named") {
+		t.Fatalf("CRL тёзки, чей корень только в -tsa-trust:\n%s", r.Text())
+	}
+}
