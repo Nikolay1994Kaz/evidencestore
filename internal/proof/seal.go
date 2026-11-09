@@ -198,6 +198,7 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 	info, why := sealTime(s, trust.TSA)
 	if why == "" && sc.revs != nil {
 		sc.ensureAssessment()
+		sc.as.Known(info.Certs...)
 		if id, err := sc.as.Add(info.Chains, info.GenTime); err == nil {
 			c.tokenID = id
 		} else {
@@ -233,6 +234,7 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 	}
 	if sc.revs != nil {
 		sc.ensureAssessment()
+		sc.as.Known(sealed.Certs...)
 		id, err := sc.as.Add(chains, at)
 		if err != nil {
 			c.err = fmt.Errorf("the seal certificate is not in force at %s: %v", fmtTime(at), err)
@@ -251,7 +253,9 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 
 // finishSeal — пункт о печати по вердиктам оценки (vs; nil — отзыв не
 // сверяется). Печать под подозрением (сертификат отозван по компрометации)
-// в силе, только если метка над ней не под подозрением и раньше отсечки.
+// в силе, только если метка над ней раньше отсечки, сама не под подозрением
+// и её отзыв проверен (время другой подписи показывает только метка,
+// прошедшая проверку, ETSI EN 319 102-1).
 func (sc *stampCheck) finishSeal(vs []tsa.Verdict, add func(string, error, string) bool) {
 	c := sc.seal
 	if c == nil {
@@ -265,8 +269,12 @@ func (sc *stampCheck) finishSeal(vs []tsa.Verdict, add func(string, error, strin
 	// службы, и цепочка печати на это время ничего не значит. Печать
 	// судится на момент проверки, как без метки.
 	at, id := c.at, c.id
-	if c.tokenID >= 0 && vs[c.tokenID].NeedPOE {
-		c.why = "the time-stamp over the seal rests on " + revokedWhy(vs[c.tokenID])
+	if c.tokenID >= 0 && (vs[c.tokenID].NeedPOE || vs[c.tokenID].Retired != nil) {
+		if v := vs[c.tokenID]; v.Retired != nil {
+			c.why = fmt.Sprintf("the time-stamp over the seal is not in force (%v)", v.Retired)
+		} else {
+			c.why = "the time-stamp over the seal rests on " + revokedWhy(v)
+		}
 		if c.nowErr != nil {
 			add(sealCheckName, fmt.Errorf("%s, so it does not show when the seal was made, and at the time of the check the seal does not hold: %v", c.why, c.nowErr), "")
 			return
@@ -286,9 +294,17 @@ func (sc *stampCheck) finishSeal(vs []tsa.Verdict, add func(string, error, strin
 	}
 	v := vs[id]
 	sc.record(v)
+	if v.Retired != nil {
+		add(sealCheckName, fmt.Errorf("the seal certificate is not in force: %v (%s)", v.Retired, detail), "")
+		return
+	}
 	if v.NeedPOE {
 		if at.IsZero() || !at.Before(v.Cutoff) {
 			add(sealCheckName, fmt.Errorf("the seal rests on %s: nothing shows it was made before %s (%s)", revokedWhy(v), fmtTime(v.Cutoff), detail), "")
+			return
+		}
+		if tv := vs[c.tokenID]; len(tv.Unchecked) > 0 {
+			add(sealCheckName, fmt.Errorf("the seal rests on %s, and the time-stamp over it would show it was made before %s, but the revocation of the time-stamp's own certificate was not checked (see the notes): pass the CRL of its CA with -tsa-crl (%s)", revokedWhy(v), fmtTime(v.Cutoff), detail), "")
 			return
 		}
 		detail += "; it rests on " + revokedWhy(v) + ", and the time-stamp shows it was made earlier"

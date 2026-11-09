@@ -213,16 +213,26 @@ func TestSealRevoked(t *testing.T) {
 	made, stamped := w.now, w.now.Add(time.Minute)
 	b.Seal = p.seal(t, w, w.signer.PublicKey(), made, stamped)
 	now := w.now.Add(48 * time.Hour)
-	run := func(s *StoreSeal, at time.Time, reason int) Report {
+	tsaCRL, err := w.tsa.RevocationList(now.Add(-time.Hour), now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runWith := func(s *StoreSeal, at time.Time, reason int, crls ...[]byte) Report {
 		tr := w.trust()
 		tr.SealTrust = p.trust()
-		tr.TSARevocations = p.crl(t, now, x509.RevocationListEntry{SerialNumber: p.org.SerialNumber, RevocationTime: at, ReasonCode: reason})
+		tr.TSARevocations = revsOf(t, now, append([][]byte{p.crlDER(t, now, x509.RevocationListEntry{SerialNumber: p.org.SerialNumber, RevocationTime: at, ReasonCode: reason})}, crls...)...)
 		bb := b
 		bb.Seal = s
 		return Verify(bb, tr)
 	}
+	run := func(s *StoreSeal, at time.Time, reason int) Report { return runWith(s, at, reason, tsaCRL) }
 	if r := run(b.Seal, stamped.Add(time.Hour), tsa.ReasonKeyCompromise); !r.Valid() || !strings.Contains(r.Text(), "made earlier") {
 		t.Fatalf("компрометация после метки над печатью:\n%s", r.Text())
+	}
+	// Отзыв службы метки над печатью не проверен — метка времени печати не
+	// показывает.
+	if r := runWith(b.Seal, stamped.Add(time.Hour), tsa.ReasonKeyCompromise); r.Valid() || !strings.Contains(r.Text(), "the revocation of the time-stamp's own certificate was not checked") {
+		t.Fatalf("компрометация после метки над печатью, отзыв службы метки не проверен:\n%s", r.Text())
 	}
 	if r := run(b.Seal, stamped.Add(-time.Second), tsa.ReasonKeyCompromise); r.Valid() || !strings.Contains(r.Text(), "nothing shows it was made before") {
 		t.Fatalf("компрометация до метки над печатью:\n%s", r.Text())
