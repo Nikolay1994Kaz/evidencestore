@@ -687,9 +687,12 @@ func TestCosignJournalDamage(t *testing.T) {
 		json.Unmarshal(l, &r)
 		lastGood = max(lastGood, r.Size)
 	}
-	// Первой — та же испорченная голова длины цепи: завышенный размер в
-	// начале не прячет верные строки после неё.
-	damaged := line(tail) + `{"name":"witness.example/w1","size":1,"root":"AAAA","sig":"AAAA"}` + "\n" +
+	// Первой — верная строка не на своём месте (журнал склеен из двух):
+	// последняя верная голова; за ней — та же испорченная голова длины цепи.
+	// Завышенный размер в начале не прячет верные строки после него, и пакет
+	// закрепляет ранняя голова, а не первая по файлу.
+	lastLine := good[bytes.LastIndexByte(good[:len(good)-1], '\n')+1:]
+	damaged := string(lastLine) + line(tail) + `{"name":"witness.example/w1","size":1,"root":"AAAA","sig":"AAAA"}` + "\n" +
 		`not json` + "\n" + line(forged) + line(foreign) + line(beyond) + string(good) + line(tail) + `{"name":"witness.example/w1","si`
 	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
 		t.Fatal(err)
