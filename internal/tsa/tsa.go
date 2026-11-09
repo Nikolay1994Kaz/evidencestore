@@ -262,6 +262,9 @@ type Info struct {
 	Serial  *big.Int
 	Policy  asn1.ObjectIdentifier
 	Signer  *x509.Certificate
+	// Chains — цепочки от сертификата службы до корня из Trust, по которым
+	// он проверен: по ним сверяется отзыв (Revocations.Check).
+	Chains [][]*x509.Certificate
 }
 
 // Trust — во что верит проверяющий: корни (у НУЦ — root_rsa_2020) и
@@ -452,15 +455,16 @@ func Verify(token []byte, imprint [32]byte, trust Trust) (Info, error) {
 	for _, c := range pool {
 		inter.AddCert(c)
 	}
-	if _, err := signer.Verify(x509.VerifyOptions{
+	chains, err := signer.Verify(x509.VerifyOptions{
 		Roots:         trust.Roots,
 		Intermediates: inter,
 		CurrentTime:   p.tst.GenTime,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping},
-	}); err != nil {
+	})
+	if err != nil {
 		return Info{}, fmt.Errorf("%w: signer certificate: %v", ErrInvalid, err)
 	}
-	return Info{GenTime: p.tst.GenTime, Serial: p.tst.SerialNumber, Policy: p.tst.Policy, Signer: signer}, nil
+	return Info{GenTime: p.tst.GenTime, Serial: p.tst.SerialNumber, Policy: p.tst.Policy, Signer: signer, Chains: chains}, nil
 }
 
 // GenTime достаёт время из токена без проверки: для показа и поиска.

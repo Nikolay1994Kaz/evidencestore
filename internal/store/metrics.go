@@ -34,6 +34,7 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		metrics.One("evidencestore_replica_last_success_timestamp_seconds", "end of the last successful copy to replica.url, 0 if none since start", metrics.Gauge, seconds(time.Unix(0, s.replicaOK.Load()))),
 		metrics.One("evidencestore_replica_errors_total", "failed copy attempts", metrics.Counter, float64(s.replicaErrors.Load())),
 		metrics.One("evidencestore_replica_cosign_journal_skipped", "1 when data_dir/cosign/cosignatures.jsonl does not continue the one in the copy (removed or replaced): the copy goes on without new witness cosignatures until replica.url points at a new location", metrics.Gauge, metrics.Bool(s.cosignSkipped.Load())),
+		metrics.One("evidencestore_replica_archive_journal_skipped", "1 when data_dir/tsa/archive.jsonl does not continue the one in the copy (removed or replaced): the copy goes on without new time-stamps of the second TSA until replica.url points at a new location", metrics.Gauge, metrics.Bool(s.archiveSkipped.Load())),
 		metrics.One("evidencestore_witness_last_success_timestamp_seconds", "when the last signed head reached witness.url, 0 if none since start", metrics.Gauge, seconds(time.Unix(0, s.witnessOK.Load()))),
 		metrics.One("evidencestore_witness_errors_total", "failed attempts to send a signed head to witness.url", metrics.Counter, float64(s.witnessErrors.Load())),
 	}
@@ -88,6 +89,12 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 			lost.Samples = append(lost.Samples, metrics.Sample{Labels: l, Value: metrics.Bool(c.LostState)})
 		}
 		fams = append(fams, head, ok, errs, refused, lost)
+	}
+	if a := st.TSAArchive; a != nil {
+		fams = append(fams,
+			metrics.One("evidencestore_tsa_archive_head", "the last head the second TSA (tsa.archive) time-stamped, 0 if none", metrics.Gauge, float64(a.Head)),
+			metrics.One("evidencestore_tsa_archive_last_success_timestamp_seconds", "when the second TSA last returned a time-stamp that verified, 0 if none since start", metrics.Gauge, seconds(a.LastAt)),
+			metrics.One("evidencestore_tsa_archive_errors_total", "failed attempts to get a time-stamp of the second TSA", metrics.Counter, float64(a.Errors)))
 	}
 	return fams
 }

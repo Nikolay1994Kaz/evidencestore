@@ -17,6 +17,8 @@
 //	evidence/     журнал улик (evlog): сегменты только дописываются
 //	chain/        цепь (auditchain) и ключ подписи хранилища sign.key
 //	tsa-local/    ключи встроенной демо-службы меток, если она включена
+//	cosign/       подписи свидетелей C2SP (cosign.go), если они настроены
+//	tsa/          метки второй службы (archive.go), если она настроена
 //
 // Всё, что меняет кейринг и цепь, идёт через этот процесс: у них один
 // писатель. Администрирование — через unix-сокет (пакет server).
@@ -237,9 +239,17 @@ type Store struct {
 	cosignMu  sync.Mutex
 	cosignLog *os.File
 	cosignIdx map[cosigKey][]cosigRef // по ключу свидетеля, по возрастанию размера
-	// cosignSkipped — журнал подписей больше не едет в копию наружу: в
-	// data_dir он не продолжает скопированный (replicaState.SkipCosign).
-	cosignSkipped atomic.Bool
+	// cosignSkipped, archiveSkipped — журнал подписей свидетелей, журнал меток
+	// второй службы больше не едет в копию наружу: в data_dir он не
+	// продолжает скопированный (replicaState.Skip).
+	cosignSkipped  atomic.Bool
+	archiveSkipped atomic.Bool
+	// Вторая служба меток (archive.go): журнал и его указатели — под
+	// archiveMu. Порядок захвата: chainMu раньше archiveMu.
+	archiver   *archiver
+	archiveMu  sync.Mutex
+	archiveLog *os.File
+	archiveIdx []archiveRef // по возрастанию размера
 	// servedHead — последняя голова, подписанная для сборщиков и statement
 	// (servedHeadLocked), под chainMu: подпись не повторяется на каждый
 	// ответ.
@@ -817,6 +827,9 @@ func (s *Store) open() error {
 	if err := s.openCosigners(); err != nil {
 		return err
 	}
+	if err := s.openArchive(); err != nil {
+		return err
+	}
 	s.appendEvent(auditchain.EventStart, "", "", []byte(s.signer.PublicKeyString()))
 	if err := s.ensureMonthScopes(s.nowTime()); err != nil {
 		// Копия в резерв не прошла: ключ заведён, но не выдаётся, пока
@@ -936,6 +949,7 @@ func (s *Store) closeFiles() error {
 		err = errors.Join(err, s.tree.close())
 	}
 	err = errors.Join(err, s.closeCosignLog())
+	err = errors.Join(err, s.closeArchiveLog())
 	if s.keys != nil {
 		err = errors.Join(err, s.keys.Close())
 	}

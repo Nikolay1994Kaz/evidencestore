@@ -14,7 +14,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -68,7 +70,7 @@ func NewAuthority(rsaKey bool) (*Authority, error) {
 		Subject:               pkix.Name{CommonName: "evidencestore demo TSA root"},
 		NotBefore:             notBefore,
 		NotAfter:              now.AddDate(20, 0, 0),
-		KeyUsage:              x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
@@ -99,6 +101,23 @@ func NewAuthority(rsaKey bool) (*Authority, error) {
 
 // Root — корневой сертификат: его проверяющий закрепляет у себя.
 func (a *Authority) Root() *x509.Certificate { return a.root }
+
+// Cert — сертификат службы, которым подписаны её токены.
+func (a *Authority) Cert() *x509.Certificate { return a.cert }
+
+// RevocationList выпускает CRL корня службы (DER) с записями revoked: тесты
+// отзыва. Только у службы, созданной в этом процессе (NewAuthority).
+func (a *Authority) RevocationList(thisUpdate, nextUpdate time.Time, revoked ...x509.RevocationListEntry) ([]byte, error) {
+	if a.rootKey == nil {
+		return nil, errors.New("tsa: the root key is not in this process")
+	}
+	return x509.CreateRevocationList(rand.Reader, &x509.RevocationList{
+		Number:                    big.NewInt(thisUpdate.Unix()),
+		ThisUpdate:                thisUpdate,
+		NextUpdate:                nextUpdate,
+		RevokedCertificateEntries: revoked,
+	}, a.root, a.rootKey)
+}
 
 // Trust — доверие к этой службе для Verify.
 func (a *Authority) Trust() Trust {
@@ -319,4 +338,36 @@ func tlv(tag byte, content []byte) []byte {
 		out = append(out, 0x83, byte(n>>16), byte(n>>8), byte(n))
 	}
 	return append(out, content...)
+}
+
+// ServeHTTP отвечает на запросы RFC 3161, как настоящая служба. Продукт
+// зовёт встроенную службу напрямую (Sign); по HTTP её зовут тесты: Request на
+// настоящем обмене RFC 3161 и вторая служба хранилища (tsa.archive).
+func (a *Authority) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req timeStampReq
+	if _, err := asn1.Unmarshal(body, &req); err != nil || !req.MessageImprint.HashAlgorithm.Algorithm.Equal(oidSHA256) {
+		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}}) // rejection
+		return
+	}
+	token, err := a.Sign(req.MessageImprint.HashedMessage, req.Nonce)
+	if err != nil {
+		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}})
+		return
+	}
+	writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 0}, Token: asn1.RawValue{FullBytes: token}})
+}
+
+func writeResp(w http.ResponseWriter, resp timeStampResp) {
+	der, err := asn1.Marshal(resp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/timestamp-reply")
+	w.Write(der)
 }

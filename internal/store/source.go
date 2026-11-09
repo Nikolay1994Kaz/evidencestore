@@ -417,6 +417,14 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	if b.Cosignatures, err = s.cosignaturesFor(links[0].Seq, links[len(links)-1].Seq, b.Upper.Token.LinkSeq); err != nil {
 		return proof.SourceBundle{}, err
 	}
+	// Метки второй службы над головами не раньше токенов краёв и закрывающей.
+	tokens := []uint64{b.Closing.LinkSeq, b.Upper.Token.LinkSeq}
+	if b.Lower.Head != 0 {
+		tokens = append([]uint64{b.Lower.Token.LinkSeq}, tokens...)
+	}
+	if b.Archive, err = s.archiveFor(tokens, links[len(links)-1].Seq); err != nil {
+		return proof.SourceBundle{}, err
+	}
 	return b, nil
 }
 

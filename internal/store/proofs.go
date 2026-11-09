@@ -89,6 +89,7 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	from := n
 
 	// T2: первая метка над головой не раньше звена улики.
+	var upperLeaf proof.Inclusion
 	for _, t := range s.tokens {
 		if t.head >= n {
 			token, err := s.leafPayloadLocked(t.leaf)
@@ -96,6 +97,9 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 				return proof.Bundle{}, err
 			}
 			b.Upper = &proof.Upper{HeadSeq: t.head, Token: token}
+			if upperLeaf, err = s.inclusionLocked(t.leaf); err != nil {
+				return proof.Bundle{}, err
+			}
 			break
 		}
 	}
@@ -145,6 +149,14 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 		}
 		to = toHead
 	}
+	// Лист токена T2 — где лежит токен (proof.revoked): по нему метку
+	// отозванного по компрометации сертификата спасает поздняя метка второй
+	// службы. Пакет доходит до его звена, только если вторая служба есть или
+	// пакет и так туда доходит: без неё лист нечем было бы подкрепить.
+	if b.Upper != nil && (s.archiver != nil || to >= upperLeaf.LinkSeq) {
+		b.Upper.Inclusion = &upperLeaf
+		to = max(to, upperLeaf.LinkSeq)
+	}
 	links, err := auditchain.ReadLinks(s.chainDir, from, to)
 	if err != nil {
 		return proof.Bundle{}, err
@@ -159,6 +171,17 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	}
 	// Подписи свидетелей C2SP: голова не раньше звена улики.
 	if b.Cosignatures, err = s.cosignaturesForLocked(links[0].Seq, links[len(links)-1].Seq, n); err != nil {
+		return proof.Bundle{}, err
+	}
+	// Метки второй службы над головами не раньше токенов T1 и T2.
+	var tokens []uint64
+	if b.Lower != nil {
+		tokens = append(tokens, b.Lower.Inclusion.LinkSeq)
+	}
+	if b.Upper != nil && b.Upper.Inclusion != nil {
+		tokens = append(tokens, b.Upper.Inclusion.LinkSeq)
+	}
+	if b.Archive, err = s.archiveForLocked(tokens, links[len(links)-1].Seq); err != nil {
 		return proof.Bundle{}, err
 	}
 
@@ -284,6 +307,8 @@ type Status struct {
 	// Cosigners — свидетели C2SP: последняя подписанная голова, ошибки,
 	// отказ (cosign.go).
 	Cosigners []CosignerStatus `json:"cosigners,omitempty"`
+	// TSAArchive — вторая служба меток (tsa.archive), nil — её нет.
+	TSAArchive *ArchiveStatus `json:"tsa_archive,omitempty"`
 }
 
 func (s *Store) Status() Status {
@@ -324,6 +349,7 @@ func (s *Store) Status() Status {
 		out.OrphanRoots = orphans
 	}
 	out.Cosigners = s.cosignerStatus()
+	out.TSAArchive = s.archiveStatus()
 	return out
 }
 

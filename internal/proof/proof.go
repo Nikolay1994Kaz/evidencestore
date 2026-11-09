@@ -24,6 +24,7 @@
 package proof
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
@@ -216,6 +217,11 @@ type Lower struct {
 type Upper struct {
 	HeadSeq uint64 `json:"head_seq"`
 	Token   []byte `json:"token"`
+	// Inclusion — лист этого токена в цепи с путём Меркла: где лежит токен.
+	// Нужен, только если сертификат службы отозван по компрометации: по нему
+	// поздняя метка или подпись свидетеля показывает, что токен существовал
+	// раньше отсечки (revoked.go). Пакеты прежних выпусков его не несут.
+	Inclusion *Inclusion `json:"inclusion,omitempty"`
 }
 
 // Bundle — пакет доказательств по одной улике.
@@ -242,6 +248,10 @@ type Bundle struct {
 	// свидетеля — голова, которую он подписал раньше всех не раньше звена
 	// улики. Поле необязательное: esverify прежних выпусков его не читает.
 	Cosignatures []Cosignature `json:"cosignatures,omitempty"`
+	// Archive — метки второй службы над головами не раньше токенов пакета
+	// (revoked.go): POE для меток основной, если её сертификат отзовут по
+	// компрометации. Необязательное, как и Cosignatures.
+	Archive []ArchiveStamp `json:"archive,omitempty"`
 }
 
 // StretchLeaf — лист участка: целиком (Leaf) или только хешем листа (Hash,
@@ -328,6 +338,10 @@ type Trust struct {
 	// владельцев (esverify -witness-key): каждый обязан подписать голову не
 	// раньше закрепляемого звена (cosigned.go). Пусто — подписи не сверяются.
 	Cosigners []cosign.Verifier
+	// TSARevocations — что проверяющий знает об отзыве сертификатов служб
+	// меток (esverify -tsa-crl, -tsa-revoked; revoked.go). nil — отзыв не
+	// сверяется, и отчёт об этом говорит.
+	TSARevocations *tsa.Revocations
 }
 
 // Check — один пункт отчёта.
@@ -388,6 +402,9 @@ type Report struct {
 	Cosigned      []CosignedHead
 	CosignUnknown int
 	CosignCarried int
+
+	// TSANotes — заметки об отзыве сертификатов служб меток (revoked.go).
+	TSANotes []string
 }
 
 // Valid — все проверки прошли (замечания вида «нет метки» проверками не
@@ -438,6 +455,7 @@ func (r Report) Notes() []string {
 		n = append(n, "the store's signature proves that THIS store signed the head; only a TSA time-stamp stands against its owner rewriting the whole chain")
 	}
 	n = append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this record", "T1", r.Lower)...)
+	n = append(n, r.TSANotes...)
 	n = append(n, "what is proven is that these bytes came from the source and have not changed, not that their content is true")
 	return n
 }
@@ -504,8 +522,9 @@ func Verify(b Bundle, trust Trust) Report {
 
 	// 6. Верхняя граница: TSA заверила голову m ≥ n. Без неё пакет — только
 	// слово хранилища: держатель ключа подписи сочинит улику с любой датой.
+	sc := newStampCheck(trust)
 	if b.Upper != nil {
-		r.Upper, err = checkUpper(*b.Upper, b.Inclusion.LinkSeq, linkAt, trust.TSA)
+		r.Upper, err = checkUpper(*b.Upper, b.Inclusion.LinkSeq, linkAt, sc)
 		add("a TSA time-stamp over the chain after the record (not later than T2)", err, fmt.Sprintf("T2 = %s, head %d", fmtTime(r.Upper), b.Upper.HeadSeq))
 	} else if !trust.AllowNoTSA {
 		add("a TSA time-stamp over the chain after the record (not later than T2)",
@@ -514,7 +533,7 @@ func Verify(b Bundle, trust Trust) Report {
 
 	// 7. Нижняя граница: токен TSA лежит в цепи раньше звена улики.
 	if b.Lower != nil {
-		r.Lower, err = checkLower(*b.Lower, b.Inclusion.LinkSeq, linkAt, trust.TSA)
+		r.Lower, err = checkLower(*b.Lower, b.Inclusion.LinkSeq, linkAt, sc)
 		add("a TSA time-stamp in the chain before the record (not earlier than T1)", err, fmt.Sprintf("T1 = %s", fmtTime(r.Lower)))
 	}
 
@@ -566,6 +585,11 @@ func Verify(b Bundle, trust Trust) Report {
 		r.Cosigned, r.CosignUnknown, err = checkCosigned(b.Cosignatures, trust.Cosigners, trust.StoreKey, b.Inclusion.LinkSeq, links, rootAt)
 		add(cosignCheckName, err, cosignDetail(r.Cosigned))
 	}
+
+	// 13. Отзыв сертификатов служб меток: метка отозванного по компрометации
+	// в силе, только если пакет показывает, что она существовала раньше.
+	sc.finish(b.Archive, b.Cosignatures, trust.Cosigners, trust.StoreKey, links[len(links)-1].Seq, rootAt, add)
+	r.TSANotes = sc.notes
 	return r
 }
 
@@ -643,7 +667,7 @@ func checkInclusion(inc Inclusion, linkAt func(uint64) (auditchain.Record, [32]b
 	return nil
 }
 
-func checkUpper(u Upper, evidenceLink uint64, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) (time.Time, error) {
+func checkUpper(u Upper, evidenceLink uint64, linkAt func(uint64) (auditchain.Record, [32]byte, bool), sc *stampCheck) (time.Time, error) {
 	if u.HeadSeq < evidenceLink {
 		return time.Time{}, fmt.Errorf("the time-stamp is over head %d, the record is in link %d: the time-stamp does not cover it", u.HeadSeq, evidenceLink)
 	}
@@ -651,14 +675,30 @@ func checkUpper(u Upper, evidenceLink uint64, linkAt func(uint64) (auditchain.Re
 	if !ok {
 		return time.Time{}, fmt.Errorf("link %d is not in the bundle", u.HeadSeq)
 	}
-	info, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, root), trust)
+	// Где лежит токен T2 (пакеты этого выпуска): без этого метку отозванного
+	// по компрометации сертификата нечем спасти.
+	var link uint64
+	if inc := u.Inclusion; inc != nil {
+		l := inc.Leaf.chain()
+		switch {
+		case l.Type != auditchain.EventTimestamp || l.Subject != strconv.FormatUint(u.HeadSeq, 10) || !bytes.Equal(l.Payload, u.Token):
+			return time.Time{}, fmt.Errorf("the leaf in link %d is not the token of this time-stamp over head %d", inc.LinkSeq, u.HeadSeq)
+		case inc.LinkSeq <= u.HeadSeq:
+			return time.Time{}, fmt.Errorf("the token of the time-stamp lies in link %d, not after head %d it certifies", inc.LinkSeq, u.HeadSeq)
+		}
+		if err := checkInclusion(*inc, linkAt); err != nil {
+			return time.Time{}, fmt.Errorf("the token of the time-stamp: %w", err)
+		}
+		link = inc.LinkSeq
+	}
+	info, err := sc.verify(u.Token, u.HeadSeq, root, link, fmt.Sprintf("time-stamp T2 over head %d", u.HeadSeq))
 	if err != nil {
 		return time.Time{}, err
 	}
 	return info.GenTime.UTC(), nil
 }
 
-func checkLower(lw Lower, evidenceLink uint64, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) (time.Time, error) {
+func checkLower(lw Lower, evidenceLink uint64, linkAt func(uint64) (auditchain.Record, [32]byte, bool), sc *stampCheck) (time.Time, error) {
 	inc := lw.Inclusion
 	if inc.Leaf.Type != uint8(auditchain.EventTimestamp) {
 		return time.Time{}, errors.New("the lower bound is not a TSA time-stamp leaf")
@@ -677,7 +717,7 @@ func checkLower(lw Lower, evidenceLink uint64, linkAt func(uint64) (auditchain.R
 	if !ok {
 		return time.Time{}, fmt.Errorf("link %d, certified by the time-stamp, is not in the bundle", stamped)
 	}
-	info, err := tsa.Verify(inc.Leaf.Payload, HeadImprint(stamped, root), trust)
+	info, err := sc.verify(inc.Leaf.Payload, stamped, root, inc.LinkSeq, fmt.Sprintf("time-stamp T1 in link %d", inc.LinkSeq))
 	if err != nil {
 		return time.Time{}, err
 	}

@@ -242,3 +242,36 @@ func TestCosignerCAResolved(t *testing.T) {
 		t.Fatalf("пути ca: %+v", got)
 	}
 }
+
+// Вторая служба меток: адрес http(s), не та же служба, есть основная и
+// доверие к её токенам; пути доверия — от каталога конфигурации.
+func TestTSAArchive(t *testing.T) {
+	base := func() *Config {
+		c := &Config{DataDir: "/var/lib/es", RootsDir: "/var/lib/es-roots", Listen: ":8443",
+			TSA:     TSA{URL: "http://tsa.one.example", Trust: []string{"/etc/one.pem"}, Archive: TSAArchive{URL: "https://tsa.two.example/tsr", Trust: []string{"/etc/two.pem"}}},
+			Sources: []Source{{Name: "abs-core", ContentType: "syslog"}}}
+		c.Defaults()
+		return c
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, spoil := range map[string]func(*Config){
+		"ftp":          func(c *Config) { c.TSA.Archive.URL = "ftp://tsa.two.example/" },
+		"local":        func(c *Config) { c.TSA.Archive.URL = "local" },
+		"та же служба": func(c *Config) { c.TSA.Archive.URL = c.TSA.URL + "/" },
+		"без основной": func(c *Config) { c.TSA.URL, c.TSA.Trust = "", nil },
+		"без доверия":  func(c *Config) { c.TSA.Archive.Trust = nil },
+	} {
+		c := base()
+		spoil(c)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "tsa.archive") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	c := Config{TSA: TSA{Archive: TSAArchive{Trust: []string{"two.pem", "/etc/abs.pem"}}}}
+	c.resolve("/etc/evidencestore")
+	if got := c.TSA.Archive.Trust; got[0] != "/etc/evidencestore/two.pem" || got[1] != "/etc/abs.pem" {
+		t.Fatalf("пути доверия второй службы: %v", got)
+	}
+}

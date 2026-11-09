@@ -140,6 +140,20 @@ type TSA struct {
 	// Trust — сертификаты, которым верит проверка токенов (у НУЦ:
 	// root_rsa_2020.cer и nca_rsa_2022.cer). Для "local" не нужен.
 	Trust []string `json:"trust"`
+	// Archive — вторая служба меток другого оператора: раз в Every она
+	// заверяет голову цепи отдельно, как свидетель, и её метки служат
+	// доказательством, что метки основной существовали раньше, если
+	// сертификат основной отзовут по компрометации ключа (RFC 3161, 4). На T1,
+	// T2 и время приёма не влияет. Пусто — без неё.
+	Archive TSAArchive `json:"archive"`
+}
+
+// TSAArchive — вторая служба меток (tsa.archive).
+type TSAArchive struct {
+	// URL службы RFC 3161, только http:// или https://.
+	URL string `json:"url"`
+	// Trust — сертификаты, которыми проверяются её токены до записи.
+	Trust []string `json:"trust"`
 }
 
 // Keys — правила ключей.
@@ -270,6 +284,9 @@ func (c *Config) resolve(base string) {
 	for i := range c.TSA.Trust {
 		abs(&c.TSA.Trust[i])
 	}
+	for i := range c.TSA.Archive.Trust {
+		abs(&c.TSA.Archive.Trust[i])
+	}
 	for i := range c.Witness.Cosigners {
 		abs(&c.Witness.Cosigners[i].CA)
 	}
@@ -385,6 +402,19 @@ func (c *Config) Validate() error {
 	}
 	if c.TSA.URL != "" && c.TSA.URL != "local" && len(c.TSA.Trust) == 0 {
 		errs = append(errs, errors.New("tsa.trust is required for a real TSA: tokens are verified before they enter the chain"))
+	}
+	if a := c.TSA.Archive; a.URL != "" {
+		u, err := url.Parse(a.URL)
+		switch {
+		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+			errs = append(errs, fmt.Errorf("tsa.archive.url %q must be http:// or https:// with a host", a.URL))
+		case c.TSA.URL == "":
+			errs = append(errs, errors.New("tsa.archive needs tsa.url: the second TSA vouches for the time-stamps of the first"))
+		case strings.TrimRight(a.URL, "/") == strings.TrimRight(c.TSA.URL, "/"):
+			errs = append(errs, errors.New("tsa.archive.url must not be tsa.url: a time-stamp of the same TSA shows nothing once its key is compromised"))
+		case len(a.Trust) == 0:
+			errs = append(errs, errors.New("tsa.archive.trust is required: its tokens are verified before they are kept"))
+		}
 	}
 	seen := map[string]bool{}
 	for i, s := range c.Sources {
