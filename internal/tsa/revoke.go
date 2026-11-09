@@ -1167,7 +1167,11 @@ func (a *Assessment) Verdicts() []Verdict {
 					}
 					ci.st.entries = append(ci.st.entries, e)
 				}
-				ci.st.notes = append(ci.st.notes, fmt.Sprintf("%s is signed with another key of %q, certified by %q under a root of -tsa-trust (RFC 5280, 6.3.3 f): its entries about certificate %q count", g.label(), issuer, bys[0].Issuer.String(), ci.c.Subject.String()))
+				n := fmt.Sprintf("%s is signed with another key of %q, certified by %q under a root of -tsa-trust (RFC 5280, 6.3.3 f): its entries about certificate %q count", g.label(), issuer, bys[0].Issuer.String(), ci.c.Subject.String())
+				if own := anchorsOf(ci.roots); len(own) > 0 && !slices.ContainsFunc(bys, func(x *x509.Certificate) bool { return p.under(x, own, 0, map[*x509.Certificate]int{}) }) {
+					n += "; that root is not the root of the chains of this certificate, and a CA of the same name under any root of -tsa-trust counts as the same CA"
+				}
+				ci.st.notes = append(ci.st.notes, n)
 				continue
 			}
 			ask := fmt.Sprintf("%s lists certificate %q (serial %s) as revoked, but is not signed with the key of its issuer %q, and no certificate here with that name and the key that signed it is certified under a root of -tsa-trust (did the CA change its key? pass that certificate in -tsa-trust, with the CA certificates between it and the root)", g.label(), ci.c.Subject.String(), ci.c.SerialNumber, issuer)
