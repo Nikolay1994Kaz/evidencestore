@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ type Authority struct {
 	ctype   asn1.ObjectIdentifier // тесты: тип содержимого в подписанных атрибутах
 	essV1   int                   // тесты: 1 — атрибут signingCertificate (v1, SHA-1) вместо v2, -1 — никакого
 	acc     accuracy              // тесты: точность метки
+	carry   []*x509.Certificate   // Carry: сертификаты в токене помимо своего
 
 	mu     sync.Mutex
 	serial int64
@@ -145,6 +147,10 @@ func (a *Authority) Reissue(serial int64, notAfter time.Time) (*Authority, error
 	return &Authority{key: a.key, cert: cert, root: a.root, rootKey: a.rootKey, policy: a.policy}, nil
 }
 
+// Carry — сертификаты, которые токены службы несут помимо её собственного
+// (служба может класть всю цепочку и прежние сертификаты ключа): тесты.
+func (a *Authority) Carry(certs ...*x509.Certificate) { a.carry = append(a.carry, certs...) }
+
 // AuthorityWith — служба с готовым ключом и сертификатом (выпущенным root или
 // центром под ним): тесты отзыва со своим УЦ. Токен несёт только сертификат
 // службы, промежуточные центры проверяющий берёт из своего доверия.
@@ -252,7 +258,11 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 	sd = append(sd, version...)
 	sd = append(sd, tlv(0x31, digestAlgs)...)
 	sd = append(sd, encap...)
-	sd = append(sd, tlv(0xA0, a.cert.Raw)...) // certificates [0] IMPLICIT
+	certs := slices.Clone(a.cert.Raw)
+	for _, c := range a.carry {
+		certs = append(certs, c.Raw...)
+	}
+	sd = append(sd, tlv(0xA0, certs)...) // certificates [0] IMPLICIT
 	sd = append(sd, tlv(0x31, si)...)
 	sdType, _ := asn1.Marshal(oidSignedData)
 	return tlv(0x30, append(sdType, tlv(0xA0, tlv(0x30, sd))...)), nil

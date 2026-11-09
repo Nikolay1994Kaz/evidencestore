@@ -60,7 +60,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	proofPath := fs.String("proof", "", "proof bundle (JSON)")
 	storeKey := fs.String("store-key", "", "pinned store public key (base64) or file containing it")
-	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM)")
+	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM): the roots, and any other certificates of the TSAs and their CAs you hold — one issued again on the same key too, so that its revocation counts for the key")
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
 	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them; with the S3 versions list next to them (aws s3api list-object-versions > DIR/versions.json) or a collector's head journal, each witness fixes the record with the head it received first (give each collector a subdirectory of its own)")
@@ -70,7 +70,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return nil
 	})
 	var tsaCRLs []string
-	fs.Func("tsa-crl", "CRL (DER or PEM) of a CA that issued a TSA certificate in -tsa-trust or in the bundle's time-stamps, fetched by you; repeat the flag (or separate with commas) for more CAs: a time-stamp whose TSA certificate was revoked for key compromise (or with no reason) counts only if the bundle shows it existed before (RFC 3161, 4)", func(v string) error {
+	fs.Func("tsa-crl", "CRL (DER or PEM) of a CA that issued a TSA certificate in -tsa-trust or in the bundle's time-stamps, fetched by you; repeat the flag (or separate with commas) for more CAs: a time-stamp whose TSA certificate was revoked for key compromise (or with no reason) counts only if the bundle shows it existed before (RFC 3161, 4), and a time-stamp shows that only when its own revocation is checked too, so give the CRLs of the second TSA as well", func(v string) error {
 		for _, p := range strings.Split(v, ",") {
 			if p = strings.TrimSpace(p); p == "" {
 				return errors.New("an empty path (a comma too many, or an empty variable?)")

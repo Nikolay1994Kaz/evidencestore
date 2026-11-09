@@ -41,6 +41,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -263,8 +264,11 @@ type Info struct {
 	Policy  asn1.ObjectIdentifier
 	Signer  *x509.Certificate
 	// Chains — цепочки от сертификата службы до корня из Trust, по которым
-	// он проверен: по ним сверяется отзыв (Revocations.Check).
+	// он проверен: по ним сверяется отзыв (Assessment.Add).
 	Chains [][]*x509.Certificate
+	// Certs — сертификаты, которые несёт сам токен: и те, что не попали в
+	// цепочки, говорят об отзыве своих ключей (Assessment.Known).
+	Certs []*x509.Certificate
 }
 
 // Trust — во что верит проверяющий: корни (у НУЦ — root_rsa_2020) и
@@ -400,7 +404,7 @@ func Verify(token []byte, imprint [32]byte, trust Trust) (Info, error) {
 	if err != nil {
 		return Info{}, fmt.Errorf("%w: signer certificate: %v", ErrInvalid, err)
 	}
-	return Info{GenTime: p.tst.GenTime, Serial: p.tst.SerialNumber, Policy: p.tst.Policy, Signer: signer, Chains: chains}, nil
+	return Info{GenTime: p.tst.GenTime, Serial: p.tst.SerialNumber, Policy: p.tst.Policy, Signer: signer, Chains: chains, Certs: p.certs}, nil
 }
 
 // Signed — токен цел: разбирается, заверяет imprint и подписан сертификатом
@@ -409,8 +413,15 @@ func Verify(token []byte, imprint [32]byte, trust Trust) (Info, error) {
 // когда были записаны, — доверие с тех пор могли сменить, а проверит его
 // аудитор.
 func Signed(token []byte, imprint [32]byte, intermediates ...*x509.Certificate) error {
-	_, _, _, err := verifySigned(token, imprint, intermediates)
+	_, err := SignedBy(token, imprint, intermediates...)
 	return err
+}
+
+// SignedBy — Signed и сертификат, которым подписан токен (из токена или
+// intermediates).
+func SignedBy(token []byte, imprint [32]byte, intermediates ...*x509.Certificate) (*x509.Certificate, error) {
+	_, signer, _, err := verifySigned(token, imprint, intermediates)
+	return signer, err
 }
 
 // verifySigned — всё, что Verify проверяет, кроме цепочки до корня: отпечаток,
@@ -490,13 +501,14 @@ func verifySigned(token []byte, imprint [32]byte, intermediates []*x509.Certific
 }
 
 // SignerKey — ключ (SubjectPublicKeyInfo) сертификата, которым подписан
-// токен, без проверки: сравнить две службы меток.
-func SignerKey(token []byte) ([]byte, error) {
+// токен, без проверки: сравнить две службы меток. Сертификат — из токена или
+// intermediates (служба может не класть его в токен).
+func SignerKey(token []byte, intermediates ...*x509.Certificate) ([]byte, error) {
 	p, err := parseToken(token)
 	if err != nil {
 		return nil, err
 	}
-	c, err := findSigner(p.signer.SID, p.certs)
+	c, err := findSigner(p.signer.SID, append(slices.Clone(p.certs), intermediates...))
 	if err != nil {
 		return nil, err
 	}

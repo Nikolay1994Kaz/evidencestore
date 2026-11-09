@@ -236,8 +236,9 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || hasNote(v, "did the CA change its key?") {
 		t.Fatalf("CRL с тем же именем под другим ключом новее своего, без записи: %+v %v", v, err)
 	}
-	// Называет — центр мог сменить ключ и отозвать сертификат уже им, а его
-	// подпись не сверить: статус не известен. Вердикт по нему не меняется.
+	// Называет — центр мог сменить ключ и отозвать сертификат уже им, но
+	// сертификата нового ключа, ведущего к тому же корню, нет (здесь — корень
+	// с тем же именем): запись не в счёт, статус не известен.
 	der, err = other.RevocationList(w.gen.Add(40*time.Hour), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: w.a.Cert().SerialNumber, RevocationTime: w.gen.Add(39 * time.Hour), ReasonCode: ReasonKeyCompromise})
 	if err != nil {
 		t.Fatal(err)
@@ -248,8 +249,17 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(newer); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "did the CA change its key?") {
+	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "lists it as revoked, but is not signed with the key of its issuer") || !hasNote(v, "did the CA change its key? pass that certificate in -tsa-trust") {
 		t.Fatalf("CRL центра под другим ключом новее своего, с записью: %+v %v", v, err)
+	}
+	// И один, без своего: статус не проверен, и заметка говорит, что он
+	// называет сертификат.
+	r = NewRevocations(now)
+	if err := r.AddCRL(newer); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "no CRL signed with the key of its issuer") || !hasNote(v, "lists certificate \"CN=evidencestore demo TSA\" as revoked") {
+		t.Fatalf("только CRL центра под другим ключом, с записью: %+v %v", v, err)
 	}
 
 	r = NewRevocations(now)
@@ -614,7 +624,10 @@ func TestRevocationsSameKeyCrossCert(t *testing.T) {
 		t.Fatalf("цепочек %d, ждали двух", len(info.Chains))
 	}
 	inter := interA.crlOf(t, dir, "inter.crl", gen.Add(time.Hour), now.Add(time.Hour), nil)
-	for reason, poe := range map[int]bool{ReasonCACompromise: true, ReasonAbsent: true, ReasonSuperseded: false} {
+	// Без причины — у сертификата центра не о ключе (keepsEarlierFor): так
+	// центр прекращает перекрёстную сертификацию. Цепочка через interA после
+	// даты отзыва не в силе, через interB — в силе.
+	for reason, poe := range map[int]bool{ReasonCACompromise: true, ReasonAbsent: false, ReasonSuperseded: false} {
 		code := reason
 		if reason == ReasonAbsent {
 			code = 0 // x509 не пишет причину unspecified: записи без причины

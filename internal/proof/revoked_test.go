@@ -46,6 +46,27 @@ func compromised(t *testing.T, a *tsa.Authority, at, now time.Time) *tsa.Revocat
 	return revocations(t, a, now, x509.RevocationListEntry{SerialNumber: a.Cert().SerialNumber, RevocationTime: at, ReasonCode: tsa.ReasonKeyCompromise})
 }
 
+// checkedToo — пустые CRL служб as в сведениях r: их отзыв проверен, и их
+// метки могут быть POE (время другой метки показывает только метка, чей
+// отзыв проверен, ETSI EN 319 102-1).
+func checkedToo(t testing.TB, r *tsa.Revocations, as ...*tsa.Authority) *tsa.Revocations {
+	t.Helper()
+	for i, a := range as {
+		der, err := a.RevocationList(r.Now.Add(-time.Hour), r.Now.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(t.TempDir(), fmt.Sprintf("also-%d.crl", i))
+		if err := os.WriteFile(p, der, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.AddCRL(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return r
+}
+
 // otherTSA — вторая служба со своим корнем; trust мира верит обеим.
 func otherTSA(t *testing.T, w *world) (*tsa.Authority, Trust) {
 	t.Helper()
@@ -166,7 +187,7 @@ func TestRevocationPOENotBeforeToken(t *testing.T) {
 	r0 := Verify(b, w.trust())
 	other, tr := otherTSA(t, w)
 	cut := r0.Upper.Add(-time.Second) // T1 раньше отсечки, T2 — нет
-	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
+	tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, cut, w.now.Add(48*time.Hour)), other)
 	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, r0.Lower.Add(-30*time.Second))}
 	r := Verify(b, tr)
 	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "time-stamp T2 over head 4 rests") || strings.Contains(c.Detail, "time-stamp T1 in link 2 rests") {
@@ -179,7 +200,7 @@ func TestRevocationPOENotBeforeToken(t *testing.T) {
 	}
 	// Отсечка после обеих: POE на полминуты раньше T1 спасает обе, и отчёт
 	// говорит, что её часы отстают.
-	tr.TSARevocations = compromised(t, w.tsa, r0.Upper.Add(time.Hour), w.now.Add(48*time.Hour))
+	tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, r0.Upper.Add(time.Hour), w.now.Add(48*time.Hour)), other)
 	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, r0.Lower.Add(-30*time.Second))}
 	if r := Verify(b, tr); !r.Valid() || !strings.Contains(revocationCheck(t, r.Checks).Detail, "its clock is behind") {
 		t.Fatalf("POE с отстающими часами, обе метки до отсечки:\n%s", r.Text())
@@ -285,7 +306,7 @@ func TestRevocationPOEFromArchive(t *testing.T) {
 	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
 	other, tr := otherTSA(t, w)
 	cut := w.now.Add(2 * time.Hour)
-	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
+	tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, cut, w.now.Add(48*time.Hour)), other)
 
 	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
 	r := Verify(b, tr)
@@ -331,7 +352,7 @@ func TestRevocationArchiveBeyondBundle(t *testing.T) {
 	w.wlink(auditchain.Leaf{Type: auditchain.EventGap, Scope: "abs-core"})
 	other, tr := otherTSA(t, w)
 	cut := w.now.Add(2 * time.Hour)
-	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
+	tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, cut, w.now.Add(48*time.Hour)), other)
 	a := archiveOver(t, w, other, 7, cut.Add(-time.Hour))
 	p, err := tlog.ProveTree(7, 5, w.tree())
 	if err != nil {
@@ -371,7 +392,7 @@ func TestRevocationPOEFromOtherTSAInBundle(t *testing.T) {
 	w.tsa = main
 	w.wlink(tokenLeaf(h3, t2))
 	b := w.bundle(e2, 3, 0, h3, t2, 2)
-	tr.TSARevocations = compromised(t, main, w.now.Add(time.Hour), w.now.Add(48*time.Hour))
+	tr.TSARevocations = checkedToo(t, compromised(t, main, w.now.Add(time.Hour), w.now.Add(48*time.Hour)), other)
 	r := Verify(b, tr)
 	if c := revocationCheck(t, r.Checks); !r.Valid() || !strings.Contains(c.Detail, "time-stamp T1 in link 2") || !strings.Contains(c.Detail, "over head 3") {
 		t.Fatalf("T1 спасает T2 другой службы:\n%s", r.Text())
@@ -432,7 +453,7 @@ func TestRevocationWindowAndSource(t *testing.T) {
 	ww := windowWorld(t, []auditchain.Leaf{rec(t, 1, at(10, 5, 0))}, nil)
 	wb := ww.window(1, 3, at(10, 4, 0), at(10, 6, 0))
 	other, tr := otherTSA(t, ww)
-	tr.TSARevocations = compromised(t, ww.tsa, at(12, 0, 0), at(23, 0, 0))
+	tr.TSARevocations = checkedToo(t, compromised(t, ww.tsa, at(12, 0, 0), at(23, 0, 0)), other)
 	if r := VerifyWindow(wb, tr, time.Time{}, time.Time{}); r.Valid() || !strings.Contains(r.Text(), "nothing in the bundle shows it existed before") {
 		t.Fatalf("окно без POE:\n%s", r.Text())
 	}
@@ -446,7 +467,7 @@ func TestRevocationWindowAndSource(t *testing.T) {
 	end := sb.Checkpoint.Size
 	other, tr = otherTSA(t, sw.world)
 	cut := sw.now.Add(2 * time.Hour)
-	tr.TSARevocations = compromised(t, sw.tsa, cut, cut.Add(24*time.Hour))
+	tr.TSARevocations = checkedToo(t, compromised(t, sw.tsa, cut, cut.Add(24*time.Hour)), other)
 	if r := VerifySource(sb, tr, time.Time{}, time.Time{}); r.Valid() {
 		t.Fatalf("источник без POE:\n%s", r.Text())
 	}
@@ -476,8 +497,8 @@ func TestRevocationArchiveRevealsKey(t *testing.T) {
 	if r := Verify(b, tr); !r.Valid() {
 		t.Fatalf("контроль без отзыва:\n%s", r.Text())
 	}
-	tr.TSARevocations = revocations(t, w.tsa, w.now.Add(48*time.Hour),
-		x509.RevocationListEntry{SerialNumber: big.NewInt(77), RevocationTime: cut, ReasonCode: tsa.ReasonKeyCompromise})
+	tr.TSARevocations = checkedToo(t, revocations(t, w.tsa, w.now.Add(48*time.Hour),
+		x509.RevocationListEntry{SerialNumber: big.NewInt(77), RevocationTime: cut, ReasonCode: tsa.ReasonKeyCompromise}), other)
 	r := Verify(b, tr)
 	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "time-stamp T1 in link 2 rests on certificate") || !strings.Contains(c.Detail, "(serial 77)") || !strings.Contains(r.Text(), "itself: not used") {
 		t.Fatalf("ключ под подозрением по метке второй службы:\n%s", r.Text())
@@ -527,8 +548,8 @@ func TestRevocationKeyCutoffBundleWide(t *testing.T) {
 			rev1.RevocationTime = c0.Add(time.Hour)
 			rev1.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 24}, Value: inv}}
 		}
-		tr.TSARevocations = revocations(t, x1, w.now.Add(48*time.Hour), rev1,
-			x509.RevocationListEntry{SerialNumber: x2.Cert().SerialNumber, RevocationTime: day.Add(12 * time.Hour), ReasonCode: tsa.ReasonKeyCompromise})
+		tr.TSARevocations = checkedToo(t, revocations(t, x1, w.now.Add(48*time.Hour), rev1,
+			x509.RevocationListEntry{SerialNumber: x2.Cert().SerialNumber, RevocationTime: day.Add(12 * time.Hour), ReasonCode: tsa.ReasonKeyCompromise}), other)
 		b.Archive = []ArchiveStamp{archiveOver(t, w, other, 2, day.Add(10*time.Hour+10*time.Minute)), archiveOver(t, w, other, 5, poe2)}
 		return Verify(b, tr)
 	}

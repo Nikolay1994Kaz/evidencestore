@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
@@ -44,12 +45,13 @@ import (
 //
 // Запись и статус — разные вещи.
 //   - Запись об отзыве — свидетельство, и оно только добавляет подозрение.
-//     Поэтому в силе записи каждого CRL с именем центра, подписанного ключом,
-//     которым выпущен сертификат, что бы ни говорили keyUsage сертификата
-//     центра в цепочке, область CRL и его свежесть, и записи всех таких CRL
-//     вместе: отзыв необратим, а истёкший сертификат центр вправе убрать из
-//     поздних CRL (RFC 5280, 3.3). Снимает запись только одно: удержание
-//     снимает более новый CRL, годный для статуса.
+//     Поэтому в силе записи каждого CRL с именем центра, каким бы ключом он
+//     подписан (центр мог сменить ключ и отозвать сертификат уже новым,
+//     RFC 5280, 6.3.3 f), что бы ни говорили keyUsage сертификата центра в
+//     цепочке, область CRL и его свежесть, и записи всех таких CRL вместе:
+//     отзыв необратим, а истёкший сертификат центр вправе убрать из поздних
+//     CRL (RFC 5280, 3.3). Снимает запись только одно: удержание снимает более
+//     новый CRL, годный для статуса, который сертификат не называет вовсе.
 //   - Статус («не отозван») — по самому свежему CRL, годному для этого: его
 //     подпись сходится с сертификатом центра, которому можно подписывать CRL
 //     (центр, cRLSign; RFC 5280, 6.3.3 f), он покрывает сертификат
@@ -59,8 +61,10 @@ import (
 //
 // Компрометация — свойство ключа, и судят о ней по всем меткам пакета сразу
 // (Assessment): запись, требующая POE, у любого сертификата с этим ключом в
-// любой цепочке любой метки ставит под подозрение каждую цепочку, где этот
-// ключ есть, с самой ранней отсечкой ключа.
+// любой цепочке любой метки — или среди сертификатов, которые дал
+// проверяющий и несут токены (Known), — ставит под подозрение каждую цепочку,
+// где этот ключ есть, с самой ранней отсечкой ключа. Отзыв сертификата центра
+// без причины — не о ключе (keepsEarlierFor).
 
 // ErrRevoked — метка не в силе по отзыву сертификата её цепочки.
 var ErrRevoked = errors.New("tsa: revoked")
@@ -124,13 +128,19 @@ var (
 	oidFreshestCRL    = asn1.ObjectIdentifier{2, 5, 29, 46}
 )
 
-// keyCompromised — причина, при которой под подозрением ключ, а не только
-// сертификат: всё, кроме вывода из работы без компрометации (RFC 3161, 4:
-// без причины не в силе «метки соответствующего ключа»). Подозрение
+// keepsEarlierFor — запись о c, при которой метки до её даты в силе, а ключ
+// не под подозрением: причина без компрометации (RFC 3161, 4, п. 1), а у
+// сертификата центра — и без причины. Правило «без причины не в силе метки
+// соответствующего ключа» RFC 3161 пишет для сертификата самой службы; центр
+// без причины отзывает, например, перекрёстный сертификат, когда прекращает
+// перекрёстную сертификацию. Сертификат службы — первый в цепочке (signer);
+// вне цепочки — не сертификат центра (IsCA).
+//
+// Остальное — под подозрением ключ, а не только сертификат: подозрение
 // переходит на любой сертификат с тем же ключом — перекрёстный сертификат
 // центра, выпущенный другим корнем, или перевыпущенный на тот же ключ.
-func keyCompromised(r int) bool {
-	return !keepsEarlier(r)
+func keepsEarlierFor(c *x509.Certificate, signer bool, r int) bool {
+	return keepsEarlier(r) || r == ReasonAbsent && c.IsCA && !signer
 }
 
 // Revocation — запись об отзыве одного сертификата.
@@ -151,6 +161,7 @@ func (r Revocation) Cutoff() time.Time {
 
 type crlFile struct {
 	name  string // путь; с номером, если в файле несколько CRL
+	lbl   string // как его называет отчёт (label)
 	rl    *x509.RevocationList
 	bySN  map[string][]Revocation // по номеру сертификата; записей может быть несколько
 	scope *crlScope               // issuingDistributionPoint; nil — все сертификаты центра
@@ -162,9 +173,7 @@ type crlFile struct {
 	deltas bool
 }
 
-func (f *crlFile) label() string {
-	return fmt.Sprintf("CRL %s of %s", f.name, f.rl.ThisUpdate.UTC().Format(time.RFC3339))
-}
+func (f *crlFile) label() string { return f.lbl }
 
 // newer — f выпущен позже g (при равном thisUpdate — по номеру CRL).
 func (f *crlFile) newer(g *crlFile) bool {
@@ -296,6 +305,9 @@ type Revocations struct {
 
 	mu   sync.Mutex
 	sigs map[sigKey]sigCheck // подпись CRL и право центра на CRL: сверяются раз
+	// naming — CRL с именем центра, по RawIssuer сертификата: CRL крупного
+	// центра за год — сотни файлов, а меток в пакете — тысячи.
+	naming map[string][]*crlFile
 }
 
 // sigKey — CRL и сертификат центра, чьим ключом сверяется его подпись.
@@ -360,15 +372,53 @@ func (r *Revocations) AddCRL(path string) error {
 		}
 		r.crls = append(r.crls, f)
 	}
+	r.mu.Lock()
+	r.naming = nil
+	r.mu.Unlock()
 	return nil
 }
 
+// crlsNaming — CRL с именем центра, выпустившего c (namesIssuerOf), в
+// порядке чтения.
+func (r *Revocations) crlsNaming(c *x509.Certificate) []*crlFile {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if out, ok := r.naming[string(c.RawIssuer)]; ok {
+		return out
+	}
+	if r.naming == nil {
+		r.naming = map[string][]*crlFile{}
+	}
+	var out []*crlFile
+	for _, f := range r.crls {
+		if f.namesIssuerOf(c) {
+			out = append(out, f)
+		}
+	}
+	r.naming[string(c.RawIssuer)] = out
+	return out
+}
+
+// signed — записи о c во всех CRL с именем его центра, подписанных ключом
+// issuer.
+func (r *Revocations) signed(c, issuer *x509.Certificate) []Revocation {
+	var out []Revocation
+	sn := c.SerialNumber.String()
+	for _, f := range r.crlsNaming(c) {
+		if es := f.bySN[sn]; len(es) > 0 && r.checkSig(f, issuer).key == nil {
+			out = append(out, es...)
+		}
+	}
+	return out
+}
+
 // crlBlocks — CRL файла: блоки PEM «X509 CRL» или DER подряд. Вне блоков PEM
-// допустим текст (RFC 7468, 2: пояснение перед блоком, вывод openssl crl
-// -text), но не двоичные данные: DER рядом с блоками PEM пропал бы молча.
-// Начал блоков должно быть столько, сколько блоков разобрано: испорченный
-// блок pem.Decode пропускает, а с ним пропала бы и запись о компрометации. В
-// блоке, как и в файле DER, — CRL подряд, с пробелами между ними.
+// допустим текст UTF-8 (RFC 7468, 2: пояснение перед блоком, вывод openssl
+// crl -text), но не двоичные данные — DER рядом с блоками PEM пропал бы молча
+// — и не обломки границ блока: «-----» вне блока бывает только у блока с
+// испорченной строкой начала или конца, а с ним пропала бы и запись о
+// компрометации. Поэтому же начал блоков должно быть столько, сколько блоков
+// разобрано. В блоке, как и в файле DER, — CRL подряд, с пробелами между ними.
 func crlBlocks(data []byte) ([][]byte, error) {
 	begin := []byte("-----BEGIN")
 	if !bytes.Contains(data, begin) {
@@ -386,8 +436,13 @@ func crlBlocks(data []byte) ([][]byte, error) {
 		if i >= 0 {
 			outside = rest[:i]
 		}
-		if !isText(outside) {
-			return nil, fmt.Errorf("binary data outside the PEM blocks (after block #%d): a DER CRL beside PEM ones? pass it in a file of its own", blocks)
+		switch {
+		case !utf8.Valid(outside):
+			return nil, fmt.Errorf("text outside the PEM blocks (after block #%d) is not UTF-8: a DER CRL beside PEM ones (pass it in a file of its own), or text in another encoding (convert it to UTF-8, or remove it)", blocks)
+		case !isText(outside):
+			return nil, fmt.Errorf("control characters outside the PEM blocks (after block #%d): a DER CRL beside PEM ones? pass it in a file of its own, or remove them", blocks)
+		case bytes.Contains(outside, []byte("-----")):
+			return nil, fmt.Errorf("a broken PEM boundary outside the PEM blocks (after block #%d): \"-----\" without a whole -----BEGIN line; is a block damaged?", blocks)
 		}
 		if i < 0 {
 			break
@@ -449,6 +504,20 @@ func isText(b []byte) bool {
 	return true
 }
 
+// uniqueExtensions — каждое расширение один раз (RFC 5280, 4.2 и 5.2): из
+// двух reasonCode x509 молча берёт последний, и компрометация пропала бы за
+// выводом из работы.
+func uniqueExtensions(xs []pkix.Extension) error {
+	for i, x := range xs {
+		for _, y := range xs[:i] {
+			if x.Id.Equal(y.Id) {
+				return fmt.Errorf("extension %s is given twice", x.Id)
+			}
+		}
+	}
+	return nil
+}
+
 // parseCRL разбирает один CRL. Расширения (RFC 5280, 5.2 и 5.3): дельта и
 // косвенный не годятся — по ним неотозванный сертификат не отличить от
 // отозванного в другом CRL; иное критичное, которое здесь не разбирается, —
@@ -458,7 +527,11 @@ func parseCRL(name string, der []byte) (*crlFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tsa: crl %s: %w", name, err)
 	}
+	if err := uniqueExtensions(rl.Extensions); err != nil {
+		return nil, fmt.Errorf("tsa: crl %s: %v", name, err)
+	}
 	f := &crlFile{name: name, rl: rl, bySN: map[string][]Revocation{}}
+	f.lbl = fmt.Sprintf("CRL %s of %s", name, rl.ThisUpdate.UTC().Format(time.RFC3339))
 	for _, x := range rl.Extensions {
 		switch {
 		case x.Id.Equal(oidDeltaCRL):
@@ -470,6 +543,9 @@ func parseCRL(name string, der []byte) (*crlFile, error) {
 			}
 			if indirect {
 				return nil, fmt.Errorf("tsa: crl %s is an indirect CRL (RFC 5280, 5.2.5): it is not supported; pass the CRL the CA that issued the certificate signed itself", name)
+			}
+			if sc.onlyAttr {
+				return nil, fmt.Errorf("tsa: crl %s lists only attribute certificates (onlyContainsAttributeCerts, RFC 5280, 5.2.5): it says nothing of TSA certificates, and its serial numbers are of other certificates", name)
 			}
 			f.scope = sc
 		case x.Id.Equal(oidFreshestCRL):
@@ -487,6 +563,9 @@ func parseCRL(name string, der []byte) (*crlFile, error) {
 	from := f.label()
 	for _, e := range rl.RevokedCertificateEntries {
 		rev := Revocation{Time: e.RevocationTime.UTC(), Reason: ReasonAbsent, From: from}
+		if err := uniqueExtensions(e.Extensions); err != nil {
+			return nil, fmt.Errorf("tsa: crl %s: the entry of serial %s: %v", name, e.SerialNumber, err)
+		}
 		for _, x := range e.Extensions {
 			switch {
 			case x.Id.Equal(oidCertIssuer):
@@ -642,6 +721,10 @@ type Verdict struct {
 	// показано независимо. POE даёт только метка без NeedPOE.
 	NeedPOE bool
 	Cutoff  time.Time
+	// Retired — метка не в силе: её цепочки отозваны без компрометации не
+	// позже её времени по записям, которые видны только всей оценке (Add
+	// ошибки не вернул). Остальные поля тогда пусты.
+	Retired error
 	// Unchecked — сертификаты цепочки, кроме корня, о чьём нынешнем статусе
 	// не говорит ни один CRL (перечень проверяющего полноты не обещает).
 	Unchecked []*x509.Certificate
@@ -669,6 +752,8 @@ func (r *Revocations) CRLs() []string {
 type Assessment struct {
 	r      *Revocations
 	stamps []assessed
+	known  []*x509.Certificate // Known: сертификаты вне цепочек
+	named  []string            // Named, посчитанные после последнего Add
 }
 
 // assessed — метка оценки: цепочки, время; err — метка не в силе.
@@ -680,6 +765,20 @@ type assessed struct {
 
 // NewAssessment — пустая оценка по этим сведениям.
 func (r *Revocations) NewAssessment() *Assessment { return &Assessment{r: r} }
+
+// Known добавляет сертификаты, которые проверяющий дал сам (-tsa-trust) или
+// которые несут токены, но которых может не быть ни в одной цепочке: ключ,
+// перевыпущенный на тот же ключ сертификат которого отозван по компрометации,
+// под подозрением и тогда, когда цепочки меток идут через прежний, истёкший
+// и потому из CRL убранный (RFC 5280, 3.3). Их записи только добавляют
+// подозрение на ключ; статуса и заметок о них нет.
+func (a *Assessment) Known(certs ...*x509.Certificate) {
+	for _, c := range certs {
+		if c != nil && !slices.ContainsFunc(a.known, func(k *x509.Certificate) bool { return bytes.Equal(k.Raw, c.Raw) }) {
+			a.known = append(a.known, c)
+		}
+	}
+}
 
 // Add добавляет метку — цепочки проверенного токена (Info.Chains) и её время
 // — и возвращает её номер в Verdicts. Ошибка (ErrRevoked) — метка не в силе:
@@ -706,6 +805,7 @@ func (a *Assessment) Add(chains [][]*x509.Certificate, gen time.Time) (int, erro
 		s.err = fmt.Errorf("%w: no certificate chain to check", ErrRevoked)
 	}
 	a.stamps = append(a.stamps, s)
+	a.named = nil
 	return len(a.stamps) - 1, s.err
 }
 
@@ -730,7 +830,7 @@ func (r *Revocations) retired(chain []*x509.Certificate, gen time.Time) error {
 			es = append(slices.Clone(es), r.signed(c, chain[i+1])...)
 		}
 		for _, e := range es {
-			if keepsEarlier(e.Reason) && !gen.Before(e.Time) {
+			if keepsEarlierFor(c, i == 0, e.Reason) && !gen.Before(e.Time) {
 				return retiredErr(c, e, gen)
 			}
 		}
@@ -742,39 +842,41 @@ func retiredErr(c *x509.Certificate, e Revocation, gen time.Time) error {
 	return fmt.Errorf("%w: certificate %q was revoked on %s (%s; %s), and the time-stamp is of %s, not earlier: RFC 3161 keeps only the time-stamps made before such a revocation", ErrRevoked, c.Subject.String(), e.Time.Format(time.RFC3339), ReasonName(e.Reason), e.From, gen.UTC().Format(time.RFC3339))
 }
 
-// signed — записи о c во всех CRL с именем его центра, подписанных ключом
-// issuer.
-func (r *Revocations) signed(c, issuer *x509.Certificate) []Revocation {
-	var out []Revocation
-	sn := c.SerialNumber.String()
-	for _, f := range r.crls {
-		if es := f.bySN[sn]; len(es) > 0 && f.namesIssuerOf(c) && r.checkSig(f, issuer).key == nil {
-			out = append(out, es...)
-		}
-	}
-	return out
-}
-
 // namesIssuerOf — CRL выпущен от имени центра, выпустившего c.
 func (f *crlFile) namesIssuerOf(c *x509.Certificate) bool {
 	return bytes.Equal(f.rl.RawIssuer, c.RawIssuer) || f.rl.Issuer.String() == c.Issuer.String()
 }
 
 // Named — CRL, названные центром какой-либо цепочки какой-либо метки оценки
-// (подпись сошлась или нет): прочие к пакету не относятся.
+// (подпись сошлась или нет): прочие к пакету не относятся. Считается раз —
+// по разным сертификатам цепочек, а не по меткам.
 func (a *Assessment) Named() []string {
-	var out []string
+	if a.named != nil {
+		return a.named
+	}
+	seen := map[[32]byte]bool{}
+	hit := map[*crlFile]bool{}
 	for _, s := range a.stamps {
 		for _, ch := range s.chains {
 			for _, c := range ch[:max(len(ch)-1, 0)] {
-				for _, f := range a.r.crls {
-					if l := f.label(); f.namesIssuerOf(c) && !slices.Contains(out, l) {
-						out = append(out, l)
-					}
+				fp := sha256.Sum256(c.Raw)
+				if seen[fp] {
+					continue
+				}
+				seen[fp] = true
+				for _, f := range a.r.crlsNaming(c) {
+					hit[f] = true
 				}
 			}
 		}
 	}
+	out := []string{}
+	for _, f := range a.r.crls {
+		if hit[f] {
+			out = append(out, f.label())
+		}
+	}
+	a.named = out
 	return out
 }
 
@@ -789,6 +891,9 @@ type certStatus struct {
 	entries []Revocation
 	from    string // самый свежий CRL, годный для статуса; пусто — нет
 	notes   []string
+	// listing — CRL с именем центра под другим ключом, называющие сертификат
+	// (смена ключа центра): Verdicts сверяет их путь к тому же корню.
+	listing []*crlFile
 }
 
 // Verdicts — вердикты всех добавленных меток по сведениям обо всех сразу (у
@@ -800,6 +905,8 @@ func (a *Assessment) Verdicts() []Verdict {
 	type certInfo struct {
 		c       *x509.Certificate
 		issuers []*x509.Certificate
+		signer  bool // сертификат службы: первый в какой-либо цепочке
+		roots   []*x509.Certificate
 		st      certStatus
 	}
 	var order []*certInfo
@@ -814,21 +921,62 @@ func (a *Assessment) Verdicts() []Verdict {
 					certs[fp] = ci
 					order = append(order, ci)
 				}
+				ci.signer = ci.signer || j == 0
 				if j < len(ch)-1 && !slices.ContainsFunc(ci.issuers, func(x *x509.Certificate) bool { return bytes.Equal(x.Raw, ch[j+1].Raw) }) {
 					ci.issuers = append(ci.issuers, ch[j+1])
+				}
+				if root := ch[len(ch)-1]; !slices.ContainsFunc(ci.roots, func(x *x509.Certificate) bool { return bytes.Equal(x.Raw, root.Raw) }) {
+					ci.roots = append(ci.roots, root)
 				}
 			}
 		}
 	}
 	byKey := map[string]keyRevocation{}
-	for _, ci := range order {
-		ci.st = a.r.judge(ci.c, ci.issuers)
-		k := string(ci.c.RawSubjectPublicKeyInfo)
-		for _, e := range ci.st.entries {
-			if old, ok := byKey[k]; keyCompromised(e.Reason) && (!ok || e.Cutoff().Before(old.e.Cutoff())) {
-				byKey[k] = keyRevocation{e, ci.c}
+	suspect := func(c *x509.Certificate, signer bool, es []Revocation) {
+		k := string(c.RawSubjectPublicKeyInfo)
+		for _, e := range es {
+			if old, ok := byKey[k]; !keepsEarlierFor(c, signer, e.Reason) && (!ok || e.Cutoff().Before(old.e.Cutoff())) {
+				byKey[k] = keyRevocation{e, c}
 			}
 		}
+	}
+	pool := slices.Clone(a.known)
+	for _, ci := range order {
+		pool = append(pool, ci.c)
+	}
+	for _, ci := range order {
+		ci.st = a.r.judge(ci.c, ci.issuers)
+		suspect(ci.c, ci.signer, ci.st.entries)
+		// CRL под другим ключом центра, называющие сертификат: центр сменил
+		// ключ и отозвал его уже новым. В счёт — если сертификат нового
+		// ключа ведёт к тому же корню; запись тогда действует как своя.
+		for _, g := range ci.st.listing {
+			issuer := ci.issuers[0].Subject.String()
+			by := a.r.rekeyedBy(g, ci.roots, pool)
+			if by == nil {
+				ci.st.notes = append(ci.st.notes, fmt.Sprintf("%s lists certificate %q as revoked, but is not signed with the key of its issuer %q, and no certificate of %q with the key that signed it, leading to the same root, was given (did the CA change its key? pass that certificate in -tsa-trust): not used", g.label(), ci.c.Subject.String(), issuer, issuer))
+				continue
+			}
+			es := g.bySN[ci.c.SerialNumber.String()]
+			ci.st.notes = append(ci.st.notes, fmt.Sprintf("%s is signed with another key of %q, certified by %q under the same root (RFC 5280, 6.3.3 f): its entries about certificate %q count", g.label(), issuer, by.Issuer.String(), ci.c.Subject.String()))
+			ci.st.entries = append(ci.st.entries, es...)
+			suspect(ci.c, ci.signer, es)
+		}
+	}
+	// Сертификаты вне цепочек: их записи — о ключе. CRL — подписанные ключом,
+	// которым выпущен сам сертификат (его центр — среди сертификатов оценки);
+	// самоподписанный корень — только по перечню, как и в цепочке.
+	for _, c := range a.known {
+		if certs[sha256.Sum256(c.Raw)] != nil {
+			continue
+		}
+		es := slices.Clone(a.r.listed[sha256.Sum256(c.Raw)])
+		for _, x := range pool {
+			if !bytes.Equal(c.RawIssuer, c.RawSubject) && !bytes.Equal(x.Raw, c.Raw) && bytes.Equal(x.RawSubject, c.RawIssuer) && x.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil {
+				es = append(es, a.r.signed(c, x)...)
+			}
+		}
+		suspect(c, false, es)
 	}
 	status := func(c *x509.Certificate) *certStatus { return &certs[sha256.Sum256(c.Raw)].st }
 	named := a.Named()
@@ -839,9 +987,11 @@ func (a *Assessment) Verdicts() []Verdict {
 			continue
 		}
 		var best *Verdict
+		var retired error
 		for _, ch := range s.chains {
 			v, err := a.r.verdictOf(ch, s.gen, status, byKey)
 			if err != nil {
+				retired = err
 				continue
 			}
 			if best == nil || v.better(*best) {
@@ -849,10 +999,12 @@ func (a *Assessment) Verdicts() []Verdict {
 			}
 		}
 		if best == nil {
-			// Не бывает: записи без компрометации у retired и verdictOf одни.
-			// Если всё же — метка под подозрением без отсечки, не чистая.
-			c := s.chains[0][0]
-			out[i] = Verdict{Revoked: c, NeedPOE: true, Entry: Revocation{Reason: ReasonAbsent, From: "an inconsistent revocation check"}, Named: named}
+			// Все цепочки не в силе по записям, которые видны только всей
+			// оценке (CRL под новым ключом центра, retired их не знает).
+			if retired == nil {
+				retired = fmt.Errorf("%w: no certificate chain to check", ErrRevoked)
+			}
+			out[i] = Verdict{Retired: retired, Named: named}
 			continue
 		}
 		best.Named = named
@@ -891,7 +1043,7 @@ func (r *Revocations) verdictOf(chain []*x509.Certificate, gen time.Time, status
 			}
 		}
 		for _, e := range es {
-			if keepsEarlier(e.Reason) && !gen.Before(e.Time) {
+			if keepsEarlierFor(c, i == 0, e.Reason) && !gen.Before(e.Time) {
 				return Verdict{}, retiredErr(c, e, gen)
 			}
 		}
@@ -917,22 +1069,21 @@ func (r *Revocations) verdictOf(chain []*x509.Certificate, gen time.Time, status
 // Записи: перечень и все CRL с именем центра, подписанные его ключом (запись
 // только добавляет подозрение, и её не отменяют ни keyUsage сертификата
 // центра, ни область CRL, ни его возраст); удержание снимает более новый CRL,
-// годный для статуса, который его не держит. Статус (from): самый свежий CRL,
-// годный для статуса, — право центра на CRL хоть у одного из issuers, c в
-// области, выпущен до истечения c или держит истёкшие, не из будущего; нет
-// такого — notes говорят почему.
+// годный для статуса, который c не называет вовсе. Статус (from): самый
+// свежий CRL, годный для статуса, — право центра на CRL хоть у одного из
+// issuers, c в области, выпущен до истечения c или держит истёкшие, не из
+// будущего; нет такого — notes говорят почему. CRL с именем центра под
+// другим ключом, называющие c, — в listing: о ключе их судит Verdicts.
 func (r *Revocations) judge(c *x509.Certificate, issuers []*x509.Certificate) certStatus {
 	st := certStatus{entries: slices.Clone(r.listed[sha256.Sum256(c.Raw)])}
 	if len(issuers) == 0 {
 		return st
 	}
 	issuer := issuers[0].Subject.String()
+	sn := c.SerialNumber.String()
 	var own, foreign []*crlFile // подписан ключом центра — нет
 	auth := map[*crlFile]bool{} // право на CRL — хоть у одного сертификата центра
-	for _, f := range r.crls {
-		if !f.namesIssuerOf(c) {
-			continue
-		}
+	for _, f := range r.crlsNaming(c) {
 		var keyErr, authErr error
 		signed := false
 		for _, is := range issuers {
@@ -949,6 +1100,9 @@ func (r *Revocations) judge(c *x509.Certificate, issuers []*x509.Certificate) ce
 		switch {
 		case !signed:
 			foreign = append(foreign, f)
+			if len(f.bySN[sn]) > 0 {
+				st.listing = append(st.listing, f)
+			}
 			st.notes = append(st.notes, fmt.Sprintf("CRL %s names the issuer %q, but is not signed with its key (%v): not used", f.name, issuer, keyErr))
 			continue
 		case !auth[f]:
@@ -968,16 +1122,16 @@ func (r *Revocations) judge(c *x509.Certificate, issuers []*x509.Certificate) ce
 		return st
 	}
 	sort.SliceStable(own, func(i, j int) bool { return own[i].newer(own[j]) })
-	sn := c.SerialNumber.String()
 	future := func(f *crlFile) bool { return f.rl.ThisUpdate.After(r.Now.Add(futureSlack)) }
 	forStatus := func(f *crlFile) bool { return auth[f] && !future(f) && f.speaks(c) }
-	held := func(g *crlFile) bool {
-		return slices.ContainsFunc(g.bySN[sn], func(e Revocation) bool { return e.Reason == ReasonCertificateHold })
-	}
 	for i, f := range own {
 		for _, e := range f.bySN[sn] {
-			if e.Reason == ReasonCertificateHold && slices.ContainsFunc(own[:i], func(g *crlFile) bool { return g.newer(f) && forStatus(g) && !held(g) }) {
-				continue // снят с удержания: более новый CRL его не держит
+			// Снят с удержания: более новый CRL, годный для статуса, c не
+			// называет вовсе (RFC 5280, 5.3.1). Названный в нём с другой
+			// причиной — удержание сделано постоянным (так AD CS переписывает
+			// и причину, и дату), и дата удержания в силе.
+			if e.Reason == ReasonCertificateHold && slices.ContainsFunc(own[:i], func(g *crlFile) bool { return g.newer(f) && forStatus(g) && len(g.bySN[sn]) == 0 }) {
+				continue
 			}
 			st.entries = append(st.entries, e)
 		}
@@ -1009,13 +1163,12 @@ func (r *Revocations) judge(c *x509.Certificate, issuers []*x509.Certificate) ce
 		return st
 	}
 	// CRL с именем центра, но другим ключом, новее статусного и называющий c:
-	// центр мог сменить ключ (RFC 5280 это допускает) и отозвать c уже им, а
-	// подпись такого CRL здесь не сверить. CRL другого центра с тем же именем
-	// или CRL другого ключа того же центра (так их публикует AD CS) c не
-	// называет: статус по своему CRL.
-	for _, g := range foreign {
-		if g.newer(cur) && !future(g) && len(g.bySN[sn]) > 0 {
-			st.notes = append(st.notes, fmt.Sprintf("the revocation of certificate %q was not checked: %s, newer than %s, lists it as revoked, but is not signed with the key of its issuer %q (did the CA change its key?), and esverify verifies a CRL only with the key of the CA in the chain of the time-stamp", c.Subject.String(), g.label(), cur.label(), issuer))
+	// центр мог сменить ключ (RFC 5280 это допускает) и отозвать c уже им.
+	// CRL другого центра с тем же именем или CRL другого ключа того же
+	// центра (так их публикует AD CS) c не называет: статус по своему.
+	for _, g := range st.listing {
+		if g.newer(cur) && !future(g) {
+			st.notes = append(st.notes, fmt.Sprintf("the revocation of certificate %q was not checked: %s, newer than %s, lists it as revoked, but is not signed with the key of its issuer %q", c.Subject.String(), g.label(), cur.label(), issuer))
 			return st
 		}
 	}
@@ -1030,6 +1183,31 @@ func (r *Revocations) judge(c *x509.Certificate, issuers []*x509.Certificate) ce
 		st.notes = append(st.notes, fmt.Sprintf("%s is past its next update (%s): a revocation after it is not seen; fetch a fresh one", st.from, cur.rl.NextUpdate.UTC().Format(time.RFC3339)))
 	}
 	return st
+}
+
+// rekeyedBy — сертификат с именем центра, издавшего CRL g, чьим ключом g
+// подписан и который ведёт к одному из корней roots на момент выпуска g (RFC
+// 5280, 6.3.3 f: путь издателя CRL — к тому же корню, что у сертификата):
+// центр сменил ключ. pool — сертификаты оценки (цепочки и Known); nil — нет
+// такого.
+func (r *Revocations) rekeyedBy(g *crlFile, roots, pool []*x509.Certificate) *x509.Certificate {
+	inter := x509.NewCertPool()
+	for _, x := range pool {
+		inter.AddCert(x)
+	}
+	for _, x := range pool {
+		if !bytes.Equal(x.RawSubject, g.rl.RawIssuer) && x.Subject.String() != g.rl.Issuer.String() || r.checkSig(g, x).key != nil {
+			continue
+		}
+		for _, root := range roots {
+			anchor := x509.NewCertPool()
+			anchor.AddCert(root)
+			if _, err := x.Verify(x509.VerifyOptions{Roots: anchor, Intermediates: inter, CurrentTime: g.rl.ThisUpdate, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err == nil {
+				return x
+			}
+		}
+	}
+	return nil
 }
 
 // futureSlack — насколько CRL может быть «из будущего» по часам проверяющего

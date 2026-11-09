@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,7 +76,27 @@ func (x *archiveTSA) trust(t *testing.T, s *Store, at time.Time) proof.Trust {
 	if err := tr.TSARevocations.AddList(p); err != nil {
 		t.Fatal(err)
 	}
+	checkedTSA(t, tr.TSARevocations, x.a)
 	return tr
+}
+
+// checkedTSA — пустые CRL служб as: их отзыв проверен, и их метки могут быть
+// POE (время другой метки показывает только метка с проверенным отзывом).
+func checkedTSA(t *testing.T, r *tsa.Revocations, as ...*tsa.Authority) {
+	t.Helper()
+	for i, a := range as {
+		der, err := a.RevocationList(r.Now.Add(-time.Hour), r.Now.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(t.TempDir(), fmt.Sprintf("tsa-%d.crl", i))
+		if err := os.WriteFile(p, der, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.AddCRL(p); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func mustArchive(t *testing.T, s *Store) {
@@ -513,6 +534,7 @@ func TestArchiveEveryServiceInBundle(t *testing.T) {
 	if err := tr.TSARevocations.AddList(p); err != nil {
 		t.Fatal(err)
 	}
+	checkedTSA(t, tr.TSARevocations, x.a, y.a)
 	if r := proof.Verify(b, tr); !r.Valid() {
 		t.Fatalf("пакет по метке новой службы:\n%s", r.Text())
 	}

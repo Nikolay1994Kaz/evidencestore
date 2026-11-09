@@ -232,8 +232,8 @@
   {
    "name": "R53 на тот же ключ переходит и отзыв без компрометации",
    "file": "internal/tsa/revoke.go",
-   "old": "\treturn !keepsEarlier(r)\n}",
-   "new": "\treturn true\n}"
+   "old": "\t\t\tif old, ok := byKey[k]; !keepsEarlierFor(c, signer, e.Reason) && (!ok || e.Cutoff().Before(old.e.Cutoff())) {",
+   "new": "\t\t\tif old, ok := byKey[k]; true && (!ok || e.Cutoff().Before(old.e.Cutoff())) {"
   },
   {
    "name": "R54 второй CRL файла не читается",
@@ -322,8 +322,8 @@
   {
    "name": "R76 отсутствие причины не переходит на тот же ключ",
    "file": "internal/tsa/revoke.go",
-   "old": "\treturn !keepsEarlier(r)\n}",
-   "new": "\treturn r != ReasonAbsent && !keepsEarlier(r)\n}"
+   "old": "\treturn keepsEarlier(r) || r == ReasonAbsent && c.IsCA && !signer\n}",
+   "new": "\treturn keepsEarlier(r) || r == ReasonAbsent\n}"
   },
   {
    "name": "R89 номер дважды в CRL — последняя запись",
@@ -364,14 +364,14 @@
   {
    "name": "R1 без компрометации — метка после отзыва в силе",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif keepsEarlier(e.Reason) && !gen.Before(e.Time) {\n\t\t\t\treturn retiredErr(c, e, gen)",
+   "old": "\t\t\tif keepsEarlierFor(c, i == 0, e.Reason) && !gen.Before(e.Time) {\n\t\t\t\treturn retiredErr(c, e, gen)",
    "new": "\t\t\tif false {\n\t\t\t\treturn retiredErr(c, e, gen)"
   },
   {
    "name": "R2 метка в момент отзыва в силе",
    "file": "internal/tsa/revoke.go",
-   "old": "if keepsEarlier(e.Reason) && !gen.Before(e.Time) {\n\t\t\t\treturn retiredErr",
-   "new": "if keepsEarlier(e.Reason) && gen.After(e.Time) {\n\t\t\t\treturn retiredErr"
+   "old": "if keepsEarlierFor(c, i == 0, e.Reason) && !gen.Before(e.Time) {\n\t\t\t\treturn retiredErr",
+   "new": "if keepsEarlierFor(c, i == 0, e.Reason) && gen.After(e.Time) {\n\t\t\t\treturn retiredErr"
   },
   {
    "name": "R6 подпись CRL ключом центра не сверяется",
@@ -430,14 +430,14 @@
   {
    "name": "R69 двоичное вне блоков PEM принято",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif !isText(outside) {",
-   "new": "\t\tif _ = outside; false {"
+   "old": "\t\tcase !utf8.Valid(outside):",
+   "new": "\t\tcase false:"
   },
   {
    "name": "R108 текст вне блоков PEM отвергается",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif !isText(outside) {",
-   "new": "\t\tif len(bytes.TrimSpace(outside)) > 0 {"
+   "old": "\t\tcase !isText(outside):",
+   "new": "\t\tcase len(bytes.TrimSpace(outside)) > 0:"
   },
   {
    "name": "R72 CRL из будущего говорит о статусе",
@@ -460,26 +460,26 @@
   {
    "name": "R85 удержание снимает CRL из будущего",
    "file": "internal/tsa/revoke.go",
-   "old": "return g.newer(f) && forStatus(g) && !held(g) }",
-   "new": "return g.newer(f) && auth[g] && g.speaks(c) && !held(g) }"
+   "old": "return g.newer(f) && forStatus(g) && len(g.bySN[sn]) == 0 }",
+   "new": "return g.newer(f) && auth[g] && g.speaks(c) && len(g.bySN[sn]) == 0 }"
   },
   {
    "name": "R109 удержание снимает CRL без права на CRL",
    "file": "internal/tsa/revoke.go",
-   "old": "return g.newer(f) && forStatus(g) && !held(g) }",
-   "new": "return g.newer(f) && !future(g) && g.speaks(c) && !held(g) }"
+   "old": "return g.newer(f) && forStatus(g) && len(g.bySN[sn]) == 0 }",
+   "new": "return g.newer(f) && !future(g) && g.speaks(c) && len(g.bySN[sn]) == 0 }"
   },
   {
    "name": "R88 CRL с именем центра под другим ключом, называющий сертификат, — не в счёт",
    "file": "internal/tsa/revoke.go",
-   "old": "\t\tif g.newer(cur) && !future(g) && len(g.bySN[sn]) > 0 {",
+   "old": "\t\tif g.newer(cur) && !future(g) {",
    "new": "\t\tif false {"
   },
   {
    "name": "R110 CRL с именем центра под другим ключом — «не проверено» и без записи",
    "file": "internal/tsa/revoke.go",
-   "old": " && len(g.bySN[sn]) > 0 {",
-   "new": " {"
+   "old": "\t\t\tif len(f.bySN[sn]) > 0 {\n\t\t\t\tst.listing = append(st.listing, f)",
+   "new": "\t\t\tif true {\n\t\t\t\tst.listing = append(st.listing, f)"
   },
   {
    "name": "R95 DER с пробелами между CRL отвергается",
@@ -520,8 +520,8 @@
   {
    "name": "R15 метка второй службы под подозрением — POE",
    "file": "internal/proof/revoked.go",
-   "old": "\t\t\tif v := vs[a.id]; v.NeedPOE {",
-   "new": "\t\t\tif v := vs[a.id]; false && v.NeedPOE {"
+   "old": "\t\t\t} else if v.NeedPOE {",
+   "new": "\t\t\t} else if false && v.NeedPOE {"
   },
   {
    "name": "R60 POE раньше времени самой метки",
@@ -544,14 +544,14 @@
   {
    "name": "R65 строка журнала сверяется текущим доверием второй службы",
    "file": "internal/store/archive.go",
-   "old": "\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
-   "new": "\t\t_, err = tsa.Verify(rec.Token, proof.HeadImprint(rec.Size, root), tsa.Trust{Roots: s.archiver.trust.Roots, Intermediates: inter})"
+   "old": "\t\tsigner, err = tsa.SignedBy(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
+   "new": "\t\tvar info tsa.Info\n\t\tinfo, err = tsa.Verify(rec.Token, proof.HeadImprint(rec.Size, root), tsa.Trust{Roots: s.archiver.trust.Roots, Intermediates: inter})\n\t\tsigner = info.Signer"
   },
   {
    "name": "R66 подпись токена строки журнала не сверяется",
    "file": "internal/store/archive.go",
-   "old": "\t\terr = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
-   "new": "\t\terr, _ = error(nil), inter"
+   "old": "\t\tsigner, err = tsa.SignedBy(rec.Token, proof.HeadImprint(rec.Size, root), inter...)",
+   "new": "\t\tk, _ := tsa.SignerKey(rec.Token, inter...)\n\t\tsigner = &x509.Certificate{RawSubjectPublicKeyInfo: k}"
   },
   {
    "name": "R83 в пакете — метка только одной второй службы",
@@ -562,7 +562,7 @@
   {
    "name": "R113 поле key строки журнала не сверяется",
    "file": "internal/store/archive.go",
-   "old": "\tif err == nil && signerKey(rec.Token) != ref.key {",
+   "old": "\tif err == nil && sha256.Sum256(signer.RawSubjectPublicKeyInfo) != ref.key {",
    "new": "\tif false {"
   },
   {
@@ -576,6 +576,126 @@
    "file": "cmd/esverify/main.go",
    "old": "\t\t\t\treturn errors.New(\"an empty path (a comma too many, or an empty variable?)\")\n\t\t\t}\n\t\t\ttsaCRLs = append(tsaCRLs, p)",
    "new": "\t\t\t\tcontinue\n\t\t\t}\n\t\t\ttsaCRLs = append(tsaCRLs, p)"
+  },
+  {
+   "name": "R115 без причины у сертификата центра — о ключе",
+   "file": "internal/tsa/revoke.go",
+   "old": "\treturn keepsEarlier(r) || r == ReasonAbsent && c.IsCA && !signer\n}",
+   "new": "\treturn keepsEarlier(r)\n}"
+  },
+  {
+   "name": "R116 сертификат службы с флагом центра — как центр",
+   "file": "internal/tsa/revoke.go",
+   "old": "\treturn keepsEarlier(r) || r == ReasonAbsent && c.IsCA && !signer\n}",
+   "new": "\treturn keepsEarlier(r) || r == ReasonAbsent && c.IsCA\n}"
+  },
+  {
+   "name": "R117 обломки границы блока вне блоков приняты",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tcase bytes.Contains(outside, []byte(\"-----\")):",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "R118 удержание снимает CRL, что называет сертификат с другой причиной",
+   "file": "internal/tsa/revoke.go",
+   "old": "return g.newer(f) && forStatus(g) && len(g.bySN[sn]) == 0 }",
+   "new": "return g.newer(f) && forStatus(g) && !slices.ContainsFunc(g.bySN[sn], func(e Revocation) bool { return e.Reason == ReasonCertificateHold }) }"
+  },
+  {
+   "name": "R119 запись CRL нового ключа центра не в счёт",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tci.st.entries = append(ci.st.entries, es...)\n\t\t\tsuspect(ci.c, ci.signer, es)",
+   "new": "\t\t\t_ = es"
+  },
+  {
+   "name": "R120 CRL нового ключа — путь к тому же корню не нужен",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif _, err := x.Verify(x509.VerifyOptions{Roots: anchor, Intermediates: inter, CurrentTime: g.rl.ThisUpdate, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err == nil {",
+   "new": "\t\t\tif anchor != nil {"
+  },
+  {
+   "name": "R121 CRL нового ключа — подпись не сверяется",
+   "file": "internal/tsa/revoke.go",
+   "old": " || r.checkSig(g, x).key != nil {\n\t\t\tcontinue",
+   "new": " {\n\t\t\tcontinue"
+  },
+  {
+   "name": "R122 вывод из работы по CRL нового ключа — метка в силе",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tout[i] = Verdict{Retired: retired, Named: named}",
+   "new": "\t\t\tout[i] = Verdict{Named: named}"
+  },
+  {
+   "name": "R123 Retired в пакете не проверяется",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tif v.Retired != nil {\n\t\t\t// Не в силе",
+   "new": "\t\tif false {\n\t\t\t// Не в силе"
+  },
+  {
+   "name": "R124 сертификаты -tsa-trust не в оценке",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tsc.as.Known(sc.trust.Intermediates...)",
+   "new": "\t\t_ = sc.trust"
+  },
+  {
+   "name": "R125 сертификаты своих токенов не в оценке",
+   "file": "internal/proof/revoked.go",
+   "old": "\tsc.as.Known(info.Certs...)\n\tid, err := sc.as.Add(info.Chains, info.GenTime)\n\tif err != nil {\n\t\t// Пункт",
+   "new": "\tid, err := sc.as.Add(info.Chains, info.GenTime)\n\tif err != nil {\n\t\t// Пункт"
+  },
+  {
+   "name": "R126 сертификаты токенов второй службы не в оценке",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tsc.as.Known(info.Certs...)\n\t\tid, err := sc.as.Add(info.Chains, info.GenTime)",
+   "new": "\t\tid, err := sc.as.Add(info.Chains, info.GenTime)"
+  },
+  {
+   "name": "R127 сертификаты токена не в Info",
+   "file": "internal/tsa/tsa.go",
+   "old": "Signer: signer, Chains: chains, Certs: p.certs}, nil",
+   "new": "Signer: signer, Chains: chains}, nil"
+  },
+  {
+   "name": "R128 Known: сертификат вне цепочек — без сверки, кем выпущен",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif !bytes.Equal(c.RawIssuer, c.RawSubject) && !bytes.Equal(x.Raw, c.Raw) && bytes.Equal(x.RawSubject, c.RawIssuer) && x.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil {",
+   "new": "\t\t\tif !bytes.Equal(c.RawIssuer, c.RawSubject) && !bytes.Equal(x.Raw, c.Raw) && bytes.Equal(x.RawSubject, c.RawIssuer) {"
+  },
+  {
+   "name": "R129 Known не в счёт",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tsuspect(c, false, es)\n\t}",
+   "new": "\t\t_ = es\n\t}"
+  },
+  {
+   "name": "R130 POE от метки с непроверенным отзывом",
+   "file": "internal/proof/revoked.go",
+   "old": "\tif len(v.Unchecked) > 0 {\n\t\tsc.weak = append(sc.weak, m)",
+   "new": "\tif false {\n\t\tsc.weak = append(sc.weak, m)"
+  },
+  {
+   "name": "R131 повтор расширения CRL принят",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif x.Id.Equal(y.Id) {\n\t\t\t\treturn fmt.Errorf(\"extension %s is given twice\", x.Id)",
+   "new": "\t\t\tif false {\n\t\t\t\treturn fmt.Errorf(\"extension %s is given twice\", x.Id)"
+  },
+  {
+   "name": "R132 CRL атрибутных сертификатов принят",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif sc.onlyAttr {\n\t\t\t\treturn nil, fmt.Errorf",
+   "new": "\t\t\tif false {\n\t\t\t\treturn nil, fmt.Errorf"
+  },
+  {
+   "name": "R133 ключ подписанта строки журнала — без доверия второй службы",
+   "file": "internal/store/archive.go",
+   "old": "\t\t\tkey := signerKey(rec.Token, inter...)",
+   "new": "\t\t\tkey := signerKey(rec.Token)"
+  },
+  {
+   "name": "R134 ключ подписанта строки журнала — без доверия при выдаче",
+   "file": "internal/tsa/tsa.go",
+   "old": "\tc, err := findSigner(p.signer.SID, append(slices.Clone(p.certs), intermediates...))",
+   "new": "\tc, err := findSigner(p.signer.SID, p.certs)"
   }
  ]
 }

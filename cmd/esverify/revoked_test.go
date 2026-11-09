@@ -29,7 +29,7 @@ import (
 // (tsa.archive) за httptest: пакет улики, ключ хранилища, корни обеих служб
 // и перечень, где сертификат службы хранилища отозван по компрометации
 // ключа завтра.
-func archivedWorld(t *testing.T) (bundle, key, trust, archiveRoot, revoked string) {
+func archivedWorld(t *testing.T) (bundle, key, trust, archiveRoot, revoked, archiveCRL string) {
 	t.Helper()
 	dir := t.TempDir()
 	write := func(name string, data []byte) string {
@@ -88,7 +88,12 @@ func archivedWorld(t *testing.T) (bundle, key, trust, archiveRoot, revoked strin
 	}
 	list, _ := json.Marshal([]map[string]string{{"cert_sha256": tsa.Fingerprint(local.Cert()), "revoked": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339), "reason": "keyCompromise"}})
 	data, _ := json.Marshal(b)
-	return write("proof.json", data), write("store.key", []byte(s.PublicKey())), write("tsa-root.crt", s.TSARoot()), archiveRoot, write("revoked.json", list)
+	// CRL второй службы: её метка — POE, только когда её отзыв проверен.
+	crl, err := second.RevocationList(time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return write("proof.json", data), write("store.key", []byte(s.PublicKey())), write("tsa-root.crt", s.TSARoot()), archiveRoot, write("revoked.json", list), write("archive.crl", crl)
 }
 
 // -tsa-revoked: сертификат службы хранилища отозван по компрометации — пакет
@@ -96,13 +101,17 @@ func archivedWorld(t *testing.T) (bundle, key, trust, archiveRoot, revoked strin
 // сведений об отзыве отчёт говорит, что отзыв не проверен; негодный файл
 // отзыва — неверный вызов.
 func TestTSARevocationFlags(t *testing.T) {
-	bundle, key, trust, archiveRoot, revoked := archivedWorld(t)
+	bundle, key, trust, archiveRoot, revoked, archiveCRL := archivedWorld(t)
 	var out, errb bytes.Buffer
 	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust}, &out, &errb); code != exitValid || !strings.Contains(out.String(), "the revocation of the TSA certificates was not checked") {
 		t.Fatalf("без сведений об отзыве: %d\n%s%s", code, out.String(), errb.String())
 	}
 	out.Reset()
-	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust + "," + archiveRoot, "-tsa-revoked", revoked}, &out, &errb); code != exitValid || !strings.Contains(out.String(), "the archive time-stamp") {
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust + "," + archiveRoot, "-tsa-revoked", revoked}, &out, &errb); code != exitInvalid || !strings.Contains(out.String(), "the revocation of its own certificate was not checked") {
+		t.Fatalf("компрометация, вторая служба в доверии, её отзыв не проверен: %d\n%s", code, out.String())
+	}
+	out.Reset()
+	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust + "," + archiveRoot, "-tsa-revoked", revoked, "-tsa-crl", archiveCRL}, &out, &errb); code != exitValid || !strings.Contains(out.String(), "the archive time-stamp") {
 		t.Fatalf("компрометация, вторая служба в доверии: %d\n%s%s", code, out.String(), errb.String())
 	}
 	out.Reset()
@@ -125,7 +134,7 @@ func TestTSARevocationFlags(t *testing.T) {
 // -tsa-crl, а не «последний побеждает»; второй список в одном файле и
 // дельта-CRL — неверный вызов, а не молча неполная проверка.
 func TestTSARevocationListsAndDelta(t *testing.T) {
-	bundle, key, trust, _, revoked := archivedWorld(t)
+	bundle, key, trust, _, revoked, _ := archivedWorld(t)
 	dir := t.TempDir()
 	empty := filepath.Join(dir, "empty.json")
 	os.WriteFile(empty, []byte(`[]`), 0o600)

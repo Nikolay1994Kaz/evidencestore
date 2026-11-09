@@ -59,8 +59,9 @@ type archiveRecord struct {
 }
 
 // signerKey — SHA-256 ключа, которым подписан токен (нули — не разобрать).
-func signerKey(token []byte) [32]byte {
-	k, err := tsa.SignerKey(token)
+// Сертификат подписанта — из токена или inter: служба может его не класть.
+func signerKey(token []byte, inter ...*x509.Certificate) [32]byte {
+	k, err := tsa.SignerKey(token, inter...)
 	if err != nil {
 		return [32]byte{}
 	}
@@ -150,7 +151,11 @@ func (s *Store) openArchive() error {
 		case rec.Size > n:
 			s.log.Error("tsa archive: a line is not used: its head is beyond the end of this chain (the store lost the end of its chain, or the file comes from another chain)", "offset", off, "head", rec.Size, "chain", n)
 		default:
-			key := signerKey(rec.Token)
+			var inter []*x509.Certificate
+			if s.archiver != nil {
+				inter = s.archiver.trust.Intermediates
+			}
+			key := signerKey(rec.Token, inter...)
 			if len(rec.Key) == 32 {
 				key = [32]byte(rec.Key)
 			}
@@ -212,7 +217,7 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	}
 	s.chainMu.Unlock()
 	if mainKey == nil && mainToken != nil {
-		if k := signerKey(mainToken); k != ([32]byte{}) {
+		if k := signerKey(mainToken, s.tsaTrust.Intermediates...); k != ([32]byte{}) {
 			mainKey = &k
 			s.tsaKey.CompareAndSwap(nil, mainKey)
 		}
@@ -372,10 +377,11 @@ func (s *Store) archiveLineLocked(ref *archiveRef, inter []*x509.Certificate) (a
 	if errors.Is(err, errTreeFile) {
 		err = fmt.Errorf("its root is not the root of this chain at head %d: the line comes from another history of this store, or tree.hashes is damaged", rec.Size)
 	}
+	var signer *x509.Certificate
 	if err == nil {
-		err = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)
+		signer, err = tsa.SignedBy(rec.Token, proof.HeadImprint(rec.Size, root), inter...)
 	}
-	if err == nil && signerKey(rec.Token) != ref.key {
+	if err == nil && sha256.Sum256(signer.RawSubjectPublicKeyInfo) != ref.key {
 		err = errors.New("its key field does not name the key that signed its token: the line was changed")
 	}
 	if err != nil {
