@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -697,11 +698,17 @@ func TestCosignJournalDamage(t *testing.T) {
 	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s2, err := reopen(cfg, c)
+	var logs bytes.Buffer
+	s2, err := Open(cfg, Options{Logger: slog.New(slog.NewTextHandler(&logs, nil)), Now: c.now, NoBackground: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s2.Close()
+	// Голова за концом цепи названа при запуске: хранилище потеряло конец
+	// цепи, или журнал из другой цепи.
+	if !strings.Contains(logs.String(), "this chain has") {
+		t.Fatalf("о голове за концом цепи в журнале процесса ни слова:\n%s", logs.String())
+	}
 	b, err := s2.Proof("abs-core", 2, false)
 	if err != nil {
 		t.Fatal(err)
