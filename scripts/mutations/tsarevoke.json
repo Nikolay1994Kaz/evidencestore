@@ -473,7 +473,7 @@
    "name": "R88 CRL с именем центра под другим ключом, называющий сертификат, — не в счёт",
    "file": "internal/tsa/revoke.go",
    "old": "\t\t\t\tif ci.st.cur != nil && g.newer(ci.st.cur) && !future(g) {",
-   "new": "\t\t\t\tif false {"
+   "new": "\t\t\t\tif _ = future; false {"
   },
   {
    "name": "R110 CRL с именем центра под другим ключом — «не проверено» и без записи",
