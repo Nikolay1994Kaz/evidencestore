@@ -139,9 +139,14 @@ func TestTSARevocationListsAndDelta(t *testing.T) {
 			t.Fatalf("%v: %d\n%s", args, code, out.String())
 		}
 	}
-	errb.Reset()
-	if code := run([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust, "-tsa-revoked", ""}, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "empty path") {
-		t.Fatalf("пустой -tsa-revoked: %d %s", code, errb.String())
+	// Пустое значение и пустой элемент списка (лишняя запятая, пустая
+	// переменная скрипта: "$FULL,$CUR") — неверный вызов, а не молча
+	// непроверенный отзыв.
+	for _, flags := range [][]string{{"-tsa-revoked", ""}, {"-tsa-revoked", " , "}, {"-tsa-revoked", revoked + ","}, {"-tsa-crl", ","}, {"-tsa-crl", "a.crl,,b.crl"}} {
+		errb.Reset()
+		if code := run(append([]string{"-proof", bundle, "-store-key", key, "-tsa-trust", trust}, flags...), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "empty path") {
+			t.Fatalf("%q: %d %s", flags, code, errb.String())
+		}
 	}
 	data, _ := os.ReadFile(revoked)
 	both := filepath.Join(dir, "both.json")

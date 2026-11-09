@@ -145,6 +145,13 @@ func (a *Authority) Reissue(serial int64, notAfter time.Time) (*Authority, error
 	return &Authority{key: a.key, cert: cert, root: a.root, rootKey: a.rootKey, policy: a.policy}, nil
 }
 
+// AuthorityWith — служба с готовым ключом и сертификатом (выпущенным root или
+// центром под ним): тесты отзыва со своим УЦ. Токен несёт только сертификат
+// службы, промежуточные центры проверяющий берёт из своего доверия.
+func AuthorityWith(key crypto.Signer, cert, root *x509.Certificate) *Authority {
+	return &Authority{key: key, cert: cert, root: root, policy: demoPolicy}
+}
+
 // Trust — доверие к этой службе для Verify.
 func (a *Authority) Trust() Trust {
 	pool := x509.NewCertPool()

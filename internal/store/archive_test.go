@@ -517,3 +517,51 @@ func TestArchiveEveryServiceInBundle(t *testing.T) {
 		t.Fatalf("пакет по метке новой службы:\n%s", r.Text())
 	}
 }
+
+// Поле key строки журнала сверяется с ключом, которым подписан токен, когда
+// строка впервые идёт в пакет: строка с чужим ключом (журнал лежит и в копии)
+// не идёт и не прячет собой метки службы, чей ключ в ней назван, — громко в
+// журнал процесса. Следующая строка той же службы — идёт.
+func TestArchiveKeyFieldChecked(t *testing.T) {
+	c := newClock()
+	x := newArchiveTSA(t)
+	cfg := testConfig(t, x.option())
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 3)
+	mustStamp(t, s)
+	c.add(5 * time.Minute)
+	ingest(t, s, "abs-core", 4, 6)
+	c.add(5 * time.Minute)
+	mustStamp(t, s)
+	mustArchive(t, s)
+	c.add(time.Minute)
+	ingest(t, s, "abs-core", 7, 7)
+	mustStamp(t, s)
+	mustArchive(t, s)
+	s.Close()
+
+	path := filepath.Join(cfg.DataDir, filepath.FromSlash(archiveFile))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	var first, second archiveRecord
+	json.Unmarshal([]byte(lines[0]), &first)
+	json.Unmarshal([]byte(lines[1]), &second)
+	first.Key = make([]byte, 32)
+	first.Key[0] = 7
+	forged, _ := json.Marshal(first)
+	if err := os.WriteFile(path, []byte(string(forged)+"\n"+lines[1]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	b, err := s2.Proof("abs-core", 5, false)
+	if err != nil || len(b.Archive) != 1 || b.Archive[0].HeadSeq != second.Size {
+		t.Fatalf("строка с чужим key: %v, меток %d (ждали одну, над головой %d)", err, len(b.Archive), second.Size)
+	}
+}

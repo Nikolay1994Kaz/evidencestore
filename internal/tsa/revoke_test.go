@@ -1,6 +1,7 @@
 package tsa
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -210,18 +211,19 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(p); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || len(v.Unchecked) != 1 || !hasNote(v, "does not verify") || !hasNote(v, "no CRL of its issuer") {
+	if v, err := w.check(r); err != nil || len(v.Unchecked) != 1 || !hasNote(v, "is not signed with its key") || !hasNote(v, "no CRL signed with the key of its issuer") {
 		t.Fatalf("чужой CRL: %+v %v", v, err)
 	}
 	// Есть и свой — берётся он.
 	if err := r.AddCRL(w.crl("own.crl", now.Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || !hasNote(v, "does not verify") {
+	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || !hasNote(v, "is not signed with its key") {
 		t.Fatalf("свой CRL рядом с чужим: %+v %v", v, err)
 	}
-	// Чужой новее своего — центр мог сменить ключ, и отзыв после своего CRL
-	// был бы в нём: статус не известен.
+	// Чужой новее своего, сертификат не называет — CRL другого центра с тем же
+	// именем или другого ключа того же центра (так публикует AD CS): статус по
+	// своему.
 	der, err = other.RevocationList(w.gen.Add(36*time.Hour), now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -231,8 +233,23 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(newer); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || len(v.Unchecked) != 1 || !hasNote(v, "did the CA change its key?") {
-		t.Fatalf("CRL центра под другим ключом новее своего: %+v %v", v, err)
+	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || hasNote(v, "did the CA change its key?") {
+		t.Fatalf("CRL с тем же именем под другим ключом новее своего, без записи: %+v %v", v, err)
+	}
+	// Называет — центр мог сменить ключ и отозвать сертификат уже им, а его
+	// подпись не сверить: статус не известен. Вердикт по нему не меняется.
+	der, err = other.RevocationList(w.gen.Add(40*time.Hour), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: w.a.Cert().SerialNumber, RevocationTime: w.gen.Add(39 * time.Hour), ReasonCode: ReasonKeyCompromise})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(newer, der, 0o600)
+	r = NewRevocations(now)
+	r.AddCRL(w.crl("own.crl", now.Add(time.Hour)))
+	if err := r.AddCRL(newer); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "did the CA change its key?") {
+		t.Fatalf("CRL центра под другим ключом новее своего, с записью: %+v %v", v, err)
 	}
 
 	r = NewRevocations(now)
@@ -661,28 +678,42 @@ func TestRevocationsStrictInput(t *testing.T) {
 		os.WriteFile(p, data, 0o600)
 		return p
 	}
-	if err := NewRevocations(now).AddCRL(write("tail.pem", append(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), "garbage"...))); err == nil {
-		t.Error("хвост после PEM принят")
-	}
 	block := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})
-	damaged := append([]byte("-----BEGIN X509 CRL-----\nnot base64!\n-----END X509 CRL-----\n"), block...)
+	other, _ := os.ReadFile(w.crlAt("b.crl", w.gen.Add(2*time.Hour), now.Add(time.Hour), nil,
+		x509.RevocationListEntry{SerialNumber: w.a.Cert().SerialNumber, RevocationTime: w.gen.Add(-time.Hour), ReasonCode: ReasonKeyCompromise}))
+	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+	damaged := cat([]byte("-----BEGIN X509 CRL-----\nnot base64!\n-----END X509 CRL-----\n"), block)
 	for name, data := range map[string][]byte{
 		"испорченный блок перед целым": damaged,
-		"мусор перед блоком":           append([]byte("<html>404</html>\n"), block...),
-		"мусор между блоками":          append(append(append([]byte(nil), block...), "<html>404</html>\n"...), block...),
+		"двоичное после PEM":           cat(block, []byte{0x00, 0xff, 0x30}),
+		"DER рядом с PEM":              cat(block, other),
+		"хвост в блоке":                pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: cat(der, []byte{0xff, 0xff})}),
+		"начало блока в тексте":        cat([]byte("see -----BEGIN X509 CRL----- below\n"), block),
 	} {
 		if err := NewRevocations(now).AddCRL(write("bad.pem", data)); err == nil {
 			t.Errorf("%s: принято", name)
 		}
 	}
 	for name, data := range map[string][]byte{
-		"BOM в начале":               append([]byte("\xef\xbb\xbf"), block...),
-		"DER с переводом строки":     append(append([]byte(nil), der...), '\n'),
-		"два блока с пустой строкой": append(append(append([]byte(nil), block...), '\n'), block...),
+		"BOM в начале":               cat([]byte("\xef\xbb\xbf"), block),
+		"DER с переводом строки":     cat(der, []byte("\n")),
+		"DER подряд через пробелы":   cat([]byte("\n"), der, []byte(" \r\n"), other),
+		"два блока с пустой строкой": cat(block, []byte("\n"), block),
+		"пояснение перед блоком":     cat([]byte("Certificate Revocation List (CRL):\n    Issuer: CN = x\n"), block),
+		"текст между блоками":        cat(block, []byte("<html>404</html>\n"), block),
+		"BOM перед каждым блоком":    cat([]byte("\xef\xbb\xbf"), block, []byte("\xef\xbb\xbf"), block),
 	} {
 		if err := NewRevocations(now).AddCRL(write("good.crl", data)); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	// Два CRL в одном блоке PEM — оба: компрометация во втором не теряется.
+	r0 := NewRevocations(now)
+	if err := r0.AddCRL(write("two-in-block.pem", pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: cat(der, other)}))); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := w.check(r0); err != nil || len(r0.crls) != 2 || !v.NeedPOE {
+		t.Fatalf("два CRL в одном блоке: %d CRL, %+v %v", len(r0.crls), v, err)
 	}
 	fp := Fingerprint(w.a.Cert())
 	for name, body := range map[string]string{
@@ -739,6 +770,11 @@ func TestRevocationsOpenSSLCRL(t *testing.T) {
 	if err := f.rl.CheckSignatureFrom(ca); err != nil {
 		t.Fatal(err)
 	}
+	// Тот же CRL так, как его пишет openssl crl -text: описание, затем блок.
+	rt := NewRevocations(r.Now)
+	if err := rt.AddCRL(filepath.Join("testdata", "openssl", "fixture-text.pem")); err != nil || len(rt.crls) != 1 || !bytes.Equal(rt.crls[0].rl.Raw, f.rl.Raw) {
+		t.Fatalf("вывод openssl crl -text: %v", err)
+	}
 	day := func(d, h int) time.Time { return time.Date(2026, 10, d, h, 0, 0, 0, time.UTC) }
 	want := map[string]Revocation{
 		"16": {Time: day(5, 12), Reason: ReasonKeyCompromise, Invalidity: day(1, 9)},
@@ -791,7 +827,7 @@ func TestRevocationsSameCertSeveralChains(t *testing.T) {
 	r.AddCRL(interA.crlOf(t, dir, "inter.crl", gen.Add(time.Hour), now.Add(time.Hour), nil,
 		x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: gen.Add(10 * time.Hour), ReasonCode: ReasonKeyCompromise}))
 	v, err := r.Check(info.Chains, info.GenTime)
-	if err != nil || !v.NeedPOE || hasNote(v, "does not verify") {
+	if err != nil || !v.NeedPOE || hasNote(v, "may sign CRLs") {
 		t.Fatalf("компрометация за второй цепочкой: %+v %v", v, err)
 	}
 	r = NewRevocations(now)
@@ -799,6 +835,82 @@ func TestRevocationsSameCertSeveralChains(t *testing.T) {
 		x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: gen.Add(-time.Hour), ReasonCode: ReasonSuperseded}))
 	if _, err := r.Check(info.Chains, info.GenTime); !errors.Is(err, ErrRevoked) {
 		t.Fatalf("вывод из работы до метки за второй цепочкой: %v", err)
+	}
+}
+
+// Цепочка одна, и в ней выпуск центра без cRLSign (сертификаты SignedData не
+// подписаны: какие положить в токен, решает тот, кто его собирает, в том
+// числе владелец украденного ключа). CRL подписан ключом центра — его записи
+// в силе: компрометация видна, хотя для статуса («не отозван») такой CRL не
+// годится. Удержание снимает только CRL, годный для статуса: здесь — никакой.
+func TestRevocationsEntriesWithoutCRLSign(t *testing.T) {
+	dir := t.TempDir()
+	rootA := issue(t, caTmpl(1, "root A"), newKey(t), nil)
+	rootB := issue(t, caTmpl(1, "root B"), newKey(t), nil)
+	kI := newKey(t)
+	interA := issue(t, caTmpl(10, "TSA CA"), kI, rootA)
+	noCRLSign := caTmpl(11, "TSA CA")
+	noCRLSign.KeyUsage = x509.KeyUsageCertSign
+	interB := issue(t, noCRLSign, kI, rootB)
+	gen := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	now := gen.Add(48 * time.Hour)
+	leaf, info := tsaUnder(t, interA, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), gen, []*x509.Certificate{rootA.cert, rootB.cert}, interB.cert)
+	if len(info.Chains) != 1 {
+		t.Fatalf("цепочек %d, ждали одну", len(info.Chains))
+	}
+	sn := leaf.cert.SerialNumber
+	r := NewRevocations(now)
+	r.AddCRL(interA.crlOf(t, dir, "inter.crl", gen.Add(time.Hour), now.Add(time.Hour), nil,
+		x509.RevocationListEntry{SerialNumber: sn, RevocationTime: gen.Add(-10 * time.Hour), ReasonCode: ReasonKeyCompromise}))
+	v, err := r.Check(info.Chains, info.GenTime)
+	if err != nil || !v.NeedPOE || len(v.Unchecked) != 2 || !hasNote(v, "may sign CRLs") || hasNote(v, `"CN=test TSA" (issued by "CN=TSA CA") was not checked: no CRL`) {
+		t.Fatalf("компрометация за выпуском центра без cRLSign: %+v %v", v, err)
+	}
+	r = NewRevocations(now)
+	r.AddCRL(interA.crlOf(t, dir, "inter2.crl", gen.Add(time.Hour), now.Add(time.Hour), nil,
+		x509.RevocationListEntry{SerialNumber: sn, RevocationTime: gen.Add(-time.Hour), ReasonCode: ReasonSuperseded}))
+	if _, err := r.Check(info.Chains, info.GenTime); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("вывод из работы до метки за выпуском без cRLSign: %v", err)
+	}
+	// Удержание в старом CRL, более новый его не держит: снять его некому.
+	hold := []string{
+		interA.crlOf(t, dir, "held.crl", gen.Add(time.Hour), now.Add(time.Hour), nil,
+			x509.RevocationListEntry{SerialNumber: sn, RevocationTime: gen.Add(-time.Hour), ReasonCode: ReasonCertificateHold}),
+		interA.crlOf(t, dir, "released.crl", gen.Add(2*time.Hour), now.Add(time.Hour), nil),
+	}
+	r = NewRevocations(now)
+	for _, p := range hold {
+		r.AddCRL(p)
+	}
+	if v, err := r.Check(info.Chains, info.GenTime); err != nil || !v.NeedPOE {
+		t.Fatalf("удержание снял CRL, не годный для статуса: %+v %v", v, err)
+	}
+	// Тот же токен с обоими выпусками центра: статус по выпуску с cRLSign, и
+	// он же снимает удержание.
+	_, info2 := tsaUnder(t, interA, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), gen, []*x509.Certificate{rootA.cert, rootB.cert}, interA.cert, interB.cert)
+	if v, err := r.Check(info2.Chains, info2.GenTime); err != nil || v.NeedPOE || hasNote(v, "may sign CRLs") {
+		t.Fatalf("удержание при выпуске с cRLSign в другой цепочке: %+v %v", v, err)
+	}
+}
+
+// Два разных центра с одним именем (или CRL каждого ключа одного центра, как
+// публикует AD CS после смены ключа): CRL другого, новее своего, сертификат
+// не называет — статус по своему, без «не проверено».
+func TestRevocationsSameNameOtherKey(t *testing.T) {
+	dir := t.TempDir()
+	rootA := issue(t, caTmpl(1, "root A"), newKey(t), nil)
+	rootC := issue(t, caTmpl(1, "root C"), newKey(t), nil)
+	caA := issue(t, caTmpl(10, "TSA CA"), newKey(t), rootA)
+	caC := issue(t, caTmpl(10, "TSA CA"), newKey(t), rootC)
+	gen := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	now := gen.Add(48 * time.Hour)
+	_, info := tsaUnder(t, caA, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), gen, []*x509.Certificate{rootA.cert, rootC.cert}, caA.cert)
+	r := NewRevocations(now)
+	r.AddCRL(caA.crlOf(t, dir, "a.crl", now.Add(-2*time.Hour), now.Add(48*time.Hour), nil))
+	r.AddCRL(caC.crlOf(t, dir, "c.crl", now.Add(-time.Hour), now.Add(48*time.Hour), nil))
+	r.AddCRL(rootA.crlOf(t, dir, "ra.crl", now.Add(-time.Hour), now.Add(48*time.Hour), nil))
+	if v, err := r.Check(info.Chains, info.GenTime); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 2 || hasNote(v, "did the CA change its key?") {
+		t.Fatalf("CRL другого центра с тем же именем: %+v %v", v, err)
 	}
 }
 

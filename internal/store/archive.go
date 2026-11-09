@@ -123,7 +123,6 @@ func (s *Store) openArchive() error {
 		return fmt.Errorf("tsa archive: %w", err)
 	}
 	n := s.chainSize()
-	s.archiveKeys = map[[32]byte]uint64{}
 	r := bufio.NewReaderSize(f, 64<<10)
 	var off int64
 	for {
@@ -156,11 +155,14 @@ func (s *Store) openArchive() error {
 				key = [32]byte(rec.Key)
 			}
 			s.archiveIdx = append(s.archiveIdx, archiveRef{size: rec.Size, off: off, n: len(line), key: key})
-			s.archiveKeys[key] = max(s.archiveKeys[key], rec.Size)
 		}
 		off += int64(len(line))
 	}
 	slices.SortStableFunc(s.archiveIdx, func(a, b archiveRef) int { return cmp.Compare(a.size, b.size) })
+	s.archiveByKey = map[[32]byte][]int{}
+	for i, ref := range s.archiveIdx {
+		s.indexArchive(i, ref.key)
+	}
 	s.archiveLog, s.archiveEnd, s.archiveOn = f, off, true
 	if k := len(s.archiveIdx); k > 0 && s.archiver != nil {
 		s.archiver.head.Store(s.archiveIdx[k-1].size)
@@ -260,7 +262,7 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	s.archiveEnd = off + int64(len(line))
 	if k := len(s.archiveIdx); k == 0 || h.size > s.archiveIdx[k-1].size {
 		s.archiveIdx = append(s.archiveIdx, archiveRef{size: h.size, off: off, n: len(line), key: key, ok: true})
-		s.archiveKeys[key] = max(s.archiveKeys[key], h.size)
+		s.indexArchive(len(s.archiveIdx)-1, key)
 	}
 	a.head.Store(h.size)
 	a.okAt.Store(time.Now().UnixNano())
@@ -293,54 +295,45 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 	}
 	var out []proof.ArchiveStamp
 	seen := map[int64]bool{} // строки, уже взятые в пакет
+	type pick struct {
+		i   int
+		rec archiveRecord
+	}
 	for _, l := range tokenLinks {
-		want := 0 // службы, у которых есть метки не раньше звена l
-		for _, top := range s.archiveKeys {
-			if top >= l {
-				want++
+		// От каждой службы — её самая ранняя годная строка не раньше звена l:
+		// поиск по строкам службы, не проход журнала на каждое звено.
+		var picked []pick
+		for _, k := range s.archiveKeyOrder {
+			idx := s.archiveByKey[k]
+			for j := sort.Search(len(idx), func(j int) bool { return s.archiveIdx[idx[j]].size >= l }); j < len(idx); j++ {
+				ref := &s.archiveIdx[idx[j]]
+				if ref.ok && seen[ref.off] {
+					break // уже в пакете
+				}
+				rec, ok, err := s.archiveLineLocked(ref, inter)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					picked = append(picked, pick{idx[j], rec})
+					break
+				}
 			}
 		}
-		found := map[[32]byte]bool{}
-		refs := s.archiveIdx
-		for i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= l }); i < len(refs) && len(found) < want; i++ {
-			ref := &refs[i]
-			if ref.bad || found[ref.key] {
-				continue
-			}
-			rec, err := s.readArchiveLocked(*ref)
-			if err != nil {
-				return nil, err
-			}
-			if !ref.ok {
-				// Подпись токена проверена, когда строка записана; доверие к
-				// службе с тех пор могли сменить, а проверит его аудитор.
-				root := [32]byte(rec.Root)
-				err := s.tree.agreesLocked(rec.Size, root)
-				if errors.Is(err, errTreeFile) {
-					err = fmt.Errorf("its root is not the root of this chain at head %d: the line comes from another history of this store, or tree.hashes is damaged", rec.Size)
-				}
-				if err == nil {
-					err = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)
-				}
-				if err != nil {
-					s.log.Error("tsa archive: a line is not used", "head", rec.Size, "offset", ref.off, "err", err)
-					ref.bad = true
-					continue
-				}
-				ref.ok = true
-			}
-			found[ref.key] = true
+		slices.SortFunc(picked, func(a, b pick) int { return cmp.Compare(a.i, b.i) })
+		for _, p := range picked {
+			ref, rec := s.archiveIdx[p.i], p.rec
 			if seen[ref.off] {
 				continue
 			}
 			seen[ref.off] = true
 			st := proof.ArchiveStamp{HeadSeq: rec.Size, Root: rec.Root, Token: rec.Token}
 			if rec.Size > last {
-				p, err := tlog.ProveTree(int64(rec.Size), int64(last), s.tree)
+				pr, err := tlog.ProveTree(int64(rec.Size), int64(last), s.tree)
 				if err != nil {
 					return nil, err
 				}
-				for _, h := range p {
+				for _, h := range pr {
 					st.Proof = append(st.Proof, h[:])
 				}
 			}
@@ -348,6 +341,50 @@ func (s *Store) archiveForLocked(tokenLinks []uint64, last uint64) ([]proof.Arch
 		}
 	}
 	return out, nil
+}
+
+// indexArchive — строка i журнала (archiveIdx) в списке её службы.
+func (s *Store) indexArchive(i int, key [32]byte) {
+	if _, ok := s.archiveByKey[key]; !ok {
+		s.archiveKeyOrder = append(s.archiveKeyOrder, key)
+	}
+	s.archiveByKey[key] = append(s.archiveByKey[key], i)
+}
+
+// archiveLineLocked читает строку ref и, когда она идёт в пакет впервые,
+// сверяет: голова — с цепью, токен цел и заверяет её (tsa.Signed: доверие к
+// службе с тех пор могли сменить, а проверит его аудитор), поле key называет
+// ключ, которым токен подписан. Не сошлось — строка помечается негодной и
+// громко в журнал процесса (ok = false). Звать под chainMu и archiveMu.
+func (s *Store) archiveLineLocked(ref *archiveRef, inter []*x509.Certificate) (archiveRecord, bool, error) {
+	if ref.bad {
+		return archiveRecord{}, false, nil
+	}
+	rec, err := s.readArchiveLocked(*ref)
+	if err != nil {
+		return rec, false, err
+	}
+	if ref.ok {
+		return rec, true, nil
+	}
+	root := [32]byte(rec.Root)
+	err = s.tree.agreesLocked(rec.Size, root)
+	if errors.Is(err, errTreeFile) {
+		err = fmt.Errorf("its root is not the root of this chain at head %d: the line comes from another history of this store, or tree.hashes is damaged", rec.Size)
+	}
+	if err == nil {
+		err = tsa.Signed(rec.Token, proof.HeadImprint(rec.Size, root), inter...)
+	}
+	if err == nil && signerKey(rec.Token) != ref.key {
+		err = errors.New("its key field does not name the key that signed its token: the line was changed")
+	}
+	if err != nil {
+		s.log.Error("tsa archive: a line is not used", "head", rec.Size, "offset", ref.off, "err", err)
+		ref.bad = true
+		return rec, false, nil
+	}
+	ref.ok = true
+	return rec, true, nil
 }
 
 // archiveFor — archiveForLocked под chainMu: для пакетов за окно и по
