@@ -97,12 +97,6 @@ func (p sealPKI) crlDER(t testing.TB, now time.Time, entries ...x509.RevocationL
 	return der
 }
 
-// crl — сведения об отзыве из CRL центра печатей.
-func (p sealPKI) crl(t testing.TB, now time.Time, entries ...x509.RevocationListEntry) *tsa.Revocations {
-	t.Helper()
-	return revsOf(t, now, p.crlDER(t, now, entries...))
-}
-
 // revsOf — сведения об отзыве из нескольких CRL.
 func revsOf(t testing.TB, now time.Time, crls ...[]byte) *tsa.Revocations {
 	t.Helper()

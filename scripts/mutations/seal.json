@@ -1,0 +1,232 @@
+{
+ "packages": [
+  "./internal/tsa/",
+  "./internal/proof/",
+  "./internal/store/",
+  "./cmd/esverify/"
+ ],
+ "mutations": [
+  {
+   "name": "X1 печать больше предела разбирается",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif len(der) > MaxSealSize {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "X2 версия SignedData не сверяется",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif sd.Version != 1 && sd.Version != 3 {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "X3 содержимое не id-data принято",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif !sd.EncapContentInfo.EContentType.Equal(oidData) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "X4 больше одного подписанта принято",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif len(sd.SignerInfos) != 1 {",
+   "new": "\tif len(sd.SignerInfos) == 0 {"
+  },
+  {
+   "name": "X5 версия SignerInfo не сверяется",
+   "file": "internal/tsa/seal.go",
+   "old": "byKeyID && si.Version != 3 || !byKeyID && si.Version != 1 {",
+   "new": "false {"
+  },
+  {
+   "name": "X6 digestAlgorithms не SET принят",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif da := sd.DigestAlgorithms; da.Class != asn1.ClassUniversal || da.Tag != asn1.TagSet || !da.IsCompound {",
+   "new": "\tif da := sd.DigestAlgorithms; false && da.IsCompound {"
+  },
+  {
+   "name": "X7 алгоритм подписанта не объявлен",
+   "file": "internal/tsa/seal.go",
+   "old": "\t\tdeclared = declared || alg.Algorithm.Equal(si.DigestAlgorithm.Algorithm)",
+   "new": "\t\tdeclared = true"
+  },
+  {
+   "name": "X8 параметры алгоритма приняты",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif !declared || !plainParams(si.DigestAlgorithm) || !plainParams(si.SignatureAlgorithm) {",
+   "new": "\tif !declared {"
+  },
+  {
+   "name": "X9 без подписанных атрибутов принято",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif len(si.SignedAttrs.FullBytes) == 0 {\n\t\treturn fail(\"no signed attributes\")",
+   "new": "\tif len(si.SignedAttrs.FullBytes) == 0 && false {\n\t\treturn fail(\"no signed attributes\")"
+  },
+  {
+   "name": "X10 атрибут дважды принят",
+   "file": "internal/tsa/seal.go",
+   "old": "\t\tif seen[a.Type.String()] {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "X11 contentType не data принят",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif rest, err := asn1.Unmarshal(ct, &ctOID); err != nil || len(rest) != 0 || !ctOID.Equal(oidData) {",
+   "new": "\tif rest, err := asn1.Unmarshal(ct, &ctOID); err != nil || len(rest) != 0 {"
+  },
+  {
+   "name": "X12 messageDigest не сверяется с содержимым",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif !bytes.Equal(h.Sum(nil), digest) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "X13 подпись не сверяется",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif err := checkSignature(signer, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature); err != nil {",
+   "new": "\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "X14 signingCertificateV2 не сверяется",
+   "file": "internal/tsa/seal.go",
+   "old": "\t\tif err := checkSigningCert(a, signer); err != nil {",
+   "new": "\t\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "X15 keyUsage подписанта не сверяется",
+   "file": "internal/tsa/seal.go",
+   "old": "\tif signer.KeyUsage != 0 && signer.KeyUsage&(x509.KeyUsageDigitalSignature|x509.KeyUsageContentCommitment) == 0 {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "X16 цепочка печати — на момент проверки, не метки",
+   "file": "internal/tsa/seal.go",
+   "old": "\tchains, err := s.Signer.Verify(x509.VerifyOptions{Roots: trust.Roots, Intermediates: inter, CurrentTime: at, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})",
+   "new": "\tchains, err := s.Signer.Verify(x509.VerifyOptions{Roots: trust.Roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})"
+  },
+  {
+   "name": "X17 имя владельца: значение без учёта регистра",
+   "file": "internal/tsa/seal.go",
+   "old": "\t\tif v, ok := a.Value.(string); ok && a.Type.Equal(p.Type) && v == p.Value {",
+   "new": "\t\tif v, ok := a.Value.(string); ok && a.Type.Equal(p.Type) && strings.EqualFold(v, p.Value) {"
+  },
+  {
+   "name": "X18 имя владельца: любой атрибут",
+   "file": "internal/tsa/seal.go",
+   "old": "\t\tif v, ok := a.Value.(string); ok && a.Type.Equal(p.Type) && v == p.Value {",
+   "new": "\t\tif v, ok := a.Value.(string); ok && v == p.Value {"
+  },
+  {
+   "name": "X19 имя владельца: OID с ведущим нулём принят",
+   "file": "internal/tsa/seal.go",
+   "old": "\t\tif err != nil || n < 0 || part != strconv.Itoa(n) {",
+   "new": "\t\tif err != nil || n < 0 {"
+  },
+  {
+   "name": "X20 заявление: хвост после ключа принят",
+   "file": "internal/proof/seal.go",
+   "old": "\tif !ok || !found || len(tail) != 0 {",
+   "new": "\tif !ok || !found {"
+  },
+  {
+   "name": "X21 заявление: заголовок не сверяется",
+   "file": "internal/proof/seal.go",
+   "old": "\trest, ok := bytes.CutPrefix(text, []byte(sealHeader))",
+   "new": "\trest, ok := bytes.CutPrefix(text, []byte(sealHeader)[:0])"
+  },
+  {
+   "name": "X22 печать на другой ключ принята",
+   "file": "internal/proof/seal.go",
+   "old": "\tcase !pub.Equal(trust.StoreKey):",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "X23 ключ из печати без имени владельца",
+   "file": "internal/proof/seal.go",
+   "old": "\tcase len(t.SealSubject) == 0:\n\t\treturn nil, errNoOwner",
+   "new": "\tcase false:\n\t\treturn nil, errNoOwner"
+  },
+  {
+   "name": "X24 имя владельца не сверяется в пакете",
+   "file": "internal/proof/seal.go",
+   "old": "\tif err := sealedBy(sealed.Signer, trust.SealSubject); err != nil {\n\t\tc.err = err\n\t\treturn\n\t}",
+   "new": "\t_ = sealedBy"
+  },
+  {
+   "name": "X25 метка над печатью не сверяется с печатью",
+   "file": "internal/proof/seal.go",
+   "old": "\tinfo, err := tsa.Verify(s.Token, SealImprint(s.CMS), tsaTrust)",
+   "new": "\tinfo, err := tsa.Verify(s.Token, SealImprint(nil), tsaTrust)"
+  },
+  {
+   "name": "X26 печать под подозрением — без проверки времени метки",
+   "file": "internal/proof/seal.go",
+   "old": "\t\tif at.IsZero() || !at.Before(v.Cutoff) {\n\t\t\tadd(sealCheckName",
+   "new": "\t\tif false {\n\t\t\tadd(sealCheckName"
+  },
+  {
+   "name": "X27 метка над печатью под подозрением — её время в силе",
+   "file": "internal/proof/seal.go",
+   "old": "\tif c.tokenID >= 0 && (vs[c.tokenID].NeedPOE || vs[c.tokenID].Retired != nil) {",
+   "new": "\tif c.tokenID >= 0 && vs[c.tokenID].Retired != nil {"
+  },
+  {
+   "name": "X28 печать на момент проверки не сверяется при метке под подозрением",
+   "file": "internal/proof/seal.go",
+   "old": "\t\tif c.nowErr != nil {\n\t\t\tadd(sealCheckName",
+   "new": "\t\tif false {\n\t\t\tadd(sealCheckName"
+  },
+  {
+   "name": "X29 метка с непроверенным отзывом показывает время печати",
+   "file": "internal/proof/seal.go",
+   "old": "\t\tif tv := vs[c.tokenID]; len(tv.Unchecked) > 0 {",
+   "new": "\t\tif tv := vs[c.tokenID]; false && len(tv.Unchecked) > 0 {"
+  },
+  {
+   "name": "X30 сертификат печати отозван без компрометации до неё — в силе",
+   "file": "internal/proof/seal.go",
+   "old": "\t\tid, err := sc.as.Add(chains, at)\n\t\tif err != nil {\n\t\t\tc.err = fmt.Errorf(\"the seal certificate is not in force",
+   "new": "\t\tid, err := sc.as.Add(chains, at)\n\t\tif err != nil && false {\n\t\t\tc.err = fmt.Errorf(\"the seal certificate is not in force"
+  },
+  {
+   "name": "X31 метка не в силе — её время в силе",
+   "file": "internal/proof/seal.go",
+   "old": "\t\t} else {\n\t\t\twhy = fmt.Sprintf(\"the time-stamp over the seal is not in force (%v)\", err)\n\t\t}",
+   "new": "\t\t} else {\n\t\t\tc.tokenID = id\n\t\t}"
+  },
+  {
+   "name": "X32 пакет без печати при -seal-trust проходит",
+   "file": "internal/proof/seal.go",
+   "old": "\t\tc.err = errors.New(\"the bundle carries no seal of the store key, and -seal-trust asks for one\")\n\t\treturn",
+   "new": "\t\treturn"
+  },
+  {
+   "name": "X33 хранилище: печать на чужой ключ — старт",
+   "file": "internal/store/seal.go",
+   "old": "\tif !pub.Equal(s.signer.PublicKey()) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "X34 хранилище: метка в data_dir не над этой печатью — в пакет",
+   "file": "internal/store/seal.go",
+   "old": "\tcase tsa.Signed(tok, proof.SealImprint(der)) != nil:",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "X35 хранилище: PEM другого типа принят",
+   "file": "internal/store/seal.go",
+   "old": "\t\tif b.Type != \"CMS\" && b.Type != \"PKCS7\" {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "X36 esverify: без -store-key и -seal-subject",
+   "file": "cmd/esverify/main.go",
+   "old": "\tcase *storeKey == \"\" && len(sealSubject) == 0:",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "X37 esverify: -seal-subject без -seal-trust",
+   "file": "cmd/esverify/main.go",
+   "old": "\tcase len(sealSubject) > 0 && *sealTrust == \"\":",
+   "new": "\tcase false:"
+  }
+ ]
+}
