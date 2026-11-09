@@ -102,9 +102,11 @@ func TestRevocationsDamagedPEMBoundary(t *testing.T) {
 		}
 	}
 	for name, c := range map[string]struct{ pre, want string }{
-		"UTF-8":      {"Список отозванных сертификатов\n", ""},
-		"cp1251":     {"\xd1\xef\xe8\xf1\xee\xea\n", "not UTF-8"},
-		"управление": {"\x1b[1mCRL\x1b[0m\n", "control characters"},
+		"UTF-8":            {"Список отозванных сертификатов\n", ""},
+		"разделитель":      {"-----\n----- файл 2 -----\n", ""},
+		"граница в тексте": {"----- END of the list -----\n", "broken PEM boundary"},
+		"cp1251":           {"\xd1\xef\xe8\xf1\xee\xea\n", "not UTF-8"},
+		"управление":       {"\x1b[1mCRL\x1b[0m\n", "control characters"},
 	} {
 		p := filepath.Join(w.dir, "text.pem")
 		os.WriteFile(p, []byte(c.pre+good), 0o600)

@@ -276,6 +276,9 @@ type Info struct {
 type Trust struct {
 	Roots         *x509.CertPool
 	Intermediates []*x509.Certificate
+	// RootCerts — те же корни списком (LoadTrust): оценке отзыва нужны и
+	// корни, через которые цепочки не идут (центр-тёзка под другим корнем).
+	RootCerts []*x509.Certificate
 }
 
 type parsed struct {
@@ -465,27 +468,39 @@ func verifySigned(token []byte, imprint [32]byte, intermediates []*x509.Certific
 	}
 
 	pool := append(append([]*x509.Certificate(nil), p.certs...), intermediates...)
-	signer, err := findSigner(p.signer.SID, pool)
-	if err != nil {
-		return fail(err)
+	// Подписант — сертификат, который называют SID, подпись и атрибут
+	// signingCertificate (RFC 3161, 2.4.1: signingCertificateV2, RFC 5816, или
+	// v1 с SHA-1 — так подписывает НУЦ РК; без него подпись можно было бы
+	// приписать другому сертификату с тем же ключом). По номеру ключа (SID —
+	// subjectKeyIdentifier) подходят все сертификаты ключа — и перевыпущенный:
+	// годен тот, кого называет атрибут.
+	candidates := findSigners(p.signer.SID, pool)
+	if len(candidates) == 0 {
+		return fail(fmt.Errorf("%w: signer certificate not found", ErrInvalid))
 	}
-	if err := checkSignature(signer, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature); err != nil {
-		return fail(err)
+	var signer *x509.Certificate
+	var firstErr error
+	for _, c := range candidates {
+		err := checkSignature(c, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature)
+		if err == nil {
+			if raw, ok := p.attr(oidSigningCertV2); ok {
+				err = checkSigningCert(raw, c)
+			} else if raw, ok := p.attr(oidSigningCertV1); ok {
+				err = checkSigningCertV1(raw, c)
+			} else {
+				err = fmt.Errorf("%w: no signing-certificate attribute", ErrInvalid)
+			}
+		}
+		if err == nil {
+			signer = c
+			break
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
-	// RFC 3161, 2.4.1: сертификат подписанта называется подписанным
-	// атрибутом — signingCertificateV2 (RFC 5816) или signingCertificate
-	// (v1, SHA-1; так подписывает НУЦ РК). Без него подпись можно было бы
-	// приписать другому сертификату с тем же ключом.
-	if raw, ok := p.attr(oidSigningCertV2); ok {
-		if err := checkSigningCert(raw, signer); err != nil {
-			return fail(err)
-		}
-	} else if raw, ok := p.attr(oidSigningCertV1); ok {
-		if err := checkSigningCertV1(raw, signer); err != nil {
-			return fail(err)
-		}
-	} else {
-		return fail(fmt.Errorf("%w: no signing-certificate attribute", ErrInvalid))
+	if signer == nil {
+		return fail(firstErr)
 	}
 	if acc := p.tst.Accuracy; acc.Seconds < 0 || acc.Millis < 0 || acc.Micros < 0 ||
 		time.Duration(acc.Seconds)*time.Second+time.Duration(acc.Millis)*time.Millisecond+time.Duration(acc.Micros)*time.Microsecond > MaxAccuracy {
@@ -538,24 +553,33 @@ func hashFor(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
 }
 
 func findSigner(sid asn1.RawValue, pool []*x509.Certificate) (*x509.Certificate, error) {
+	if cs := findSigners(sid, pool); len(cs) > 0 {
+		return cs[0], nil
+	}
+	return nil, fmt.Errorf("%w: signer certificate not found", ErrInvalid)
+}
+
+// findSigners — все сертификаты pool, которые называет SID, по порядку.
+func findSigners(sid asn1.RawValue, pool []*x509.Certificate) []*x509.Certificate {
+	var out []*x509.Certificate
 	if sid.Class == asn1.ClassContextSpecific && sid.Tag == 0 {
 		for _, c := range pool {
 			if len(c.SubjectKeyId) > 0 && bytes.Equal(c.SubjectKeyId, sid.Bytes) {
-				return c, nil
+				out = append(out, c)
 			}
 		}
-		return nil, fmt.Errorf("%w: signer certificate not found", ErrInvalid)
+		return out
 	}
 	var ias issuerAndSerial
 	if _, err := asn1.Unmarshal(sid.FullBytes, &ias); err != nil {
-		return nil, fmt.Errorf("%w: bad signer identifier", ErrInvalid)
+		return nil
 	}
 	for _, c := range pool {
 		if bytes.Equal(c.RawIssuer, ias.Issuer.FullBytes) && c.SerialNumber.Cmp(ias.Serial) == 0 {
-			return c, nil
+			out = append(out, c)
 		}
 	}
-	return nil, fmt.Errorf("%w: signer certificate not found", ErrInvalid)
+	return out
 }
 
 var (
@@ -679,6 +703,7 @@ func LoadTrust(paths string) (Trust, error) {
 			}
 			if bytes.Equal(c.RawIssuer, c.RawSubject) && c.CheckSignatureFrom(c) == nil {
 				t.Roots.AddCert(c)
+				t.RootCerts = append(t.RootCerts, c)
 				roots++
 			} else {
 				t.Intermediates = append(t.Intermediates, c)

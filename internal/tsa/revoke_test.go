@@ -249,7 +249,7 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(newer); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "lists it as revoked, but is not signed with the key of its issuer") || !hasNote(v, "did the CA change its key? pass that certificate in -tsa-trust") {
+	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "lists it as revoked, and its signature cannot be checked") || !hasNote(v, "did the CA change its key? pass that certificate in -tsa-trust") {
 		t.Fatalf("CRL центра под другим ключом новее своего, с записью: %+v %v", v, err)
 	}
 	// И один, без своего: статус не проверен, и заметка говорит, что он

@@ -141,7 +141,8 @@ func (sc *stampCheck) verify(token []byte, head uint64, root [32]byte, link uint
 func (sc *stampCheck) ensureAssessment() {
 	if sc.as == nil {
 		sc.as = sc.revs.NewAssessment()
-		sc.as.Known(sc.trust.Intermediates...)
+		sc.as.KnownTrusted(sc.trust.Intermediates...)
+		sc.as.KnownTrusted(sc.trust.RootCerts...)
 	}
 }
 

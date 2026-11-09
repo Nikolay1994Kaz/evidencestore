@@ -50,12 +50,28 @@ const archiveFile = "tsa/archive.jsonl"
 
 // archiveRecord — строка журнала: голова и токен второй службы над ней; Key —
 // SHA-256 ключа (SubjectPublicKeyInfo), которым токен подписан: службы
-// различаются по нему (у строк без него — ключ из токена).
+// различаются по нему (у строк без него — ключ из токена). Cert — сертификат
+// подписанта, когда токен его не несёт (он был в tsa.archive.trust): строка
+// годна и после того, как tsa.archive сменили или убрали.
 type archiveRecord struct {
 	Size  uint64 `json:"size"`
 	Root  []byte `json:"root"`
 	Token []byte `json:"token"`
 	Key   []byte `json:"key,omitempty"`
+	Cert  []byte `json:"cert,omitempty"`
+}
+
+// signerCerts — сертификаты, которыми искать подписанта строки: доверие
+// второй службы и Cert строки.
+func (rec archiveRecord) signerCerts(inter []*x509.Certificate) []*x509.Certificate {
+	if len(rec.Cert) == 0 {
+		return inter
+	}
+	c, err := x509.ParseCertificate(rec.Cert)
+	if err != nil {
+		return inter
+	}
+	return append(slices.Clone(inter), c)
 }
 
 // signerKey — SHA-256 ключа, которым подписан токен (нули — не разобрать).
@@ -155,7 +171,7 @@ func (s *Store) openArchive() error {
 			if s.archiver != nil {
 				inter = s.archiver.trust.Intermediates
 			}
-			key := signerKey(rec.Token, inter...)
+			key := signerKey(rec.Token, rec.signerCerts(inter)...)
 			if len(rec.Key) == 32 {
 				key = [32]byte(rec.Key)
 			}
@@ -243,7 +259,11 @@ func (s *Store) ArchiveOnce(ctx context.Context) (err error) {
 	if mainKey != nil && *mainKey == key {
 		return fmt.Errorf("%s signs with the key of tsa.url (%q): it is the same TSA, and its time-stamps show nothing once that key is compromised; point tsa.archive at a TSA of another operator", a.url, info.Signer.Subject.String())
 	}
-	line, err := json.Marshal(archiveRecord{Size: h.size, Root: h.root[:], Token: token, Key: key[:]})
+	rec := archiveRecord{Size: h.size, Root: h.root[:], Token: token, Key: key[:]}
+	if !slices.ContainsFunc(info.Certs, func(c *x509.Certificate) bool { return bytes.Equal(c.Raw, info.Signer.Raw) }) {
+		rec.Cert = info.Signer.Raw
+	}
+	line, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -379,7 +399,7 @@ func (s *Store) archiveLineLocked(ref *archiveRef, inter []*x509.Certificate) (a
 	}
 	var signer *x509.Certificate
 	if err == nil {
-		signer, err = tsa.SignedBy(rec.Token, proof.HeadImprint(rec.Size, root), inter...)
+		signer, err = tsa.SignedBy(rec.Token, proof.HeadImprint(rec.Size, root), rec.signerCerts(inter)...)
 	}
 	if err == nil && sha256.Sum256(signer.RawSubjectPublicKeyInfo) != ref.key {
 		err = errors.New("its key field does not name the key that signed its token: the line was changed")
