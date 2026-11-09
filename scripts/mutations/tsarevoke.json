@@ -1,0 +1,227 @@
+{
+ "packages": [
+  "./internal/tsa/",
+  "./internal/proof/",
+  "./internal/store/",
+  "./internal/config/",
+  "./cmd/esverify/"
+ ],
+ "mutations": [
+  {
+   "name": "R1 без компрометации — метка после отзыва в силе",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\t\tif !gen.Before(e.Time) {",
+   "new": "\t\t\t\tif false {"
+  },
+  {
+   "name": "R2 метка в момент отзыва в силе",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\t\tif !gen.Before(e.Time) {",
+   "new": "\t\t\t\tif gen.After(e.Time) {"
+  },
+  {
+   "name": "R3 компрометация — как вывод из работы",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tcase ReasonUnspecified, ReasonAffiliationChanged, ReasonSuperseded, ReasonCessationOfOperation:",
+   "new": "\tcase ReasonUnspecified, ReasonKeyCompromise, ReasonAffiliationChanged, ReasonSuperseded, ReasonCessationOfOperation:"
+  },
+  {
+   "name": "R4 нет причины в CRL — как unspecified",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\trev := Revocation{Time: e.RevocationTime.UTC(), Reason: ReasonAbsent, From: from}",
+   "new": "\t\trev := Revocation{Time: e.RevocationTime.UTC(), Reason: ReasonUnspecified, From: from}"
+  },
+  {
+   "name": "R5 invalidityDate не сдвигает отсечку",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tif !r.Invalidity.IsZero() && r.Invalidity.Before(r.Time) {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "R6 подпись CRL не сверяется",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif f.rl.CheckSignatureFrom(issuer) != nil {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "R7 свежесть CRL не сверяется",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tstale = f.rl.NextUpdate.IsZero() || !r.Now.Before(f.rl.NextUpdate)",
+   "new": "\t\tstale = false"
+  },
+  {
+   "name": "R8 removeFromCRL — как отзыв",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif rev.Reason == ReasonRemoveFromCRL {\n\t\t\tcontinue",
+   "new": "\t\tif false {\n\t\t\tcontinue"
+  },
+  {
+   "name": "R9 отзыв по перечню — только у листа",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tfor i, c := range chain {",
+   "new": "\tfor i, c := range chain[:1] {"
+  },
+  {
+   "name": "R11 чужая причина в перечне принята",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif rev.Reason == -2 {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "R12 метка подозрительного ключа — как чистая",
+   "file": "internal/proof/revoked.go",
+   "old": "\tif v.NeedPOE {\n\t\tsc.pending",
+   "new": "\tif false && v.NeedPOE {\n\t\tsc.pending"
+  },
+  {
+   "name": "R13 POE позже отсечки",
+   "file": "internal/proof/revoked.go",
+   "old": "m.at.Before(p.cutoff)",
+   "new": "!m.at.IsZero()"
+  },
+  {
+   "name": "R14 POE над головой раньше токена",
+   "file": "internal/proof/revoked.go",
+   "old": "m.head >= p.link && ",
+   "new": "m.head+1 > 0 && "
+  },
+  {
+   "name": "R15 метка второй службы — того же скомпрометированного ключа",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tcase v.NeedPOE:\n\t\t\tsc.notes = append(sc.notes, fmt.Sprintf(\"the archive time-stamp over head %d rests on a revoked certificate itself",
+   "new": "\t\tcase false:\n\t\t\tsc.notes = append(sc.notes, fmt.Sprintf(\"the archive time-stamp over head %d rests on a revoked certificate itself"
+  },
+  {
+   "name": "R16 доказательство продолжения метки второй службы не сверяется",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\t\tif bad || tlog.CheckTree(p, int64(a.HeadSeq), tlog.Hash(root), int64(last), tlog.Hash(end)) != nil {",
+   "new": "\t\t\tif bad {"
+  },
+  {
+   "name": "R17 корень метки второй службы внутри пакета не сверяется",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\t\tif r, ok := rootAt(a.HeadSeq); !ok || r != root || len(a.Proof) != 0 {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "R18 корень подписи свидетеля как POE не сверяется",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tif r, ok := rootAt(c.Size); !ok || r != [32]byte(c.Root) {\n\t\t\tcontinue",
+   "new": "\t\tif false {\n\t\t\tcontinue"
+  },
+  {
+   "name": "R22 без сведений об отзыве — без заметки",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\tif sc.tokens > 0 {\n\t\t\tsc.notes = append(sc.notes, RevocationNotChecked)",
+   "new": "\t\tif false {\n\t\t\tsc.notes = append(sc.notes, RevocationNotChecked)"
+  },
+  {
+   "name": "R20 лист T2 не сверяется с токеном",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tcase l.Type != auditchain.EventTimestamp || l.Subject != strconv.FormatUint(u.HeadSeq, 10) || !bytes.Equal(l.Payload, u.Token):",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "R21 звено токена T2 не берётся",
+   "file": "internal/proof/proof.go",
+   "old": "\t\tlink = inc.LinkSeq\n",
+   "new": "\t\tlink = 0 * inc.LinkSeq\n"
+  },
+  {
+   "name": "R23 токен второй службы не проверяется перед записью",
+   "file": "internal/store/archive.go",
+   "old": "\tif _, err := tsa.Verify(token, imprint, a.trust); err != nil {",
+   "new": "\tif _, err := tsa.Verify(token, imprint, a.trust); false && err != nil {"
+  },
+  {
+   "name": "R24 вторая служба спрашивается и без новой головы",
+   "file": "internal/store/archive.go",
+   "old": "\tif !ok || h.size <= a.head.Load() {",
+   "new": "\tif !ok {"
+  },
+  {
+   "name": "R30 голова дальше конца пакета — без доказательства продолжения",
+   "file": "internal/store/archive.go",
+   "old": "\t\t\t\tif rec.Size > last {",
+   "new": "\t\t\t\tif false {"
+  },
+  {
+   "name": "R32 оборванная строка журнала второй службы не отрезается",
+   "file": "internal/store/archive.go",
+   "old": "\t\t\tif len(line) > 0 {\n\t\t\t\ts.log.Warn(\"tsa archive: a torn",
+   "new": "\t\t\tif false && len(line) > 0 {\n\t\t\t\ts.log.Warn(\"tsa archive: a torn"
+  },
+  {
+   "name": "R34 строка журнала второй службы не проверяется при выдаче",
+   "file": "internal/store/archive.go",
+   "old": "\t\t\tif !ref.ok {\n\t\t\t\troot := [32]byte(rec.Root)",
+   "new": "\t\t\tif false {\n\t\t\t\troot := [32]byte(rec.Root)"
+  },
+  {
+   "name": "R26 метки второй службы не в пакете одной улики",
+   "file": "internal/store/proofs.go",
+   "old": "\tif b.Archive, err = s.archiveForLocked(tokens, links[len(links)-1].Seq); err != nil {",
+   "new": "\tif b.Archive, err = []proof.ArchiveStamp(nil), error(nil); err != nil {"
+  },
+  {
+   "name": "R27 метки второй службы не в пакете за окно",
+   "file": "internal/store/window.go",
+   "old": "\tif b.Archive, err = s.archiveForStretch(lowerHead, b.StretchEnd, links[len(links)-1].Seq); err != nil {",
+   "new": "\tif b.Archive, err = []proof.ArchiveStamp(nil), error(nil); err != nil {"
+  },
+  {
+   "name": "R28 метки второй службы не в пакете по источнику",
+   "file": "internal/store/source.go",
+   "old": "\tif b.Archive, err = s.archiveFor(tokens, links[len(links)-1].Seq); err != nil {",
+   "new": "\tif b.Archive, err = []proof.ArchiveStamp(nil), error(nil); err != nil {"
+  },
+  {
+   "name": "R29 лист T2 не в пакете при второй службе",
+   "file": "internal/store/proofs.go",
+   "old": "\tif b.Upper != nil && (s.archiver != nil || to >= upperLeaf.LinkSeq) {",
+   "new": "\tif b.Upper != nil && (false || to >= upperLeaf.LinkSeq) {"
+  },
+  {
+   "name": "R31 журнал второй службы не едет в копию",
+   "file": "internal/store/replica.go",
+   "old": "\t\tsnap.sizes[archiveFile] = size",
+   "new": "\t\t_ = size"
+  },
+  {
+   "name": "R35 вторая служба — та же служба",
+   "file": "internal/config/config.go",
+   "old": "\t\tcase strings.TrimRight(a.URL, \"/\") == strings.TrimRight(c.TSA.URL, \"/\"):",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "R36 вторая служба без доверия",
+   "file": "internal/config/config.go",
+   "old": "\t\tcase len(a.Trust) == 0:",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "R37 вторая служба без основной",
+   "file": "internal/config/config.go",
+   "old": "\t\tcase c.TSA.URL == \"\":",
+   "new": "\t\tcase false:"
+  },
+  {
+   "name": "R38 путь доверия второй службы не от каталога конфигурации",
+   "file": "internal/config/config.go",
+   "old": "\t\tabs(&c.TSA.Archive.Trust[i])",
+   "new": "\t\t_ = c.TSA.Archive.Trust[i]"
+  },
+  {
+   "name": "R39 -tsa-revoked не читается",
+   "file": "cmd/esverify/main.go",
+   "old": "\t\t\tif err := pt.TSARevocations.AddList(*tsaRevoked); err != nil {",
+   "new": "\t\t\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "R40 -tsa-crl не читается",
+   "file": "cmd/esverify/main.go",
+   "old": "\t\t\tif err := pt.TSARevocations.AddCRL(p); err != nil {",
+   "new": "\t\t\tif err := error(nil); err != nil {"
+  }
+ ]
+}

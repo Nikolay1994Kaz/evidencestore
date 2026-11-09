@@ -237,21 +237,29 @@ func TestArchiveJournal(t *testing.T) {
 	}
 	s.Close()
 
-	// Порча: голова за концом цепи и оборванная последняя строка.
+	// Порча: перед настоящей строкой — та же голова с испорченным токеном,
+	// после — голова за концом цепи и оборванная последняя строка.
 	path := filepath.Join(cfg.DataDir, filepath.FromSlash(archiveFile))
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	good, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.WriteString(`{"size":99999,"root":"` + strings.Repeat("A", 43) + `=","token":"AA=="}` + "\n" + `{"size":1,"ro`)
-	f.Close()
+	var rec archiveRecord
+	json.Unmarshal(good[:strings.IndexByte(string(good), '\n')], &rec)
+	rec.Token = append([]byte(nil), rec.Token...)
+	rec.Token[len(rec.Token)-1] ^= 1
+	forged, _ := json.Marshal(rec)
+	damaged := string(forged) + "\n" + string(good) + `{"size":99999,"root":"` + strings.Repeat("A", 43) + `=","token":"AA=="}` + "\n" + `{"size":1,"ro`
+	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	s2, err := reopen(cfg, c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, err := s2.Proof("abs-core", 2, false)
-	if err != nil || len(b.Archive) != len(before.Archive) || b.Archive[0].HeadSeq != before.Archive[0].HeadSeq {
-		t.Fatalf("после порчи: %v, метки %+v, до %+v", err, b.Archive, before.Archive)
+	if err != nil || len(b.Archive) != len(before.Archive) || string(b.Archive[0].Token) != string(before.Archive[0].Token) {
+		t.Fatalf("после порчи: %v, меток %d, до %d", err, len(b.Archive), len(before.Archive))
 	}
 	if back, _ := os.ReadFile(path); strings.HasSuffix(string(back), `"ro`) {
 		t.Fatal("оборванная строка не отрезана")

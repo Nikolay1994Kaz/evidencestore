@@ -504,8 +504,8 @@
   {
    "name": "S39 удалённый журнал подписей останавливает копию",
    "file": "internal/store/replica.go",
-   "old": "\t\tif name == cosignFile && (s.replica.SkipCosign || size < from) {",
-   "new": "\t\tif false && name == cosignFile && (s.replica.SkipCosign || size < from) {"
+   "old": "\t\tif isJournal(name) && (s.replica.Skip[name] || size < from) {",
+   "new": "\t\tif false && isJournal(name) && (s.replica.Skip[name] || size < from) {"
   },
   {
    "name": "S40 один фоновый обход на всех: зависший задаёт ритм",
@@ -516,14 +516,14 @@
   {
    "name": "S41 копия читает журнал подписей по пути: удалённый на ходу её останавливает",
    "file": "internal/store/replica.go",
-   "old": "\t\tif name == cosignFile {\n\t\t\tread = s.cosignRange\n\t\t}\n",
+   "old": "\t\tif isJournal(name) {\n\t\t\tread = func(from, end int64) ([]byte, error) { return s.journalRange(name, from, end) }\n\t\t}\n",
    "new": ""
   },
   {
    "name": "S42 журнал подписей не едет в копию без тревоги",
    "file": "internal/store/replica.go",
-   "old": "\t\t\t\tskipCosign = true\n\t\t\t\ts.cosignSkipped.Store(true)",
-   "new": "\t\t\t\tskipCosign = true"
+   "old": "\t\t\t\tskip[name] = true\n\t\t\t\ts.journalSkipped(name).Store(true)",
+   "new": "\t\t\t\tskip[name] = true"
   },
   {
    "name": "S43 ошибка головы копии не в счётчике свидетеля S3",
@@ -612,8 +612,8 @@
   {
    "name": "F1 адрес свидетеля C2SP любой схемы",
    "file": "internal/config/config.go",
-   "old": "(u.Scheme != \"http\" && u.Scheme != \"https\")",
-   "new": "(u.Scheme == \"\")"
+   "old": "(u.Scheme != \"http\" && u.Scheme != \"https\") || u.Host == \"\" || u.RawQuery != \"\"",
+   "new": "(u.Scheme == \"\") || u.Host == \"\" || u.RawQuery != \"\""
   },
   {
    "name": "F2 свидетель дважды",

@@ -167,6 +167,20 @@ func TestRevocationPOEFromArchive(t *testing.T) {
 	if r := Verify(b, tr); r.Valid() {
 		t.Fatalf("метка второй службы позже отсечки спасла:\n%s", r.Text())
 	}
+	// Над головой раньше звена токена T1 (звено 2) — токена в ней нет.
+	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 1, cut.Add(-time.Hour)), archiveOver(t, w, other, 5, cut.Add(time.Minute))}
+	if r := Verify(b, tr); r.Valid() {
+		t.Fatalf("метка над головой раньше токена спасла:\n%s", r.Text())
+	}
+	// Метка над чужим корнем головы пакета — не POE этой цепи.
+	fake := [32]byte{7}
+	other.Now = func() time.Time { return cut.Add(-time.Hour) }
+	imprint := HeadImprint(5, fake)
+	token, _ := other.Sign(imprint[:], nil)
+	b.Archive = []ArchiveStamp{{HeadSeq: 5, Root: fake[:], Token: token}}
+	if r := Verify(b, tr); r.Valid() || !strings.Contains(r.Text(), "does not agree with the chain in the bundle") {
+		t.Fatalf("метка над чужим корнем:\n%s", r.Text())
+	}
 	b.Archive = []ArchiveStamp{archiveOver(t, w, w.tsa, 5, cut.Add(-time.Hour))}
 	if r := Verify(b, tr); r.Valid() || !strings.Contains(r.Text(), "rests on a revoked certificate itself") {
 		t.Fatalf("метка той же службы:\n%s", r.Text())
@@ -252,6 +266,11 @@ func TestRevocationPOEFromWitness(t *testing.T) {
 	if r := Verify(b, tr); r.Valid() {
 		t.Fatalf("подпись свидетеля позже отсечки спасла:\n%s", r.Text())
 	}
+	// Подпись над чужим корнем головы пакета — не POE этой цепи.
+	b.Cosignatures = []Cosignature{w.cosigned(s, 5, [32]byte{7}, cut.Add(-time.Hour))}
+	if c := revocationCheck(t, Verify(b, tr).Checks); c.OK {
+		t.Fatalf("подпись свидетеля над чужим корнем спасла: %+v", c)
+	}
 }
 
 // Лист T2 в пакете обязан быть листом этого токена.
@@ -264,6 +283,18 @@ func TestRevocationUpperInclusionChecked(t *testing.T) {
 	b.Upper.Inclusion = ptr(w.inclusion(2, 0)) // токен T1
 	if r := Verify(b, w.trust()); r.Valid() {
 		t.Fatalf("токен T1 вместо T2:\n%s", r.Text())
+	}
+	// Лист после головы T2, но не её токен.
+	w.wlink(auditchain.Leaf{Type: auditchain.EventGap, Scope: "abs-core"})
+	e2 := b.Evidence
+	b = w.bundle(e2, 3, 1, b.Upper.HeadSeq, b.Upper.Token, 2)
+	b.Upper.Inclusion = ptr(w.inclusion(6, 0))
+	if r := Verify(b, w.trust()); r.Valid() {
+		t.Fatalf("чужой лист после головы T2:\n%s", r.Text())
+	}
+	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
+	if r := Verify(b, w.trust()); !r.Valid() {
+		t.Fatalf("лист T2 в пакете длиннее:\n%s", r.Text())
 	}
 }
 
