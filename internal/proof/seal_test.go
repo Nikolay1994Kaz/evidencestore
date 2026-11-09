@@ -300,3 +300,31 @@ func TestSealTokenNotTrusted(t *testing.T) {
 		t.Fatalf("метка в силе, печать выведена после неё: %+v", c)
 	}
 }
+
+// Заявление печати — ровно SealStatement: строки через LF или CRLF, ключ в
+// base64 без «=», ничего после него.
+func TestSealedStatementKey(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(nil)
+	good := string(SealStatement(pub))
+	if k, err := SealedStatementKey([]byte(good)); err != nil || !k.Equal(pub) {
+		t.Fatalf("LF: %v", err)
+	}
+	if k, err := SealedStatementKey([]byte(strings.ReplaceAll(good, "\n", "\r\n"))); err != nil || !k.Equal(pub) {
+		t.Fatalf("CRLF: %v", err)
+	}
+	key := strings.TrimSuffix(strings.TrimPrefix(good, "evidencestore store key\n"), "\n")
+	for name, text := range map[string]string{
+		"хвост":            good + "and more\n",
+		"пустая строка":    good + "\n",
+		"без перевода":     strings.TrimSuffix(good, "\n"),
+		"с «=»":            "evidencestore store key\n" + key + "=\n",
+		"пробел":           "evidencestore store key\n " + key + "\n",
+		"другой заголовок": "evidencestore store keys\n" + key + "\n",
+		"короткий ключ":    "evidencestore store key\n" + key[:20] + "\n",
+		"только заголовок": "evidencestore store key\n",
+	} {
+		if _, err := SealedStatementKey([]byte(text)); err == nil {
+			t.Errorf("%s: принято", name)
+		}
+	}
+}
