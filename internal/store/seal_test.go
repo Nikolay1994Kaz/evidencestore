@@ -91,6 +91,11 @@ func TestStoreSeal(t *testing.T) {
 	tr := trustOf(t, s2)
 	tr.StoreKey = nil
 	tr.SealTrust = &tsa.Trust{Roots: pool}
+	pin, err := tsa.ParseSubjectPin("O=Example Bank")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.SealSubject = []tsa.SubjectPin{pin}
 	b, err := s2.Proof("abs-core", 5, false)
 	if err != nil || b.Seal == nil || len(b.Seal.Token) == 0 {
 		t.Fatalf("пакет одной улики: %v %+v", err, b.Seal)
@@ -124,6 +129,34 @@ func TestStoreSeal(t *testing.T) {
 		t.Fatalf("метка над печатью после перезапуска: %v", err)
 	}
 	s3.Close()
+
+	// Метка в data_dir не над этой печатью — не в пакет; берётся новая.
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, sealTokenFile), token[:len(token)/2], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s5, err := reopen(cfg, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s5.Proof("abs-core", 5, false); err != nil || b.Seal == nil || len(b.Seal.Token) != 0 || s5.Status().Seal.Stamped.IsZero() != true {
+		t.Fatalf("испорченная метка над печатью попала в пакет: %v", err)
+	}
+	if err := s5.StampSeal(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s5.Proof("abs-core", 5, false); err != nil || b.Seal == nil || len(b.Seal.Token) == 0 {
+		t.Fatalf("новая метка над печатью: %v", err)
+	}
+	s5.Close()
+
+	// Не печать в PEM.
+	os.WriteFile(cfg.Seal.File, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: org.Raw}), 0o600)
+	if s6, err := reopen(cfg, c); err == nil || !strings.Contains(err.Error(), "not CMS") {
+		if s6 != nil {
+			s6.Close()
+		}
+		t.Fatalf("сертификат вместо печати: %v", err)
+	}
 
 	other, err := tsa.Seal(orgKey, org, nil, []byte("evidencestore store key\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"), time.Now())
 	if err != nil {

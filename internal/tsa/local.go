@@ -190,13 +190,55 @@ func (a *Authority) Carry(certs ...*x509.Certificate) { a.carry = append(a.carry
 // — at. Для тестов и учебного стенда: печать организации ставится её
 // средствами (openssl cms -sign -nodetach, NCALayer).
 func Seal(key crypto.Signer, cert *x509.Certificate, extra []*x509.Certificate, content []byte, at time.Time) ([]byte, error) {
+	return sealShaped(key, cert, extra, content, at, sealShape{})
+}
+
+// sealShape — тесты: печать, отступающая от правил в одном месте; нулевая —
+// правильная.
+type sealShape struct {
+	sdVersion, siVersion int                   // 0 — 1
+	signers              int                   // 0 — 1
+	noAttrs              bool                  // без подписанных атрибутов
+	twice                bool                  // атрибут contentType дважды
+	attrType             asn1.ObjectIdentifier // значение атрибута contentType; nil — data
+	eType                asn1.ObjectIdentifier // тип вложенного содержимого; nil — data
+	declared             asn1.ObjectIdentifier // перечень digestAlgorithms; nil — SHA-256
+	algsSequence         bool                  // digestAlgorithms — SEQUENCE вместо SET
+	digestParams         bool                  // у digestAlgorithm параметры (не NULL)
+	essCert              *x509.Certificate     // signingCertificateV2 с хэшем этого сертификата
+}
+
+func sealShaped(key crypto.Signer, cert *x509.Certificate, extra []*x509.Certificate, content []byte, at time.Time, sh sealShape) ([]byte, error) {
+	or := func(v, def int) int {
+		if v == 0 {
+			return def
+		}
+		return v
+	}
+	oidOr := func(v, def asn1.ObjectIdentifier) asn1.ObjectIdentifier {
+		if v == nil {
+			return def
+		}
+		return v
+	}
 	digest := sha256.Sum256(content)
-	attrs, err := attributesSet(attr(oidContentType, oidData), attr(oidMessageDigst, digest[:]), attr(oidSigningTime, at.UTC()))
+	attrList := []rawAttr{attr(oidContentType, oidOr(sh.attrType, oidData)), attr(oidMessageDigst, digest[:]), attr(oidSigningTime, at.UTC())}
+	if sh.twice {
+		attrList = append(attrList, attr(oidContentType, oidData))
+	}
+	if sh.essCert != nil {
+		h := sha256.Sum256(sh.essCert.Raw)
+		attrList = append(attrList, attr(oidSigningCertV2, signingCertificateV2{Certs: []essCertIDv2{{CertHash: h[:]}}}))
+	}
+	attrs, err := attributesSet(attrList...)
 	if err != nil {
 		return nil, err
 	}
-	attrsDigest := sha256.Sum256(attrs)
-	sig, err := key.Sign(rand.Reader, attrsDigest[:], crypto.SHA256)
+	signed := sha256.Sum256(attrs)
+	if sh.noAttrs {
+		signed = digest
+	}
+	sig, err := key.Sign(rand.Reader, signed[:], crypto.SHA256)
 	if err != nil {
 		return nil, err
 	}
@@ -204,38 +246,51 @@ func Seal(key crypto.Signer, cert *x509.Certificate, extra []*x509.Certificate, 
 	if _, ok := key.(*ecdsa.PrivateKey); ok {
 		sigAlg = x509.ECDSAWithSHA256
 	}
-	si, err := asn1.Marshal(struct {
-		Version            int
-		SID                issuerAndSerial
-		DigestAlgorithm    pkix.AlgorithmIdentifier
-		SignedAttrs        asn1.RawValue
-		SignatureAlgorithm pkix.AlgorithmIdentifier
-		Signature          []byte
-	}{
-		Version:            1,
-		SID:                issuerAndSerial{Issuer: asn1.RawValue{FullBytes: cert.RawIssuer}, Serial: cert.SerialNumber},
-		DigestAlgorithm:    pkix.AlgorithmIdentifier{Algorithm: oidSHA256},
-		SignedAttrs:        asn1.RawValue{FullBytes: append([]byte{0xA0}, attrs[1:]...)},
-		SignatureAlgorithm: pkix.AlgorithmIdentifier{Algorithm: sigAlgOID(sigAlg)},
-		Signature:          sig,
-	})
-	if err != nil {
-		return nil, err
+	digestAlg := pkix.AlgorithmIdentifier{Algorithm: oidSHA256}
+	if sh.digestParams {
+		digestAlg.Parameters = asn1.RawValue{Tag: asn1.TagInteger, Bytes: []byte{1}}
+	}
+	var si []byte
+	for _, v := range []any{or(sh.siVersion, 1), issuerAndSerial{Issuer: asn1.RawValue{FullBytes: cert.RawIssuer}, Serial: cert.SerialNumber}, digestAlg} {
+		der, err := asn1.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		si = append(si, der...)
+	}
+	if !sh.noAttrs {
+		si = append(si, append([]byte{0xA0}, attrs[1:]...)...)
+	}
+	for _, v := range []any{pkix.AlgorithmIdentifier{Algorithm: sigAlgOID(sigAlg)}, sig} {
+		der, err := asn1.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		si = append(si, der...)
+	}
+	si = tlv(0x30, si)
+	var infos []byte
+	for range or(sh.signers, 1) {
+		infos = append(infos, si...)
 	}
 	eContent, _ := asn1.Marshal(content)
-	dataType, _ := asn1.Marshal(oidData)
-	version, _ := asn1.Marshal(1)
-	digestAlgs, _ := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: oidSHA256})
+	dataType, _ := asn1.Marshal(oidOr(sh.eType, oidData))
+	version, _ := asn1.Marshal(or(sh.sdVersion, 1))
+	digestAlgs, _ := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: oidOr(sh.declared, oidSHA256)})
+	algsTag := byte(0x31)
+	if sh.algsSequence {
+		algsTag = 0x30
+	}
 	var certs []byte
 	for _, c := range append([]*x509.Certificate{cert}, extra...) {
 		certs = append(certs, c.Raw...)
 	}
 	var sd []byte
 	sd = append(sd, version...)
-	sd = append(sd, tlv(0x31, digestAlgs)...)
+	sd = append(sd, tlv(algsTag, digestAlgs)...)
 	sd = append(sd, tlv(0x30, append(dataType, tlv(0xA0, eContent)...))...)
 	sd = append(sd, tlv(0xA0, certs)...)
-	sd = append(sd, tlv(0x31, si)...)
+	sd = append(sd, tlv(0x31, infos)...)
 	sdType, _ := asn1.Marshal(oidSignedData)
 	return tlv(0x30, append(sdType, tlv(0xA0, tlv(0x30, sd))...)), nil
 }

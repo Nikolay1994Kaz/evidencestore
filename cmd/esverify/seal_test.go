@@ -24,8 +24,9 @@ import (
 )
 
 // Хранилище с печатью организации на свой ключ: esverify с корнем центра
-// печатей (-seal-trust) проверяет пакет без -store-key; с чужим корнем — нет;
-// без обоих флагов — неверный вызов.
+// печатей (-seal-trust) и именем владельца (-seal-subject) проверяет пакет
+// без -store-key; с чужим корнем или чужим именем — нет; без имени, без
+// корня к имени и без обоих ключей — неверный вызов.
 func TestSealTrustFlag(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, data []byte) string {
@@ -97,12 +98,32 @@ func TestSealTrustFlag(t *testing.T) {
 	otherRoot := write("other-root.pem", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: other.Raw}))
 
 	var out, errb bytes.Buffer
-	if code := run([]string{"-proof", bundle, "-seal-trust", sealRoot, "-tsa-trust", tsaRoot}, &out, &errb); code != exitValid || !strings.Contains(out.String(), "Example Bank seal") {
+	if code := run([]string{"-proof", bundle, "-seal-trust", sealRoot, "-seal-subject", "CN=Example Bank seal", "-seal-subject", "2.5.4.3=Example Bank seal", "-tsa-trust", tsaRoot}, &out, &errb); code != exitValid || !strings.Contains(out.String(), "Example Bank seal") {
 		t.Fatalf("по печати, без -store-key: %d\n%s%s", code, out.String(), errb.String())
 	}
 	out.Reset()
-	if code := run([]string{"-proof", bundle, "-seal-trust", otherRoot, "-tsa-trust", tsaRoot}, &out, &errb); code != exitInvalid {
+	if code := run([]string{"-proof", bundle, "-seal-trust", otherRoot, "-seal-subject", "CN=Example Bank seal", "-tsa-trust", tsaRoot}, &out, &errb); code != exitInvalid {
 		t.Fatalf("чужой центр печатей: %d\n%s", code, out.String())
+	}
+	out.Reset()
+	if code := run([]string{"-proof", bundle, "-seal-trust", sealRoot, "-seal-subject", "CN=Example Bank", "-tsa-trust", tsaRoot}, &out, &errb); code != exitInvalid || !strings.Contains(out.String(), "its name has no CN=Example Bank") {
+		t.Fatalf("печать другого владельца: %d\n%s", code, out.String())
+	}
+	out.Reset()
+	if code := run([]string{"-proof", bundle, "-store-key", s.PublicKey(), "-seal-trust", sealRoot, "-seal-subject", "O=Example Bank", "-tsa-trust", tsaRoot}, &out, &errb); code != exitInvalid || !strings.Contains(out.String(), "its name has no O=Example Bank") {
+		t.Fatalf("печать другого владельца при закреплённом ключе: %d\n%s", code, out.String())
+	}
+	for _, args := range [][]string{
+		{"-seal-trust", sealRoot},
+		{"-store-key", s.PublicKey(), "-seal-subject", "CN=Example Bank seal"},
+		{"-seal-trust", sealRoot, "-seal-subject", "Example Bank seal"},
+		{"-seal-trust", sealRoot, "-seal-subject", "commonName=Example Bank seal"},
+		{"-seal-trust", sealRoot, "-seal-subject", "CN="},
+	} {
+		errb.Reset()
+		if code := run(append([]string{"-proof", bundle, "-tsa-trust", tsaRoot}, args...), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "seal") {
+			t.Fatalf("%q: %d\n%s", args, code, errb.String())
+		}
 	}
 	out.Reset()
 	if code := run([]string{"-proof", bundle, "-store-key", s.PublicKey(), "-tsa-trust", tsaRoot}, &out, &errb); code != exitValid || !strings.Contains(out.String(), "-seal-trust") {

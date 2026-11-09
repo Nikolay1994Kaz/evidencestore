@@ -6,6 +6,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -197,4 +199,68 @@ func VerifySeal(der []byte, trust Trust, at time.Time) (Sealed, [][]*x509.Certif
 		return Sealed{}, nil, fmt.Errorf("%w: seal: signer certificate: %v", ErrInvalid, err)
 	}
 	return s, chains, nil
+}
+
+// SubjectPin — атрибут имени владельца печати, которого требует проверяющий
+// (esverify -seal-subject O=Example Bank): под корнем национального центра
+// сертификаты у многих организаций, и печать любой из них иначе ручалась бы
+// за любой ключ.
+type SubjectPin struct {
+	Type  asn1.ObjectIdentifier
+	Value string
+	text  string
+}
+
+// pinTypes — имена атрибутов, как их пишут в RFC 4514 и openssl.
+var pinTypes = map[string]asn1.ObjectIdentifier{
+	"CN":                     {2, 5, 4, 3},
+	"SERIALNUMBER":           {2, 5, 4, 5},
+	"C":                      {2, 5, 4, 6},
+	"L":                      {2, 5, 4, 7},
+	"ST":                     {2, 5, 4, 8},
+	"STREET":                 {2, 5, 4, 9},
+	"O":                      {2, 5, 4, 10},
+	"OU":                     {2, 5, 4, 11},
+	"ORGANIZATIONIDENTIFIER": {2, 5, 4, 97},
+	"UID":                    {0, 9, 2342, 19200300, 100, 1, 1},
+	"DC":                     {0, 9, 2342, 19200300, 100, 1, 25},
+	"EMAILADDRESS":           {1, 2, 840, 113549, 1, 9, 1},
+}
+
+// ParseSubjectPin — ATTRIBUTE=VALUE: имя атрибута (O, OU, CN, serialNumber,
+// organizationIdentifier, …) или его OID через точки, значение — ровно как в
+// сертификате.
+func ParseSubjectPin(text string) (SubjectPin, error) {
+	name, value, ok := strings.Cut(text, "=")
+	name = strings.TrimSpace(name)
+	if !ok || name == "" || value == "" {
+		return SubjectPin{}, fmt.Errorf("%q: want ATTRIBUTE=VALUE, such as O=Example Bank or 2.5.4.97=NTRKZ-123456789012", text)
+	}
+	if oid, ok := pinTypes[strings.ToUpper(name)]; ok {
+		return SubjectPin{Type: oid, Value: value, text: text}, nil
+	}
+	var oid asn1.ObjectIdentifier
+	for _, part := range strings.Split(name, ".") {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 || part != strconv.Itoa(n) {
+			return SubjectPin{}, fmt.Errorf("%q: %q is neither an attribute name (O, OU, CN, serialNumber, organizationIdentifier, …) nor an OID", text, name)
+		}
+		oid = append(oid, n)
+	}
+	if len(oid) < 2 {
+		return SubjectPin{}, fmt.Errorf("%q: %q is not an OID", text, name)
+	}
+	return SubjectPin{Type: oid, Value: value, text: text}, nil
+}
+
+func (p SubjectPin) String() string { return p.text }
+
+// In — есть ли в имени атрибут этого типа ровно с этим значением.
+func (p SubjectPin) In(n pkix.Name) bool {
+	for _, a := range n.Names {
+		if v, ok := a.Value.(string); ok && a.Type.Equal(p.Type) && v == p.Value {
+			return true
+		}
+	}
+	return false
 }

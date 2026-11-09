@@ -61,7 +61,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 	proofPath := fs.String("proof", "", "proof bundle (JSON)")
 	storeKey := fs.String("store-key", "", "pinned store public key (base64) or file containing it; may be left out with -seal-trust")
 	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM): the roots, and any other certificates of the TSAs and their CAs you hold — one issued again on the same key too, so that its revocation counts for the key")
-	sealTrust := fs.String("seal-trust", "", "certificates, comma-separated (DER or PEM), of the CA that issued the X.509 certificate the store's owner sealed the store key with: the bundle's seal (seal.file of the store) then vouches for the store key, and without -store-key the key is taken from it")
+	sealTrust := fs.String("seal-trust", "", "certificates, comma-separated (DER or PEM), of the CA that issued the X.509 certificate the store's owner sealed the store key with: the bundle's seal (seal.file of the store) then vouches for the store key, and without -store-key the key is taken from it (then -seal-subject is required)")
+	var sealSubject []tsa.SubjectPin
+	fs.Func("seal-subject", "ATTRIBUTE=VALUE the seal certificate's subject must hold, exactly (O=Example Bank, OU=BIN123456789012, organizationIdentifier=NTRKZ-123456789012, or an OID: 2.5.4.97=…); repeat the flag for more: every one must be there. Required with -seal-trust and no -store-key: under a national CA many organizations hold certificates, and the seal of any of them would otherwise vouch for any key", func(v string) error {
+		p, err := tsa.ParseSubjectPin(v)
+		if err != nil {
+			return err
+		}
+		sealSubject = append(sealSubject, p)
+		return nil
+	})
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
 	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them; with the S3 versions list next to them (aws s3api list-object-versions > DIR/versions.json) or a collector's head journal, each witness fixes the record with the head it received first (give each collector a subdirectory of its own)")
@@ -98,8 +107,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	windowTo := fs.String("to", "", "bundle over a window of time: the end of your window (RFC 3339)")
 	bodiesDir := fs.String("bodies", "", "bundle over a window of time: once it verifies, write every opened body to DIR/<source>-<seq> exactly as the source sent it")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: esverify -proof FILE (-store-key KEY | -seal-trust CERT[,CERT]) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
-		fmt.Fprintln(stderr, "       esverify -proof WINDOW (-store-key KEY | -seal-trust CERT[,CERT]) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE (-store-key KEY | -seal-trust CERT[,CERT] -seal-subject ATTR=VALUE…) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
+		fmt.Fprintln(stderr, "       esverify -proof WINDOW (-store-key KEY | -seal-trust CERT[,CERT] -seal-subject ATTR=VALUE…) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
 		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
@@ -120,6 +129,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return exitUsage
 	}
+	switch {
+	case len(sealSubject) > 0 && *sealTrust == "":
+		return usageErr(errors.New("-seal-subject names the owner of the seal: give the roots of its CA with -seal-trust"))
+	case *storeKey == "" && len(sealSubject) == 0:
+		return usageErr(errors.New("without -store-key the store key is taken from the bundle's seal: name its owner with -seal-subject (such as -seal-subject \"O=Example Bank\"), since a seal of anyone the CA certified would do otherwise"))
+	}
 	var key ed25519.PublicKey
 	var err error
 	if *storeKey != "" {
@@ -138,6 +153,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return usageErr(fmt.Errorf("-seal-trust: %w", err))
 		}
 		pt.SealTrust = &st
+		pt.SealSubject = sealSubject
 	}
 	if len(tsaCRLs) > 0 || len(tsaRevoked) > 0 {
 		// Свежесть CRL — на момент проверки: отзыв, случившийся после
@@ -185,7 +201,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if pt.TSARevocations != nil {
 			now = pt.TSARevocations.Now
 		}
-		if k, err := proof.SealedKey(proof.BundleSeal(data), *pt.SealTrust, trust, now); err == nil {
+		if k, err := proof.SealedKey(proof.BundleSeal(data), pt, now); err == nil {
 			key = k
 			pt.StoreKey = k
 		}

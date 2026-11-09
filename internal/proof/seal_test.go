@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -63,6 +64,11 @@ func (p sealPKI) trust() *tsa.Trust {
 // seal — печать организации на ключ pub в момент at и метка службы мира над
 // ней в момент stamped (ноль — без метки).
 func (p sealPKI) seal(t testing.TB, w *world, pub ed25519.PublicKey, at, stamped time.Time) *StoreSeal {
+	return p.sealBy(t, w.tsa, pub, at, stamped)
+}
+
+// sealBy — то же, метка службы a.
+func (p sealPKI) sealBy(t testing.TB, a *tsa.Authority, pub ed25519.PublicKey, at, stamped time.Time) *StoreSeal {
 	t.Helper()
 	cms, err := tsa.Seal(p.orgKey, p.org, nil, SealStatement(pub), at)
 	if err != nil {
@@ -70,33 +76,60 @@ func (p sealPKI) seal(t testing.TB, w *world, pub ed25519.PublicKey, at, stamped
 	}
 	s := &StoreSeal{CMS: cms}
 	if !stamped.IsZero() {
-		was := w.tsa.Now
-		w.tsa.Now = func() time.Time { return stamped }
+		was := a.Now
+		a.Now = func() time.Time { return stamped }
 		imprint := SealImprint(cms)
-		if s.Token, err = w.tsa.Sign(imprint[:], nil); err != nil {
+		if s.Token, err = a.Sign(imprint[:], nil); err != nil {
 			t.Fatal(err)
 		}
-		w.tsa.Now = was
+		a.Now = was
 	}
 	return s
 }
 
-// crl — CRL центра печатей с записями, на момент now.
-func (p sealPKI) crl(t testing.TB, now time.Time, entries ...x509.RevocationListEntry) *tsa.Revocations {
+// crlDER — CRL центра печатей с записями, на момент now.
+func (p sealPKI) crlDER(t testing.TB, now time.Time, entries ...x509.RevocationListEntry) []byte {
 	t.Helper()
 	der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(1), ThisUpdate: now.Add(-time.Hour), NextUpdate: now.Add(time.Hour), RevokedCertificateEntries: entries}, p.root, p.rootKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "seal-ca.crl")
-	if err := os.WriteFile(path, der, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	return der
+}
+
+// crl — сведения об отзыве из CRL центра печатей.
+func (p sealPKI) crl(t testing.TB, now time.Time, entries ...x509.RevocationListEntry) *tsa.Revocations {
+	t.Helper()
+	return revsOf(t, now, p.crlDER(t, now, entries...))
+}
+
+// revsOf — сведения об отзыве из нескольких CRL.
+func revsOf(t testing.TB, now time.Time, crls ...[]byte) *tsa.Revocations {
+	t.Helper()
 	r := tsa.NewRevocations(now)
-	if err := r.AddCRL(path); err != nil {
-		t.Fatal(err)
+	for i, der := range crls {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("%d.crl", i))
+		if err := os.WriteFile(path, der, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.AddCRL(path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return r
+}
+
+func pins(t testing.TB, texts ...string) []tsa.SubjectPin {
+	t.Helper()
+	var out []tsa.SubjectPin
+	for _, s := range texts {
+		p, err := tsa.ParseSubjectPin(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func sealCheckOf(r Report) (Check, bool) {
@@ -108,9 +141,10 @@ func sealCheckOf(r Report) (Check, bool) {
 	return Check{}, false
 }
 
-// Печать организации на ключ хранилища: с корнем центра печатей ключ можно не
-// закреплять; печать на другой ключ, чужим центром, без печати при
-// -seal-trust — провал; без -seal-trust печать только названа.
+// Печать организации на ключ хранилища: с корнем центра печатей и именем
+// владельца ключ можно не закреплять; без имени — нельзя; печать на другой
+// ключ, чужим центром, другого владельца, без печати при -seal-trust —
+// провал; без -seal-trust печать только названа.
 func TestSealOfStoreKey(t *testing.T) {
 	w, b := standard(t, nil)
 	p := newSealPKI(t)
@@ -122,8 +156,20 @@ func TestSealOfStoreKey(t *testing.T) {
 		t.Fatalf("печать при закреплённом ключе:\n%s", r.Text())
 	}
 	tr.StoreKey = nil
+	if r := Verify(b, tr); r.Valid() || !strings.Contains(r.Text(), "nothing names whose seal") {
+		t.Fatalf("ключ из печати без имени владельца:\n%s", r.Text())
+	}
+	tr.SealSubject = pins(t, "O=Example Bank", "CN=Example Bank seal")
 	if r := Verify(b, tr); !r.Valid() {
 		t.Fatalf("ключ из печати:\n%s", r.Text())
+	}
+	tr.SealSubject = pins(t, "O=Example Bank", "CN=Example Bank")
+	if r := Verify(b, tr); r.Valid() || !strings.Contains(r.Text(), "its name has no CN=Example Bank") {
+		t.Fatalf("ключ из печати другого владельца:\n%s", r.Text())
+	}
+	tr.StoreKey = w.signer.PublicKey()
+	if r := Verify(b, tr); r.Valid() || !strings.Contains(r.Text(), "its name has no CN=Example Bank") {
+		t.Fatalf("печать другого владельца при закреплённом ключе:\n%s", r.Text())
 	}
 	// Печать на другой ключ: при закреплённом — провал пункта; без него —
 	// подпись головы не сходится.
@@ -136,6 +182,7 @@ func TestSealOfStoreKey(t *testing.T) {
 		t.Fatalf("печать на другой ключ:\n%s", r.Text())
 	}
 	tr2.StoreKey = nil
+	tr2.SealSubject = pins(t, "O=Example Bank")
 	if r := Verify(b2, tr2); r.Valid() {
 		t.Fatalf("печать на другой ключ, ключ не закреплён:\n%s", r.Text())
 	}
@@ -196,5 +243,56 @@ func TestSealRevoked(t *testing.T) {
 	forged.Token = other.Token
 	if r := run(&forged, stamped.Add(time.Hour), tsa.ReasonKeyCompromise); r.Valid() || !strings.Contains(r.Text(), "does not verify") {
 		t.Fatalf("метка над другой печатью:\n%s", r.Text())
+	}
+}
+
+// Метка над печатью, которая не в силе или под подозрением (ключ её службы
+// скомпрометирован), времени печати не показывает: печать судится на момент
+// проверки, как без метки. Действует сейчас — в силе; истекла или отозвана
+// к моменту проверки — нет, как бы ни была датирована метка.
+func TestSealTokenNotTrusted(t *testing.T) {
+	w, b := standard(t, nil)
+	p := newSealPKI(t)
+	other, tr := otherTSA(t, w)
+	made, stamped := w.now, w.now.Add(time.Minute)
+	b.Seal = p.sealBy(t, other, w.signer.PublicKey(), made, stamped)
+	tr.SealTrust = p.trust()
+	otherCRL := func(now time.Time, reason int, at time.Time) []byte {
+		der, err := other.RevocationList(now.Add(-time.Hour), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: other.Cert().SerialNumber, RevocationTime: at, ReasonCode: reason})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return der
+	}
+	check := func(now time.Time, crls ...[]byte) Check {
+		t.Helper()
+		tr := tr
+		tr.TSARevocations = revsOf(t, now, crls...)
+		c, ok := sealCheckOf(Verify(b, tr))
+		if !ok {
+			t.Fatal("нет пункта о печати")
+		}
+		return c
+	}
+	soon, late := w.now.Add(48*time.Hour), time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	for name, crl := range map[string]func(time.Time) []byte{
+		"компрометация службы метки": func(now time.Time) []byte { return otherCRL(now, tsa.ReasonKeyCompromise, stamped.Add(time.Hour)) },
+		"служба выведена до метки":   func(now time.Time) []byte { return otherCRL(now, tsa.ReasonSuperseded, stamped.Add(-time.Second)) },
+	} {
+		if c := check(soon, crl(soon)); !c.OK || !strings.Contains(c.Detail, "when the seal was made is not shown") {
+			t.Fatalf("%s, печать действует сейчас: %+v", name, c)
+		}
+		if c := check(late, crl(late)); c.OK || !strings.Contains(c.Detail, "expired") {
+			t.Fatalf("%s, сертификат печати истёк к проверке: %+v", name, c)
+		}
+		sealCRL := p.crlDER(t, soon, x509.RevocationListEntry{SerialNumber: p.org.SerialNumber, RevocationTime: stamped.Add(2 * time.Hour), ReasonCode: tsa.ReasonSuperseded})
+		if c := check(soon, crl(soon), sealCRL); c.OK || !strings.Contains(c.Detail, "not in force") {
+			t.Fatalf("%s, сертификат печати выведен после метки, до проверки: %+v", name, c)
+		}
+	}
+	// Метка в силе: тот же отзыв печати после метки её не валит.
+	sealCRL := p.crlDER(t, soon, x509.RevocationListEntry{SerialNumber: p.org.SerialNumber, RevocationTime: stamped.Add(2 * time.Hour), ReasonCode: tsa.ReasonSuperseded})
+	if c := check(soon, sealCRL); !c.OK || !strings.Contains(c.Detail, "time-stamped at") {
+		t.Fatalf("метка в силе, печать выведена после неё: %+v", c)
 	}
 }

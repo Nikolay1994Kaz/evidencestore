@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"math/big"
 	"os"
@@ -98,5 +99,91 @@ func TestSealVerify(t *testing.T) {
 		if _, err := OpenSeal(d); err == nil {
 			t.Fatalf("обрывок принят: %d байт", len(d))
 		}
+	}
+}
+
+// Имя владельца печати: атрибут по имени или OID, значение — ровно.
+func TestSubjectPin(t *testing.T) {
+	name := pkix.Name{}
+	name.FillFromRDNSequence(&pkix.RDNSequence{
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 10}, Value: "Example Bank"}},
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 11}, Value: "BIN123456789012"}},
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 97}, Value: "NTRKZ-123456789012"}},
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "Example Bank seal"}},
+	})
+	for text, want := range map[string]bool{
+		"O=Example Bank":                            true,
+		"o=Example Bank":                            true,
+		" OU =BIN123456789012":                      true,
+		"organizationIdentifier=NTRKZ-123456789012": true,
+		"2.5.4.97=NTRKZ-123456789012":               true,
+		"CN=Example Bank seal":                      true,
+		"O=Example bank":                            false,
+		"O=Example Bank ":                           false,
+		"O=Example":                                 false,
+		"CN=Example Bank":                           false,
+		"OU=Example Bank":                           false,
+		"2.5.4.10=BIN123456789012":                  false,
+		"serialNumber=BIN123456789012":              false,
+	} {
+		p, err := ParseSubjectPin(text)
+		if err != nil {
+			t.Fatalf("%q: %v", text, err)
+		}
+		if p.In(name) != want || p.String() != text {
+			t.Errorf("%q: In = %v, want %v; String = %q", text, p.In(name), want, p)
+		}
+	}
+	for _, bad := range []string{"", "Example Bank", "=Example Bank", "O=", "commonName=x", "2.5.x=y", "2=y", "2.-5=y", "2.05=y", "1.2.3"} {
+		if _, err := ParseSubjectPin(bad); err == nil {
+			t.Errorf("%q принят", bad)
+		}
+	}
+}
+
+// Печать, отступающая от правил в одном месте, не открывается — и говорит,
+// в каком; правильная, в том числе с верным signingCertificateV2 и версией 3,
+// открывается.
+func TestSealShapes(t *testing.T) {
+	root := issue(t, caTmpl(1, "seal root"), newKey(t), nil)
+	org := issue(t, &x509.Certificate{SerialNumber: big.NewInt(10), Subject: pkix.Name{CommonName: "seal"},
+		NotBefore: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC), KeyUsage: x509.KeyUsageDigitalSignature}, newKey(t), root)
+	other := issue(t, &x509.Certificate{SerialNumber: big.NewInt(11), Subject: pkix.Name{CommonName: "other"},
+		NotBefore: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC), KeyUsage: x509.KeyUsageDigitalSignature}, newKey(t), root)
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	content := []byte("evidencestore store key\nAAAA\n")
+	open := func(sh sealShape, content []byte) error {
+		t.Helper()
+		der, err := sealShaped(org.key, org.cert, nil, content, at, sh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = OpenSeal(der)
+		return err
+	}
+	for _, sh := range []sealShape{{}, {sdVersion: 3}, {essCert: org.cert}} {
+		if err := open(sh, content); err != nil {
+			t.Fatalf("%+v: %v", sh, err)
+		}
+	}
+	for want, sh := range map[string]sealShape{
+		"SignedData version 2":                        {sdVersion: 2},
+		"SignerInfo version 3":                        {siVersion: 3},
+		"2 signers, want one":                         {signers: 2},
+		"no signed attributes":                        {noAttrs: true},
+		"given twice":                                 {twice: true},
+		"the content-type attribute is not data":      {attrType: oidTSTInfo},
+		"the content is not data":                     {eType: oidTSTInfo},
+		"not declared":                                {declared: oidSHA384},
+		"not a SET":                                   {algsSequence: true},
+		"carry parameters":                            {digestParams: true},
+		"signing-certificate attribute names another": {essCert: other.cert},
+	} {
+		if err := open(sh, content); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: %v", want, err)
+		}
+	}
+	if err := open(sealShape{}, bytes.Repeat([]byte("x"), MaxSealSize)); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("печать больше предела: %v", err)
 	}
 }

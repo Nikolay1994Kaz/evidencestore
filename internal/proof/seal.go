@@ -92,19 +92,43 @@ func sealTime(s *StoreSeal, tsaTrust tsa.Trust) (tsa.Info, string) {
 	return info, ""
 }
 
-// SealedKey — ключ хранилища из печати пакета, проверенной корнями seal на
-// момент метки над ней (без метки — на момент now): для esverify без
-// -store-key. Отзыв сертификата печати сверяет Verify.
-func SealedKey(s *StoreSeal, seal, tsaTrust tsa.Trust, now time.Time) (ed25519.PublicKey, error) {
-	if s == nil {
+// errNoOwner — ключ из печати без имени её владельца: под корнем центра
+// сертификаты у многих, и печать любого ручалась бы за любой ключ.
+var errNoOwner = errors.New("the store key is not pinned (-store-key), and nothing names whose seal must vouch for it (-seal-subject): a seal of anyone the CA certified would do")
+
+// sealedBy — сертификат печати несёт все атрибуты имени, которых требует
+// проверяющий.
+func sealedBy(c *x509.Certificate, pins []tsa.SubjectPin) error {
+	for _, p := range pins {
+		if !p.In(c.Subject) {
+			return fmt.Errorf("the seal is by %q, and its name has no %s (-seal-subject)", c.Subject.String(), p)
+		}
+	}
+	return nil
+}
+
+// SealedKey — ключ хранилища из печати пакета, проверенной корнями
+// t.SealTrust на момент метки над ней (без метки — на момент now), чей
+// владелец назван в t.SealSubject: для esverify без -store-key. Отзыв
+// сертификата печати сверяет Verify.
+func SealedKey(s *StoreSeal, t Trust, now time.Time) (ed25519.PublicKey, error) {
+	switch {
+	case t.SealTrust == nil:
+		return nil, errors.New("no roots for the seal (-seal-trust)")
+	case len(t.SealSubject) == 0:
+		return nil, errNoOwner
+	case s == nil:
 		return nil, errors.New("the bundle carries no seal of the store key")
 	}
 	at := now
-	if info, why := sealTime(s, tsaTrust); why == "" {
+	if info, why := sealTime(s, t.TSA); why == "" {
 		at = info.GenTime
 	}
-	sealed, _, err := tsa.VerifySeal(s.CMS, seal, at)
+	sealed, _, err := tsa.VerifySeal(s.CMS, *t.SealTrust, at)
 	if err != nil {
+		return nil, err
+	}
+	if err := sealedBy(sealed.Signer, t.SealSubject); err != nil {
 		return nil, err
 	}
 	return SealedStatementKey(sealed.Content)
@@ -121,14 +145,16 @@ func (t Trust) withSealedKey(s *StoreSeal) Trust {
 	if t.TSARevocations != nil {
 		now = t.TSARevocations.Now
 	}
-	if k, err := SealedKey(s, *t.SealTrust, t.TSA, now); err == nil {
+	if k, err := SealedKey(s, t, now); err == nil {
 		t.StoreKey = k
 	}
 	return t
 }
 
 // sealCheck — печать пакета, как её проверили; id, tokenID — номера печати и
-// метки над ней в оценке отзыва (-1 — нет).
+// метки над ней в оценке отзыва (-1 — нет). nowID, nowErr — печать на
+// момент проверки, когда метка есть: на случай, если метка окажется под
+// подозрением и времени печати не покажет.
 type sealCheck struct {
 	err     error
 	signer  *x509.Certificate
@@ -136,6 +162,8 @@ type sealCheck struct {
 	why     string    // почему нет метки
 	id      int
 	tokenID int
+	nowID   int
+	nowErr  error
 }
 
 // sealCheckName — пункт отчёта о печати.
@@ -159,27 +187,26 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 		}
 		return
 	}
-	c := &sealCheck{id: -1, tokenID: -1}
+	c := &sealCheck{id: -1, tokenID: -1, nowID: -1}
 	sc.seal = c
 	if s == nil {
 		c.err = errors.New("the bundle carries no seal of the store key, and -seal-trust asks for one")
 		return
 	}
+	// Метка, которая не в силе, времени печати не показывает: печать
+	// судится на момент проверки, как без метки.
 	info, why := sealTime(s, trust.TSA)
-	at := now
-	if why == "" {
-		at = info.GenTime
-		if sc.revs != nil {
-			sc.ensureAssessment()
-			if id, err := sc.as.Add(info.Chains, info.GenTime); err == nil {
-				c.tokenID = id
-			} else {
-				why = fmt.Sprintf("the time-stamp over the seal is not in force (%v)", err)
-			}
+	if why == "" && sc.revs != nil {
+		sc.ensureAssessment()
+		if id, err := sc.as.Add(info.Chains, info.GenTime); err == nil {
+			c.tokenID = id
+		} else {
+			why = fmt.Sprintf("the time-stamp over the seal is not in force (%v)", err)
 		}
 	}
+	at := now
 	if why == "" {
-		c.at = info.GenTime
+		at, c.at = info.GenTime, info.GenTime
 	}
 	c.why = why
 	sealed, chains, err := tsa.VerifySeal(s.CMS, *trust.SealTrust, at)
@@ -188,10 +215,17 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 		return
 	}
 	c.signer = sealed.Signer
+	if err := sealedBy(sealed.Signer, trust.SealSubject); err != nil {
+		c.err = err
+		return
+	}
 	pub, err := SealedStatementKey(sealed.Content)
 	switch {
 	case err != nil:
 		c.err = err
+		return
+	case trust.StoreKey == nil && len(trust.SealSubject) == 0:
+		c.err = errNoOwner
 		return
 	case !pub.Equal(trust.StoreKey):
 		c.err = errors.New("the seal vouches for another key than the store key this bundle is checked with")
@@ -205,6 +239,13 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 			return
 		}
 		c.id = id
+		if c.tokenID >= 0 {
+			if _, nowChains, err := tsa.VerifySeal(s.CMS, *trust.SealTrust, now); err != nil {
+				c.nowErr = err
+			} else if c.nowID, err = sc.as.Add(nowChains, now); err != nil {
+				c.nowErr = fmt.Errorf("the seal certificate is not in force at %s: %v", fmtTime(now), err)
+			}
+		}
 	}
 }
 
@@ -220,9 +261,17 @@ func (sc *stampCheck) finishSeal(vs []tsa.Verdict, add func(string, error, strin
 		add(sealCheckName, c.err, "")
 		return
 	}
-	at := c.at
-	if c.tokenID >= 0 && vs != nil && vs[c.tokenID].NeedPOE {
-		at, c.why = time.Time{}, "the time-stamp over the seal rests on "+revokedWhy(vs[c.tokenID])
+	// Метка над печатью под подозрением: её время выбирал тот, у кого ключ
+	// службы, и цепочка печати на это время ничего не значит. Печать
+	// судится на момент проверки, как без метки.
+	at, id := c.at, c.id
+	if c.tokenID >= 0 && vs[c.tokenID].NeedPOE {
+		c.why = "the time-stamp over the seal rests on " + revokedWhy(vs[c.tokenID])
+		if c.nowErr != nil {
+			add(sealCheckName, fmt.Errorf("%s, so it does not show when the seal was made, and at the time of the check the seal does not hold: %v", c.why, c.nowErr), "")
+			return
+		}
+		at, id = time.Time{}, c.nowID
 	}
 	detail := fmt.Sprintf("%q, issued by %q", c.signer.Subject.String(), c.signer.Issuer.String())
 	if at.IsZero() {
@@ -235,7 +284,7 @@ func (sc *stampCheck) finishSeal(vs []tsa.Verdict, add func(string, error, strin
 		add(sealCheckName, nil, detail)
 		return
 	}
-	v := vs[c.id]
+	v := vs[id]
 	sc.record(v)
 	if v.NeedPOE {
 		if at.IsZero() || !at.Before(v.Cutoff) {
