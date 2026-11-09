@@ -143,24 +143,36 @@ func OpenSeal(der []byte, intermediates ...*x509.Certificate) (Sealed, error) {
 	if !bytes.Equal(h.Sum(nil), digest) {
 		return fail("the signed digest does not match the content")
 	}
+	// Подписант — из сертификатов, которые называет SID, тот, чья подпись
+	// сходится и кого называет атрибут signingCertificate (CAdES), если он
+	// есть (openssl cms без -cades его не пишет): по номеру ключа подходят
+	// все сертификаты ключа.
 	pool := append(append([]*x509.Certificate(nil), certs...), intermediates...)
-	signer, err := findSigner(si.SID, pool)
-	if err != nil {
-		return Sealed{}, err
+	candidates := findSigners(si.SID, pool)
+	if len(candidates) == 0 {
+		return fail("the signer certificate is not in the seal")
 	}
-	if err := checkSignature(signer, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature); err != nil {
-		return Sealed{}, err
+	var signer *x509.Certificate
+	var firstErr error
+	for _, c := range candidates {
+		err := checkSignature(c, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature)
+		if err == nil {
+			if a, ok := attrOf(si, oidSigningCertV2); ok {
+				err = checkSigningCert(a, c)
+			} else if a, ok := attrOf(si, oidSigningCertV1); ok {
+				err = checkSigningCertV1(a, c)
+			}
+		}
+		if err == nil {
+			signer = c
+			break
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
-	// Сертификат, названный в атрибуте signingCertificate (CAdES), — ровно
-	// подписант; атрибута может не быть (openssl cms без -cades).
-	if a, ok := attrOf(si, oidSigningCertV2); ok {
-		if err := checkSigningCert(a, signer); err != nil {
-			return Sealed{}, err
-		}
-	} else if a, ok := attrOf(si, oidSigningCertV1); ok {
-		if err := checkSigningCertV1(a, signer); err != nil {
-			return Sealed{}, err
-		}
+	if signer == nil {
+		return Sealed{}, firstErr
 	}
 	if signer.KeyUsage != 0 && signer.KeyUsage&(x509.KeyUsageDigitalSignature|x509.KeyUsageContentCommitment) == 0 {
 		return fail("the signer certificate may not sign (key usage)")
