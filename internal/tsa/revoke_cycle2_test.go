@@ -338,3 +338,36 @@ func TestRevocationsNoReasonSignerMarkedCA(t *testing.T) {
 		t.Fatalf("служба с флагом центра, отозвана без причины: %+v %v", v, err)
 	}
 }
+
+// R76. Сертификат службы, отозванный без причины, ставит под подозрение ключ
+// (RFC 3161, 4): метка того же ключа под другим сертификатом, не отозванным,
+// тоже ждёт POE.
+func TestRevocationsNoReasonSignerTaintsKey(t *testing.T) {
+	dir := t.TempDir()
+	root := issue(t, caTmpl(1, "no reason root"), newKey(t), nil)
+	ca := issue(t, caTmpl(10, "TSA CA"), newKey(t), root)
+	k := newKey(t)
+	tmpl := func(serial int64) *x509.Certificate {
+		return &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "TSA"}, NotBefore: day(2025, 1, 1), NotAfter: day(2030, 1, 1),
+			KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping}}
+	}
+	x1, x2 := issue(t, tmpl(1), k, ca), issue(t, tmpl(2), k, ca)
+	pool := x509.NewCertPool()
+	pool.AddCert(root.cert)
+	trust := Trust{Roots: pool, Intermediates: []*x509.Certificate{ca.cert}}
+	i1 := renewedStamp(t, x1, root, day(2026, 10, 1), trust)
+	i2 := renewedStamp(t, x2, root, day(2026, 10, 2), trust)
+	r := NewRevocations(day(2026, 11, 2))
+	r.AddCRL(ca.crlOf(t, dir, "ca.crl", day(2026, 11, 1), day(2026, 12, 1), nil,
+		x509.RevocationListEntry{SerialNumber: x1.cert.SerialNumber, RevocationTime: day(2026, 10, 20)}))
+	r.AddCRL(root.crlOf(t, dir, "root.crl", day(2026, 11, 1), day(2026, 12, 1), nil))
+	a := r.NewAssessment()
+	a.Add(i1.Chains, i1.GenTime)
+	id2, err := a.Add(i2.Chains, i2.GenTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := a.Verdicts()[id2]; !v.NeedPOE || !strings.Contains(v.Entry.From, "with the same key") {
+		t.Fatalf("метка того же ключа под неотозванным сертификатом: %+v", v)
+	}
+}
