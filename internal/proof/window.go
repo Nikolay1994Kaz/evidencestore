@@ -932,7 +932,7 @@ func (r WindowReport) Notes() []string {
 	case len(r.Cosigned) == 0:
 		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the whole chain")
 	}
-	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this stretch", time.Time{})...)
+	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this stretch", "T2", r.Upper)...)
 }
 
 // Text — отчёт человеческим языком. Как у пакета одной улики, всё, что

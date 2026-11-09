@@ -236,7 +236,7 @@ type Store struct {
 	cosigners []*cosigner
 	cosignMu  sync.Mutex
 	cosignLog *os.File
-	cosignIdx map[string][]cosigRef
+	cosignIdx map[cosigKey][]cosigRef // по ключу свидетеля, по возрастанию размера
 	// servedHead — последняя голова, подписанная для сборщиков и statement
 	// (servedHeadLocked), под chainMu: подпись не повторяется на каждый
 	// ответ.

@@ -63,15 +63,16 @@ func (c Checkpoint) Note(pub ed25519.PublicKey) []byte {
 }
 
 // CosignNotes — заметки отчёта о подписях свидетелей; part — что они
-// закрепляют («this record», «this stretch», «this part»); after — время
-// метки TSA, раньше которой голова существовать не могла (T1 записи), ноль —
-// не сверять.
-func CosignNotes(checked bool, pins []CosignedHead, unknown, carried int, part string, after time.Time) []string {
+// закрепляют («this record», «this stretch», «this part»); stamp и after —
+// метка TSA, после токена которой лежит подписанная голова (T1 записи, T2
+// участка), и её время: голова не могла существовать раньше, и подпись со
+// временем раньше значит, что часы свидетеля отставали. Ноль — не сверять.
+func CosignNotes(checked bool, pins []CosignedHead, unknown, carried int, part, stamp string, after time.Time) []string {
 	var n []string
 	for _, p := range pins {
 		n = append(n, fmt.Sprintf("witness %s cosigned head %d at %s, after checking that it extends every head it had cosigned before: a rewrite of %s after that time would contradict its cosignature, as long as the witness and its key are out of the store administrator's reach; a rewrite made before it received a head after %s is not caught", p.Witness, p.Size, fmtTime(p.Time), part, part))
 		if !after.IsZero() && p.Time.Before(after.Add(-ReceiveSkew)) {
-			n = append(n, fmt.Sprintf("witness %s dates its cosignature %s, before the TSA time-stamp T1 = %s that this record follows: its clock was behind, and the time of its cosignature cannot be relied on", p.Witness, fmtTime(p.Time), fmtTime(after)))
+			n = append(n, fmt.Sprintf("witness %s dates its cosignature %s, before the TSA time-stamp %s = %s, and the head it cosigned lies after that time-stamp's token: its clock was behind, and the time of its cosignature cannot be relied on", p.Witness, fmtTime(p.Time), stamp, fmtTime(after)))
 		}
 	}
 	switch {

@@ -64,7 +64,10 @@ const cosignFile = "cosign/cosignatures.jsonl"
 const maxCosignAnswer = 64 << 10
 
 type cosigner struct {
-	v      cosign.Verifier
+	v cosign.Verifier
+	// old — прежние ключи свидетеля (old_keys): головы им не уходят, их
+	// подписи из журнала идут в пакеты.
+	old    []cosign.Verifier
 	url    string // <url>/add-checkpoint
 	client *http.Client
 
@@ -98,6 +101,20 @@ type cosigRef struct {
 	ok, bad bool
 }
 
+// cosigKey — ключ свидетеля в индексе журнала подписей: имя и номер ключа.
+// Подписи прежнего ключа того же свидетеля — под своим cosigKey.
+type cosigKey struct {
+	name string
+	id   uint32
+}
+
+func keyOf(v cosign.Verifier) cosigKey { return cosigKey{v.Name, v.ID} }
+
+// keys — ключи свидетеля для пакетов: текущий, за ним прежние.
+func (c *cosigner) keys() []cosign.Verifier {
+	return append([]cosign.Verifier{c.v}, c.old...)
+}
+
 // cosigRecord — строка журнала подписей.
 type cosigRecord struct {
 	Name string `json:"name"`
@@ -112,18 +129,22 @@ type cosigRecord struct {
 // байта, голова не длиннее цепи, у свидетеля — по возрастанию. Подпись и
 // сверка с цепью — когда строка впервые идёт в пакет (cosignaturesForLocked):
 // проверять при запуске каждую строку стоило бы десятков секунд на год
-// журнала у каждого свидетеля. Чужая строка (свидетеля нет в конфигурации)
-// остаётся и не идёт никуда; битая или за концом цепи — громко в журнал
-// процесса.
+// журнала у каждого свидетеля. Чужая строка (ключа нет в конфигурации — ни
+// текущим, ни прежним) остаётся и не идёт никуда; битая или за концом цепи —
+// громко в журнал процесса.
 func (s *Store) openCosigners() error {
+	byKey := map[cosigKey]bool{}
 	for _, w := range s.cfg.Witness.Cosigners {
 		c, err := newCosigner(w)
 		if err != nil {
 			return err
 		}
 		s.cosigners = append(s.cosigners, c)
+		for _, v := range c.keys() {
+			byKey[keyOf(v)] = true
+		}
 	}
-	s.cosignIdx = map[string][]cosigRef{}
+	s.cosignIdx = map[cosigKey][]cosigRef{}
 	if len(s.cosigners) == 0 {
 		return nil
 	}
@@ -134,10 +155,6 @@ func (s *Store) openCosigners() error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("cosignatures: %w", err)
-	}
-	byName := map[string]*cosigner{}
-	for _, c := range s.cosigners {
-		byName[c.v.Name] = c
 	}
 	n := s.chainSize()
 	r := bufio.NewReaderSize(f, 64<<10)
@@ -160,53 +177,58 @@ func (s *Store) openCosigners() error {
 			f.Close()
 			return fmt.Errorf("cosignatures: %w", err)
 		}
-		ref, c, err := parseCosigLine(bytes.TrimSuffix(line, []byte("\n")), byName, n)
+		ref, k, err := parseCosigLine(bytes.TrimSuffix(line, []byte("\n")), byKey, n)
 		switch {
 		case err != nil:
 			s.log.Error("cosignatures: a line is not used", "offset", off, "err", err)
-		case c != nil:
+		case k != (cosigKey{}):
 			ref.off, ref.n = off, len(line)
-			s.cosignIdx[c.v.Name] = append(s.cosignIdx[c.v.Name], ref)
+			s.cosignIdx[k] = append(s.cosignIdx[k], ref)
 		}
 		off += int64(len(line))
 	}
-	// Подписи одного свидетеля идут по размеру (tlog-cosignature), но строка
-	// с завышенным размером (порча) не должна прятать верные после неё:
-	// индекс сортируется, повторы одного размера остаются в порядке файла —
-	// первая выдача в пакет проверяет их по очереди.
-	for name, refs := range s.cosignIdx {
+	// Подписи одного ключа идут по размеру (tlog-cosignature), но строка с
+	// завышенным размером (порча) не должна прятать верные после неё: индекс
+	// сортируется, повторы одного размера остаются в порядке файла — первая
+	// выдача в пакет проверяет их по очереди.
+	for k, refs := range s.cosignIdx {
 		slices.SortStableFunc(refs, func(a, b cosigRef) int { return cmp.Compare(a.size, b.size) })
-		s.cosignIdx[name] = refs
+		s.cosignIdx[k] = refs
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		f.Close()
 		return err
 	}
 	s.cosignLog = f
-	// Последняя строка каждого свидетеля проверяется сразу: с её головы
-	// хранилище спрашивает свидетеля после запуска (lastCosigned), её же
-	// показывает status. Не сошлась — берётся предыдущая.
+	// Последняя строка текущего ключа каждого свидетеля проверяется сразу: с
+	// её головы хранилище спрашивает свидетеля после запуска (lastCosigned),
+	// её же показывает status. Не сошлась — берётся предыдущая. Строки прежних
+	// ключей — только при выдаче в пакет.
 	s.chainMu.Lock()
 	s.cosignMu.Lock()
 	defer s.chainMu.Unlock()
 	defer s.cosignMu.Unlock()
 	for _, c := range s.cosigners {
-		refs := s.cosignIdx[c.v.Name]
+		refs := s.cosignIdx[keyOf(c.v)]
 		for len(refs) > 0 {
 			ref := &refs[len(refs)-1]
 			r, err := s.readCosigLocked(*ref, c.v.Name)
 			if err != nil {
 				return err
 			}
-			sigErr, rootErr := s.verifyCosigLocked(c, r)
+			at, sigErr, rootErr := s.verifyCosigLocked(c.v, r)
 			if sigErr == nil && rootErr == nil {
 				ref.ok = true
+				// Время последней подписи — из неё самой (часы свидетеля, не в
+				// будущем): иначе после каждого запуска тревога «давно нет
+				// подписи» до первой новой.
+				c.okAt.Store(time.Unix(int64(min(at, uint64(time.Now().Unix()))), 0).UnixNano())
 				break
 			}
 			s.log.Error("cosignatures: a line is not used", "witness", c.v.Name, "head", r.Size, "offset", ref.off, "err", errors.Join(sigErr, rootErr))
 			refs = refs[:len(refs)-1]
 		}
-		s.cosignIdx[c.v.Name] = refs
+		s.cosignIdx[keyOf(c.v)] = refs
 		var head uint64
 		if len(refs) > 0 {
 			head = refs[len(refs)-1].size
@@ -216,31 +238,42 @@ func (s *Store) openCosigners() error {
 	return nil
 }
 
-// parseCosigLine разбирает строку журнала без проверки подписи. c — её
-// свидетель; nil без ошибки — свидетеля или этого его ключа нет в
-// конфигурации. n — длина цепи.
-func parseCosigLine(line []byte, byName map[string]*cosigner, n uint64) (cosigRef, *cosigner, error) {
+// parseCosigLine разбирает строку журнала без проверки подписи. k — её ключ;
+// пустой без ошибки — этого ключа (имени и номера) нет в конфигурации. n —
+// длина цепи.
+func parseCosigLine(line []byte, byKey map[cosigKey]bool, n uint64) (cosigRef, cosigKey, error) {
 	var r cosigRecord
 	if err := json.Unmarshal(line, &r); err != nil {
-		return cosigRef{}, nil, err
+		return cosigRef{}, cosigKey{}, err
 	}
-	c := byName[r.Name]
-	if c == nil || len(r.Sig) < 4 || binary.BigEndian.Uint32(r.Sig) != c.v.ID {
-		return cosigRef{}, nil, nil
+	if len(r.Sig) < 4 {
+		return cosigRef{}, cosigKey{}, nil
+	}
+	k := cosigKey{r.Name, binary.BigEndian.Uint32(r.Sig)}
+	if !byKey[k] {
+		return cosigRef{}, cosigKey{}, nil
 	}
 	if len(r.Root) != 32 || r.Size == 0 || len(r.Sig) != cosign.BlobSize {
-		return cosigRef{}, nil, fmt.Errorf("witness %s: head %d does not parse (root of %d bytes, cosignature of %d)", r.Name, r.Size, len(r.Root), len(r.Sig))
+		return cosigRef{}, cosigKey{}, fmt.Errorf("witness %s: head %d does not parse (root of %d bytes, cosignature of %d)", r.Name, r.Size, len(r.Root), len(r.Sig))
 	}
 	if r.Size > n {
-		return cosigRef{}, nil, fmt.Errorf("witness %s cosigned head %d, and this chain has %d links: the store lost the end of its chain, or the file comes from another chain", r.Name, r.Size, n)
+		return cosigRef{}, cosigKey{}, fmt.Errorf("witness %s cosigned head %d, and this chain has %d links: the store lost the end of its chain, or the file comes from another chain", r.Name, r.Size, n)
 	}
-	return cosigRef{size: r.Size}, c, nil
+	return cosigRef{size: r.Size}, k, nil
 }
 
 func newCosigner(w config.Cosigner) (*cosigner, error) {
 	v, err := cosign.ParseVerifier(w.Key)
 	if err != nil {
 		return nil, err
+	}
+	var old []cosign.Verifier
+	for _, k := range w.OldKeys {
+		ov, err := cosign.ParseVerifier(k)
+		if err != nil {
+			return nil, fmt.Errorf("witness %s: old_keys: %w", v.Name, err)
+		}
+		old = append(old, ov)
 	}
 	tc := &tls.Config{MinVersion: tls.VersionTLS12}
 	if w.CA != "" {
@@ -258,6 +291,7 @@ func newCosigner(w config.Cosigner) (*cosigner, error) {
 	tr.TLSClientConfig = tc
 	return &cosigner{
 		v:   v,
+		old: old,
 		url: strings.TrimRight(w.URL, "/") + "/add-checkpoint",
 		// Перенаправлений не следуем: свидетель — тот адрес, что в
 		// конфигурации, и голова не уходит туда, куда укажет ответ.
@@ -305,8 +339,9 @@ func (s *Store) CosignOnce(ctx context.Context) error {
 	if s.replicaRemote != nil {
 		limit = s.replicaShipped.Load()
 	}
-	// Голову копии не снять (tree.hashes) — очередь всё равно уходит: головы
-	// под метками в ней уже с корнями; ошибка видна у каждого свидетеля.
+	// Голову копии не снять (tree.hashes) — очередь всё равно уходит, пока
+	// доказательства продолжения строятся (головы под метками в ней уже с
+	// корнями); ошибка видна у каждого свидетеля.
 	errs := make([]error, len(s.cosigners)+1)
 	if headErr != nil {
 		errs[len(s.cosigners)] = fmt.Errorf("the head for the witnesses: %w", headErr)
@@ -376,9 +411,9 @@ func (s *Store) cosignHead(ctx context.Context, c *cosigner, h witnessHead) erro
 		// не подпишет с нуля молча любую историю.
 		old := c.size
 		if !c.known {
-			old = s.lastCosigned(c.v.Name)
+			old = s.lastCosigned(c.v)
 		}
-		if old > h.size || old == h.size && s.hasCosig(c.v.Name, h.size) {
+		if old > h.size || old == h.size && s.hasCosig(c.v, h.size) {
 			return nil
 		}
 		body, err := s.addCheckpointBody(old, h)
@@ -405,14 +440,14 @@ func (s *Store) cosignHead(ctx context.Context, c *cosigner, h witnessHead) erro
 				c.known = false
 				return fmt.Errorf("409 without the witness's tree size: %q", answer)
 			}
-			if last := s.lastCosigned(c.v.Name); size < last {
+			if last := s.lastCosigned(c.v); size < last {
 				c.lostState.Store(true)
 				c.known = false
-				return fmt.Errorf("the witness reports head %d, older than head %d it has cosigned for this store: it lost its state, and from there it would cosign a second history under the same key; its operator has to start it over with a new key (eswitness init in a new data_dir), and the new verifier key goes into witness.cosigners", size, last)
+				return fmt.Errorf("the witness reports head %d, older than head %d it has cosigned for this store: it lost its state, and from there it would cosign a second history under the same key; its operator has to start it over with a new key (eswitness init in a new data_dir): the new verifier key goes into witness.cosigners, the old one into that entry's old_keys", size, last)
 			}
 			c.lostState.Store(false)
 			c.size, c.known = size, true
-			if size > 0 && size != h.size && size <= s.chainSize() && !s.hasCosig(c.v.Name, size) {
+			if size > 0 && size != h.size && size <= s.chainSize() && !s.hasCosig(c.v, size) {
 				// Свидетель подписал голову, которой нет в журнале подписей
 				// (падение между его ответом и записью): она нужна пакетам,
 				// которые на ней кончаются, — просим её снова.
@@ -578,28 +613,28 @@ func (s *Store) keepCosignature(c *cosigner, h witnessHead, answer []byte) error
 	c.head.Store(h.size)
 	c.okAt.Store(time.Now().UnixNano())
 	c.lastErr.Store(nil)
-	refs := s.cosignIdx[c.v.Name]
+	refs := s.cosignIdx[keyOf(c.v)]
 	if len(refs) == 0 || h.size > refs[len(refs)-1].size {
-		s.cosignIdx[c.v.Name] = append(refs, cosigRef{size: h.size, off: off, n: len(line), ok: true})
+		s.cosignIdx[keyOf(c.v)] = append(refs, cosigRef{size: h.size, off: off, n: len(line), ok: true})
 	}
 	return nil
 }
 
-// lastCosigned — последняя голова свидетеля name в журнале подписей, 0 — нет.
-func (s *Store) lastCosigned(name string) uint64 {
+// lastCosigned — последняя голова ключа v в журнале подписей, 0 — нет.
+func (s *Store) lastCosigned(v cosign.Verifier) uint64 {
 	s.cosignMu.Lock()
 	defer s.cosignMu.Unlock()
-	if refs := s.cosignIdx[name]; len(refs) > 0 {
+	if refs := s.cosignIdx[keyOf(v)]; len(refs) > 0 {
 		return refs[len(refs)-1].size
 	}
 	return 0
 }
 
-// hasCosig — в журнале есть подпись свидетеля name над головой size.
-func (s *Store) hasCosig(name string, size uint64) bool {
+// hasCosig — в журнале есть подпись ключа v над головой size.
+func (s *Store) hasCosig(v cosign.Verifier, size uint64) bool {
 	s.cosignMu.Lock()
 	defer s.cosignMu.Unlock()
-	refs := s.cosignIdx[name]
+	refs := s.cosignIdx[keyOf(v)]
 	i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= size })
 	return i < len(refs) && refs[i].size == size
 }
@@ -616,15 +651,15 @@ func (s *Store) cosignaturesFor(first, last, evLink uint64) ([]proof.Cosignature
 }
 
 // cosignaturesForLocked — подписи свидетелей для пакета из звеньев
-// first…last, который закрепляет звено evLink: у каждого свидетеля — подпись
-// самой ранней головы не раньше max(evLink, first). Она может лежать и дальше
-// конца пакета: тогда проверка назовёт голову, до которой просить пакет.
-// Строка, которая идёт в пакет впервые, проверяется ключом свидетеля и
-// сверяется с цепью. Подпись не сошлась — строка испорчена и уходит из
-// индекса; корня нет в цепи (свидетель видел другую историю, или испорчен
-// tree.hashes) — строка помечается и не идёт никуда до перезапуска, в пакет
-// идёт следующая. То и другое — громко в журнал процесса. Звать под chainMu
-// (порядок: chainMu раньше cosignMu).
+// first…last, который закрепляет звено evLink: у каждого ключа свидетеля
+// (текущего и прежних) — подпись самой ранней головы не раньше max(evLink,
+// first). Она может лежать и дальше конца пакета: тогда проверка назовёт
+// голову, до которой просить пакет. Строка, которая идёт в пакет впервые,
+// проверяется своим ключом и сверяется с цепью. Подпись не сошлась — строка
+// испорчена и уходит из индекса; корня нет в цепи (свидетель видел другую
+// историю, или испорчен tree.hashes) — строка помечается и не идёт никуда до
+// перезапуска, в пакет идёт следующая. То и другое — громко в журнал
+// процесса. Звать под chainMu (порядок: chainMu раньше cosignMu).
 func (s *Store) cosignaturesForLocked(first, last, evLink uint64) ([]proof.Cosignature, error) {
 	if len(s.cosigners) == 0 {
 		return nil, nil
@@ -634,37 +669,51 @@ func (s *Store) cosignaturesForLocked(first, last, evLink uint64) ([]proof.Cosig
 	defer s.cosignMu.Unlock()
 	var out []proof.Cosignature
 	for _, c := range s.cosigners {
-		refs := s.cosignIdx[c.v.Name]
-		for i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }); i < len(refs); {
-			if refs[i].bad {
-				i++
-				continue
-			}
-			r, err := s.readCosigLocked(refs[i], c.v.Name)
+		for _, v := range c.keys() {
+			cs, err := s.earliestCosigLocked(v, lo)
 			if err != nil {
 				return nil, err
 			}
-			if !refs[i].ok {
-				sigErr, rootErr := s.verifyCosigLocked(c, r)
-				switch {
-				case sigErr != nil:
-					s.log.Error("cosignatures: a line is not used", "witness", c.v.Name, "head", r.Size, "offset", refs[i].off, "err", sigErr)
-					refs = slices.Delete(refs, i, i+1)
-					s.cosignIdx[c.v.Name] = refs
-					continue
-				case rootErr != nil:
-					s.log.Error("cosignatures: the witness cosigned a root this chain does not have at that head: it saw another history of this store, or tree.hashes is damaged", "witness", c.v.Name, "head", r.Size, "offset", refs[i].off, "err", rootErr)
-					refs[i].bad = true
-					i++
-					continue
-				}
-				refs[i].ok = true
-			}
-			out = append(out, proof.Cosignature{Name: r.Name, Size: r.Size, Root: r.Root, Sig: r.Sig})
-			break
+			out = append(out, cs...)
 		}
 	}
 	return out, nil
+}
+
+// earliestCosigLocked — подпись ключа v над самой ранней головой не раньше
+// lo, проверенная (cosignaturesForLocked); нет такой — пусто. Звать под
+// chainMu и cosignMu.
+func (s *Store) earliestCosigLocked(v cosign.Verifier, lo uint64) ([]proof.Cosignature, error) {
+	k := keyOf(v)
+	refs := s.cosignIdx[k]
+	for i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }); i < len(refs); {
+		if refs[i].bad {
+			i++
+			continue
+		}
+		r, err := s.readCosigLocked(refs[i], v.Name)
+		if err != nil {
+			return nil, err
+		}
+		if !refs[i].ok {
+			_, sigErr, rootErr := s.verifyCosigLocked(v, r)
+			switch {
+			case sigErr != nil:
+				s.log.Error("cosignatures: a line is not used", "witness", v.Name, "key", fmt.Sprintf("%08x", v.ID), "head", r.Size, "offset", refs[i].off, "err", sigErr)
+				refs = slices.Delete(refs, i, i+1)
+				s.cosignIdx[k] = refs
+				continue
+			case rootErr != nil:
+				s.log.Error("cosignatures: the witness cosigned a root this chain does not have at that head: it saw another history of this store, or tree.hashes is damaged", "witness", v.Name, "key", fmt.Sprintf("%08x", v.ID), "head", r.Size, "offset", refs[i].off, "err", rootErr)
+				refs[i].bad = true
+				i++
+				continue
+			}
+			refs[i].ok = true
+		}
+		return []proof.Cosignature{{Name: r.Name, Size: r.Size, Root: r.Root, Sig: r.Sig}}, nil
+	}
+	return nil, nil
 }
 
 // readCosigLocked читает строку журнала ref свидетеля name. Звать под
@@ -681,14 +730,15 @@ func (s *Store) readCosigLocked(ref cosigRef, name string) (cosigRecord, error) 
 	return r, nil
 }
 
-// verifyCosigLocked — подпись строки ключом свидетеля (sigErr) и её корень в
-// этой цепи (rootErr). Звать под chainMu.
-func (s *Store) verifyCosigLocked(c *cosigner, r cosigRecord) (sigErr, rootErr error) {
+// verifyCosigLocked — подпись строки ключом v (sigErr; at — её время) и её
+// корень в этой цепи (rootErr). Звать под chainMu.
+func (s *Store) verifyCosigLocked(v cosign.Verifier, r cosigRecord) (at uint64, sigErr, rootErr error) {
 	root := [32]byte(r.Root)
-	if _, err := c.v.Verify(cosign.CheckpointText(proof.OriginFor(s.signer.PublicKey()), r.Size, root), r.Sig); err != nil {
-		return err, nil
+	at, err := v.Verify(cosign.CheckpointText(proof.OriginFor(s.signer.PublicKey()), r.Size, root), r.Sig)
+	if err != nil {
+		return 0, err, nil
 	}
-	return nil, s.tree.agreesLocked(r.Size, root)
+	return at, nil, s.tree.agreesLocked(r.Size, root)
 }
 
 // CosignerStatus — свидетель C2SP в evidencestore status.

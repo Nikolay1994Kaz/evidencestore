@@ -280,4 +280,12 @@ func TestValidName(t *testing.T) {
 			t.Errorf("%q принято", n)
 		}
 	}
+	// Строка подписи чужого ключа с именем длиннее 255 байт разбирается
+	// (signed-note длину не ограничивает) — её пропускают, а не отвергают
+	// всю заметку.
+	long := strings.Repeat("a", MaxNameLen+45)
+	line := strings.TrimSuffix(SigLine(long, make([]byte, BlobSize)), "\n")
+	if name, _, err := ParseSigLine(line); err != nil || name != long {
+		t.Fatalf("длинное имя в строке подписи: %v", err)
+	}
 }

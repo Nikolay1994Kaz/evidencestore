@@ -276,14 +276,14 @@
   {
    "name": "S1 строка журнала без проверки подписи",
    "file": "internal/store/cosign.go",
-   "old": "\tif _, err := c.v.Verify(cosign.CheckpointText(proof.OriginFor(s.signer.PublicKey()), r.Size, root), r.Sig); err != nil {\n\t\treturn err, nil",
-   "new": "\tif _, err := c.v.Verify(cosign.CheckpointText(proof.OriginFor(s.signer.PublicKey()), r.Size, root), r.Sig); false && err != nil {\n\t\treturn err, nil"
+   "old": "\tat, err := v.Verify(cosign.CheckpointText(proof.OriginFor(s.signer.PublicKey()), r.Size, root), r.Sig)\n\tif err != nil {\n\t\treturn 0, err, nil",
+   "new": "\tat, err := v.Verify(cosign.CheckpointText(proof.OriginFor(s.signer.PublicKey()), r.Size, root), r.Sig)\n\tif false && err != nil {\n\t\treturn 0, err, nil"
   },
   {
    "name": "S2 строка журнала без сверки с цепью",
    "file": "internal/store/cosign.go",
-   "old": "\treturn nil, s.tree.agreesLocked(r.Size, root)",
-   "new": "\treturn nil, error(nil)"
+   "old": "\treturn at, nil, s.tree.agreesLocked(r.Size, root)",
+   "new": "\treturn at, nil, error(nil)"
   },
   {
    "name": "S3 оборванная строка журнала не отрезается",
@@ -330,7 +330,7 @@
   {
    "name": "S10 голова того же размера без подписи в журнале уходит из очереди",
    "file": "internal/store/cosign.go",
-   "old": "\t\tif old > h.size || old == h.size && s.hasCosig(c.v.Name, h.size) {",
+   "old": "\t\tif old > h.size || old == h.size && s.hasCosig(c.v, h.size) {",
    "new": "\t\tif old >= h.size {"
   },
   {
@@ -360,8 +360,8 @@
   {
    "name": "S15 в пакет — последняя подпись, а не ранняя",
    "file": "internal/store/cosign.go",
-   "old": "\t\tfor i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }); i < len(refs); {",
-   "new": "\t\tfor i := max(sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }), len(refs)-1); i < len(refs); {"
+   "old": "\tfor i := sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }); i < len(refs); {",
+   "new": "\tfor i := max(sort.Search(len(refs), func(i int) bool { return refs[i].size >= lo }), len(refs)-1); i < len(refs); {"
   },
   {
    "name": "S16 подпись раньше звена улики идёт в пакет",
@@ -378,7 +378,7 @@
   {
    "name": "S18 после запуска — с нуля, а не с последней подписанной головы",
    "file": "internal/store/cosign.go",
-   "old": "\t\t\told = s.lastCosigned(c.v.Name)",
+   "old": "\t\t\told = s.lastCosigned(c.v)",
    "new": "\t\t\told = 0"
   },
   {
@@ -400,16 +400,16 @@
    "new": "\t\tfunc() {\n\t\t\tif err := s.cosignQueue(ctx, c, limit); err != nil {\n\t\t\t\tc.errors.Add(1)\n\t\t\t\tmsg := err.Error()\n\t\t\t\tc.lastErr.Store(&msg)\n\t\t\t\terrs[i] = fmt.Errorf(\"witness %s: %w\", c.v.Name, err)\n\t\t\t}\n\t\t}()"
   },
   {
-   "name": "S22 испорченная строка журнала прячет верную того же размера",
+   "name": "S22 строка с завышенным размером прячет верные: индекс не сортируется",
    "file": "internal/store/cosign.go",
-   "old": "\t\t\tif len(refs) == 0 || ref.size >= refs[len(refs)-1].size {",
-   "new": "\t\t\tif len(refs) == 0 || ref.size > refs[len(refs)-1].size {"
+   "old": "\t\tslices.SortStableFunc(refs, func(a, b cosigRef) int { return cmp.Compare(a.size, b.size) })\n",
+   "new": "\t\t_ = cmp.Compare[uint64]\n"
   },
   {
    "name": "S23 строка с чужой подписью — свидетель без подписи в пакете",
    "file": "internal/store/cosign.go",
-   "old": "\t\t\t\t\trefs = slices.Delete(refs, i, i+1)\n\t\t\t\t\ts.cosignIdx[c.v.Name] = refs\n\t\t\t\t\tcontinue",
-   "new": "\t\t\t\t\ts.cosignIdx[c.v.Name] = slices.Clip(refs)\n\t\t\t\t\tbreak"
+   "old": "\t\t\t\trefs = slices.Delete(refs, i, i+1)\n\t\t\t\ts.cosignIdx[k] = refs\n\t\t\t\tcontinue",
+   "new": "\t\t\t\ts.cosignIdx[k] = slices.Clip(refs)\n\t\t\t\tbreak"
   },
   {
    "name": "S24 голова за концом цепи из журнала — в status и пакеты",
@@ -420,8 +420,8 @@
   {
    "name": "S25 потерю состояния свидетелем не видно",
    "file": "internal/store/cosign.go",
-   "old": "\t\t\tif last := s.lastCosigned(c.v.Name); size < last {\n\t\t\t\tc.lostState.Store(true)",
-   "new": "\t\t\tif last := s.lastCosigned(c.v.Name); false && size < last {\n\t\t\t\tc.lostState.Store(true)"
+   "old": "\t\t\tif last := s.lastCosigned(c.v); size < last {\n\t\t\t\tc.lostState.Store(true)",
+   "new": "\t\t\tif last := s.lastCosigned(c.v); false && size < last {\n\t\t\t\tc.lostState.Store(true)"
   },
   {
    "name": "S26 подпись головы свидетеля не запрашивается снова",
@@ -450,14 +450,62 @@
   {
    "name": "S30 последняя строка свидетеля при запуске не проверяется",
    "file": "internal/store/cosign.go",
-   "old": "\t\t\tif sigErr == nil && rootErr == nil {\n\t\t\t\tref.ok = true\n\t\t\t\tbreak",
-   "new": "\t\t\tif true || sigErr == nil && rootErr == nil {\n\t\t\t\tref.ok = true\n\t\t\t\tbreak"
+   "old": "\t\t\tif sigErr == nil && rootErr == nil {\n\t\t\t\tref.ok = true\n",
+   "new": "\t\t\tif true || sigErr == nil && rootErr == nil {\n\t\t\t\tref.ok = true\n"
   },
   {
    "name": "S31 остановка хранилища не прерывает обход",
    "file": "internal/store/jobs.go",
    "old": "\t\tcase <-s.stop:\n\t\t\tcancel()",
    "new": "\t\tcase <-s.stop:"
+  },
+  {
+   "name": "S32 422 на повторном запросе головы — не тревога",
+   "file": "internal/store/cosign.go",
+   "old": "\tcase http.StatusUnprocessableEntity:\n\t\tc.refused.Store(true)\n\t\treturn errCosignRefused\n\t}\n\treturn fmt.Errorf",
+   "new": "\tcase http.StatusUnprocessableEntity:\n\t\tc.refused.Store(false)\n\t\treturn errCosignRefused\n\t}\n\treturn fmt.Errorf"
+  },
+  {
+   "name": "S33 подписи прежних ключей не идут в пакеты",
+   "file": "internal/store/cosign.go",
+   "old": "\t\tfor _, v := range c.keys() {\n\t\t\tcs, err := s.earliestCosigLocked(v, lo)",
+   "new": "\t\tfor _, v := range c.keys()[:1] {\n\t\t\tcs, err := s.earliestCosigLocked(v, lo)"
+  },
+  {
+   "name": "S34 строки прежних ключей не в индексе",
+   "file": "internal/store/cosign.go",
+   "old": "\t\tfor _, v := range c.keys() {\n\t\t\tbyKey[keyOf(v)] = true",
+   "new": "\t\tfor _, v := range c.keys()[:1] {\n\t\t\tbyKey[keyOf(v)] = true"
+  },
+  {
+   "name": "S35 время последней подписи после запуска — ноль",
+   "file": "internal/store/cosign.go",
+   "old": "\t\t\t\tc.okAt.Store(time.Unix(int64(min(at, uint64(time.Now().Unix()))), 0).UnixNano())",
+   "new": "\t\t\t\t_ = at"
+  },
+  {
+   "name": "S36 время последней подписи после запуска — в будущем",
+   "file": "internal/store/cosign.go",
+   "old": "time.Unix(int64(min(at, uint64(time.Now().Unix()))), 0)",
+   "new": "time.Unix(int64(at), 0)"
+  },
+  {
+   "name": "S37 неудачный повторный запрос подписи не повторяется",
+   "file": "internal/store/cosign.go",
+   "old": "\t\t\t\t\tc.known = false\n\t\t\t\t\treturn fmt.Errorf(\"head %d the witness has cosigned, again: %w\", size, err)",
+   "new": "\t\t\t\t\treturn fmt.Errorf(\"head %d the witness has cosigned, again: %w\", size, err)"
+  },
+  {
+   "name": "S38 ошибка головы копии не в счётчиках свидетелей C2SP",
+   "file": "internal/store/cosign.go",
+   "old": "\t\tfor _, c := range s.cosigners {\n\t\t\tc.errors.Add(1)",
+   "new": "\t\tfor _, c := range s.cosigners[:0] {\n\t\t\tc.errors.Add(1)"
+  },
+  {
+   "name": "S39 удалённый журнал подписей останавливает копию",
+   "file": "internal/store/replica.go",
+   "old": "\t\tif name == cosignFile && (s.replica.SkipCosign || size < from) {",
+   "new": "\t\tif false && name == cosignFile && (s.replica.SkipCosign || size < from) {"
   },
   {
    "name": "P1 корень подписанной головы не сверяется с пакетом",
@@ -596,6 +644,60 @@
    "file": "internal/proof/proof.go",
    "old": "\tcase r.WitnessNone && len(r.Cosigned) > 0:",
    "new": "\tcase false:"
+  },
+  {
+   "name": "C18 строка подписи чужого ключа с длинным именем — отказ всей заметке",
+   "file": "internal/cosign/cosign.go",
+   "old": "\tif !ok || !validKeyName(name) {",
+   "new": "\tif !ok || !ValidName(name) {"
+  },
+  {
+   "name": "W29 оборванная строка журнала подписанного не отрезается",
+   "file": "internal/witness/witness.go",
+   "old": "\t} else if fi.Size() > whole {",
+   "new": "\t} else if false && fi.Size() > whole {"
+  },
+  {
+   "name": "W30 повтор той же головы пишет на диск",
+   "file": "internal/witness/witness.go",
+   "old": "\t\tif line := ownSigLine(cur.Note, s.signer); line != \"\" {",
+   "new": "\t\tif line := ownSigLine(cur.Note, s.signer); false && line != \"\" {"
+  },
+  {
+   "name": "P15 пакет за окно без заметки об отстающих часах",
+   "file": "internal/proof/window.go",
+   "old": "\"this stretch\", \"T2\", r.Upper)",
+   "new": "\"this stretch\", \"T2\", time.Time{})"
+  },
+  {
+   "name": "P16 пакет по источнику без заметки об отстающих часах",
+   "file": "internal/proof/source.go",
+   "old": "\"this part\", \"T2\", r.Upper)",
+   "new": "\"this part\", \"T2\", time.Time{})"
+  },
+  {
+   "name": "F5 прежний ключ повторяет текущий",
+   "file": "internal/config/config.go",
+   "old": "\t\t\t} else if err := seen(i, v); err != nil {",
+   "new": "\t\t\t} else if err := seen(i, v); false && err != nil {"
+  },
+  {
+   "name": "F6 больше четырёх прежних ключей",
+   "file": "internal/config/config.go",
+   "old": "\t\tif len(w.OldKeys) > MaxOldKeys {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "F7 прежний ключ не разбирается",
+   "file": "internal/config/config.go",
+   "old": "\t\t\tv, err := cosign.ParseVerifier(k)\n\t\t\tif err != nil {",
+   "new": "\t\t\tv, err := cosign.ParseVerifier(k)\n\t\t\tif false {"
+  },
+  {
+   "name": "E6 -store-key: имя файла в виде ключа читается ключом",
+   "file": "cmd/esverify/main.go",
+   "old": "\tif err := notAlsoFile(\"-store-key\", v, func(v string) bool { _, ok := parseStoreKey(v); return ok }); err != nil {",
+   "new": "\tif err := notAlsoFile(\"-store-key\", v, func(v string) bool { _, ok := parseStoreKey(v); return ok }); false && err != nil {"
   },
   {
    "name": "X1 ключ свидетеля читается всем",

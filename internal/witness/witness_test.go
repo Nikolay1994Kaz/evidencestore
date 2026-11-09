@@ -263,7 +263,8 @@ func TestWitnessGarbageProofIsNotEvidence(t *testing.T) {
 
 // Заметка, которую свидетель хранит и отдаёт мониторам, — текст точки, одна
 // подпись хранилища и подпись свидетеля, сколько бы строк ни пришло в запросе
-// (повтор, чужие ключи, строка под именем самого свидетеля).
+// (повтор, чужие ключи, в том числе с длинным именем, строка под именем
+// самого свидетеля).
 func TestWitnessStoredNoteIsClean(t *testing.T) {
 	c := newChain(t)
 	r := newRig(t, t.TempDir(), c)
@@ -272,7 +273,10 @@ func TestWitnessStoredNoteIsClean(t *testing.T) {
 	note := c.note(4)
 	text, sigs, _ := cosign.SplitNote(note)
 	junk := "— " + r.key.Name + " " + base64.StdEncoding.EncodeToString(append(binary.BigEndian.AppendUint32(nil, r.key.ID), make([]byte, 72)...))
-	poisoned := string(text) + "\n" + sigs[0] + "\n" + sigs[0] + "\n" + junk + "\n— other.example/k AAAAAAAA\n"
+	// Чужой ключ с именем длиннее 255 байт — signed-note имя не ограничивает:
+	// строку пропускают, а не отвергают заметку.
+	long := "— " + strings.Repeat("x", 300) + " AAAAAAAA"
+	poisoned := string(text) + "\n" + sigs[0] + "\n" + sigs[0] + "\n" + junk + "\n— other.example/k AAAAAAAA\n" + long + "\n"
 	if code, body, _ := r.add(cosign.AddCheckpoint(4, nil, []byte(poisoned))); code != http.StatusOK {
 		t.Fatalf("та же голова с лишними строками: %d %s", code, body)
 	}
@@ -392,7 +396,6 @@ func TestWitnessConcurrentRequestsDoNotRollBack(t *testing.T) {
 	}
 }
 
-// Время подписей не идёт назад, даже если часы машины отступили.
 // Часы отступили немного (подстройка NTP) — подписи не идут назад. Часы
 // убежали вперёд, и их поправили — подписи снова берут текущее время, а не
 // застревают на убежавшем навсегда (и после перезапуска).

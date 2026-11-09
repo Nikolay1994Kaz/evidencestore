@@ -991,7 +991,7 @@ func (r SourceReport) Notes() []string {
 	case len(r.Cosigned) == 0:
 		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the chain: a rewrite after the lower time-stamp needs a fresh upper one, and a T2 more than an hour after the window is a sign of it; a witness (esverify -heads or -witness-key) catches one made sooner")
 	}
-	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this part", time.Time{})...)
+	return append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this part", "T2", r.Upper)...)
 }
 
 // Text — отчёт человеческим языком, как у пакета за окно: всё из пакета —

@@ -100,7 +100,8 @@ type Config struct {
 	// Listen — адрес приёма голов, например 127.0.0.1:8444.
 	Listen string `json:"listen"`
 	// DataDir — ключ свидетеля (witness.key), состояние журналов (state/),
-	// журнал отказов (refused.jsonl), замок (LOCK).
+	// журнал подписанного (cosigned.jsonl), журнал отказов (refused.jsonl),
+	// замок (LOCK).
 	DataDir string `json:"data_dir"`
 	// TLS — сертификат и ключ HTTPS. Нет — обычный HTTP (за прокси с TLS):
 	// подпись свидетеля от транспорта не зависит.

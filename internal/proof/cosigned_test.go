@@ -205,6 +205,46 @@ func TestCosignedWindowAndSource(t *testing.T) {
 	}
 }
 
+// Пакет за окно и по источнику: закрепляющая голова лежит после токена T2,
+// и подпись со временем раньше T2 значит, что часы свидетеля отставали.
+func TestCosignedClockBehindNotedWindowAndSource(t *testing.T) {
+	s := cosigner(t, "witness.example/w1")
+	ww := windowWorld(t, nil, nil) // звенья 1..3, StretchEnd = 3
+	wb := ww.window(1, 3, at(10, 4, 0), at(10, 6, 0))
+	t2 := VerifyWindow(wb, cosignTrust(ww), time.Time{}, time.Time{}).Upper
+	if t2.IsZero() {
+		t.Fatal("в пакете за окно нет T2")
+	}
+	for _, c := range []struct {
+		at     time.Time
+		behind bool
+	}{{t2.Add(-time.Hour), true}, {t2.Add(time.Second), false}} {
+		wb.Cosignatures = []Cosignature{ww.cosigned(s, 3, ww.root(3), c.at)}
+		r := VerifyWindow(wb, cosignTrust(ww, s), time.Time{}, time.Time{})
+		if !r.Valid() || strings.Contains(r.Text(), "its clock was behind") != c.behind {
+			t.Fatalf("окно, подпись в %s при T2 %s:\n%s", c.at, t2, r.Text())
+		}
+	}
+
+	sw := newSrcWorld(t, srcOpts{})
+	sb := sw.bundle(at(10, 4, 0), at(10, 6, 0))
+	t2 = VerifySource(sb, cosignTrust(sw.world), time.Time{}, time.Time{}).Upper
+	if t2.IsZero() {
+		t.Fatal("в пакете по источнику нет T2")
+	}
+	end := sb.Checkpoint.Size
+	for _, c := range []struct {
+		at     time.Time
+		behind bool
+	}{{t2.Add(-time.Hour), true}, {t2.Add(time.Second), false}} {
+		sb.Cosignatures = []Cosignature{sw.cosigned(s, end, sw.root(end), c.at)}
+		r := VerifySource(sb, cosignTrust(sw.world, s), time.Time{}, time.Time{})
+		if !r.Valid() || strings.Contains(r.Text(), "its clock was behind") != c.behind {
+			t.Fatalf("источник, подпись в %s при T2 %s:\n%s", c.at, t2, r.Text())
+		}
+	}
+}
+
 // Заметка точки — та, что примет свидетель: текст, пустая строка, подпись
 // хранилища, которая сходится.
 func TestCheckpointNote(t *testing.T) {

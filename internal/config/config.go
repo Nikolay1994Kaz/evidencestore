@@ -94,12 +94,21 @@ type Cosigner struct {
 	// печатает eswitness vkey. Берётся у владельца свидетеля: им хранилище
 	// проверяет каждую подпись до того, как положить её в журнал.
 	Key string `json:"key"`
+	// OldKeys — прежние ключи этого свидетеля (он начат заново с новым
+	// ключом). Головы им не уходят, а их подписи из журнала подписей идут в
+	// пакеты по-прежнему: аудитор, закрепивший прежний ключ, проверяет им
+	// историю до смены.
+	OldKeys []string `json:"old_keys"`
 	// CA — сертификаты УЦ для HTTPS свидетеля (PEM). Пусто — системные.
 	CA string `json:"ca"`
 }
 
 // MaxCosigners — предел свидетелей C2SP: каждый — запрос на каждую голову.
 const MaxCosigners = 8
+
+// MaxOldKeys — предел прежних ключей у свидетеля: каждый — ещё подпись в
+// каждом пакете.
+const MaxOldKeys = 4
 
 // TLS — сертификаты приёма.
 type TLS struct {
@@ -426,17 +435,41 @@ func (c *Config) Validate() error {
 }
 
 // validateCosigners — свидетели C2SP: адрес http(s), ключ проверки
-// разбирается, имена не повторяются.
+// разбирается, имена не повторяются; прежние ключи разбираются, и ни один
+// ключ (имя и номер, или сам ключ) не встречается дважды.
 func (c *Config) validateCosigners() []error {
 	var errs []error
 	if len(c.Witness.Cosigners) > MaxCosigners {
 		errs = append(errs, fmt.Errorf("witness.cosigners: %d witnesses, at most %d", len(c.Witness.Cosigners), MaxCosigners))
 	}
 	names := map[string]bool{}
+	type keyID struct {
+		name string
+		id   uint32
+	}
+	ids, keys := map[keyID]bool{}, map[string]bool{}
+	seen := func(i int, v cosign.Verifier) error {
+		if ids[keyID{v.Name, v.ID}] || keys[string(v.Key)] {
+			return fmt.Errorf("witness.cosigners[%d]: key %s+%08x is listed twice", i, v.Name, v.ID)
+		}
+		ids[keyID{v.Name, v.ID}], keys[string(v.Key)] = true, true
+		return nil
+	}
 	for i, w := range c.Witness.Cosigners {
 		u, err := url.Parse(w.URL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
 			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: url %q must be http:// or https:// with a host, without a query: the store posts to <url>/add-checkpoint", i, w.URL))
+		}
+		if len(w.OldKeys) > MaxOldKeys {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: %d old_keys, at most %d", i, len(w.OldKeys), MaxOldKeys))
+		}
+		for j, k := range w.OldKeys {
+			v, err := cosign.ParseVerifier(k)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("witness.cosigners[%d].old_keys[%d]: %w", i, j, err))
+			} else if err := seen(i, v); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		v, err := cosign.ParseVerifier(w.Key)
 		if err != nil {
@@ -445,6 +478,8 @@ func (c *Config) validateCosigners() []error {
 		}
 		if names[v.Name] {
 			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: witness %s is listed twice", i, v.Name))
+		} else if err := seen(i, v); err != nil {
+			errs = append(errs, err)
 		}
 		names[v.Name] = true
 	}

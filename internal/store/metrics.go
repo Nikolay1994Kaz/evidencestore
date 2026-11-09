@@ -74,7 +74,7 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 	fams = append(fams, records, last, silent, lost, contact, dups, conflicts, noSubject, epochs, gw)
 	if len(st.Cosigners) > 0 {
 		head := metrics.Family{Name: "evidencestore_cosigner_head", Help: "the last head the C2SP witness cosigned for this store, 0 if none known", Type: metrics.Gauge}
-		ok := metrics.Family{Name: "evidencestore_cosigner_last_success_timestamp_seconds", Help: "when the C2SP witness last returned a cosignature that verified, 0 if none since start", Type: metrics.Gauge}
+		ok := metrics.Family{Name: "evidencestore_cosigner_last_success_timestamp_seconds", Help: "when the C2SP witness last returned a cosignature that verified (after a start: the time its last cosignature in the journal carries), 0 if none", Type: metrics.Gauge}
 		errs := metrics.Family{Name: "evidencestore_cosigner_errors_total", Help: "failed rounds of sending heads to the C2SP witness", Type: metrics.Counter}
 		refused := metrics.Family{Name: "evidencestore_cosigner_refused", Help: "1 when the C2SP witness refused the consistency proof from the last head it cosigned: it holds another history of this store's chain", Type: metrics.Gauge}
 		lost := metrics.Family{Name: "evidencestore_cosigner_lost_state", Help: "1 when the C2SP witness reports an older head than it cosigned for this store: it lost its state and would cosign a second history under the same key", Type: metrics.Gauge}

@@ -437,7 +437,7 @@ func (r Report) Notes() []string {
 	case len(r.Cosigned) == 0:
 		n = append(n, "the store's signature proves that THIS store signed the head; only a TSA time-stamp stands against its owner rewriting the whole chain")
 	}
-	n = append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this record", r.Lower)...)
+	n = append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this record", "T1", r.Lower)...)
 	n = append(n, "what is proven is that these bytes came from the source and have not changed, not that their content is true")
 	return n
 }

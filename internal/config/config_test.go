@@ -173,6 +173,12 @@ func TestValidateCosigners(t *testing.T) {
 		"с запросом": {{URL: "https://w.example/?a=1", Key: key}},
 		"не ключ":    {{URL: "https://w.example/", Key: "witness.example/w1"}},
 		"дважды":     {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: key}},
+		// Прежний ключ — не ключ, тот же, что текущий, или текущий другого
+		// свидетеля; больше предела.
+		"прежний не ключ":     {{URL: "https://w.example/", Key: key, OldKeys: []string{"witness.example/w1"}}},
+		"прежний = текущий":   {{URL: "https://w.example/", Key: key, OldKeys: []string{key}}},
+		"прежний у другого":   {{URL: "https://a.example/", Key: other(t)}, {URL: "https://b.example/", Key: rekey(t, "witness.example/w3"), OldKeys: []string{key}}, {URL: "https://c.example/", Key: key}},
+		"прежних больше пяти": {{URL: "https://w.example/", Key: key, OldKeys: []string{rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1")}}},
 	}
 	// Девять разных свидетелей — больше предела, даже без повторов.
 	var nine []Cosigner
@@ -195,6 +201,21 @@ func TestValidateCosigners(t *testing.T) {
 	if errs := good.validateCosigners(); len(errs) != 0 {
 		t.Fatal(errs)
 	}
+	// Свидетель начат заново с новым ключом: прежний — в old_keys.
+	good.Witness.Cosigners[0] = Cosigner{URL: "https://w.example/", Key: rekey(t, "witness.example/w1"), OldKeys: []string{key, rekey(t, "witness.example/w1-before")}}
+	if errs := good.validateCosigners(); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+}
+
+// rekey — новый ключ проверки свидетеля name.
+func rekey(t *testing.T, name string) string {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	s, err := cosign.NewSigner(name, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Verifier().String()
 }
 
 func other(t *testing.T) string {

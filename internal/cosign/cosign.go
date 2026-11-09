@@ -63,10 +63,18 @@ func decode64(s string) ([]byte, error) {
 	return b, nil
 }
 
-// ValidName — имя ключа или происхождения: непустое, не длиннее 255 байт, в
-// UTF-8, без пробелов Unicode, плюса и управляющих символов.
+// ValidName — имя свидетеля или происхождения (tlog-cosignature,
+// tlog-checkpoint): имя ключа signed-note не длиннее 255 байт.
 func ValidName(name string) bool {
-	if name == "" || len(name) > MaxNameLen || !utf8.ValidString(name) {
+	return len(name) <= MaxNameLen && validKeyName(name)
+}
+
+// validKeyName — имя ключа signed-note: непустое, в UTF-8, без пробелов
+// Unicode, плюса и управляющих символов. Длину signed-note не ограничивает:
+// строку подписи чужого ключа с длинным именем нужно пропустить, а не
+// отвергнуть всю заметку.
+func validKeyName(name string) bool {
+	if name == "" || !utf8.ValidString(name) {
 		return false
 	}
 	for _, r := range name {
@@ -254,7 +262,7 @@ func ParseSigLine(line string) (name string, sig []byte, err error) {
 		return "", nil, errors.New("a signature line starts with an em dash and a space")
 	}
 	name, enc, ok := strings.Cut(rest, " ")
-	if !ok || !ValidName(name) {
+	if !ok || !validKeyName(name) {
 		return "", nil, errors.New("a signature line names no valid key")
 	}
 	if sig, err = decode64(enc); err != nil || len(sig) < 4 {

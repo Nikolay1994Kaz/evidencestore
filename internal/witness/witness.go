@@ -181,11 +181,17 @@ func New(signer cosign.Signer, logs []Log, dir string, log *slog.Logger) (*Serve
 			return nil, err
 		}
 	}
+	// Только что заведённый журнал не пропадёт при падении вместе с записью
+	// каталога: fsync каталога данных.
+	if err := syncDir(dir); err != nil {
+		s.ledger.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
 // newKeyAdvice — что делать свидетелю, который не помнит, что подписал.
-const newKeyAdvice = "start a new witness with a new key (eswitness init with a new data_dir) and give its verifier key to the store and to auditors; cosignatures of this key stay valid for the history they cover"
+const newKeyAdvice = "start a new witness with a new key (eswitness init with a new data_dir) and give its verifier key to the store and to auditors; cosignatures of this key stay valid for the history they cover, and the store keeps putting them into bundles when this key moves to the witness's old_keys"
 
 // readLedger — последняя подписанная голова каждого журнала по журналу
 // подписанного и длина его целых строк. Оборванная последняя строка (падение
@@ -496,6 +502,9 @@ func (s *Server) refuse(ev refusal) {
 			f.Truncate(size) // недописанная строка не склеится со следующей
 		}
 		err = errors.Join(err, f.Close())
+		if err == nil && size == 0 {
+			err = syncDir(s.dir) // первая строка: файл только что заведён
+		}
 	}
 	if err != nil {
 		s.log.Error("witness: writing the refusal journal", "err", err)
