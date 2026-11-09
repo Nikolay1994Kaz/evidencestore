@@ -24,7 +24,7 @@ import (
 
 // revocations — сведения об отзыве на момент now: CRL корня службы a с
 // записями (сертификат службы — серийный номер её сертификата).
-func revocations(t *testing.T, a *tsa.Authority, now time.Time, entries ...x509.RevocationListEntry) *tsa.Revocations {
+func revocations(t testing.TB, a *tsa.Authority, now time.Time, entries ...x509.RevocationListEntry) *tsa.Revocations {
 	t.Helper()
 	der, err := a.RevocationList(now.Add(-time.Hour), now.Add(time.Hour), entries...)
 	if err != nil {
@@ -42,7 +42,7 @@ func revocations(t *testing.T, a *tsa.Authority, now time.Time, entries ...x509.
 }
 
 // compromised — сертификат службы a отозван по компрометации ключа в at.
-func compromised(t *testing.T, a *tsa.Authority, at, now time.Time) *tsa.Revocations {
+func compromised(t testing.TB, a *tsa.Authority, at, now time.Time) *tsa.Revocations {
 	return revocations(t, a, now, x509.RevocationListEntry{SerialNumber: a.Cert().SerialNumber, RevocationTime: at, ReasonCode: tsa.ReasonKeyCompromise})
 }
 

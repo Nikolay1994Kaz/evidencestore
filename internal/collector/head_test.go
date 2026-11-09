@@ -602,7 +602,7 @@ func TestTornHeadLineIsCut(t *testing.T) {
 	if err := os.WriteFile(journal, append(append([]byte(nil), whole...), whole[:len(whole)/2]...), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c = r.collector(t)
+	r.collector(t) // запуск отрезает обрывок
 	if data, _ := os.ReadFile(journal); string(data) != string(whole) {
 		t.Fatalf("обрывок не отрезан:\n%q", data)
 	}

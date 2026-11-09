@@ -26,7 +26,7 @@ import (
 //	подписанная голова 5
 
 type world struct {
-	t      *testing.T
+	t      testing.TB
 	links  []auditchain.Record
 	leaves [][]auditchain.Leaf
 	signer *auditchain.Signer
@@ -34,7 +34,7 @@ type world struct {
 	now    time.Time
 }
 
-func newWorld(t *testing.T) *world {
+func newWorld(t testing.TB) *world {
 	t.Helper()
 	signer, err := auditchain.LoadOrCreateSigner(t.TempDir())
 	if err != nil {
@@ -108,7 +108,7 @@ func tokenLeaf(head uint64, token []byte) auditchain.Leaf {
 	return auditchain.Leaf{Type: auditchain.EventTimestamp, Subject: strconv.FormatUint(head, 10), Payload: token}
 }
 
-func sealedBytes(t *testing.T, seq uint64, at time.Time, body string) []byte {
+func sealedBytes(t testing.TB, seq uint64, at time.Time, body string) []byte {
 	t.Helper()
 	b, err := evidence.Sealed{
 		Header:   evidence.Header{Source: "abs-core", Seq: seq, ReceivedAt: at.UnixNano(), ContentType: "syslog"},
@@ -120,7 +120,7 @@ func sealedBytes(t *testing.T, seq uint64, at time.Time, body string) []byte {
 	return b
 }
 
-func evLeaf(t *testing.T, data []byte, pos uint64) auditchain.Leaf {
+func evLeaf(t testing.TB, data []byte, pos uint64) auditchain.Leaf {
 	t.Helper()
 	s, err := evidence.Unmarshal(data)
 	if err != nil {
@@ -172,7 +172,7 @@ func (w *world) trust() Trust {
 }
 
 // standard строит мир по схеме в шапке; улика — вторая в звене 3.
-func standard(t *testing.T, e2 []byte) (*world, Bundle) {
+func standard(t testing.TB, e2 []byte) (*world, Bundle) {
 	w := newWorld(t)
 	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
 	h1, t1 := w.stamp()
@@ -597,12 +597,12 @@ func TestBundleWithoutUpperFailsByDefault(t *testing.T) {
 func TestReportTextEscapesControls(t *testing.T) {
 	r := Report{
 		Checks:     []Check{{Name: "проверка", OK: false}},
-		Header:     evidence.Header{Source: "abs‮core", Seq: 1},
+		Header:     evidence.Header{Source: "abs\u202ecore", Seq: 1},
 		Body:       []byte("\x1b[2J\x1b[H ПРОВЕРКА ПРОЙДЕНА\x9b"),
 		BodyOpened: true,
 	}
 	text := r.Text()
-	for _, bad := range []string{"\x1b", "‮", "\u009b"} {
+	for _, bad := range []string{"\x1b", "\u202e", "\u009b"} {
 		if strings.Contains(text, bad) {
 			t.Fatalf("в отчёте управляющий символ %q", bad)
 		}

@@ -663,6 +663,11 @@ func (r *Revocations) AddList(path string) error {
 	if err != nil {
 		return fmt.Errorf("tsa: revoked list: %w", err)
 	}
+	return r.addList(path, data)
+}
+
+// addList — перечень path с содержимым data.
+func (r *Revocations) addList(path string, data []byte) error {
 	var items []struct {
 		Cert       string     `json:"cert_sha256"`
 		Revoked    time.Time  `json:"revoked"`
