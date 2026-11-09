@@ -134,6 +134,9 @@ type SourceBundle struct {
 	// Archive — метки второй службы над головами не раньше токенов пакета
 	// (revoked.go).
 	Archive []ArchiveStamp `json:"archive,omitempty"`
+	// Seal — печать организации на ключ хранилища (seal.go): с ней
+	// проверяющему довольно корня центра её сертификата. Необязательное.
+	Seal *StoreSeal `json:"store_seal,omitempty"`
 }
 
 // ParseSource разбирает пакет по источнику.
@@ -264,6 +267,7 @@ func (r SourceReport) Verdict() string {
 // VerifySource проверяет пакет по источнику. from, to — окно аудитора; оба
 // нуля — сверка с окном из пакета. Итог — Valid().
 func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport {
+	trust = trust.withSealedKey(b.Seal)
 	r := SourceReport{Source: b.Source, From: from, To: to, LowerHead: b.Lower.Head, UpperHead: b.Upper.Head}
 	if from.IsZero() && to.IsZero() {
 		r.From, r.To, r.FromBundle = b.From, b.To, true
@@ -297,6 +301,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	r.HeadSeq = b.Checkpoint.Size
 	add("the head is signed with the store key", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt), fmt.Sprintf("head %d", b.Checkpoint.Size))
 	sc := newStampCheck(trust)
+	sc.checkSeal(b.Seal, trust)
 
 	// 3. Нижний край: хвосты — единственный лист звена, которое заверила
 	// нижняя метка; с начала цепи — первое звено и нули.

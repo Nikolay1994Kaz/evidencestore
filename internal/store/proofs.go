@@ -201,6 +201,7 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	if b.Archive, err = s.archiveForLocked(tokens, links[len(links)-1].Seq); err != nil {
 		return proof.Bundle{}, err
 	}
+	b.Seal = s.bundleSeal()
 
 	if withDEK {
 		sealed, err := evidence.Unmarshal(data)
@@ -326,6 +327,8 @@ type Status struct {
 	Cosigners []CosignerStatus `json:"cosigners,omitempty"`
 	// TSAArchive — вторая служба меток (tsa.archive), nil — её нет.
 	TSAArchive *ArchiveStatus `json:"tsa_archive,omitempty"`
+	// Seal — печать организации на ключ хранилища (seal.file), nil — её нет.
+	Seal *SealStatus `json:"seal,omitempty"`
 }
 
 func (s *Store) Status() Status {
@@ -367,6 +370,7 @@ func (s *Store) Status() Status {
 	}
 	out.Cosigners = s.cosignerStatus()
 	out.TSAArchive = s.archiveStatus()
+	out.Seal = s.sealStatus()
 	return out
 }
 

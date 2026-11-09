@@ -59,8 +59,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("esverify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	proofPath := fs.String("proof", "", "proof bundle (JSON)")
-	storeKey := fs.String("store-key", "", "pinned store public key (base64) or file containing it")
+	storeKey := fs.String("store-key", "", "pinned store public key (base64) or file containing it; may be left out with -seal-trust")
 	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM): the roots, and any other certificates of the TSAs and their CAs you hold — one issued again on the same key too, so that its revocation counts for the key")
+	sealTrust := fs.String("seal-trust", "", "certificates, comma-separated (DER or PEM), of the CA that issued the X.509 certificate the store's owner sealed the store key with: the bundle's seal (seal.file of the store) then vouches for the store key, and without -store-key the key is taken from it")
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
 	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
 	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them; with the S3 versions list next to them (aws s3api list-object-versions > DIR/versions.json) or a collector's head journal, each witness fixes the record with the head it received first (give each collector a subdirectory of its own)")
@@ -97,8 +98,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	windowTo := fs.String("to", "", "bundle over a window of time: the end of your window (RFC 3339)")
 	bodiesDir := fs.String("bodies", "", "bundle over a window of time: once it verifies, write every opened body to DIR/<source>-<seq> exactly as the source sent it")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: esverify -proof FILE -store-key KEY -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
-		fmt.Fprintln(stderr, "       esverify -proof WINDOW -store-key KEY -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE (-store-key KEY | -seal-trust CERT[,CERT]) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
+		fmt.Fprintln(stderr, "       esverify -proof WINDOW (-store-key KEY | -seal-trust CERT[,CERT]) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
 		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
@@ -115,19 +116,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return exitUsage
 	}
-	if *proofPath == "" || *storeKey == "" || *tsaTrust == "" {
+	if *proofPath == "" || *tsaTrust == "" || *storeKey == "" && *sealTrust == "" {
 		fs.Usage()
 		return exitUsage
 	}
-	key, err := readKey(*storeKey)
-	if err != nil {
-		return usageErr(err)
+	var key ed25519.PublicKey
+	var err error
+	if *storeKey != "" {
+		if key, err = readKey(*storeKey); err != nil {
+			return usageErr(err)
+		}
 	}
 	trust, err := tsa.LoadTrust(*tsaTrust)
 	if err != nil {
 		return usageErr(err)
 	}
 	pt := proof.Trust{StoreKey: key, TSA: trust, AllowNoTSA: *allowNoTSA}
+	if *sealTrust != "" {
+		st, err := tsa.LoadTrust(*sealTrust)
+		if err != nil {
+			return usageErr(fmt.Errorf("-seal-trust: %w", err))
+		}
+		pt.SealTrust = &st
+	}
 	if len(tsaCRLs) > 0 || len(tsaRevoked) > 0 {
 		// Свежесть CRL — на момент проверки: отзыв, случившийся после
 		// thisUpdate, в старом CRL не виден.
@@ -161,6 +172,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if *headsDir != "" {
 		if pt.Witness, err = readHeads(*headsDir); err != nil {
 			return usageErr(fmt.Errorf("heads: %w", err))
+		}
+	}
+	data, err := os.ReadFile(*proofPath)
+	if err != nil {
+		return usageErr(err)
+	}
+	if key == nil {
+		// Ключ — из печати пакета, проверенной корнями -seal-trust. Не
+		// сошлась — ключа нет, и отчёт скажет почему (пункт о печати).
+		now := time.Now()
+		if pt.TSARevocations != nil {
+			now = pt.TSARevocations.Now
+		}
+		if k, err := proof.SealedKey(proof.BundleSeal(data), *pt.SealTrust, trust, now); err == nil {
+			key = k
+			pt.StoreKey = k
 		}
 	}
 	seenKey := map[string]string{}
@@ -204,10 +231,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err := json.Unmarshal(data, promise); err != nil {
 			return usageErr(fmt.Errorf("promise file %s: %w", *promisePath, err))
 		}
-	}
-	data, err := os.ReadFile(*proofPath)
-	if err != nil {
-		return usageErr(err)
 	}
 	// Пакеты за окно — своими правилами; флаги пакета одной улики к ним не
 	// подходят, и наоборот.

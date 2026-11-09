@@ -74,6 +74,7 @@ type stampCheck struct {
 	beyond    []beyondCosig   // подписи свидетелей дальше конца пакета: куда его продлить
 	named     map[string]bool // CRL, которые назвал центр в цепочке какой-то метки
 	notes     []string
+	seal      *sealCheck // печать на ключ хранилища (seal.go); nil — не сверяется
 }
 
 // ownStamp — своя метка пакета в оценке: номер в ней, где лежит токен и как
@@ -202,6 +203,7 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 		if sc.tokens > 0 {
 			sc.notes = append(sc.notes, RevocationNotChecked)
 		}
+		sc.finishSeal(nil, add)
 		return
 	}
 	sc.ensureAssessment()
@@ -291,6 +293,7 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 			sc.notes = append(sc.notes, l+" is of no CA in the chains of the time-stamps checked in this bundle: not used")
 		}
 	}
+	sc.finishSeal(vs, add)
 }
 
 // markNamed — CRL, к которым относится хоть один сертификат меток пакета.

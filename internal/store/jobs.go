@@ -54,6 +54,7 @@ func (s *Store) startBackground() {
 	}
 	s.startCosignLoops()
 	s.startArchiveLoop()
+	s.startSealLoop()
 	s.loop(time.Minute, func() { s.Maintain(s.nowTime()) })
 	s.loop(10*time.Second, func() {
 		now := s.nowTime()

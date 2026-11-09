@@ -46,12 +46,21 @@ type Config struct {
 	Keys    Keys     `json:"keys"`
 	Replica Replica  `json:"replica"`
 	Witness Witness  `json:"witness"`
+	Seal    Seal     `json:"seal"`
 	Sources []Source `json:"sources"`
 
 	// Demo — стенд для показа: разрешает короткие сроки (keys.min_wait меньше
 	// часа), чтобы уничтожение ключа уложилось в демо. В бою — никогда:
 	// окно отмены уничтожения тогда — секунды.
 	Demo bool `json:"demo"`
+}
+
+// Seal — печать организации на ключ хранилища (docs/keys.md): заявление,
+// которое печатает evidencestore seal-statement, с печатью сертификатом X.509
+// организации (CMS SignedData, содержимое внутри: openssl cms -sign -nodetach).
+type Seal struct {
+	// File — печать, DER или PEM. Пусто — печати нет.
+	File string `json:"file"`
 }
 
 // Replica — копия журнала улик и цепи наружу (S3 или каталог). keyring.dat
@@ -290,6 +299,7 @@ func (c *Config) resolve(base string) {
 	for i := range c.Witness.Cosigners {
 		abs(&c.Witness.Cosigners[i].CA)
 	}
+	abs(&c.Seal.File)
 }
 
 // Defaults подставляет значения по умолчанию.

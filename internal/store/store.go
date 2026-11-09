@@ -259,6 +259,11 @@ type Store struct {
 	// tsaKey — SHA-256 ключа основной службы по её последней метке: вторая
 	// служба с тем же ключом — та же служба.
 	tsaKey atomic.Pointer[[32]byte]
+	// sealCMS — печать организации на ключ хранилища (seal.file; seal.go),
+	// sealBy — кто её поставил, sealToken — метка над ней (nil — ещё нет).
+	sealCMS   []byte
+	sealBy    string
+	sealToken atomic.Pointer[[]byte]
 	// archiveOn — журнал меток второй службы открыт (с tsa.archive или
 	// оставшийся после неё); не меняется после открытия.
 	archiveOn bool
@@ -840,6 +845,9 @@ func (s *Store) open() error {
 		return err
 	}
 	if err := s.openArchive(); err != nil {
+		return err
+	}
+	if err := s.openSeal(); err != nil {
 		return err
 	}
 	s.appendEvent(auditchain.EventStart, "", "", []byte(s.signer.PublicKeyString()))

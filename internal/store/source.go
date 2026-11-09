@@ -425,6 +425,7 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	if b.Archive, err = s.archiveFor(tokens, links[len(links)-1].Seq); err != nil {
 		return proof.SourceBundle{}, err
 	}
+	b.Seal = s.bundleSeal()
 	return b, nil
 }
 

@@ -101,6 +101,9 @@ type WindowBundle struct {
 	// Archive — метки второй службы над головами не раньше меток участка
 	// (revoked.go).
 	Archive []ArchiveStamp `json:"archive,omitempty"`
+	// Seal — печать организации на ключ хранилища (seal.go): с ней
+	// проверяющему довольно корня центра её сертификата. Необязательное.
+	Seal *StoreSeal `json:"store_seal,omitempty"`
 }
 
 // WindowRecord — улика с участка и ключ её записи. Ключа нет — ключ месяца
@@ -253,6 +256,7 @@ type windowStamp struct {
 // VerifyWindow проверяет пакет за окно. from, to — окно аудитора; оба нуля —
 // сверка с окном из пакета (отчёт об этом говорит). Итог — Valid().
 func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport {
+	trust = trust.withSealedKey(b.Seal)
 	r := WindowReport{From: from, To: to, LowerHead: b.LowerHead, StretchEnd: b.StretchEnd, Leaves: len(b.Leaves)}
 	if from.IsZero() && to.IsZero() {
 		r.From, r.To, r.FromBundle = b.From, b.To, true
@@ -300,6 +304,7 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 
 	// 4. Токены всех меток участка сходятся с заверенными головами.
 	sc := newStampCheck(trust)
+	sc.checkSeal(b.Seal, trust)
 	stamps, err := windowStamps(leaves, stretch, linkAt, sc)
 	if !add("every TSA time-stamp in the stretch verifies", err, fmt.Sprintf("%d time-stamps", len(stamps))) {
 		return r

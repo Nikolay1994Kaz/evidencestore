@@ -71,6 +71,8 @@ func main() {
 		err = cmdProof(args)
 	case "tsa-root":
 		err = cmdTSARoot(args)
+	case "seal-statement":
+		err = cmdSealStatement(args)
 	case "keys":
 		err = cmdKeys(args)
 	case "sources":
@@ -123,6 +125,9 @@ Operator (talks to the running server via its admin socket):
                                                investigation inside the organization; -source S -dek
                                                attaches that source's records with their record keys
   tsa-root  -config FILE -out FILE             root certificate of the built-in demo TSA
+  seal-statement -config FILE [-out FILE]      the statement your organization seals with its X.509
+                                               certificate (openssl cms -sign -nodetach …) for seal.file:
+                                               auditors then check the store key by the root of its CA
   keys list|due      -config FILE
   keys deactivate    -config FILE -scope S [-force]
   keys schedule      -config FILE -scope S -approve A -approve B [-wait 168h]
@@ -321,6 +326,24 @@ func cmdProof(args []string) error {
 		return err
 	}
 	return output(*out, body)
+}
+
+func cmdSealStatement(args []string) error {
+	fs := flag.NewFlagSet("seal-statement", flag.ExitOnError)
+	out := fs.String("out", "", "write the statement to FILE (default: stdout)")
+	cfg, err := loadConfig(fs, args)
+	if err != nil {
+		return err
+	}
+	text, err := store.SealStatement(cfg)
+	if err != nil {
+		return err
+	}
+	if *out == "" {
+		_, err = os.Stdout.Write(text)
+		return err
+	}
+	return os.WriteFile(*out, text, 0o644)
 }
 
 func cmdTSARoot(args []string) error {

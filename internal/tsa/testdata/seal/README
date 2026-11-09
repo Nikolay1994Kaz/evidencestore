@@ -1,0 +1,12 @@
+Печать от openssl (независимая от Go запись) для TestSealOpenSSL. Сделано так (openssl 3.0):
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -subj "/CN=seal fixture CA" -days 7000 \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" -addext "basicConstraints=critical,CA:TRUE"
+  openssl req -newkey rsa:2048 -nodes -keyout org.key -out org.csr -subj "/O=Example Bank/CN=Example Bank seal"
+  openssl x509 -req -in org.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out org.crt -days 6000 \
+    -extfile <(printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,nonRepudiation\n')
+  openssl cms -sign -binary -nodetach -md sha256 -in statement.txt -signer org.crt -inkey org.key -outform DER -out seal.p7s
+  openssl cms -sign -nodetach -md sha256 -in statement.txt -signer org.crt -inkey org.key -outform DER -out seal-crlf.p7s
+  openssl cms -sign -binary -md sha256 -in statement.txt -signer org.crt -inkey org.key -outform DER -out detached.p7s
+seal-crlf.p7s — без -binary: openssl переводит строки в CRLF (каноническая форма S/MIME).
+detached.p7s — содержимое снаружи: такая печать не принимается.
+Ключи не сохранены: тест только разбирает печать и сверяет подпись и цепочку.

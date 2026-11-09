@@ -157,6 +157,7 @@ func (s *Store) ProofWindow(from, to time.Time, source string, withDEK bool, toH
 	if b.Archive, err = s.archiveForStretch(lowerHead, b.StretchEnd, links[len(links)-1].Seq); err != nil {
 		return proof.WindowBundle{}, err
 	}
+	b.Seal = s.bundleSeal()
 	if source != "" {
 		b.KeysFor = source
 		// Листья и звенья от ключей не зависят: заново — только улики (P-86).

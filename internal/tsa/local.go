@@ -185,6 +185,61 @@ func (a *Authority) WithoutCert() { a.noCert = true }
 // (служба может класть всю цепочку и прежние сертификаты ключа): тесты.
 func (a *Authority) Carry(certs ...*x509.Certificate) { a.carry = append(a.carry, certs...) }
 
+// Seal ставит печать на content: CMS SignedData с содержимым внутри, подпись
+// ключом key, сертификат cert (и extra — промежуточные) в печати, signingTime
+// — at. Для тестов и учебного стенда: печать организации ставится её
+// средствами (openssl cms -sign -nodetach, NCALayer).
+func Seal(key crypto.Signer, cert *x509.Certificate, extra []*x509.Certificate, content []byte, at time.Time) ([]byte, error) {
+	digest := sha256.Sum256(content)
+	attrs, err := attributesSet(attr(oidContentType, oidData), attr(oidMessageDigst, digest[:]), attr(oidSigningTime, at.UTC()))
+	if err != nil {
+		return nil, err
+	}
+	attrsDigest := sha256.Sum256(attrs)
+	sig, err := key.Sign(rand.Reader, attrsDigest[:], crypto.SHA256)
+	if err != nil {
+		return nil, err
+	}
+	sigAlg := x509.SHA256WithRSA
+	if _, ok := key.(*ecdsa.PrivateKey); ok {
+		sigAlg = x509.ECDSAWithSHA256
+	}
+	si, err := asn1.Marshal(struct {
+		Version            int
+		SID                issuerAndSerial
+		DigestAlgorithm    pkix.AlgorithmIdentifier
+		SignedAttrs        asn1.RawValue
+		SignatureAlgorithm pkix.AlgorithmIdentifier
+		Signature          []byte
+	}{
+		Version:            1,
+		SID:                issuerAndSerial{Issuer: asn1.RawValue{FullBytes: cert.RawIssuer}, Serial: cert.SerialNumber},
+		DigestAlgorithm:    pkix.AlgorithmIdentifier{Algorithm: oidSHA256},
+		SignedAttrs:        asn1.RawValue{FullBytes: append([]byte{0xA0}, attrs[1:]...)},
+		SignatureAlgorithm: pkix.AlgorithmIdentifier{Algorithm: sigAlgOID(sigAlg)},
+		Signature:          sig,
+	})
+	if err != nil {
+		return nil, err
+	}
+	eContent, _ := asn1.Marshal(content)
+	dataType, _ := asn1.Marshal(oidData)
+	version, _ := asn1.Marshal(1)
+	digestAlgs, _ := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: oidSHA256})
+	var certs []byte
+	for _, c := range append([]*x509.Certificate{cert}, extra...) {
+		certs = append(certs, c.Raw...)
+	}
+	var sd []byte
+	sd = append(sd, version...)
+	sd = append(sd, tlv(0x31, digestAlgs)...)
+	sd = append(sd, tlv(0x30, append(dataType, tlv(0xA0, eContent)...))...)
+	sd = append(sd, tlv(0xA0, certs)...)
+	sd = append(sd, tlv(0x31, si)...)
+	sdType, _ := asn1.Marshal(oidSignedData)
+	return tlv(0x30, append(sdType, tlv(0xA0, tlv(0x30, sd))...)), nil
+}
+
 // AuthorityWith — служба с готовым ключом и сертификатом (выпущенным root или
 // центром под ним): тесты отзыва со своим УЦ. Токен несёт только сертификат
 // службы, промежуточные центры проверяющий берёт из своего доверия.

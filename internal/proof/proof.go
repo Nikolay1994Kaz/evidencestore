@@ -252,6 +252,9 @@ type Bundle struct {
 	// (revoked.go): POE для меток основной, если её сертификат отзовут по
 	// компрометации. Необязательное, как и Cosignatures.
 	Archive []ArchiveStamp `json:"archive,omitempty"`
+	// Seal — печать организации на ключ хранилища (seal.go): с ней
+	// проверяющему довольно корня центра её сертификата. Необязательное.
+	Seal *StoreSeal `json:"store_seal,omitempty"`
 }
 
 // StretchLeaf — лист участка: целиком (Leaf) или только хешем листа (Hash,
@@ -342,6 +345,11 @@ type Trust struct {
 	// меток (esverify -tsa-crl, -tsa-revoked; revoked.go). nil — отзыв не
 	// сверяется, и отчёт об этом говорит.
 	TSARevocations *tsa.Revocations
+	// SealTrust — корни (и промежуточные) центров, чьим сертификатом
+	// организация ставит печать на ключ хранилища (esverify -seal-trust;
+	// seal.go). nil — печать не сверяется. Без StoreKey ключ хранилища
+	// берётся из печати, проверенной этими корнями: закреплён тогда корень.
+	SealTrust *tsa.Trust
 }
 
 // Check — один пункт отчёта.
@@ -463,6 +471,7 @@ func (r Report) Notes() []string {
 // Verify проверяет пакет. Возвращает отчёт всегда; ошибка — только если
 // пакет даже не разбирается. Итог — Report.Valid().
 func Verify(b Bundle, trust Trust) Report {
+	trust = trust.withSealedKey(b.Seal)
 	var r Report
 	add := func(name string, err error, detail string) bool {
 		c := Check{Name: name, OK: err == nil, Detail: detail}
@@ -523,6 +532,7 @@ func Verify(b Bundle, trust Trust) Report {
 	// 6. Верхняя граница: TSA заверила голову m ≥ n. Без неё пакет — только
 	// слово хранилища: держатель ключа подписи сочинит улику с любой датой.
 	sc := newStampCheck(trust)
+	sc.checkSeal(b.Seal, trust)
 	if b.Upper != nil {
 		r.Upper, err = checkUpper(*b.Upper, b.Inclusion.LinkSeq, linkAt, sc)
 		add("a TSA time-stamp over the chain after the record (not later than T2)", err, fmt.Sprintf("T2 = %s, head %d", fmtTime(r.Upper), b.Upper.HeadSeq))
