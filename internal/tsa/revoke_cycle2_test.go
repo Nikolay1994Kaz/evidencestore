@@ -245,7 +245,7 @@ func TestRevocationsRekeyedCA(t *testing.T) {
 	if v := run(ReasonKeyCompromise, gen.Add(time.Hour)); v.NeedPOE || !hasNote(v, "pass that certificate in -tsa-trust") {
 		t.Fatalf("сертификата нового ключа нет: %+v", v)
 	}
-	if v := run(ReasonKeyCompromise, gen.Add(time.Hour), caB.cert); !v.NeedPOE || !strings.Contains(v.Entry.From, "new-key.crl") || !hasNote(v, "under the same root") {
+	if v := run(ReasonKeyCompromise, gen.Add(time.Hour), caB.cert); !v.NeedPOE || !strings.Contains(v.Entry.From, "new-key.crl") || !hasNote(v, "under a root of -tsa-trust") {
 		t.Fatalf("сертификат нового ключа известен: %+v", v)
 	}
 	if v := run(ReasonSuperseded, gen.Add(-time.Hour), caB.cert); v.Retired == nil || !strings.Contains(v.Retired.Error(), "superseded") {

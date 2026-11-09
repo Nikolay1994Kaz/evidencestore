@@ -258,7 +258,7 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 		default:
 			f := fmt.Sprintf("%s rests on %s: its time proves nothing, and nothing in the bundle shows it existed before %s — a time-stamp of another TSA or a cosignature of a witness given with -witness-key, over a head at or after link %d and dated earlier", p.what, p.why, fmtTime(p.cutoff), p.link)
 			if w, ok := poeIn(sc.weak, p); ok {
-				f += fmt.Sprintf("; %s would show it, but the revocation of its own certificate was not checked (see the notes), and a time-stamp shows the time of another only when its own certificate is known not to be revoked (ETSI EN 319 102-1): pass the CRL of its CA with -tsa-crl", w.what)
+				f += fmt.Sprintf("; %s would show it, but the revocation of its own certificate was not checked (see the notes), and a time-stamp shows the time of another only when its own certificate is known not to be revoked (ETSI EN 319 102-1): pass the CRLs of its CA with -tsa-crl, and the certificates the notes ask for in -tsa-trust", w.what)
 			}
 			for _, b := range sc.beyond {
 				if laterOf(b.at, p.gen).Before(p.cutoff) {
@@ -375,7 +375,10 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 		info, err := tsa.Verify(a.Token, HeadImprint(a.HeadSeq, root), trust)
 		if err != nil {
 			hint := "is the root of that TSA in -tsa-trust?"
-			if errors.Is(err, tsa.ErrNoSigner) {
+			switch {
+			case errors.Is(err, tsa.ErrNoSigner) && carried != nil:
+				hint = "the certificate the bundle carries beside it is not the one that signed it: pass the certificate of that TSA in -tsa-trust"
+			case errors.Is(err, tsa.ErrNoSigner):
 				hint = "that TSA does not put its certificate in its time-stamps, and the bundle does not carry it: pass that certificate in -tsa-trust"
 			}
 			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d was not used: %v (%s)", a.HeadSeq, err, hint)})

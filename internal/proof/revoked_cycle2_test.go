@@ -219,7 +219,7 @@ func TestRevocationRekeyedCAInTrust(t *testing.T) {
 	if r := run(tsa.ReasonKeyCompromise, soon, caA.cert); !r.Valid() || !strings.Contains(r.Text(), "pass that certificate in -tsa-trust") {
 		t.Fatalf("сертификата нового ключа нет:\n%s", r.Text())
 	}
-	if r := run(tsa.ReasonKeyCompromise, soon, caA.cert, caB.cert); r.Valid() || !strings.Contains(r.Text(), "under the same root") {
+	if r := run(tsa.ReasonKeyCompromise, soon, caA.cert, caB.cert); r.Valid() || !strings.Contains(r.Text(), "under a root of -tsa-trust") {
 		t.Fatalf("сертификат нового ключа в -tsa-trust:\n%s", r.Text())
 	}
 	before := func(now time.Time) time.Time { return now.Add(-time.Second) }
@@ -293,35 +293,44 @@ func twinRoot(t *testing.T, of *tsa.Authority) (*x509.Certificate, func(this, ne
 	}
 }
 
-// P-178, пересмотр 10.11. Центр-тёзка второй службы (то же имя корня, его
-// корень только среди корней проверяющего) и его более новый CRL с тем же
-// номером: «другим центром» проверка его не признаёт — имя издателя и номер
-// называют один сертификат, а CRL, которого не связать с корнем, мог
-// выпустить и сам центр под новым ключом. Метка второй службы «не
+// P-178, пересмотр 10.11 (и цикл 3, заход 1). Центр-тёзка второй службы
+// (то же имя корня) и его более новый CRL с тем же номером: «другим центром»
+// проверка его не признаёт — имя издателя и номер называют один сертификат.
+// Корень тёзки дал проверяющий — это CRL того же центра под другим ключом:
+// запись о компрометации в счёт, метка второй службы под подозрением, POE не
+// даёт. Корня тёзки нет — CRL не связать с корнем: метка второй службы «не
 // проверена», POE не даёт; отчёт называет CRL и что дать.
 func TestRevocationNamesakeIsNotChecked(t *testing.T) {
-	w, b := standard(t, nil)
-	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
-	other, tr := otherTSA(t, w)
-	cut := w.now.Add(2 * time.Hour)
-	now := w.now.Add(48 * time.Hour)
-	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
-	tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, cut, now), other)
-	if r := Verify(b, tr); !r.Valid() {
-		t.Fatalf("контроль, без CRL тёзки:\n%s", r.Text())
-	}
-	root, crl := twinRoot(t, other)
-	tr.TSA.Roots.AddCert(root)
-	tr.TSA.RootCerts = append(tr.TSA.RootCerts, root)
-	p := filepath.Join(t.TempDir(), "twin.crl")
-	if err := os.WriteFile(p, crl(now.Add(-30*time.Minute), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: other.Cert().SerialNumber, RevocationTime: w.now, ReasonCode: tsa.ReasonKeyCompromise}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := tr.TSARevocations.AddCRL(p); err != nil {
-		t.Fatal(err)
-	}
-	r := Verify(b, tr)
-	if r.Valid() || !strings.Contains(r.Text(), "twin.crl") || !strings.Contains(r.Text(), "did the CA change its key?") {
-		t.Fatalf("CRL тёзки второй службы новее её CRL и называет её номер:\n%s", r.Text())
+	for _, trusted := range []bool{false, true} {
+		w, b := standard(t, nil)
+		b.Upper.Inclusion = ptr(w.inclusion(5, 0))
+		other, tr := otherTSA(t, w)
+		cut := w.now.Add(2 * time.Hour)
+		now := w.now.Add(48 * time.Hour)
+		b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
+		tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, cut, now), other)
+		if r := Verify(b, tr); !r.Valid() {
+			t.Fatalf("контроль, без CRL тёзки:\n%s", r.Text())
+		}
+		root, crl := twinRoot(t, other)
+		if trusted {
+			tr.TSA.Roots.AddCert(root)
+			tr.TSA.RootCerts = append(tr.TSA.RootCerts, root)
+		}
+		p := filepath.Join(t.TempDir(), "twin.crl")
+		if err := os.WriteFile(p, crl(now.Add(-30*time.Minute), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: other.Cert().SerialNumber, RevocationTime: w.now, ReasonCode: tsa.ReasonKeyCompromise}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := tr.TSARevocations.AddCRL(p); err != nil {
+			t.Fatal(err)
+		}
+		r := Verify(b, tr)
+		want := "did the CA change its key?"
+		if trusted {
+			want = "itself: not used" // метка второй службы под подозрением
+		}
+		if r.Valid() || !strings.Contains(r.Text(), "twin.crl") || !strings.Contains(r.Text(), want) {
+			t.Fatalf("CRL тёзки второй службы новее её CRL и называет её номер (корень тёзки дан: %v):\n%s", trusted, r.Text())
+		}
 	}
 }

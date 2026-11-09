@@ -170,12 +170,13 @@ func TestRevocationsC2bRekeyedListingSupersededLeavesUnchecked(t *testing.T) {
 	}
 }
 
-// H5, пересмотр 10.11. Центры-тёзки с одинаковыми номерами: CRL тёзки новее
-// своего и называет тот же номер — свой сертификат «не проверен», дан ли
-// корень тёзки проверяющим или принесён токеном: имя издателя и номер
-// называют один сертификат (RFC 5280, 4.1.2.2), и CRL, которого не связать с
-// корнем сертификата, мог выпустить и сам центр под новым ключом. Демо-службы
-// так не совпадают: имя и номера у каждой свои.
+// H5, пересмотр 10.11 (и цикл 3, заход 1). Центры-тёзки с одинаковыми
+// номерами: имя издателя и номер называют один сертификат (RFC 5280,
+// 4.1.2.2), и тёзок проверка не признаёт. CRL тёзки, чей корень дал
+// проверяющий, — CRL того же центра под другим ключом: его записи в счёт
+// (ключ под подозрением). Корень тёзки принёс только токен — CRL «не
+// известен», и свой сертификат «не проверен». Демо-службы так не совпадают:
+// имя и номера у каждой свои.
 func TestRevocationsC2bNamesakeCRLMakesUnchecked(t *testing.T) {
 	b, err := NewAuthority(false)
 	if err != nil {
@@ -195,7 +196,6 @@ func TestRevocationsC2bNamesakeCRLMakesUnchecked(t *testing.T) {
 	check := func(a *Authority, trusted bool) Verdict {
 		t.Helper()
 		pool := x509.NewCertPool()
-		pool.AddCert(a.Root())
 		pool.AddCert(b.Root())
 		info, err := Verify(token, imprint, Trust{Roots: pool})
 		if err != nil {
@@ -228,11 +228,11 @@ func TestRevocationsC2bNamesakeCRLMakesUnchecked(t *testing.T) {
 		t.Fatalf("две демо-службы: CRL одной называет сертификат другой: %+v", v)
 	}
 	twin := twinOf(t, b)
-	for _, trusted := range []bool{false, true} {
-		v := check(twin, trusted)
-		if len(v.Unchecked) != 1 || v.NeedPOE || !hasNote(v, "newer than") || !hasNote(v, "did the CA change its key?") {
-			t.Errorf("тёзка (корень дал проверяющий: %v): CRL тёзки новее своего и называет тот же номер, а статус не «не проверен»: %+v", trusted, v)
-		}
+	if v := check(twin, false); len(v.Unchecked) != 1 || v.NeedPOE || !hasNote(v, "newer than") || !hasNote(v, "did the CA change its key?") {
+		t.Errorf("корень тёзки принёс токен: CRL тёзки новее своего и называет тот же номер, а статус не «не проверен»: %+v", v)
+	}
+	if v := check(twin, true); !v.NeedPOE || !hasNote(v, "under a root of -tsa-trust") {
+		t.Errorf("корень тёзки дал проверяющий: его CRL — CRL того же центра, а запись о компрометации не в счёт: %+v", v)
 	}
 }
 

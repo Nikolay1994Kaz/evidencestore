@@ -81,7 +81,7 @@ func TestC2cR2RekeyedCAMissingIntermediateBundle(t *testing.T) {
 	// (пересмотр 10.11: тёзкой такой CRL не считается).
 	r := run(c1.cert, c2.cert)
 	rc := revocationCheck(t, r.Checks)
-	if !strings.Contains(rc.Detail, "not checked") || !strings.Contains(r.Text(), "with the CA certificates between it and the root") {
+	if !strings.Contains(rc.Detail, "not checked") || !strings.Contains(r.Text(), "its issuers up to a root of -tsa-trust are not") {
 		t.Errorf("C2 в -tsa-trust, без его промежуточного: отчёт не говорит, что отзыв не проверен и что дать:\n%s", r.Text())
 	}
 }

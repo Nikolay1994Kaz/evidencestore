@@ -44,7 +44,7 @@ func TestRevocationsRedesignPathIgnoresDatesAndTokenCerts(t *testing.T) {
 		}
 		return a.Verdicts()[i]
 	}
-	if v := run(func(a *Assessment) { a.KnownTrusted(caNew.cert) }); !v.NeedPOE || !strings.Contains(v.Entry.From, "new.crl") || !hasNote(v, "under the same root") {
+	if v := run(func(a *Assessment) { a.KnownTrusted(caNew.cert) }); !v.NeedPOE || !strings.Contains(v.Entry.From, "new.crl") || !hasNote(v, "under a root of -tsa-trust") {
 		t.Fatalf("сертификат нового ключа дан, промежуточный истёк к дате CRL: компрометация не в счёт: %+v", v)
 	}
 	v := run(func(a *Assessment) { a.Known(caNew.cert) })

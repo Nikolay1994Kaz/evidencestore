@@ -15,6 +15,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
@@ -1048,6 +1049,20 @@ func (a *Assessment) Verdicts() []Verdict {
 			}
 		}
 	}
+	// anchors — корни, под которыми ключ, подписавший CRL под другим ключом
+	// центра, засчитывается: корни всех цепочек и все корни проверяющего, а
+	// не только корни цепочек самого сертификата. Цепочку выбирает тот, кто
+	// собирал пакет (сертификаты в токенах): с перекрёстным сертификатом
+	// центра от другого доверенного корня он увёл бы её от корня, под которым
+	// выпущен новый ключ центра. Такой CRL только добавляет записи; цена —
+	// центр того же имени под другим доверенным корнем, с теми же номерами,
+	// считается тем же центром (limitations.md).
+	anchors := anchorsOf(allRoots)
+	for _, c := range a.known {
+		if a.trusted[sha256.Sum256(c.Raw)] && bytes.Equal(c.RawIssuer, c.RawSubject) && c.CheckSignatureFrom(c) == nil {
+			anchors[anchorOf(c)] = true
+		}
+	}
 	a.extra = nil
 	for _, k := range a.known {
 		if certs[sha256.Sum256(k.Raw)] != nil || !chainKeys[string(k.RawSubjectPublicKeyInfo)] {
@@ -1087,8 +1102,10 @@ func (a *Assessment) Verdicts() []Verdict {
 	}
 	future := func(f *crlFile) bool { return f.rl.ThisUpdate.After(a.r.Now.Add(futureSlack)) }
 	// unknownKey — ключи, чей сертификат вне цепочек называет CRL, которого
-	// не связать с корнем: заметки для сертификатов цепочек с этим ключом.
-	unknownKey := map[string][]string{}
+	// не связать с корнем, записью, которая поставила бы ключ под
+	// подозрение: заметки для сертификатов цепочек с этим ключом.
+	type keyDoubt struct{ ask, why string }
+	unknownKey := map[string][]keyDoubt{}
 	for _, ci := range order {
 		ci.st = a.r.judge(ci.c, ci.issuers)
 		if !ci.inChain && len(ci.issuers) == 0 && a.trusted[sha256.Sum256(ci.c.Raw)] && !bytes.Equal(ci.c.RawIssuer, ci.c.RawSubject) {
@@ -1112,29 +1129,44 @@ func (a *Assessment) Verdicts() []Verdict {
 		if len(ci.issuers) > 0 {
 			issuer = ci.issuers[0].Subject.String()
 		}
-		as := anchorsOf(ci.roots)
+		as := anchors
 		sn := ci.c.SerialNumber.String()
 		for _, g := range ci.st.listing {
-			if by := a.r.crlSigner(g, p, as); by != nil {
+			if bys := a.r.crlSigners(g, p, as); len(bys) > 0 {
 				for _, e := range g.bySN[sn] {
 					// Удержание снимает более новый CRL того же ключа, который
-					// сертификат не называет вовсе, — как у своего CRL.
+					// сертификат не называет вовсе, — как у своего CRL: право
+					// на CRL хоть у одного сертификата этого ключа под корнем.
 					if e.Reason == ReasonCertificateHold && slices.ContainsFunc(a.r.crlsNaming(ci.c), func(h *crlFile) bool {
-						return h.newer(g) && !future(h) && h.speaks(ci.c) && len(h.bySN[sn]) == 0 && a.r.checkSig(h, by).auth == nil
+						return h.newer(g) && !future(h) && h.speaks(ci.c) && len(h.bySN[sn]) == 0 &&
+							slices.ContainsFunc(bys, func(x *x509.Certificate) bool { return a.r.checkSig(h, x).auth == nil })
 					}) {
 						continue
 					}
 					ci.st.entries = append(ci.st.entries, e)
 				}
-				ci.st.notes = append(ci.st.notes, fmt.Sprintf("%s is signed with another key of %q, certified by %q under the same root (RFC 5280, 6.3.3 f): its entries about certificate %q count", g.label(), issuer, by.Issuer.String(), ci.c.Subject.String()))
+				ci.st.notes = append(ci.st.notes, fmt.Sprintf("%s is signed with another key of %q, certified by %q under a root of -tsa-trust (RFC 5280, 6.3.3 f): its entries about certificate %q count", g.label(), issuer, bys[0].Issuer.String(), ci.c.Subject.String()))
 				continue
 			}
-			ask := fmt.Sprintf("%s lists certificate %q (serial %s) as revoked, but is not signed with the key of its issuer %q, and no certificate here with that name and the key that signed it is certified under the root of that certificate (did the CA change its key? pass that certificate in -tsa-trust, with the CA certificates between it and the root)", g.label(), ci.c.Subject.String(), ci.c.SerialNumber, issuer)
+			ask := fmt.Sprintf("%s lists certificate %q (serial %s) as revoked, but is not signed with the key of its issuer %q, and no certificate here with that name and the key that signed it is certified under a root of -tsa-trust (did the CA change its key? pass that certificate in -tsa-trust, with the CA certificates between it and the root)", g.label(), ci.c.Subject.String(), ci.c.SerialNumber, issuer)
+			if x := slices.IndexFunc(p.named(g.rl.RawIssuer, g.rl.Issuer), func(x *x509.Certificate) bool { return a.r.checkSig(g, x).key == nil }); x >= 0 {
+				ask = fmt.Sprintf("%s lists certificate %q (serial %s) as revoked, but is not signed with the key of its issuer %q; the certificate of the key that signed it (issued by %q) is here, but its issuers up to a root of -tsa-trust are not (pass them in -tsa-trust)", g.label(), ci.c.Subject.String(), ci.c.SerialNumber, issuer, p.named(g.rl.RawIssuer, g.rl.Issuer)[x].Issuer.String())
+			}
 			switch {
 			case !ci.inChain:
-				if !future(g) && (ci.st.cur == nil || g.newer(ci.st.cur)) {
-					k := string(ci.c.RawSubjectPublicKeyInfo)
-					unknownKey[k] = append(unknownKey[k], ask+": that certificate has the same key")
+				// Вне цепочек на вердикт влияет только запись, ставящая ключ
+				// под подозрение (вывод из работы без компрометации и центр
+				// без причины — нет): только она и делает ключ сомнительным.
+				k := string(ci.c.RawSubjectPublicKeyInfo)
+				var why []string
+				for _, e := range g.bySN[sn] {
+					if !keepsEarlier(e.Reason) && !chainOnly(ci.c, signerKeys[k], e) {
+						why = append(why, ReasonName(e.Reason))
+					}
+				}
+				if len(why) > 0 && !future(g) && (ci.st.cur == nil || g.newer(ci.st.cur)) {
+					unknownKey[k] = append(unknownKey[k], keyDoubt{ask + ": that certificate has the same key",
+						fmt.Sprintf("%s lists certificate %q (serial %s) with the same key as revoked (%s), and its signature cannot be checked", g.label(), ci.c.Subject.String(), ci.c.SerialNumber, strings.Join(why, ", "))})
 				}
 			case ci.st.cur != nil && g.newer(ci.st.cur) && !future(g):
 				ci.st.notes = append(ci.st.notes, ask, fmt.Sprintf("the revocation of certificate %q was not checked: %s, newer than %s, lists it as revoked, and its signature cannot be checked", ci.c.Subject.String(), g.label(), ci.st.cur.label()))
@@ -1148,13 +1180,14 @@ func (a *Assessment) Verdicts() []Verdict {
 	// Ключ сертификата вне цепочек, названного таким CRL, — ключ и
 	// сертификатов цепочек: их статус тоже не известен.
 	for _, ci := range order {
-		if ns := unknownKey[string(ci.c.RawSubjectPublicKeyInfo)]; ci.inChain && len(ns) > 0 {
-			ci.st.notes = append(ci.st.notes, ns...)
-			if ci.st.cur != nil {
-				ci.st.notes = append(ci.st.notes, fmt.Sprintf("the revocation of certificate %q was not checked: a CRL newer than %s lists another certificate with its key as revoked, and its signature cannot be checked", ci.c.Subject.String(), ci.st.cur.label()))
-				ci.st.from, ci.st.cur = "", nil
-			}
+		ds := unknownKey[string(ci.c.RawSubjectPublicKeyInfo)]
+		if !ci.inChain || len(ds) == 0 {
+			continue
 		}
+		for _, d := range ds {
+			ci.st.notes = append(ci.st.notes, d.ask, fmt.Sprintf("the revocation of certificate %q was not checked: %s", ci.c.Subject.String(), d.why))
+		}
+		ci.st.from, ci.st.cur = "", nil
 	}
 	status := func(c *x509.Certificate) *certStatus { return &certs[sha256.Sum256(c.Raw)].st }
 	a.named = nil
@@ -1458,14 +1491,16 @@ func (p *paths) issued(c, parent *x509.Certificate) bool {
 // него. Сроки не сверяются: CRL, засчитанный так, только добавляет записи
 // (статуса не даёт, удержания не снимает), а ключ, однажды выпущенный под
 // корнем с именем центра, — ключ этого центра.
-func (p *paths) under(c *x509.Certificate, as map[anchor]bool, depth int, seen map[*x509.Certificate]bool) bool {
+func (p *paths) under(c *x509.Certificate, as map[anchor]bool, depth int, seen map[*x509.Certificate]int) bool {
 	if as[anchorOf(c)] {
 		return true
 	}
-	if depth == maxPath || seen[c] {
+	// seen — на какой глубине сертификат уже обойден: дойти до него ближе к
+	// началу — обойти снова (глубже предел пути наступает позже).
+	if d, ok := seen[c]; depth == maxPath || ok && d <= depth {
 		return false
 	}
-	seen[c] = true
+	seen[c] = depth
 	for _, parent := range p.named(c.RawIssuer, c.Issuer) {
 		if parent != c && !bytes.Equal(parent.Raw, c.Raw) && p.issued(c, parent) && p.under(parent, as, depth+1, seen) {
 			return true
@@ -1474,20 +1509,21 @@ func (p *paths) under(c *x509.Certificate, as map[anchor]bool, depth int, seen m
 	return false
 }
 
-// crlSigner — сертификат с именем центра, выпустившего CRL g, чьим ключом g
+// crlSigners — сертификаты с именем центра, выпустившего CRL g, чьим ключом g
 // подписан и чей ключ выпущен под одним из корней as (RFC 5280, 6.3.3 f: путь
 // издателя CRL — к тому же корню, что у сертификата; корень — имя и ключ):
-// центр сменил ключ. nil — такого в оценке нет. Другого центра с тем же
+// центр сменил ключ. Пусто — таких в оценке нет. Другого центра с тем же
 // именем проверка не признаёт: имя издателя и номер называют один сертификат
 // (RFC 5280, 4.1.2.2), и CRL, который нельзя связать с корнем, мог выпустить
 // и сам центр под ключом, сертификата которого здесь нет.
-func (r *Revocations) crlSigner(g *crlFile, p *paths, as map[anchor]bool) *x509.Certificate {
+func (r *Revocations) crlSigners(g *crlFile, p *paths, as map[anchor]bool) []*x509.Certificate {
+	var out []*x509.Certificate
 	for _, x := range p.named(g.rl.RawIssuer, g.rl.Issuer) {
-		if r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]bool{}) {
-			return x
+		if r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]int{}) {
+			out = append(out, x)
 		}
 	}
-	return nil
+	return out
 }
 
 // futureSlack — насколько CRL может быть «из будущего» по часам проверяющего
