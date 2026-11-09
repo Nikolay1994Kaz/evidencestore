@@ -34,7 +34,7 @@
    "name": "X5 версия SignerInfo не сверяется",
    "file": "internal/tsa/seal.go",
    "old": "byKeyID && si.Version != 3 || !byKeyID && si.Version != 1 {",
-   "new": "false {"
+   "new": "byKeyID && false || !byKeyID && false {"
   },
   {
    "name": "X6 digestAlgorithms не SET принят",
@@ -76,13 +76,13 @@
    "name": "X12 messageDigest не сверяется с содержимым",
    "file": "internal/tsa/seal.go",
    "old": "\tif !bytes.Equal(h.Sum(nil), digest) {",
-   "new": "\tif false {"
+   "new": "\tif !bytes.Equal(digest, digest) {"
   },
   {
    "name": "X13 подпись не сверяется",
    "file": "internal/tsa/seal.go",
    "old": "\t\terr := checkSignature(c, si.SignatureAlgorithm.Algorithm, hash, attrsSet, si.Signature)",
-   "new": "\t\terr := error(nil)"
+   "new": "\t\terr := error(nil); _ = attrsSet"
   },
   {
    "name": "X14 signingCertificateV2 не сверяется",
@@ -124,7 +124,7 @@
    "name": "X20 заявление: хвост после ключа принят",
    "file": "internal/proof/seal.go",
    "old": "\tif !ok || !found || len(tail) != 0 {",
-   "new": "\tif !ok || !found {"
+   "new": "\tif _ = tail; !ok || !found {"
   },
   {
    "name": "X21 заявление: заголовок не сверяется",
@@ -136,7 +136,7 @@
    "name": "X22 печать на другой ключ принята",
    "file": "internal/proof/seal.go",
    "old": "\tcase !pub.Equal(trust.StoreKey):",
-   "new": "\tcase false:"
+   "new": "\tcase !pub.Equal(pub):"
   },
   {
    "name": "X23 ключ из печати без имени владельца",
@@ -202,7 +202,7 @@
    "name": "X33 хранилище: печать на чужой ключ — старт",
    "file": "internal/store/seal.go",
    "old": "\tif !pub.Equal(s.signer.PublicKey()) {",
-   "new": "\tif false {"
+   "new": "\tif !pub.Equal(pub) {"
   },
   {
    "name": "X34 хранилище: метка в data_dir не над этой печатью — в пакет",
