@@ -95,7 +95,7 @@
    "name": "R16 доказательство продолжения метки второй службы не сверяется",
    "file": "internal/proof/revoked.go",
    "old": "\t\t\tif bad || tlog.CheckTree(p, int64(a.HeadSeq), tlog.Hash(root), int64(last), tlog.Hash(end)) != nil {",
-   "new": "\t\t\tif bad {"
+   "new": "\t\t\tif bad || false && tlog.CheckTree(p, int64(a.HeadSeq), tlog.Hash(root), int64(last), tlog.Hash(end)) != nil {"
   },
   {
    "name": "R17 корень метки второй службы внутри пакета не сверяется",
@@ -119,7 +119,7 @@
    "name": "R20 лист T2 не сверяется с токеном",
    "file": "internal/proof/proof.go",
    "old": "\t\tcase l.Type != auditchain.EventTimestamp || l.Subject != strconv.FormatUint(u.HeadSeq, 10) || !bytes.Equal(l.Payload, u.Token):",
-   "new": "\t\tcase false:"
+   "new": "\t\tcase false && (l.Type != auditchain.EventTimestamp || l.Subject != strconv.FormatUint(u.HeadSeq, 10) || !bytes.Equal(l.Payload, u.Token)):"
   },
   {
    "name": "R21 звено токена T2 не берётся",
@@ -221,7 +221,7 @@
    "name": "R40 -tsa-crl не читается",
    "file": "cmd/esverify/main.go",
    "old": "\t\t\tif err := pt.TSARevocations.AddCRL(p); err != nil {",
-   "new": "\t\t\tif err := error(nil); err != nil {"
+   "new": "\t\t\tif err := error(nil); p == \"\" && err != nil {"
   }
  ]
 }
