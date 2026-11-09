@@ -1232,3 +1232,43 @@ func TestCosignJournalRemovedWhileRunning(t *testing.T) {
 		t.Fatalf("копия не пошла дальше (%d → %d) или журнал подписей в неё больше не едет (%v)", before, after, s.cosignSkipped.Load())
 	}
 }
+
+// Свидетель держит голову W с чужим корнем, а подписи W в журнале хранилища
+// нет: 409 W → повторный запрос подписи W → 422. Это та же развилка, что 422
+// на обычной голове, и тревога refused ставится в том же обходе (R1, P-124).
+func TestCosignRecosignRefusalIsAlarm(t *testing.T) {
+	c := newClock()
+	w := newLiveWitness(t, "witness.example/w1")
+	s := openStore(t, testConfig(t, w.option()), c)
+	w.attach(s)
+	ingest(t, s, "abs-core", 1, 1)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	mustCosign(t, s)
+	known := s.cosigners[0].size
+	origin := proof.OriginFor(w.trust(t, s).StoreKey)
+	// Свидетель «видел» другую историю: голова known+1 с чужим корнем,
+	// подписанная хранилищем; журнал подписанного убран, чтобы он стартовал.
+	wsize, other := known+1, [32]byte{9}
+	cp := proof.SignCheckpoint(s.signer, wsize, other)
+	w.srv.Load().Close()
+	path := filepath.Join(w.dir, "state", witness.OriginHash(origin)+".json")
+	data, _ := json.Marshal(map[string]any{"origin": origin, "size": wsize, "root": other[:], "time": 1, "note": string(cp.Note(s.signer.PublicKey()))})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(filepath.Join(w.dir, "cosigned.jsonl"))
+	w.attach(s)
+	for q := uint64(2); s.Head().Seq <= wsize; q++ {
+		c.add(time.Second)
+		ingest(t, s, "abs-core", q, q)
+		if err := s.flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := s.CosignOnce(context.Background())
+	if st := s.Status().Cosigners[0]; err == nil || !st.Refused {
+		t.Fatalf("свидетель держит другую историю (422 на повторный запрос головы %d), а тревоги refused нет: %v, %+v", wsize, err, st)
+	}
+}
