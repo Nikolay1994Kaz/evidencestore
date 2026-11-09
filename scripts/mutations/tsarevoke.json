@@ -677,7 +677,7 @@
    "name": "R131 повтор расширения CRL принят",
    "file": "internal/tsa/revoke.go",
    "old": "\t\t\tif x.Id.Equal(y.Id) {\n\t\t\t\treturn fmt.Errorf(\"extension %s is given twice\", x.Id)",
-   "new": "\t\t\tif false {\n\t\t\t\treturn fmt.Errorf(\"extension %s is given twice\", x.Id)"
+   "new": "\t\t\tif _ = y; false {\n\t\t\t\treturn fmt.Errorf(\"extension %s is given twice\", x.Id)"
   },
   {
    "name": "R132 CRL атрибутных сертификатов принят",
