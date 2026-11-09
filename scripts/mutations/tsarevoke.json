@@ -431,7 +431,7 @@
    "name": "R69 двоичное вне блоков PEM принято",
    "file": "internal/tsa/revoke.go",
    "old": "\t\tif !isText(outside) {",
-   "new": "\t\tif false {"
+   "new": "\t\tif _ = outside; false {"
   },
   {
    "name": "R108 текст вне блоков PEM отвергается",
