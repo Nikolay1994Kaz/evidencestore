@@ -275,17 +275,21 @@ func TestWitnessGarbageProofIsNotEvidence(t *testing.T) {
 func TestWitnessStoredNoteIsClean(t *testing.T) {
 	c := newChain(t)
 	r := newRig(t, t.TempDir(), c)
-	c.grow(4)
+	c.grow(5)
 	r.mustCosign(c, 0, 4)
-	note := c.note(4)
+	// Новая голова с лишними строками: в состояние ложится чистая заметка.
+	note := c.note(5)
 	text, sigs, _ := cosign.SplitNote(note)
 	junk := "— " + r.key.Name + " " + base64.StdEncoding.EncodeToString(append(binary.BigEndian.AppendUint32(nil, r.key.ID), make([]byte, 72)...))
 	// Чужой ключ с именем длиннее 255 байт — signed-note имя не ограничивает:
 	// строку пропускают, а не отвергают заметку.
 	long := "— " + strings.Repeat("x", 300) + " AAAAAAAA"
 	poisoned := string(text) + "\n" + sigs[0] + "\n" + sigs[0] + "\n" + junk + "\n— other.example/k AAAAAAAA\n" + long + "\n"
-	if code, body, _ := r.add(cosign.AddCheckpoint(4, nil, []byte(poisoned))); code != http.StatusOK {
-		t.Fatalf("та же голова с лишними строками: %d %s", code, body)
+	if code, body, _ := r.add(cosign.AddCheckpoint(4, c.proof(5, 4), []byte(poisoned))); code != http.StatusOK {
+		t.Fatalf("голова с лишними строками: %d %s", code, body)
+	}
+	if code, body, _ := r.add(cosign.AddCheckpoint(5, nil, []byte(poisoned))); code != http.StatusOK {
+		t.Fatalf("та же голова снова с лишними строками: %d %s", code, body)
 	}
 	resp, err := http.Get(r.ts.URL + "/" + OriginHash(c.origin()) + "/checkpoint")
 	if err != nil {
@@ -665,7 +669,7 @@ func TestWitnessLedgerCompacted(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, cosignedFile+".tmp")); !os.IsNotExist(err) {
 		t.Fatalf("временный файл сжатия остался: %v", err)
 	}
-	c.grow(7)
+	c.grow(1)
 	r2.mustCosign(c, 6, 7) // дописывается после сжатия целой строкой
 	r2.w.Close()
 
