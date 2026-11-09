@@ -173,6 +173,8 @@ func TestValidateCosigners(t *testing.T) {
 		"с запросом": {{URL: "https://w.example/?a=1", Key: key}},
 		"не ключ":    {{URL: "https://w.example/", Key: "witness.example/w1"}},
 		"дважды":     {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: key}},
+		// Два текущих ключа одного свидетеля: прежний — в old_keys.
+		"имя дважды": {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: rekey(t, "witness.example/w1")}},
 		// Прежний ключ — не ключ, тот же, что текущий, или текущий другого
 		// свидетеля; больше предела.
 		"прежний не ключ":     {{URL: "https://w.example/", Key: key, OldKeys: []string{"witness.example/w1"}}},
