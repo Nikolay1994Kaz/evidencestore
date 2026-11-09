@@ -14,15 +14,6 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
-// c2crlAt — CRL центра ca с thisUpdate this и nextUpdate next.
-func r1crl(t *testing.T, revs *tsa.Revocations, ca *c2ca, this, next time.Time, entries ...x509.RevocationListEntry) {
-	t.Helper()
-	before := len(revs.CRLs())
-	c2crl(t, revs, ca, this, entries...)
-	_ = before
-	_ = next
-}
-
 // H1 сквозь пакет. Служба перевыпущена на тот же ключ: метки идут через X1
 // (истёк), текущий X2 дан в -tsa-trust. Центр сменил ключ и отозвал X2
 // (выпущенный прежним ключом) по компрометации уже новым ключом;
