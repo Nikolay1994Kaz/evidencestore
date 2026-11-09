@@ -461,7 +461,7 @@
    "name": "R90 поле области не по порядку принято",
    "file": "internal/tsa/revoke.go",
    "old": "e.Tag <= last || e.Tag > 5",
-   "new": "e.Tag < 0 || e.Tag > 5"
+   "new": "e.Tag < last-last || e.Tag > 5"
   },
   {
    "name": "R91 перечень называет сертификат — заметка «не называет»",
