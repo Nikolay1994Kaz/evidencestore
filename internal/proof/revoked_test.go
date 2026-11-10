@@ -1,13 +1,11 @@
 package proof
 
 import (
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/asn1"
 	"fmt"
 	"math/big"
 	"os"
@@ -208,9 +206,12 @@ func TestRevocationPOENotBeforeToken(t *testing.T) {
 }
 
 // Тот же ключ под двумя сертификатами в одном пакете: T1 — под отозванным по
-// компрометации, T2 — под перевыпущенным, которого нет ни в одном CRL. T2
-// подписана ключом под подозрением: сама ждёт POE и T1 не спасает.
-func TestRevocationSameKeyTaintsOwnStamps(t *testing.T) {
+// компрометации, T2 — под перевыпущенным, которого нет ни в одном CRL.
+// Судится сертификат, а не ключ (tsa/revoke.go, срез 10.11): T2 не под
+// подозрением и показывает T1 существовавшей раньше отсечки. Что ключ один,
+// знает проверяющий: он называет перевыпущенный сертификат в перечне — и
+// тогда T2 сама ждёт POE и T1 не спасает (предел записан в limitations.md).
+func TestRevocationSameKeyOtherCertNeedsList(t *testing.T) {
 	w := newWorld(t)
 	main := w.tsa
 	reissued, err := main.Reissue(77, w.now.Add(240*time.Hour))
@@ -238,29 +239,17 @@ func TestRevocationSameKeyTaintsOwnStamps(t *testing.T) {
 	}
 	tr.TSARevocations = compromised(t, main, w.now.Add(time.Hour), w.now.Add(48*time.Hour))
 	r := Verify(b, tr)
-	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, fmt.Sprintf("time-stamp T2 over head %d rests on certificate", h3)) || !strings.Contains(c.Detail, fmt.Sprintf(`(serial %s) issued by %q with the same key`, main.Cert().SerialNumber, main.Root().Subject.String())) {
-		t.Fatalf("T2 того же ключа под перевыпущенным сертификатом:\n%s", r.Text())
+	if c := revocationCheck(t, r.Checks); !r.Valid() || !strings.Contains(c.Detail, "time-stamp T1") || !strings.Contains(c.Detail, fmt.Sprintf("over head %d", h3)) || !strings.Contains(c.Detail, "shows it existed before") {
+		t.Fatalf("T2 под перевыпущенным сертификатом, которого CRL не называет:\n%s", r.Text())
 	}
-}
-
-// Сертификат службы перевыпущен на тот же ключ: CRL отзывает новый по
-// компрометации, прежний не назван нигде. Метка «второй службы», подписанная
-// тем же ключом под прежним сертификатом, — не POE: ключ под подозрением в
-// этом же пакете.
-func TestRevocationPOESameKeyOtherCert(t *testing.T) {
-	w, b := standard(t, nil)
-	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
-	cut := w.now.Add(2 * time.Hour)
-	tr := w.trust()
-	tr.TSARevocations = compromised(t, w.tsa, cut, w.now.Add(48*time.Hour))
-	old, err := w.tsa.Reissue(77, w.now.Add(time.Hour))
-	if err != nil {
+	list := filepath.Join(t.TempDir(), "mine.json")
+	os.WriteFile(list, []byte(fmt.Sprintf(`[{"cert_sha256": %q, "revoked": %q, "reason": "keyCompromise"}]`, tsa.Fingerprint(reissued.Cert()), w.now.Add(time.Hour).Format(time.RFC3339))), 0o600)
+	if err := tr.TSARevocations.AddList(list); err != nil {
 		t.Fatal(err)
 	}
-	b.Archive = []ArchiveStamp{archiveOver(t, w, old, 5, w.now)}
-	r := Verify(b, tr)
-	if r.Valid() || !strings.Contains(r.Text(), "with the same key) itself: not used") {
-		t.Fatalf("POE тем же ключом под другим сертификатом:\n%s", r.Text())
+	r = Verify(b, tr)
+	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, fmt.Sprintf("time-stamp T2 over head %d rests on certificate", h3)) || !strings.Contains(c.Detail, "mine.json") {
+		t.Fatalf("перевыпущенный сертификат назван в перечне:\n%s", r.Text())
 	}
 }
 
@@ -478,178 +467,6 @@ func TestRevocationWindowAndSource(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
-
-// Подозрение из метки второй службы — и когда свои метки ничего не ждут:
-// T1 и T2 подписаны ключом, другой сертификат которого (в метке второй службы
-// того же пакета) отозван по компрометации. Ключ один — POE нужна всем, и
-// метка тем же ключом её не даёт; даёт метка другой службы раньше отсечки.
-func TestRevocationArchiveRevealsKey(t *testing.T) {
-	w, b := standard(t, nil)
-	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
-	re, err := w.tsa.Reissue(77, w.now.Add(240*time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	other, tr := otherTSA(t, w)
-	cut := w.now.Add(2 * time.Hour)
-	same := archiveOver(t, w, re, 5, w.now)
-	b.Archive = []ArchiveStamp{same}
-	if r := Verify(b, tr); !r.Valid() {
-		t.Fatalf("контроль без отзыва:\n%s", r.Text())
-	}
-	tr.TSARevocations = checkedToo(t, revocations(t, w.tsa, w.now.Add(48*time.Hour),
-		x509.RevocationListEntry{SerialNumber: big.NewInt(77), RevocationTime: cut, ReasonCode: tsa.ReasonKeyCompromise}), other)
-	r := Verify(b, tr)
-	if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "time-stamp T1 in link 2 rests on certificate") || !strings.Contains(c.Detail, "(serial 77)") || !strings.Contains(r.Text(), "itself: not used") {
-		t.Fatalf("ключ под подозрением по метке второй службы:\n%s", r.Text())
-	}
-	b.Archive = []ArchiveStamp{same, archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
-	if r := Verify(b, tr); !r.Valid() {
-		t.Fatalf("POE от другой службы:\n%s", r.Text())
-	}
-}
-
-// Отсечка ключа — по всему пакету. У ключа два сертификата: X1 отозван по
-// компрометации в 10:30 (или в 11:30 с invalidityDate 10:30), X2 — в 12:00.
-// T1 подписана под X1, T2 — под X2: T2 ждёт POE раньше 10:30, не раньше
-// 12:00, и метка второй службы в 11:00 её не спасает — ключ к тому времени
-// уже украден. POE раньше 10:30 — спасает.
-func TestRevocationKeyCutoffBundleWide(t *testing.T) {
-	day := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
-	c0 := day.Add(10*time.Hour + 30*time.Minute)
-	run := func(withInvalidity bool, poe2 time.Time) Report {
-		w := newWorld(t)
-		x1 := w.tsa
-		x2, err := x1.Reissue(77, w.now.Add(240*time.Hour))
-		if err != nil {
-			t.Fatal(err)
-		}
-		x2.Now = func() time.Time { return w.now }
-		other, tr := otherTSA(t, w)
-		w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
-		h1, t1 := w.stamp()
-		w.now = w.now.Add(time.Second)
-		w.wlink(tokenLeaf(h1, t1))
-		e1 := sealedBytes(t, 1, w.now.Add(time.Second), "first")
-		e2 := sealedBytes(t, 2, w.now.Add(2*time.Second), "second")
-		w.now = w.now.Add(3 * time.Second)
-		w.wlink(evLeaf(t, e1, 1), evLeaf(t, e2, 2))
-		w.wlink(auditchain.Leaf{Type: auditchain.EventGap, Scope: "abs-core"})
-		w.now = w.now.Add(time.Second)
-		w.tsa = x2
-		h4, t2 := w.stamp()
-		w.wlink(tokenLeaf(h4, t2))
-		w.tsa = x1
-		b := w.bundle(e2, 3, 1, h4, t2, 2)
-		b.Upper.Inclusion = ptr(w.inclusion(5, 0))
-		rev1 := x509.RevocationListEntry{SerialNumber: x1.Cert().SerialNumber, RevocationTime: c0, ReasonCode: tsa.ReasonKeyCompromise}
-		if withInvalidity {
-			inv, _ := asn1.MarshalWithParams(c0, "generalized")
-			rev1.RevocationTime = c0.Add(time.Hour)
-			rev1.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{2, 5, 29, 24}, Value: inv}}
-		}
-		tr.TSARevocations = checkedToo(t, revocations(t, x1, w.now.Add(48*time.Hour), rev1,
-			x509.RevocationListEntry{SerialNumber: x2.Cert().SerialNumber, RevocationTime: day.Add(12 * time.Hour), ReasonCode: tsa.ReasonKeyCompromise}), other)
-		b.Archive = []ArchiveStamp{archiveOver(t, w, other, 2, day.Add(10*time.Hour+10*time.Minute)), archiveOver(t, w, other, 5, poe2)}
-		return Verify(b, tr)
-	}
-	for _, inv := range []bool{false, true} {
-		r := run(inv, day.Add(11*time.Hour))
-		if c := revocationCheck(t, r.Checks); r.Valid() || !strings.Contains(c.Detail, "time-stamp T2 over head 4 rests on certificate") || !strings.Contains(c.Detail, "before 2026-10-03 10:30:00 UTC") {
-			t.Fatalf("invalidityDate %v: T2 спасла POE после отсечки ключа:\n%s", inv, r.Text())
-		}
-		if r := run(inv, day.Add(10*time.Hour+20*time.Minute)); !r.Valid() {
-			t.Fatalf("invalidityDate %v: POE раньше отсечки ключа:\n%s", inv, r.Text())
-		}
-	}
-}
-
-// Подозрение на ключ — из любой цепочки любой метки, не только выбранной:
-// ключ kQ верхнего центра под двумя сертификатами, «Upper B» (отозван по
-// компрометации) и «Upper C». У T1 и T2 две цепочки, лучшая — мимо kQ; метка
-// второй службы — только через «Upper C», то есть через kQ: она не POE.
-func TestRevocationSuspectKeyInAnyChain(t *testing.T) {
-	type ca struct {
-		cert *x509.Certificate
-		key  crypto.Signer
-	}
-	key := func() crypto.Signer {
-		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return k
-	}
-	issue := func(serial int64, cn string, isCA bool, k crypto.Signer, parent *ca) *ca {
-		tmpl := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: cn},
-			NotBefore: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC)}
-		if isCA {
-			tmpl.KeyUsage, tmpl.BasicConstraintsValid, tmpl.IsCA = x509.KeyUsageCertSign|x509.KeyUsageCRLSign, true, true
-		} else {
-			tmpl.KeyUsage, tmpl.ExtKeyUsage = x509.KeyUsageDigitalSignature, []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping}
-		}
-		pc, pk := tmpl, k
-		if parent != nil {
-			pc, pk = parent.cert, parent.key
-		}
-		der, err := x509.CreateCertificate(rand.Reader, tmpl, pc, k.Public(), pk)
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, _ := x509.ParseCertificate(der)
-		return &ca{c, k}
-	}
-	rootA, rootB, rootC := issue(1, "root A", true, key(), nil), issue(1, "root B", true, key(), nil), issue(1, "root C", true, key(), nil)
-	kQ, kK := key(), key()
-	upB, upC := issue(20, "Upper B", true, kQ, rootB), issue(21, "Upper C", true, kQ, rootC)
-	caA, caB := issue(30, "TSA CA", true, kK, rootA), issue(31, "TSA CA", true, kK, upB)
-	mainLeaf := issue(77, "main TSA", false, key(), caA)
-	caS := issue(40, "Second CA", true, key(), upC)
-	secLeaf := issue(88, "second TSA", false, key(), caS)
-
-	w := newWorld(t)
-	w.tsa = tsa.AuthorityWith(mainLeaf.key, mainLeaf.cert, rootA.cert)
-	w.tsa.Now = func() time.Time { return w.now }
-	second := tsa.AuthorityWith(secLeaf.key, secLeaf.cert, rootC.cert)
-	w.wlink(auditchain.Leaf{Type: auditchain.EventStart})
-	h1, t1 := w.stamp()
-	w.now = w.now.Add(time.Second)
-	w.wlink(tokenLeaf(h1, t1))
-	e2 := sealedBytes(t, 2, w.now.Add(time.Second), "second")
-	w.now = w.now.Add(3 * time.Second)
-	w.wlink(evLeaf(t, e2, 1))
-	w.now = w.now.Add(time.Second)
-	h3, t2 := w.stamp()
-	w.wlink(tokenLeaf(h3, t2))
-	b := w.bundle(e2, 3, 0, h3, t2, 2)
-	b.Upper.Inclusion = ptr(w.inclusion(4, 0))
-
-	pool := x509.NewCertPool()
-	for _, c := range []*ca{rootA, rootB, rootC} {
-		pool.AddCert(c.cert)
-	}
-	tr := Trust{StoreKey: w.signer.PublicKey(), TSA: tsa.Trust{Roots: pool, Intermediates: []*x509.Certificate{caA.cert, caB.cert, upB.cert, upC.cert, caS.cert}}}
-	day := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
-	revs := tsa.NewRevocations(day.Add(48 * time.Hour))
-	addCRL := func(c *ca, entries ...x509.RevocationListEntry) {
-		der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(1), ThisUpdate: day.Add(47 * time.Hour), NextUpdate: day.Add(72 * time.Hour), RevokedCertificateEntries: entries}, c.cert, c.key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		p := filepath.Join(t.TempDir(), "ca.crl")
-		os.WriteFile(p, der, 0o600)
-		if err := revs.AddCRL(p); err != nil {
-			t.Fatal(err)
-		}
-	}
-	addCRL(rootB, x509.RevocationListEntry{SerialNumber: upB.cert.SerialNumber, RevocationTime: day.Add(9 * time.Hour), ReasonCode: tsa.ReasonKeyCompromise})
-	addCRL(caA, x509.RevocationListEntry{SerialNumber: mainLeaf.cert.SerialNumber, RevocationTime: day.Add(12 * time.Hour), ReasonCode: tsa.ReasonKeyCompromise})
-	tr.TSARevocations = revs
-	b.Archive = []ArchiveStamp{archiveOver(t, w, second, 4, day.Add(11*time.Hour))}
-	if r := Verify(b, tr); r.Valid() || !strings.Contains(r.Text(), "itself: not used") {
-		t.Fatalf("POE через ключ, отозванный в невыбранной цепочке:\n%s", r.Text())
-	}
-}
 
 // Часы свидетеля позади основной службы больше чем на минуту: подпись над
 // головой звена T2 датирована раньше T2 и считается со времени T2 — POE в

@@ -14,75 +14,6 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
-// H1 сквозь пакет. Служба перевыпущена на тот же ключ: метки идут через X1
-// (истёк), текущий X2 дан в -tsa-trust. Центр сменил ключ и отозвал X2
-// (выпущенный прежним ключом) по компрометации уже новым ключом;
-// сертификат нового ключа центра тоже в -tsa-trust. Ни второй службы, ни
-// свидетеля: пакет обязан не пройти. Проходит.
-func TestRevocationC2bRenewedTSARevokedByRekeyedCABundle(t *testing.T) {
-	root := c2issue(t, 1, "r1 root", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), nil)
-	caOld := c2issue(t, 10, "TSA CA", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), root)
-	caNew := c2issue(t, 11, "TSA CA", true, c2date(2026, 9, 1), c2date(2040, 1, 1), c2key(t), root)
-	kTSA := c2key(t)
-	x1 := c2issue(t, 1, "main TSA", false, c2date(2024, 1, 1), c2date(2026, 6, 30), kTSA, caOld)
-	x2 := c2issue(t, 2, "main TSA", false, c2date(2026, 6, 1), c2date(2029, 1, 1), kTSA, caOld)
-	run := func(inter ...*x509.Certificate) Report {
-		w := newWorld(t)
-		w.now = time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-		a := tsa.AuthorityWith(kTSA, x1.cert, root.cert)
-		a.Now = func() time.Time { return w.now }
-		b := c2bundle(t, w, a, a)
-		pool := x509.NewCertPool()
-		pool.AddCert(root.cert)
-		tr := Trust{StoreKey: w.signer.PublicKey(), TSA: tsa.Trust{Roots: pool, Intermediates: inter}}
-		tr.TSARevocations = tsa.NewRevocations(c2date(2027, 3, 10))
-		c2crl(t, tr.TSARevocations, caOld, c2date(2026, 3, 2))
-		c2crl(t, tr.TSARevocations, caNew, c2date(2027, 3, 1), x509.RevocationListEntry{SerialNumber: x2.cert.SerialNumber, RevocationTime: c2date(2027, 2, 20), ReasonCode: tsa.ReasonKeyCompromise})
-		c2crl(t, tr.TSARevocations, root, c2date(2027, 3, 1))
-		return Verify(b, tr)
-	}
-	r := run(caOld.cert, caNew.cert, x2.cert)
-	t.Logf("verdict valid=%v\n%s", r.Valid(), r.Text())
-	if r.Valid() {
-		t.Errorf("ключ службы отозван по компрометации (X2 в -tsa-trust, CRL нового ключа центра, сертификат нового ключа в -tsa-trust), POE нет — пакет прошёл")
-	}
-}
-
-// H2 сквозь пакет. X2 (тот же ключ, текущий) был на удержании и снят;
-// проверяющий дал X2 в -tsa-trust, как велит документ, и все CRL центра.
-// Честный пакет без второй службы не проходит.
-func TestRevocationC2bRenewedTSAReleasedHoldBundle(t *testing.T) {
-	root := c2issue(t, 1, "r1 root", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), nil)
-	ca := c2issue(t, 10, "TSA CA", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), root)
-	kTSA := c2key(t)
-	x1 := c2issue(t, 1, "main TSA", false, c2date(2024, 1, 1), c2date(2026, 6, 30), kTSA, ca)
-	x2 := c2issue(t, 2, "main TSA", false, c2date(2026, 6, 1), c2date(2029, 1, 1), kTSA, ca)
-	run := func(inter ...*x509.Certificate) Report {
-		w := newWorld(t)
-		w.now = time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-		a := tsa.AuthorityWith(kTSA, x1.cert, root.cert)
-		a.Now = func() time.Time { return w.now }
-		b := c2bundle(t, w, a, a)
-		pool := x509.NewCertPool()
-		pool.AddCert(root.cert)
-		tr := Trust{StoreKey: w.signer.PublicKey(), TSA: tsa.Trust{Roots: pool, Intermediates: inter}}
-		tr.TSARevocations = tsa.NewRevocations(c2date(2027, 3, 10))
-		c2crl(t, tr.TSARevocations, ca, c2date(2026, 3, 2))
-		c2crl(t, tr.TSARevocations, ca, c2date(2026, 11, 2), x509.RevocationListEntry{SerialNumber: x2.cert.SerialNumber, RevocationTime: c2date(2026, 11, 1), ReasonCode: tsa.ReasonCertificateHold})
-		c2crl(t, tr.TSARevocations, ca, c2date(2027, 3, 1))
-		c2crl(t, tr.TSARevocations, root, c2date(2027, 3, 1))
-		return Verify(b, tr)
-	}
-	if r := run(ca.cert); !r.Valid() {
-		t.Fatalf("контроль: без X2 в -tsa-trust:\n%s", r.Text())
-	}
-	r := run(ca.cert, x2.cert)
-	t.Logf("with X2 in -tsa-trust valid=%v\n%s", r.Valid(), r.Text())
-	if !r.Valid() {
-		t.Errorf("X2 в -tsa-trust, удержание X2 снято — честный пакет не прошёл")
-	}
-}
-
 // H5 сквозь пакет. Две демо-службы (имена и номера одни, ключи разные):
 // основная отозвана по компрометации после меток, метка второй — над
 // головой T2 раньше отсечки. Проверяющий дал CRL обеих; CRL основной на
@@ -120,44 +51,6 @@ func TestRevocationC2bNamesakeDemoTSAsBundle(t *testing.T) {
 	t.Logf("main CRL a minute newer: valid=%v\n%s", r.Valid(), r.Text())
 	if !r.Valid() {
 		t.Errorf("CRL основной службы на минуту новее CRL второй (тёзки) — честный пакет не прошёл")
-	}
-}
-
-// H4 сквозь пакет. Центр второй службы сменил ключ и в CRL нового ключа
-// назвал её сертификат выведенным из работы (superseded) после её метки;
-// сертификат нового ключа центра — в -tsa-trust (как велит документ).
-// Основная служба отозвана по компрометации. Метка второй службы в силе и
-// показала бы существование, но её сертификат «не проверен» — пакет не
-// проходит.
-func TestRevocationC2bSecondTSARekeyedCASupersededBundle(t *testing.T) {
-	w, b := standard(t, nil)
-	b.Upper.Inclusion = ptr(w.inclusion(5, 0))
-	cut := w.now.Add(2 * time.Hour)
-	now := w.now.Add(48 * time.Hour)
-	root2 := c2issue(t, 1, "second root", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), nil)
-	caOld := c2issue(t, 10, "second CA", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), root2)
-	caNew := c2issue(t, 11, "second CA", true, c2date(2026, 9, 1), c2date(2040, 1, 1), c2key(t), root2)
-	leaf := c2issue(t, 7, "second TSA", false, c2date(2024, 1, 1), c2date(2030, 1, 1), c2key(t), caOld)
-	other := tsa.AuthorityWith(leaf.key, leaf.cert, root2.cert)
-	b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
-	tr := w.trust()
-	tr.TSA.Roots.AddCert(root2.cert)
-	tr.TSA.Intermediates = append(tr.TSA.Intermediates, caOld.cert, caNew.cert)
-	revs := tsa.NewRevocations(now)
-	der, _ := w.tsa.RevocationList(now.Add(-time.Hour), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: w.tsa.Cert().SerialNumber, RevocationTime: cut, ReasonCode: tsa.ReasonKeyCompromise})
-	p := filepath.Join(t.TempDir(), "main.crl")
-	os.WriteFile(p, der, 0o600)
-	if err := revs.AddCRL(p); err != nil {
-		t.Fatal(err)
-	}
-	c2crl(t, revs, caOld, now.Add(-10*24*time.Hour))
-	c2crl(t, revs, caNew, now.Add(-time.Hour), x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: cut.Add(time.Hour), ReasonCode: tsa.ReasonSuperseded})
-	c2crl(t, revs, root2, now.Add(-time.Hour))
-	tr.TSARevocations = revs
-	r := Verify(b, tr)
-	t.Logf("valid=%v\n%s", r.Valid(), r.Text())
-	if !r.Valid() && strings.Contains(r.Text(), "the revocation of its own certificate was not checked") {
-		t.Errorf("метка второй службы в силе (superseded после неё, CRL нового ключа признан), но не POE: честный пакет не прошёл")
 	}
 }
 
@@ -202,9 +95,9 @@ func TestRevocationC2bSecondTSAExpiredCertBundle(t *testing.T) {
 }
 
 // H6 сквозь пакет. Поле certificates токена не подписано: к метке второй
-// службы можно дописать сертификаты, и подпись токена сойдётся. Все они идут
-// в оценку (Known), и Verdicts сверяет подпись на каждой паре Known × pool
-// с совпавшими именами.
+// службы можно дописать сертификаты, и подпись токена сойдётся. До среза
+// 10.11 все они шли в оценку отзыва, и проверка пакета росла квадратично;
+// теперь оценка их не видит, и время проверки от их числа не зависит.
 func TestRevocationC2bJunkCertsInArchiveTokens(t *testing.T) {
 	w, b := standard(t, nil)
 	root2 := c2issue(t, 1, "second root", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), nil)

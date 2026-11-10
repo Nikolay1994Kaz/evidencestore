@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -157,50 +158,18 @@ func TestRevocationPOEOnlyFromCheckedStamp(t *testing.T) {
 	}
 }
 
-// P-161 сквозь пакет. Центр продлён на тот же ключ, корень отозвал текущий
-// сертификат центра по компрометации, прежний истёк. Метки — под службой,
-// выпущенной ключом центра временем до продления. С текущим сертификатом
-// центра в -tsa-trust пакет не проходит; без него — проходит (из CRL ключа не
-// узнать: limitations.md).
-func TestRevocationRenewedCAKeyInTrust(t *testing.T) {
-	root := c2issue(t, 1, "renewal root", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), nil)
-	kCA := c2key(t)
-	caOld := c2issue(t, 10, "TSA CA", true, c2date(2020, 1, 1), c2date(2026, 6, 30), kCA, root)
-	caCur := c2issue(t, 11, "TSA CA", true, c2date(2026, 6, 1), c2date(2035, 1, 1), kCA, root)
-	forged := c2issue(t, 99, "TSA", false, c2date(2025, 1, 1), c2date(2026, 6, 29), c2key(t), caOld)
-	run := func(inter ...*x509.Certificate) Report {
-		w := newWorld(t)
-		w.now = time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-		a := tsa.AuthorityWith(forged.key, forged.cert, root.cert)
-		a.Now = func() time.Time { return w.now }
-		b := c2bundle(t, w, a, a)
-		pool := x509.NewCertPool()
-		pool.AddCert(root.cert)
-		tr := Trust{StoreKey: w.signer.PublicKey(), TSA: tsa.Trust{Roots: pool, Intermediates: inter}}
-		tr.TSARevocations = tsa.NewRevocations(c2date(2027, 3, 10))
-		c2crl(t, tr.TSARevocations, root, c2date(2027, 3, 1), x509.RevocationListEntry{SerialNumber: caCur.cert.SerialNumber, RevocationTime: c2date(2027, 2, 20), ReasonCode: tsa.ReasonKeyCompromise})
-		c2crl(t, tr.TSARevocations, root, c2date(2026, 6, 15))
-		c2crl(t, tr.TSARevocations, caCur, c2date(2026, 6, 1))
-		return Verify(b, tr)
-	}
-	if r := run(caOld.cert); !r.Valid() {
-		t.Fatalf("без текущего сертификата центра:\n%s", r.Text())
-	}
-	if r := run(caOld.cert, caCur.cert); r.Valid() || !strings.Contains(revocationCheck(t, r.Checks).Detail, "with the same key") {
-		t.Fatalf("текущий сертификат центра в -tsa-trust:\n%s", r.Text())
-	}
-}
-
-// P-162 сквозь пакет. Центр сменил ключ; CRL нового ключа отзывает службу
-// прежнего по компрометации. С сертификатом нового ключа в -tsa-trust пакет
-// не проходит; без него проходит, и заметка говорит, что CRL называет
-// службу и что дать. Вывод из работы до T2 в CRL нового ключа — T2 не в силе.
-func TestRevocationRekeyedCAInTrust(t *testing.T) {
+// Центр сменил ключ; CRL нового ключа называет службу прежнего отозванной.
+// Подпись такого CRL с цепочкой меток не сверить (срез 10.11: путь нового
+// ключа к корню не строится, с его сертификатом в -tsa-trust или без него):
+// записи не в счёт, отзыв службы «не проверен», пакет проходит, и заметка
+// говорит, что делать. Проверяющий, который этому CRL верит, называет
+// сертификат службы в перечне — и пакет без POE не проходит.
+func TestRevocationOtherKeyCRLNotChecked(t *testing.T) {
 	root := c2issue(t, 1, "rekey root", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), nil)
 	caA := c2issue(t, 10, "TSA CA", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), root)
 	caB := c2issue(t, 11, "TSA CA", true, c2date(2026, 1, 1), c2date(2040, 1, 1), c2key(t), root)
 	leaf := c2issue(t, 77, "main TSA", false, c2date(2024, 1, 1), c2date(2030, 1, 1), c2key(t), caA)
-	run := func(reason int, at func(time.Time) time.Time, inter ...*x509.Certificate) Report {
+	run := func(reason int, at func(time.Time) time.Time, listed bool, inter ...*x509.Certificate) Report {
 		w := newWorld(t)
 		a := tsa.AuthorityWith(leaf.key, leaf.cert, root.cert)
 		a.Now = func() time.Time { return w.now }
@@ -213,124 +182,28 @@ func TestRevocationRekeyedCAInTrust(t *testing.T) {
 		c2crl(t, tr.TSARevocations, caA, w.now.Add(-time.Hour))
 		c2crl(t, tr.TSARevocations, caB, w.now.Add(29*24*time.Hour), x509.RevocationListEntry{SerialNumber: leaf.cert.SerialNumber, RevocationTime: at(t2), ReasonCode: reason})
 		c2crl(t, tr.TSARevocations, root, w.now.Add(29*24*time.Hour))
+		if listed {
+			list := filepath.Join(t.TempDir(), "mine.json")
+			os.WriteFile(list, []byte(fmt.Sprintf(`[{"cert_sha256": %q, "revoked": %q, "reason": "keyCompromise"}]`, tsa.Fingerprint(leaf.cert), at(t2).Format(time.RFC3339))), 0o600)
+			if err := tr.TSARevocations.AddList(list); err != nil {
+				t.Fatal(err)
+			}
+		}
 		return Verify(b, tr)
 	}
 	soon := func(now time.Time) time.Time { return now.Add(time.Hour) }
-	if r := run(tsa.ReasonKeyCompromise, soon, caA.cert); !r.Valid() || !strings.Contains(r.Text(), "pass that certificate in -tsa-trust") {
-		t.Fatalf("сертификата нового ключа нет:\n%s", r.Text())
-	}
-	if r := run(tsa.ReasonKeyCompromise, soon, caA.cert, caB.cert); r.Valid() || !strings.Contains(r.Text(), "under a root of -tsa-trust") {
-		t.Fatalf("сертификат нового ключа в -tsa-trust:\n%s", r.Text())
-	}
 	before := func(now time.Time) time.Time { return now.Add(-time.Second) }
-	if r := run(tsa.ReasonSuperseded, before, caA.cert, caB.cert); r.Valid() || !strings.Contains(revocationCheck(t, r.Checks).Detail, "superseded") {
-		t.Fatalf("выведен из работы до T2 в CRL нового ключа:\n%s", r.Text())
-	}
-}
-
-// P-161, сертификаты токенов. Служба перевыпущена на тот же ключ (X1 истёк,
-// X1r отозван по компрометации) и кладёт в токены оба сертификата: метки под
-// X1 под подозрением. Так же — когда X1r несёт метка второй службы, а не
-// свои.
-func TestRevocationTokenCarriesRenewedCert(t *testing.T) {
-	root := c2issue(t, 1, "renewal root", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), nil)
-	ca := c2issue(t, 10, "TSA CA", true, c2date(2020, 1, 1), c2date(2040, 1, 1), c2key(t), root)
-	kTSA := c2key(t)
-	x1 := c2issue(t, 1, "main TSA", false, c2date(2024, 1, 1), c2date(2026, 12, 31), kTSA, ca)
-	x1r := c2issue(t, 2, "main TSA", false, c2date(2026, 6, 1), c2date(2028, 12, 31), kTSA, ca)
-	run := func(own bool) Report {
-		w := newWorld(t)
-		w.now = time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-		a := tsa.AuthorityWith(kTSA, x1.cert, root.cert)
-		a.Now = func() time.Time { return w.now }
-		if own {
-			a.Carry(x1r.cert)
-		}
-		b := c2bundle(t, w, a, a)
-		pool := x509.NewCertPool()
-		pool.AddCert(root.cert)
-		tr := Trust{StoreKey: w.signer.PublicKey(), TSA: tsa.Trust{Roots: pool, Intermediates: []*x509.Certificate{ca.cert}}}
-		if !own {
-			other, _ := otherTSA(t, w)
-			tr.TSA.Roots.AddCert(other.Root())
-			other.Carry(x1r.cert)
-			b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, w.now)}
-		}
-		tr.TSARevocations = tsa.NewRevocations(c2date(2027, 3, 10))
-		c2crl(t, tr.TSARevocations, ca, c2date(2027, 3, 1), x509.RevocationListEntry{SerialNumber: x1r.cert.SerialNumber, RevocationTime: c2date(2027, 2, 20), ReasonCode: tsa.ReasonKeyCompromise})
-		c2crl(t, tr.TSARevocations, ca, c2date(2026, 12, 1))
-		c2crl(t, tr.TSARevocations, root, c2date(2027, 3, 1))
-		return Verify(b, tr)
-	}
-	for _, own := range []bool{true, false} {
-		if r := run(own); r.Valid() || !strings.Contains(revocationCheck(t, r.Checks).Detail, "with the same key") {
-			t.Fatalf("X1r в токенах (свои %v):\n%s", own, r.Text())
+	for name, r := range map[string]Report{
+		"сертификата нового ключа нет":               run(tsa.ReasonKeyCompromise, soon, false, caA.cert),
+		"сертификат нового ключа в -tsa-trust":       run(tsa.ReasonKeyCompromise, soon, false, caA.cert, caB.cert),
+		"выведен из работы до T2 в CRL нового ключа": run(tsa.ReasonSuperseded, before, false, caA.cert, caB.cert),
+	} {
+		if !r.Valid() || !strings.Contains(r.Text(), "did the CA change its key?") || !strings.Contains(r.Text(), "list the certificate with -tsa-revoked") ||
+			!strings.Contains(revocationCheck(t, r.Checks).Detail, "the revocation of 1 certificates was not checked") {
+			t.Errorf("%s:\n%s", name, r.Text())
 		}
 	}
-}
-
-// twinRoot — корень с тем же именем, что у корня службы of, со своим ключом
-// (центр-тёзка), и CRL от его имени.
-func twinRoot(t *testing.T, of *tsa.Authority) (*x509.Certificate, func(this, next time.Time, es ...x509.RevocationListEntry) []byte) {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{SerialNumber: of.Root().SerialNumber, RawSubject: of.Root().RawSubject, NotBefore: of.Root().NotBefore, NotAfter: of.Root().NotAfter,
-		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, _ := x509.ParseCertificate(der)
-	return root, func(this, next time.Time, es ...x509.RevocationListEntry) []byte {
-		der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(this.Unix()), ThisUpdate: this, NextUpdate: next, RevokedCertificateEntries: es}, root, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return der
-	}
-}
-
-// P-178, пересмотр 10.11 (и цикл 3, заход 1). Центр-тёзка второй службы
-// (то же имя корня) и его более новый CRL с тем же номером: «другим центром»
-// проверка его не признаёт — имя издателя и номер называют один сертификат.
-// Корень тёзки дал проверяющий — это CRL того же центра под другим ключом:
-// запись о компрометации в счёт, метка второй службы под подозрением, POE не
-// даёт. Корня тёзки нет — CRL не связать с корнем: метка второй службы «не
-// проверена», POE не даёт; отчёт называет CRL и что дать.
-func TestRevocationNamesakeIsNotChecked(t *testing.T) {
-	for _, trusted := range []bool{false, true} {
-		w, b := standard(t, nil)
-		b.Upper.Inclusion = ptr(w.inclusion(5, 0))
-		other, tr := otherTSA(t, w)
-		cut := w.now.Add(2 * time.Hour)
-		now := w.now.Add(48 * time.Hour)
-		b.Archive = []ArchiveStamp{archiveOver(t, w, other, 5, cut.Add(-time.Hour))}
-		tr.TSARevocations = checkedToo(t, compromised(t, w.tsa, cut, now), other)
-		if r := Verify(b, tr); !r.Valid() {
-			t.Fatalf("контроль, без CRL тёзки:\n%s", r.Text())
-		}
-		root, crl := twinRoot(t, other)
-		if trusted {
-			tr.TSA.Roots.AddCert(root)
-			tr.TSA.RootCerts = append(tr.TSA.RootCerts, root)
-		}
-		p := filepath.Join(t.TempDir(), "twin.crl")
-		if err := os.WriteFile(p, crl(now.Add(-30*time.Minute), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: other.Cert().SerialNumber, RevocationTime: w.now, ReasonCode: tsa.ReasonKeyCompromise}), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := tr.TSARevocations.AddCRL(p); err != nil {
-			t.Fatal(err)
-		}
-		r := Verify(b, tr)
-		want := "did the CA change its key?"
-		if trusted {
-			want = "itself: not used" // метка второй службы под подозрением
-		}
-		if r.Valid() || !strings.Contains(r.Text(), "twin.crl") || !strings.Contains(r.Text(), want) {
-			t.Fatalf("CRL тёзки второй службы новее её CRL и называет её номер (корень тёзки дан: %v):\n%s", trusted, r.Text())
-		}
+	if r := run(tsa.ReasonKeyCompromise, soon, true, caA.cert); r.Valid() || !strings.Contains(revocationCheck(t, r.Checks).Detail, "mine.json") {
+		t.Fatalf("служба названа в перечне проверяющего:\n%s", r.Text())
 	}
 }

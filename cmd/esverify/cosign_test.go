@@ -172,6 +172,12 @@ func TestWitnessKeyFlag(t *testing.T) {
 // не подменяет ключ. Один ключ под двумя именами — неверный вызов.
 func TestWitnessKeyNotShadowedByFile(t *testing.T) {
 	bundle, key, trust, vkey := cosignedWorld(t)
+	// Ключ, что кончается на «/», файлом по такому пути не подложить: путь
+	// называл бы каталог, и подложенного файла esverify не видит. Так кончается
+	// один ключ из 64, и тест падал раз в 64 прогона (P-230): берётся другой.
+	for strings.HasSuffix(vkey, "/") {
+		bundle, key, trust, vkey = cosignedWorld(t)
+	}
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	evil, _ := cosign.NewSigner("witness.example/w1", priv)
 	dir := t.TempDir()

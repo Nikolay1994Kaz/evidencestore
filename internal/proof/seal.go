@@ -198,7 +198,6 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 	info, why := sealTime(s, trust.TSA)
 	if why == "" && sc.revs != nil {
 		sc.ensureAssessment()
-		sc.as.Known(info.Certs...)
 		if id, err := sc.as.Add(info.Chains, info.GenTime); err == nil {
 			c.tokenID = id
 		} else {
@@ -234,7 +233,6 @@ func (sc *stampCheck) checkSeal(s *StoreSeal, trust Trust) {
 	}
 	if sc.revs != nil {
 		sc.ensureAssessment()
-		sc.as.Known(sealed.Certs...)
 		id, err := sc.as.Add(chains, at)
 		if err != nil {
 			c.err = fmt.Errorf("the seal certificate is not in force at %s: %v", fmtTime(at), err)
@@ -269,12 +267,8 @@ func (sc *stampCheck) finishSeal(vs []tsa.Verdict, add func(string, error, strin
 	// службы, и цепочка печати на это время ничего не значит. Печать
 	// судится на момент проверки, как без метки.
 	at, id := c.at, c.id
-	if c.tokenID >= 0 && (vs[c.tokenID].NeedPOE || vs[c.tokenID].Retired != nil) {
-		if v := vs[c.tokenID]; v.Retired != nil {
-			c.why = fmt.Sprintf("the time-stamp over the seal is not in force (%v)", v.Retired)
-		} else {
-			c.why = "the time-stamp over the seal rests on " + revokedWhy(v)
-		}
+	if c.tokenID >= 0 && vs[c.tokenID].NeedPOE {
+		c.why = "the time-stamp over the seal rests on " + revokedWhy(vs[c.tokenID])
 		if c.nowErr != nil {
 			add(sealCheckName, fmt.Errorf("%s, so it does not show when the seal was made, and at the time of the check the seal does not hold: %v", c.why, c.nowErr), "")
 			return
@@ -294,10 +288,6 @@ func (sc *stampCheck) finishSeal(vs []tsa.Verdict, add func(string, error, strin
 	}
 	v := vs[id]
 	sc.record(v)
-	if v.Retired != nil {
-		add(sealCheckName, fmt.Errorf("the seal certificate is not in force: %v (%s)", v.Retired, detail), "")
-		return
-	}
 	if v.NeedPOE {
 		if at.IsZero() || !at.Before(v.Cutoff) {
 			add(sealCheckName, fmt.Errorf("the seal rests on %s: nothing shows it was made before %s (%s)", revokedWhy(v), fmtTime(v.Cutoff), detail), "")

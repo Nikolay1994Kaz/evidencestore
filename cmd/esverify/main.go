@@ -60,7 +60,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	proofPath := fs.String("proof", "", "proof bundle (JSON)")
 	storeKey := fs.String("store-key", "", "pinned store public key (base64) or file containing it; may be left out with -seal-trust")
-	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM): the roots, and any other certificates of the TSAs and their CAs you hold — one issued again on the same key too, so that its revocation counts for the key")
+	tsaTrust := fs.String("tsa-trust", "", "TSA certificates, comma-separated (DER or PEM): the roots, and the certificates of the TSAs and of the CAs between them and the roots that the time-stamps do not carry")
 	sealTrust := fs.String("seal-trust", "", "certificates, comma-separated (DER or PEM), of the CA that issued the X.509 certificate the store's owner sealed the store key with: the bundle's seal (seal.file of the store) then vouches for the store key, and without -store-key the key is taken from it (then -seal-subject is required)")
 	var sealSubject []tsa.SubjectPin
 	fs.Func("seal-subject", "ATTRIBUTE=VALUE the seal certificate's subject must hold, exactly (O=Example Bank, OU=BIN123456789012, organizationIdentifier=NTRKZ-123456789012, or an OID: 2.5.4.97=…); repeat the flag for more: every one must be there. Required with -seal-trust and no -store-key: under a national CA many organizations hold certificates, and the seal of any of them would otherwise vouch for any key", func(v string) error {
@@ -80,7 +80,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return nil
 	})
 	var tsaCRLs []string
-	fs.Func("tsa-crl", "CRL (DER or PEM) of a CA that issued a TSA certificate in -tsa-trust or in the bundle's time-stamps, fetched by you; repeat the flag (or separate with commas) for more CAs: a time-stamp whose TSA certificate was revoked for key compromise (or with no reason) counts only if the bundle shows it existed before (RFC 3161, 4), and a time-stamp shows that only when its own revocation is checked too, so give the CRLs of the second TSA as well", func(v string) error {
+	fs.Func("tsa-crl", "CRL (DER, or PEM blocks with nothing but whitespace around them) of a CA that issued a certificate in the chain of a time-stamp of the bundle, fetched by you; repeat the flag (or separate with commas) for more CAs: a time-stamp whose TSA certificate was revoked for key compromise (or with no reason) counts only if the bundle shows it existed before (RFC 3161, 4), and a time-stamp shows that only when its own revocation is checked too, so give the CRLs of the second TSA as well", func(v string) error {
 		for _, p := range strings.Split(v, ",") {
 			if p = strings.TrimSpace(p); p == "" {
 				return errors.New("an empty path (a comma too many, or an empty variable?)")

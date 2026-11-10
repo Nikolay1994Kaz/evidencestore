@@ -218,22 +218,10 @@
    "new": "\t\t\t_ = t"
   },
   {
-   "name": "R49 записи берутся только из самого свежего CRL центра",
-   "file": "internal/tsa/revoke.go",
-   "old": "\tfor i, f := range own {\n\t\tfor _, e := range f.bySN[sn] {",
-   "new": "\tfor i, f := range own[:min(1, len(own))] {\n\t\tfor _, e := range f.bySN[sn] {"
-  },
-  {
    "name": "R50 удержание не снимается новым CRL",
    "file": "internal/tsa/revoke.go",
    "old": "\t\t\tif e.Reason == ReasonCertificateHold && slices.ContainsFunc(own[:i],",
    "new": "\t\t\tif false && e.Reason == ReasonCertificateHold && slices.ContainsFunc(own[:i],"
-  },
-  {
-   "name": "R53 на тот же ключ переходит и отзыв без компрометации",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif keepsEarlier(e.Reason) || chainOnly(ci.c, signerKeys[k], e) {\n\t\t\t\tcontinue\n\t\t\t}",
-   "new": "\t\t\tif false {\n\t\t\t\tcontinue\n\t\t\t}"
   },
   {
    "name": "R54 второй CRL файла не читается",
@@ -320,12 +308,6 @@
    "new": "\tif false && mainKey != nil && *mainKey == key {"
   },
   {
-   "name": "R76 отсутствие причины не переходит на тот же ключ",
-   "file": "internal/tsa/revoke.go",
-   "old": "\treturn e.Reason == ReasonAbsent && c.IsCA && !signer\n}",
-   "new": "\treturn e.Reason == ReasonAbsent\n}"
-  },
-  {
    "name": "R89 номер дважды в CRL — последняя запись",
    "file": "internal/tsa/revoke.go",
    "old": "\t\tf.bySN[e.SerialNumber.String()] = append(f.bySN[e.SerialNumber.String()], rev)",
@@ -362,18 +344,6 @@
    "new": ""
   },
   {
-   "name": "R1 без компрометации — метка после отзыва в силе",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif keepsEarlier(e.Reason) && !gen.Before(e.Time) {\n\t\t\t\treturn retiredErr(c, e, gen)",
-   "new": "\t\t\tif false {\n\t\t\t\treturn retiredErr(c, e, gen)"
-  },
-  {
-   "name": "R2 метка в момент отзыва в силе",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif keepsEarlier(e.Reason) && !gen.Before(e.Time) {\n\t\t\t\treturn retiredErr",
-   "new": "\t\t\tif keepsEarlier(e.Reason) && gen.After(e.Time) {\n\t\t\t\treturn retiredErr"
-  },
-  {
    "name": "R6 подпись CRL ключом центра не сверяется",
    "file": "internal/tsa/revoke.go",
    "old": "\ts := sigCheck{key: issuer.CheckSignature(f.rl.SignatureAlgorithm, f.rl.RawTBSRevocationList, f.rl.Signature)}",
@@ -398,46 +368,10 @@
    "new": "r.checkSig(f, issuer).auth == nil {"
   },
   {
-   "name": "R9 отзыв корня по перечню не сверяется",
-   "file": "internal/tsa/revoke.go",
-   "old": "\tif len(issuers) == 0 {\n\t\treturn st\n\t}",
-   "new": "\tif len(issuers) == 0 {\n\t\treturn certStatus{}\n\t}"
-  },
-  {
-   "name": "R52 компрометация ключа не переходит на сертификат того же ключа",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\te := k.e",
-   "new": "\t\tif !ok || !bytes.Equal(k.cert.Raw, c.Raw) {\n\t\t\tcontinue\n\t\t}\n\t\te := k.e"
-  },
-  {
-   "name": "R106 подозрение на ключ — только от сертификатов той же цепочки",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tk, ok := byKey[string(c.RawSubjectPublicKeyInfo)]\n",
-   "new": "\t\tk, ok := byKey[string(c.RawSubjectPublicKeyInfo)]\n\t\tok = ok && slices.ContainsFunc(chain, func(x *x509.Certificate) bool { return bytes.Equal(x.Raw, k.cert.Raw) })\n"
-  },
-  {
-   "name": "R107 отсечка ключа — не самая ранняя",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif old, ok := byKey[k]; !ok || e.Cutoff().Before(old.e.Cutoff()) {",
-   "new": "\t\t\tif old, ok := byKey[k]; !ok || e.Cutoff().After(old.e.Cutoff()) {"
-  },
-  {
    "name": "R55 мусор после DER принят",
    "file": "internal/tsa/revoke.go",
    "old": "\t\t\treturn nil, fmt.Errorf(\"data after CRL #%d is not DER: %v\", len(out), err)",
    "new": "\t\t\treturn out, nil"
-  },
-  {
-   "name": "R69 двоичное вне блоков PEM принято",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tcase !utf8.Valid(outside):",
-   "new": "\t\tcase false:"
-  },
-  {
-   "name": "R108 текст вне блоков PEM отвергается",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tcase !isText(outside):",
-   "new": "\t\tcase len(bytes.TrimSpace(outside)) > 0:"
   },
   {
    "name": "R72 CRL из будущего говорит о статусе",
@@ -452,12 +386,6 @@
    "new": "\tif n := bytes.Count(data, begin); false && n != blocks {"
   },
   {
-   "name": "R78 статус сертификата — по центру первой цепочки",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\tif j < len(ch)-1 && !has(ci.issuers, ch[j+1]) {",
-   "new": "\t\t\t\tif j < len(ch)-1 && len(ci.issuers) == 0 {"
-  },
-  {
    "name": "R85 удержание снимает CRL из будущего",
    "file": "internal/tsa/revoke.go",
    "old": "return g.newer(f) && forStatus(g) && len(g.bySN[sn]) == 0 }",
@@ -470,28 +398,10 @@
    "new": "return g.newer(f) && !future(g) && g.speaks(c) && len(g.bySN[sn]) == 0 }"
   },
   {
-   "name": "R88 CRL с именем центра под другим ключом, называющий сертификат, — не в счёт",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tcase ci.st.cur != nil && g.newer(ci.st.cur) && !future(g):",
-   "new": "\t\t\tcase ci.st.cur != nil && g.newer(ci.st.cur) && !future(g) && false:"
-  },
-  {
-   "name": "R110 CRL с именем центра под другим ключом — «не проверено» и без записи",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tcase !signed && len(f.bySN[sn]) > 0:",
-   "new": "\t\tcase !signed:"
-  },
-  {
    "name": "R95 DER с пробелами между CRL отвергается",
    "file": "internal/tsa/revoke.go",
    "old": "; len(rest) > 0; rest = bytes.TrimLeft(rest, \" \\t\\r\\n\") {",
    "new": "; len(rest) > 0; {"
-  },
-  {
-   "name": "R96 BOM перед PEM отвергается",
-   "file": "internal/tsa/revoke.go",
-   "old": "\tif !utf8.Valid(b) {",
-   "new": "\tif !utf8.Valid(b) || bytes.Contains(b, []byte(\"\\xef\\xbb\\xbf\")) {"
   },
   {
    "name": "R111 два CRL в блоке PEM — только первый",
@@ -518,22 +428,10 @@
    "new": "\t\tif at.Before(p.cutoff)"
   },
   {
-   "name": "R15 метка второй службы под подозрением — POE",
-   "file": "internal/proof/revoked.go",
-   "old": "\t\t\t} else if v.NeedPOE {",
-   "new": "\t\t\t} else if false && v.NeedPOE {"
-  },
-  {
    "name": "R60 POE раньше времени самой метки",
    "file": "internal/proof/revoked.go",
    "old": "\t\tat := laterOf(m.at, p.gen)",
    "new": "\t\tat := m.at"
-  },
-  {
-   "name": "R112 свои метки судятся без меток второй службы",
-   "file": "internal/proof/revoked.go",
-   "old": "\tarchs := sc.archived(archive, last, rootAt)\n\tvs := sc.as.Verdicts()",
-   "new": "\tvs := sc.as.Verdicts()\n\tarchs := sc.archived(archive, last, rootAt)\n\tvs = append(vs[:len(sc.own):len(sc.own)], sc.as.Verdicts()[len(sc.own):]...)"
   },
   {
    "name": "R34 строка журнала второй службы не проверяется при выдаче",
@@ -578,94 +476,16 @@
    "new": "\t\t\t\tcontinue\n\t\t\t}\n\t\t\ttsaCRLs = append(tsaCRLs, p)"
   },
   {
-   "name": "R115 без причины у сертификата центра — о ключе",
-   "file": "internal/tsa/revoke.go",
-   "old": "\treturn e.Reason == ReasonAbsent && c.IsCA && !signer\n}",
-   "new": "\treturn false\n}"
-  },
-  {
-   "name": "R116 сертификат службы с флагом центра — как центр",
-   "file": "internal/tsa/revoke.go",
-   "old": "\treturn e.Reason == ReasonAbsent && c.IsCA && !signer\n}",
-   "new": "\treturn e.Reason == ReasonAbsent && c.IsCA\n}"
-  },
-  {
-   "name": "R117 обломки границы блока вне блоков приняты",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tcase brokenBoundary(outside) != \"\":",
-   "new": "\t\tcase false:"
-  },
-  {
    "name": "R118 удержание снимает CRL, что называет сертификат с другой причиной",
    "file": "internal/tsa/revoke.go",
    "old": "return g.newer(f) && forStatus(g) && len(g.bySN[sn]) == 0 }",
    "new": "return g.newer(f) && forStatus(g) && !slices.ContainsFunc(g.bySN[sn], func(e Revocation) bool { return e.Reason == ReasonCertificateHold }) }"
   },
   {
-   "name": "R119 запись CRL нового ключа центра не в счёт",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\t\tci.st.entries = append(ci.st.entries, e)",
-   "new": "\t\t\t\t\t_ = e"
-  },
-  {
-   "name": "R120 CRL нового ключа — путь к тому же корню не нужен",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]int{}) {",
-   "new": "\t\tif r.checkSig(g, x).key == nil {"
-  },
-  {
-   "name": "R121 CRL нового ключа — подпись не сверяется",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif r.checkSig(g, x).key == nil && p.under(x, as, 0, map[*x509.Certificate]int{}) {",
-   "new": "\t\tif p.under(x, as, 0, map[*x509.Certificate]int{}) {"
-  },
-  {
-   "name": "R122 вывод из работы по CRL нового ключа — метка в силе",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tout[i] = Verdict{Retired: retired, Named: named}",
-   "new": "\t\t\tout[i] = Verdict{Named: named}"
-  },
-  {
-   "name": "R123 Retired в пакете не проверяется",
-   "file": "internal/proof/revoked.go",
-   "old": "\t\tif v.Retired != nil {\n\t\t\t// Не в силе",
-   "new": "\t\tif false {\n\t\t\t// Не в силе"
-  },
-  {
-   "name": "R124 сертификаты -tsa-trust не в оценке",
-   "file": "internal/proof/revoked.go",
-   "old": "\t\tsc.as.KnownTrusted(sc.trust.Intermediates...)",
-   "new": "\t\t_ = sc.trust"
-  },
-  {
-   "name": "R125 сертификаты своих токенов не в оценке",
-   "file": "internal/proof/revoked.go",
-   "old": "\tsc.as.Known(info.Certs...)\n\tid, err := sc.as.Add(info.Chains, info.GenTime)\n\tif err != nil {\n\t\t// Пункт",
-   "new": "\tid, err := sc.as.Add(info.Chains, info.GenTime)\n\tif err != nil {\n\t\t// Пункт"
-  },
-  {
-   "name": "R126 сертификаты токенов второй службы не в оценке",
-   "file": "internal/proof/revoked.go",
-   "old": "\t\tsc.as.Known(info.Certs...)\n\t\tsc.as.Known(carried...)",
-   "new": "\t\tsc.as.Known(carried...)"
-  },
-  {
-   "name": "R127 сертификаты токена не в Info",
+   "name": "R127 сертификаты токена не в Info: журнал второй службы хранит и те, что токен несёт сам",
    "file": "internal/tsa/tsa.go",
    "old": "Signer: signer, Chains: chains, Certs: p.certs}, nil",
    "new": "Signer: signer, Chains: chains}, nil"
-  },
-  {
-   "name": "R128 Known: сертификат вне цепочек — без сверки, кем выпущен",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\tif !bytes.Equal(x.Raw, k.Raw) && x.CheckSignature(k.SignatureAlgorithm, k.RawTBSCertificate, k.Signature) == nil {",
-   "new": "\t\t\t\tif !bytes.Equal(x.Raw, k.Raw) {"
-  },
-  {
-   "name": "R129 Known не в счёт",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif certs[sha256.Sum256(k.Raw)] != nil || !chainKeys[string(k.RawSubjectPublicKeyInfo)] {\n\t\t\tcontinue\n\t\t}",
-   "new": "\t\tif true {\n\t\t\tcontinue\n\t\t}"
   },
   {
    "name": "R130 POE от метки с непроверенным отзывом",
@@ -698,48 +518,6 @@
    "new": "\tc, err := findSigner(p.signer.SID, append(slices.Clone(p.certs), intermediates[:0]...))"
   },
   {
-   "name": "R135 центр без причины — подозрения на цепочку нет",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tcase chainOnly(c, i == 0, e):\n\t\t\t\te.From +=",
-   "new": "\t\t\tcase false && chainOnly(c, i == 0, e):\n\t\t\t\te.From +="
-  },
-  {
-   "name": "R136 сертификаты из токенов строят путь (центр, ключ нового центра)",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif a.trusted[sha256.Sum256(c.Raw)] {\n\t\t\tp.add(c)\n\t\t}",
-   "new": "\t\tp.add(c)"
-  },
-  {
-   "name": "R137 корень — только имя, без ключа",
-   "file": "internal/tsa/revoke.go",
-   "old": "\treturn anchor{string(c.RawSubject), string(c.RawSubjectPublicKeyInfo)}",
-   "new": "\treturn anchor{string(c.RawSubject), \"\"}"
-  },
-  {
-   "name": "R138 путь — без сверки подписи центра",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tok = c.CheckSignatureFrom(parent) == nil",
-   "new": "\t\tok = bytes.Equal(c.RawIssuer, parent.RawSubject)"
-  },
-  {
-   "name": "R139 путь — только прямой выпуск ключом корня",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif parent != c && !bytes.Equal(parent.Raw, c.Raw) && p.issued(c, parent) && p.under(parent, as, depth+1, seen) {",
-   "new": "\t\tif parent != c && !bytes.Equal(parent.Raw, c.Raw) && p.issued(c, parent) && as[anchorOf(parent)] && seen != nil {"
-  },
-  {
-   "name": "R141 сертификаты вне цепочек — без снятия удержания (только записи)",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tci.st = a.r.judge(ci.c, ci.issuers)\n\t\tif !ci.inChain && len(ci.issuers) == 0",
-   "new": "\t\tci.st = a.r.judge(ci.c, ci.issuers)\n\t\tif !ci.inChain {\n\t\t\tfor _, x := range ci.issuers {\n\t\t\t\tci.st.entries = append(ci.st.entries, a.r.signed(ci.c, x)...)\n\t\t\t}\n\t\t}\n\t\tif !ci.inChain && len(ci.issuers) == 0"
-  },
-  {
-   "name": "R142 предел Known — и для данных проверяющим",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tcase len(a.known) >= maxKnown && !trusted:",
-   "new": "\t\tcase len(a.known) >= 1:"
-  },
-  {
    "name": "R143 журнал второй службы: сертификат подписанта не пишется",
    "file": "internal/store/archive.go",
    "old": "\t\t\t\trec.Cert = c.Raw",
@@ -750,84 +528,6 @@
    "file": "internal/tsa/tsa.go",
    "old": "\tcandidates := findSigners(p.signer.SID, pool)",
    "new": "\tcandidates := findSigners(p.signer.SID, pool)[:min(1, len(findSigners(p.signer.SID, pool)))]"
-  },
-  {
-   "name": "R145 корни -tsa-trust не в оценке",
-   "file": "internal/proof/revoked.go",
-   "old": "\t\tsc.as.KnownTrusted(sc.trust.RootCerts...)",
-   "new": "\t\t_ = sc.trust.RootCerts"
-  },
-  {
-   "name": "R146 удержание из CRL нового ключа не снимается",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\t\tif e.Reason == ReasonCertificateHold && slices.ContainsFunc(a.r.crlsNaming(ci.c), func(h *crlFile) bool {",
-   "new": "\t\t\t\t\tif false && e.Reason == ReasonCertificateHold && slices.ContainsFunc(a.r.crlsNaming(ci.c), func(h *crlFile) bool {"
-  },
-  {
-   "name": "R147 удержание из CRL нового ключа снимает CRL любого ключа",
-   "file": "internal/tsa/revoke.go",
-   "old": "slices.ContainsFunc(bys, func(x *x509.Certificate) bool { return a.r.checkSig(h, x).auth == nil })",
-   "new": "len(bys) > 0"
-  },
-  {
-   "name": "R148 удержание из CRL нового ключа снимает и более старый",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\t\t\treturn h.newer(g) && !future(h) && h.speaks(ci.c) && len(h.bySN[sn]) == 0",
-   "new": "\t\t\t\t\t\treturn h != g && !future(h) && h.speaks(ci.c) && len(h.bySN[sn]) == 0"
-  },
-  {
-   "name": "R149 CRL под неизвестным ключом о сертификате вне цепочек — не о ключе",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\t\t\tif !keepsEarlier(e.Reason) && !chainOnly(ci.c, signerKeys[k], e) {",
-   "new": "\t\t\t\t\tif false {"
-  },
-  {
-   "name": "R150 ключ с неизвестным статусом — статус сертификатов цепочек цел",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t}\n\t\tci.st.from, ci.st.cur = \"\", nil\n\t}\n\tstatus := func",
-   "new": "\t\t}\n\t}\n\tstatus := func"
-  },
-  {
-   "name": "R151 сертификат вне цепочек без центра — не судится",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif !ci.inChain && len(ci.issuers) == 0 && a.trusted[sha256.Sum256(ci.c.Raw)] && !bytes.Equal(ci.c.RawIssuer, ci.c.RawSubject) {",
-   "new": "\t\tif false {"
-  },
-  {
-   "name": "R152 сертификат вне цепочек без центра — и из токена",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif !ci.inChain && len(ci.issuers) == 0 && a.trusted[sha256.Sum256(ci.c.Raw)] && !bytes.Equal(ci.c.RawIssuer, ci.c.RawSubject) {",
-   "new": "\t\tif !ci.inChain && len(ci.issuers) == 0 && !bytes.Equal(ci.c.RawIssuer, ci.c.RawSubject) {"
-  },
-  {
-   "name": "R153 сертификат службы вне цепочек с флагом центра — как центр",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif keepsEarlier(e.Reason) || chainOnly(ci.c, signerKeys[k], e) {",
-   "new": "\t\t\tif keepsEarlier(e.Reason) || chainOnly(ci.c, signerKeys[k] && (ci.inChain || !ci.c.IsCA), e) {"
-  },
-  {
-   "name": "R154 имя субъекта — только байты",
-   "file": "internal/tsa/revoke.go",
-   "old": "\tfor _, c := range p.by[k[1]] {",
-   "new": "\tfor _, c := range p.by[k[1]][:0] {"
-  },
-  {
-   "name": "R155 обломок границы: метка X509 CRL без тире принята",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif bytes.Contains(bytes.Join(bytes.Fields(l), []byte(\" \")), []byte(\"X509 CRL\")) || base64Body(t) {",
-   "new": "\t\tif bytes.HasPrefix(l, []byte(\"--\")) && bytes.Contains(l, []byte(\"X509 CRL\")) || base64Body(t) {"
-  },
-  {
-   "name": "R156 обломок границы: довольно двух тире",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tif !bytes.HasPrefix(l, []byte(\"-----\")) && !bytes.HasSuffix(l, []byte(\"-----\")) {",
-   "new": "\t\tif !bytes.HasPrefix(l, []byte(\"--\")) && !bytes.HasSuffix(l, []byte(\"--\")) {"
-  },
-  {
-   "name": "R157 обломок границы: слово подстрокой",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif string(w) == \"BEGIN\" || string(w) == \"END\" {",
-   "new": "\t\t\tif bytes.Contains(w, []byte(\"BEGIN\")) || bytes.Contains(w, []byte(\"END\")) {"
   },
   {
    "name": "R158 подписант: подпись у каждого кандидата SID",
@@ -872,30 +572,6 @@
    "new": "\t\treturn n.SetInt64(2), nil"
   },
   {
-   "name": "R165 отброшенный сверх предела считается при каждом повторе",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tif !a.gone[fp] {\n\t\t\t\ta.gone[fp] = true\n\t\t\t\ta.dropped++\n\t\t\t}",
-   "new": "\t\t\ta.gone[fp] = true\n\t\t\ta.dropped++"
-  },
-  {
-   "name": "R166 корни проверяющего не в счёт для CRL нового ключа",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\t\tanchors[anchorOf(c)] = true",
-   "new": "\t\t\t_ = c"
-  },
-  {
-   "name": "R167 корни только цепочек самого сертификата",
-   "file": "internal/tsa/revoke.go",
-   "old": "\t\tas := anchors\n",
-   "new": "\t\tas := anchorsOf(ci.roots)\n"
-  },
-  {
-   "name": "R168 обход пути: узел не обходится снова и ближе к началу",
-   "file": "internal/tsa/revoke.go",
-   "old": "\tif d, ok := seen[c]; depth == maxPath || ok && d <= depth {",
-   "new": "\tif _, ok := seen[c]; depth == maxPath || ok {"
-  },
-  {
    "name": "R169 журнал второй службы: центры ниже корня не пишутся",
    "file": "internal/store/archive.go",
    "old": "\t\t\t\trec.Chain = append(rec.Chain, c.Raw)",
@@ -908,16 +584,142 @@
    "new": "\treturn out"
   },
   {
-   "name": "R171 тело блока PEM без границ принято",
+   "name": "R180 записи берутся только из самого свежего CRL центра",
    "file": "internal/tsa/revoke.go",
-   "old": "[]byte(\"X509 CRL\")) || base64Body(t) {",
-   "new": "[]byte(\"X509 CRL\")) || false && base64Body(t) {"
+   "old": "\t\tfor i, f := range own {\n\t\t\tfor _, e := range f.bySN[sn] {",
+   "new": "\t\tfor i, f := range own[:min(1, len(own))] {\n\t\t\tfor _, e := range f.bySN[sn] {"
   },
   {
-   "name": "R172 тело блока: отпечаток шестнадцатеричными цифрами — обломок",
+   "name": "R181 без компрометации — метка после отзыва в силе",
    "file": "internal/tsa/revoke.go",
-   "old": "\treturn !hex\n",
-   "new": "\treturn hex || !hex\n"
+   "old": "\t\t\tif keepsEarlier(e.Reason) && !gen.Before(e.Time) {\n\t\t\t\treturn fmt.Errorf(\"%w: certificate",
+   "new": "\t\t\tif false {\n\t\t\t\treturn fmt.Errorf(\"%w: certificate"
+  },
+  {
+   "name": "R182 метка в момент отзыва в силе",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif keepsEarlier(e.Reason) && !gen.Before(e.Time) {",
+   "new": "\t\t\tif keepsEarlier(e.Reason) && gen.After(e.Time) {"
+  },
+  {
+   "name": "R183 текст вокруг блоков PEM принят",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif !bytes.HasPrefix(rest, begin) {\n\t\t\treturn nil, fmt.Errorf(\"something other than PEM blocks",
+   "new": "\t\tif false {\n\t\t\treturn nil, fmt.Errorf(\"something other than PEM blocks"
+  },
+  {
+   "name": "R184 BOM перед блоком PEM отвергается",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tconst pemSpace = \" \\t\\r\\n\\ufeff\"",
+   "new": "\tconst pemSpace = \" \\t\\r\\n\""
+  },
+  {
+   "name": "R185 центры сертификата — только из первой цепочки",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\t\tif is := ch[j+1]; !slices.ContainsFunc(ci.issuers, func(x *x509.Certificate) bool { return bytes.Equal(x.Raw, is.Raw) }) {",
+   "new": "\t\t\t\tif is := ch[j+1]; len(ci.issuers) == 0 {"
+  },
+  {
+   "name": "R186 CRL под другим ключом, новее статусного и с записью, статуса не снимает",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tdoubted = true",
+   "new": "\t\t\tdoubted = false"
+  },
+  {
+   "name": "R187 CRL под другим ключом снимает статус и когда старше статусного",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif cur != nil && f.newer(cur) && !future(f) {",
+   "new": "\t\tif cur != nil && !future(f) {"
+  },
+  {
+   "name": "R188 CRL под другим ключом из будущего снимает статус",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif cur != nil && f.newer(cur) && !future(f) {",
+   "new": "\t\tif cur != nil && f.newer(cur) {"
+  },
+  {
+   "name": "R189 записи CRL под другим ключом, называющего сертификат, в счёт",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif !signed {\n\t\t\tforeign = append(foreign, f)",
+   "new": "\t\tif !signed && len(f.bySN[sn]) == 0 {\n\t\t\tforeign = append(foreign, f)"
+  },
+  {
+   "name": "R190 отзыв без компрометации позже метки — подозрение",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif keepsEarlier(e.Reason) {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif cut := e.Cutoff()",
+   "new": "\t\t\tif false {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif cut := e.Cutoff()"
+  },
+  {
+   "name": "R191 отсечка цепочки — не самая ранняя",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif cut := e.Cutoff(); !v.NeedPOE || cut.Before(v.Cutoff) {",
+   "new": "\t\t\tif cut := e.Cutoff(); !v.NeedPOE || cut.After(v.Cutoff) {"
+  },
+  {
+   "name": "R192 корень судится по CRL, как остальные",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif i == len(chain)-1 {\n\t\t\tes = r.listed[sha256.Sum256(c.Raw)]\n\t\t} else {",
+   "new": "\t\tif i < 0 {\n\t\t\tes = r.listed[sha256.Sum256(c.Raw)]\n\t\t} else {"
+  },
+  {
+   "name": "R193 цепочка, отозванная без компрометации к времени метки, судится дальше",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif s.err == nil {\n\t\t\t\ts.err = err\n\t\t\t}\n\t\t\tcontinue\n\t\t}\n\t\ts.live = append(s.live, ch)",
+   "new": "\t\t\tif s.err == nil {\n\t\t\t\ts.err = err\n\t\t\t}\n\t\t}\n\t\ts.live = append(s.live, ch)"
+  },
+  {
+   "name": "R194 из цепочек метки берётся первая, а не лучшая",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif v := a.r.verdictOf(ch, status); j == 0 || v.better(out[i]) {",
+   "new": "\t\t\tif v := a.r.verdictOf(ch, status); j == 0 {"
+  },
+  {
+   "name": "R195 из цепочек метки берётся последняя, а не лучшая",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\t\tif v := a.r.verdictOf(ch, status); j == 0 || v.better(out[i]) {",
+   "new": "\t\t\tif v := a.r.verdictOf(ch, status); j >= 0 {"
+  },
+  {
+   "name": "R196 лучшая цепочка — та, что под подозрением",
+   "file": "internal/tsa/revoke.go",
+   "old": "\tcase v.NeedPOE != o.NeedPOE:\n\t\treturn !v.NeedPOE",
+   "new": "\tcase v.NeedPOE != o.NeedPOE:\n\t\treturn v.NeedPOE"
+  },
+  {
+   "name": "R197 из цепочек под подозрением лучшая — с ранней отсечкой",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\treturn v.Cutoff.After(o.Cutoff)",
+   "new": "\t\treturn v.Cutoff.Before(o.Cutoff)"
+  },
+  {
+   "name": "R198 CRL метки, что не в силе, к пакету не относятся",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tfor _, ch := range s.chains {\n\t\t\tfor _, c := range ch[:max(len(ch)-1, 0)] {",
+   "new": "\t\tfor _, ch := range s.live {\n\t\t\tfor _, c := range ch[:max(len(ch)-1, 0)] {"
+  },
+  {
+   "name": "R199 метка не в силе получает вердикт своей цепочки",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tfor j, ch := range s.live {",
+   "new": "\t\tfor j, ch := range s.chains {"
+  },
+  {
+   "name": "R200 метка второй службы под подозрением — POE",
+   "file": "internal/proof/revoked.go",
+   "old": "\t\t\tif v := vs[a.id]; v.NeedPOE {",
+   "new": "\t\t\tif v := vs[a.id]; false && v.NeedPOE {"
+  },
+  {
+   "name": "R201 из чистых цепочек лучшая — где больше непроверенного",
+   "file": "internal/tsa/revoke.go",
+   "old": "\treturn len(v.Unchecked) < len(o.Unchecked)",
+   "new": "\treturn len(v.Unchecked) > len(o.Unchecked)"
+  },
+  {
+   "name": "R202 отзыв корня по перечню не в счёт",
+   "file": "internal/tsa/revoke.go",
+   "old": "\t\tif i == len(chain)-1 {\n\t\t\tes = r.listed[sha256.Sum256(c.Raw)]\n\t\t} else {",
+   "new": "\t\tif i == len(chain)-1 {\n\t\t\tes = nil\n\t\t} else {"
   }
  ]
 }

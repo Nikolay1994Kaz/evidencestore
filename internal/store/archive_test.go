@@ -267,6 +267,11 @@ func TestArchiveJournal(t *testing.T) {
 	}
 	var rec archiveRecord
 	json.Unmarshal(good[:strings.IndexByte(string(good), '\n')], &rec)
+	// Токен этой службы несёт её сертификат сам: второй раз, рядом с токеном,
+	// журнал его не хранит и в пакет не кладёт (мутация R127).
+	if len(rec.Cert) != 0 || len(rec.Chain) != 0 || len(before.Archive[0].Certs) != 0 {
+		t.Fatalf("сертификат, который токен несёт сам, записан ещё раз: в журнале %d и %d байт, в пакете %d", len(rec.Cert), len(rec.Chain), len(before.Archive[0].Certs))
+	}
 	rec.Token = append([]byte(nil), rec.Token...)
 	rec.Token[len(rec.Token)-1] ^= 1
 	forged, _ := json.Marshal(rec)

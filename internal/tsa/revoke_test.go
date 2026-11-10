@@ -268,9 +268,10 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || hasNote(v, "did the CA change its key?") {
 		t.Fatalf("CRL с тем же именем под другим ключом новее своего, без записи: %+v %v", v, err)
 	}
-	// Называет — центр мог сменить ключ и отозвать сертификат уже им, но
-	// сертификата нового ключа, ведущего к тому же корню, нет (здесь — корень
-	// с тем же именем): запись не в счёт, статус не известен.
+	// Называет — центр мог сменить ключ и отозвать сертификат уже им, а мог
+	// быть и другой центр с тем же именем: подпись такого CRL с цепочкой не
+	// сверить. Запись не в счёт, статус не известен, и заметка велит назвать
+	// сертификат в перечне, если проверяющий этому CRL верит.
 	der, err = other.RevocationList(w.gen.Add(40*time.Hour), now.Add(time.Hour), x509.RevocationListEntry{SerialNumber: w.a.Cert().SerialNumber, RevocationTime: w.gen.Add(39 * time.Hour), ReasonCode: ReasonKeyCompromise})
 	if err != nil {
 		t.Fatal(err)
@@ -281,8 +282,34 @@ func TestRevocationsCRLItself(t *testing.T) {
 	if err := r.AddCRL(newer); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !hasNote(v, "lists it as revoked, and its signature cannot be checked") || !hasNote(v, "did the CA change its key? pass that certificate in -tsa-trust") {
+	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 1 || len(v.CRLs) != 0 || !hasNote(v, "lists it as revoked, and its signature cannot be checked") || !hasNote(v, "did the CA change its key?") || !hasNote(v, "list the certificate with -tsa-revoked") {
 		t.Fatalf("CRL центра под другим ключом новее своего, с записью: %+v %v", v, err)
+	}
+	// Сертификат этого другого ключа в -tsa-trust ничего не меняет: путь к
+	// корню для него не строится (до 10.11 строился — DECISIONS, п. 35).
+	// Называет сертификат проверяющий — и тогда запись в счёт.
+	if err := r.addList("mine.json", []byte(`[{"cert_sha256": "`+Fingerprint(w.a.Cert())+`", "revoked": "`+w.gen.Add(39*time.Hour).Format(time.RFC3339)+`", "reason": "keyCompromise"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := w.check(r); err != nil || !v.NeedPOE || !v.Cutoff.Equal(w.gen.Add(39*time.Hour)) || !strings.Contains(v.Entry.From, "mine.json") {
+		t.Fatalf("тот же сертификат в перечне проверяющего: %+v %v", v, err)
+	}
+	// Такой CRL старше своего: статус — по своему, более свежему; заметка о
+	// нём остаётся.
+	r = NewRevocations(now)
+	r.AddCRL(w.crlAt("own-late.crl", w.gen.Add(44*time.Hour), now.Add(time.Hour), nil))
+	if err := r.AddCRL(newer); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := w.check(r); err != nil || v.NeedPOE || len(v.Unchecked) != 0 || len(v.CRLs) != 1 || !hasNote(v, "did the CA change its key?") || hasNote(v, "its signature cannot be checked") {
+		t.Fatalf("CRL центра под другим ключом старше своего, с записью: %+v %v", v, err)
+	}
+	// Он же из будущего (позже момента проверки): о статусе не говорит.
+	r = NewRevocations(w.gen.Add(38 * time.Hour))
+	r.AddCRL(w.crlAt("own-early.crl", w.gen.Add(time.Hour), now.Add(time.Hour), nil))
+	r.AddCRL(newer)
+	if v, err := w.check(r); err != nil || len(v.Unchecked) != 0 || !hasNote(v, "did the CA change its key?") {
+		t.Fatalf("CRL центра под другим ключом из будущего: %+v %v", v, err)
 	}
 	// И один, без своего: статус не проверен, и заметка говорит, что он
 	// называет сертификат.
@@ -637,11 +664,12 @@ func TestRevocationsHold(t *testing.T) {
 	}
 }
 
-// Компрометация — свойство ключа: промежуточный центр выпущен двумя корнями
-// с одним ключом; корень A отозвал свой выпуск по cACompromise, CRL корня B
-// не дан — цепочка через B не прячет компрометацию; запись без причины —
-// тоже (RFC 3161, 4: не в силе метки ключа). Отзыв без компрометации
-// (superseded) на другой выпуск не переходит.
+// Центр выпущен двумя корнями на один ключ (перекрёстная сертификация): у
+// метки две цепочки. Судится сертификат, а не ключ: что бы корень A ни
+// записал о своём выпуске центра, цепочка через выпуск корня B остаётся, и
+// вердикт — по лучшей из цепочек, в каком бы порядке они ни шли.
+// Компрометацию ключа центра на другой выпуск переносит проверяющий, назвав
+// его в перечне (limitations.md).
 func TestRevocationsSameKeyCrossCert(t *testing.T) {
 	dir := t.TempDir()
 	rootA := issue(t, caTmpl(1, "root A"), newKey(t), nil)
@@ -655,22 +683,61 @@ func TestRevocationsSameKeyCrossCert(t *testing.T) {
 	if len(info.Chains) != 2 {
 		t.Fatalf("цепочек %d, ждали двух", len(info.Chains))
 	}
+	viaA, viaB := info.Chains[0], info.Chains[1]
+	if !bytes.Equal(viaA[1].Raw, interA.cert.Raw) {
+		viaA, viaB = viaB, viaA
+	}
+	orders := map[string][][]*x509.Certificate{"A, B": {viaA, viaB}, "B, A": {viaB, viaA}}
 	inter := interA.crlOf(t, dir, "inter.crl", gen.Add(time.Hour), now.Add(time.Hour), nil)
-	// Без причины — у сертификата центра не о ключе (keepsEarlierFor): так
-	// центр прекращает перекрёстную сертификацию. Цепочка через interA после
-	// даты отзыва не в силе, через interB — в силе.
-	for reason, poe := range map[int]bool{ReasonCACompromise: true, ReasonAbsent: false, ReasonSuperseded: false} {
+	entry := func(c *pki, at time.Time, code int) x509.RevocationListEntry {
+		return x509.RevocationListEntry{SerialNumber: c.cert.SerialNumber, RevocationTime: at, ReasonCode: code}
+	}
+	for _, reason := range []int{ReasonCACompromise, ReasonAbsent, ReasonSuperseded} {
 		code := reason
 		if reason == ReasonAbsent {
 			code = 0 // x509 не пишет причину unspecified: записи без причины
 		}
 		r := NewRevocations(now)
 		r.AddCRL(inter)
-		r.AddCRL(rootA.crlOf(t, dir, "rootA"+ReasonName(reason)+".crl", gen.Add(time.Hour), now.Add(time.Hour), nil,
-			x509.RevocationListEntry{SerialNumber: interA.cert.SerialNumber, RevocationTime: gen.Add(-time.Hour), ReasonCode: code}))
-		v, err := r.Check(info.Chains, info.GenTime)
-		if err != nil || v.NeedPOE != poe {
-			t.Errorf("%s: %+v %v", ReasonName(reason), v, err)
+		r.AddCRL(rootA.crlOf(t, dir, "rootA"+ReasonName(reason)+".crl", gen.Add(time.Hour), now.Add(time.Hour), nil, entry(interA, gen.Add(-time.Hour), code)))
+		for order, chains := range orders {
+			v, err := r.Check(chains, info.GenTime)
+			if err != nil || v.NeedPOE || len(v.Unchecked) != 1 || !bytes.Equal(v.Unchecked[0].Raw, interB.cert.Raw) {
+				t.Errorf("%s, цепочки %s: вердикт — по цепочке через выпуск корня B, чей отзыв не проверен: %+v %v", ReasonName(reason), order, v, err)
+			}
+		}
+		if reason != ReasonCACompromise {
+			continue
+		}
+		// Одна цепочка — через отозванный выпуск: ждёт POE.
+		if v, err := r.Check([][]*x509.Certificate{viaA}, info.GenTime); err != nil || !v.NeedPOE || !bytes.Equal(v.Revoked.Raw, interA.cert.Raw) {
+			t.Errorf("одна цепочка, через выпуск корня A: %+v %v", v, err)
+		}
+		if err := r.addList("mine.json", []byte(`[{"cert_sha256": "`+Fingerprint(interB.cert)+`", "revoked": "`+gen.Add(-time.Hour).Format(time.RFC3339)+`", "reason": "cACompromise"}]`)); err != nil {
+			t.Fatal(err)
+		}
+		if v, err := r.Check(info.Chains, info.GenTime); err != nil || !v.NeedPOE {
+			t.Errorf("оба выпуска названы отозванными: %+v %v", v, err)
+		}
+	}
+	// Обе цепочки под подозрением: лучшая — с поздней отсечкой.
+	early, late := gen.Add(2*time.Hour), gen.Add(20*time.Hour)
+	r := NewRevocations(now)
+	r.AddCRL(inter)
+	r.AddCRL(rootA.crlOf(t, dir, "rootA-early.crl", gen.Add(30*time.Hour), now.Add(time.Hour), nil, entry(interA, early, ReasonCACompromise)))
+	r.AddCRL(rootB.crlOf(t, dir, "rootB-late.crl", gen.Add(30*time.Hour), now.Add(time.Hour), nil, entry(interB, late, ReasonCACompromise)))
+	for order, chains := range orders {
+		if v, err := r.Check(chains, info.GenTime); err != nil || !v.NeedPOE || !v.Cutoff.Equal(late) || !bytes.Equal(v.Revoked.Raw, interB.cert.Raw) {
+			t.Errorf("обе под подозрением, цепочки %s: %+v %v", order, v, err)
+		}
+	}
+	// Обе чисты: лучшая — та, где проверено всё.
+	r = NewRevocations(now)
+	r.AddCRL(inter)
+	r.AddCRL(rootA.crlOf(t, dir, "rootA-clean.crl", gen.Add(30*time.Hour), now.Add(time.Hour), nil))
+	for order, chains := range orders {
+		if v, err := r.Check(chains, info.GenTime); err != nil || v.NeedPOE || len(v.Unchecked) != 0 || len(v.CRLs) != 2 {
+			t.Errorf("обе чисты, цепочки %s: %+v %v", order, v, err)
 		}
 	}
 }
@@ -742,6 +809,15 @@ func TestRevocationsStrictInput(t *testing.T) {
 		"DER рядом с PEM":              cat(block, other),
 		"хвост в блоке":                pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: cat(der, []byte{0xff, 0xff})}),
 		"начало блока в тексте":        cat([]byte("see -----BEGIN X509 CRL----- below\n"), block),
+		// Вокруг блоков — только пробелы: текст не отличить от блока с
+		// испорченной границей, который pem.Decode пропустил бы молча.
+		"пояснение перед блоком":   cat([]byte("Certificate Revocation List (CRL):\n    Issuer: CN = x\n"), block),
+		"текст между блоками":      cat(block, []byte("<html>404</html>\n"), block),
+		"текст после блока":        cat(block, []byte("fetched 2026-11-10\n")),
+		"в строке начала 4 тире":   cat(block, bytes.Replace(block, []byte("-----BEGIN"), []byte("----BEGIN"), 1)),
+		"в строке начала опечатка": cat(bytes.Replace(block, []byte("BEGIN X509"), []byte("BEGlN X509"), 1), block),
+		"нет строки начала":        cat(block, block[bytes.IndexByte(block, '\n')+1:]),
+		"нет строки конца":         cat(block[:bytes.LastIndex(block, []byte("-----END"))], block),
 	} {
 		if err := NewRevocations(now).AddCRL(write("bad.pem", data)); err == nil {
 			t.Errorf("%s: принято", name)
@@ -752,9 +828,8 @@ func TestRevocationsStrictInput(t *testing.T) {
 		"DER с переводом строки":     cat(der, []byte("\n")),
 		"DER подряд через пробелы":   cat([]byte("\n"), der, []byte(" \r\n"), other),
 		"два блока с пустой строкой": cat(block, []byte("\n"), block),
-		"пояснение перед блоком":     cat([]byte("Certificate Revocation List (CRL):\n    Issuer: CN = x\n"), block),
-		"текст между блоками":        cat(block, []byte("<html>404</html>\n"), block),
 		"BOM перед каждым блоком":    cat([]byte("\xef\xbb\xbf"), block, []byte("\xef\xbb\xbf"), block),
+		"пробелы вокруг блоков":      cat([]byte(" \r\n\t"), block, []byte("\r\n \n"), block, []byte("\n\n")),
 	} {
 		if err := NewRevocations(now).AddCRL(write("good.crl", data)); err != nil {
 			t.Errorf("%s: %v", name, err)
@@ -823,9 +898,9 @@ func TestRevocationsOpenSSLCRL(t *testing.T) {
 	if err := f.rl.CheckSignatureFrom(ca); err != nil {
 		t.Fatal(err)
 	}
-	// Тот же CRL так, как его пишет openssl crl -text: описание, затем блок.
-	rt := NewRevocations(r.Now)
-	if err := rt.AddCRL(filepath.Join("testdata", "openssl", "fixture-text.pem")); err != nil || len(rt.crls) != 1 || !bytes.Equal(rt.crls[0].rl.Raw, f.rl.Raw) {
+	// Тот же CRL так, как его пишет openssl crl -text (описание, затем блок),
+	// — отказ с советом: вокруг блоков допустимы только пробелы.
+	if err := NewRevocations(r.Now).AddCRL(filepath.Join("testdata", "openssl", "fixture-text.pem")); err == nil || !strings.Contains(err.Error(), "openssl crl -in FILE -out CLEAN") {
 		t.Fatalf("вывод openssl crl -text: %v", err)
 	}
 	day := func(d, h int) time.Time { return time.Date(2026, 10, d, h, 0, 0, 0, time.UTC) }

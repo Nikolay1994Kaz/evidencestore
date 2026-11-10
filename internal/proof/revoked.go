@@ -18,10 +18,10 @@ import (
 
 // Отзыв сертификатов служб меток в пакете (tsa.Revocations; RFC 3161, 4).
 //
-// Все метки пакета — свои и второй службы — судятся вместе (tsa.Assessment):
-// компрометация — свойство ключа, и запись о ней у любого сертификата ключа в
-// любой цепочке любой метки пакета ставит под подозрение каждую метку, чьи
-// цепочки все несут этот ключ, с самой ранней отсечкой ключа. Отозванная без
+// Все метки пакета — свои и второй службы — судятся одной оценкой
+// (tsa.Assessment): сертификат, общий для многих меток, судится раз, по
+// цепочке метки (перенос подозрения по ключу на другие сертификаты того же
+// ключа — дело перечня проверяющего, tsa/revoke.go). Отозванная без
 // компрометации не позже её времени — метка не в силе, и пункт, где она
 // нужна, не проходит. Под подозрением — время метки ничего не доказывает, и
 // метка в силе, только если пакет показывает, что она существовала раньше
@@ -129,7 +129,6 @@ func (sc *stampCheck) verify(token []byte, head uint64, root [32]byte, link uint
 		return info, nil
 	}
 	sc.ensureAssessment()
-	sc.as.Known(info.Certs...)
 	id, err := sc.as.Add(info.Chains, info.GenTime)
 	if err != nil {
 		// Пункт, где метка нужна, не проходит; пункт об отзыве — тоже, чтобы
@@ -143,14 +142,10 @@ func (sc *stampCheck) verify(token []byte, head uint64, root [32]byte, link uint
 	return info, nil
 }
 
-// ensureAssessment — оценка отзыва пакета; сертификаты, которые проверяющий
-// дал в -tsa-trust, входят в неё сразу: ключ перевыпущенного сертификата
-// судится и тогда, когда цепочки меток через него не идут.
+// ensureAssessment — оценка отзыва пакета, одна на все его метки.
 func (sc *stampCheck) ensureAssessment() {
 	if sc.as == nil {
 		sc.as = sc.revs.NewAssessment()
-		sc.as.KnownTrusted(sc.trust.Intermediates...)
-		sc.as.KnownTrusted(sc.trust.RootCerts...)
 	}
 }
 
@@ -192,8 +187,7 @@ type archiveCheck struct {
 }
 
 // finish — пункт отчёта об отзыве. Метки второй службы, что проходят Verify,
-// входят в оценку всегда: ключи их цепочек судятся вместе со своими, даже
-// когда POE не понадобится. Затем вердикты всех меток пакета: своя под
+// входят в оценку. Затем вердикты всех меток пакета: своя под
 // подозрением ищет POE — свою метку не под подозрением, метку второй службы,
 // подпись закреплённого свидетеля. last — последнее звено пакета, rootAt —
 // корни дерева на звеньях пакета. Без сведений об отзыве пункта нет, а
@@ -213,12 +207,6 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 	for _, o := range sc.own {
 		v := vs[o.id]
 		sc.record(v)
-		if v.Retired != nil {
-			// Не в силе по записям, которые видны только всей оценке (CRL
-			// под новым ключом центра): как отзыв до её времени в verify.
-			sc.revoked = append(sc.revoked, fmt.Sprintf("%s: %v", o.mark.what, v.Retired))
-			continue
-		}
 		if v.NeedPOE {
 			p := o.mark
 			p.cutoff, p.why = v.Cutoff, revokedWhy(v)
@@ -233,9 +221,7 @@ func (sc *stampCheck) finish(archive []ArchiveStamp, cs []Cosignature, keys []co
 				sc.notes = append(sc.notes, a.why)
 				continue
 			}
-			if v := vs[a.id]; v.Retired != nil {
-				sc.notes = append(sc.notes, fmt.Sprintf("the archive time-stamp over head %d was not used: %v", a.a.HeadSeq, v.Retired))
-			} else if v.NeedPOE {
+			if v := vs[a.id]; v.NeedPOE {
 				sc.notes = append(sc.notes, fmt.Sprintf("the archive time-stamp over head %d rests on %s itself: not used", a.a.HeadSeq, revokedWhy(v)))
 			} else {
 				sc.record(v)
@@ -352,7 +338,7 @@ func (sc *stampCheck) addPOE(v tsa.Verdict, m poeMark) {
 }
 
 // archived — метки второй службы пакета: токен проходит Verify — метка входит
-// в оценку (её ключи судятся вместе со всеми); голова сходится с пакетом
+// в оценку; голова сходится с пакетом
 // (корень на звене пакета или доказательство продолжения от его последнего
 // звена) — может быть POE. Не сошлась — заметка, не провал: метка второй
 // службы пакету не обязательна. Заметки — только когда POE понадобилась.
@@ -394,8 +380,6 @@ func (sc *stampCheck) archived(archive []ArchiveStamp, last uint64, rootAt func(
 			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d was not used: %v (%s)", a.HeadSeq, err, hint)})
 			continue
 		}
-		sc.as.Known(info.Certs...)
-		sc.as.Known(carried...)
 		id, err := sc.as.Add(info.Chains, info.GenTime)
 		if err != nil {
 			out = append(out, archiveCheck{a: a, id: -1, why: fmt.Sprintf("the archive time-stamp over head %d was not used: %v", a.HeadSeq, err)})

@@ -270,8 +270,9 @@ type Info struct {
 	// Chains — цепочки от сертификата службы до корня из Trust, по которым
 	// он проверен: по ним сверяется отзыв (Assessment.Add).
 	Chains [][]*x509.Certificate
-	// Certs — сертификаты, которые несёт сам токен: и те, что не попали в
-	// цепочки, говорят об отзыве своих ключей (Assessment.Known).
+	// Certs — сертификаты, которые несёт сам токен (поле certificates в CMS
+	// не подписано): журнал второй службы по ним решает, какие сертификаты
+	// цепочки хранить рядом с токеном.
 	Certs []*x509.Certificate
 }
 
@@ -280,10 +281,6 @@ type Info struct {
 type Trust struct {
 	Roots         *x509.CertPool
 	Intermediates []*x509.Certificate
-	// RootCerts — те же корни списком (LoadTrust): оценке отзыва нужны и
-	// корни, через которые цепочки не идут (путь сертификата нового ключа
-	// центра к корню, продлённому на тот же ключ).
-	RootCerts []*x509.Certificate
 }
 
 type parsed struct {
@@ -712,7 +709,6 @@ func LoadTrust(paths string) (Trust, error) {
 			}
 			if bytes.Equal(c.RawIssuer, c.RawSubject) && c.CheckSignatureFrom(c) == nil {
 				t.Roots.AddCert(c)
-				t.RootCerts = append(t.RootCerts, c)
 				roots++
 			} else {
 				t.Intermediates = append(t.Intermediates, c)

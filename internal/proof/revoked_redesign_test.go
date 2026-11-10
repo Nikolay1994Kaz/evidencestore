@@ -89,7 +89,6 @@ func TestRevocationArchiveCarriesChain(t *testing.T) {
 	st := archiveOver(t, w, other, 5, cut.Add(-time.Hour))
 	tr := w.trust()
 	tr.TSA.Roots.AddCert(root)
-	tr.TSA.RootCerts = append(tr.TSA.RootCerts, root)
 	tr.TSARevocations = compromised(t, w.tsa, cut, now)
 	for i, c := range []struct {
 		ca  *x509.Certificate

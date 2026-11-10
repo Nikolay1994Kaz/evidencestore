@@ -8,6 +8,7 @@ CRL от openssl (независимая от Go запись) для TestRevoca
   ca.cnf: crl_extensions с issuingDistributionPoint (fullname URI, onlyuser), authorityKeyIdentifier;
   openssl ca -config ca.cnf -gencrl -out fixture.crl
 Ключ центра не сохранён: он не нужен — тест только разбирает CRL и сверяет подпись.
-fixture-text.pem — тот же CRL так, как его пишет openssl crl -text (описание, затем блок PEM;
-RFC 7468, 2: текст вне блока допустим):
+fixture-text.pem — тот же CRL так, как его пишет openssl crl -text (описание, затем блок PEM):
   openssl crl -in fixture.crl -text -out fixture-text.pem
+RFC 7468, 2, текст вне блока разрешает, а esverify — нет (с 10.11.2026: вокруг блоков только
+пробелы, иначе блок с испорченной границей пропал бы молча): файл — пример отказа.

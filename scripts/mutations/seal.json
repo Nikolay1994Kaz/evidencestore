@@ -165,8 +165,8 @@
   {
    "name": "X27 метка над печатью под подозрением — её время в силе",
    "file": "internal/proof/seal.go",
-   "old": "\tif c.tokenID >= 0 && (vs[c.tokenID].NeedPOE || vs[c.tokenID].Retired != nil) {",
-   "new": "\tif c.tokenID >= 0 && vs[c.tokenID].Retired != nil {"
+   "old": "\tif c.tokenID >= 0 && vs[c.tokenID].NeedPOE {",
+   "new": "\tif false && c.tokenID >= 0 && vs[c.tokenID].NeedPOE {"
   },
   {
    "name": "X28 печать на момент проверки не сверяется при метке под подозрением",

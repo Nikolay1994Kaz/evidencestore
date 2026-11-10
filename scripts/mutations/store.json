@@ -58,8 +58,8 @@
   {
    "name": "P9 токен T2 не проверяется",
    "file": "internal/proof/proof.go",
-   "old": "\tinfo, err := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, root), trust)\n\tif err != nil {\n\t\treturn time.Time{}, err\n\t}\n",
-   "new": "\tinfo, _ := tsa.Verify(u.Token, HeadImprint(u.HeadSeq, root), trust)\n"
+   "old": "\tinfo, err := sc.verify(u.Token, u.HeadSeq, root, link, fmt.Sprintf(\"time-stamp T2 over head %d\", u.HeadSeq))\n\tif err != nil {\n\t\treturn time.Time{}, err\n\t}\n",
+   "new": "\tinfo, _ := sc.verify(u.Token, u.HeadSeq, root, link, fmt.Sprintf(\"time-stamp T2 over head %d\", u.HeadSeq))\n"
   },
   {
    "name": "P10 T1 может лежать после улики",
@@ -664,8 +664,8 @@
   {
    "name": "S81 копию, которую data_dir не продолжает, дописывают (Z-09)",
    "file": "internal/store/replica.go",
-   "old": "\tif err := s.checkReplicaTail(ctx, r, files); err != nil {",
-   "new": "\tif err := error(nil); err != nil {"
+   "old": "\tskip, err := s.checkReplicaTail(ctx, r, files)\n\tif err != nil {",
+   "new": "\tskip, err := s.checkReplicaTail(ctx, r, files)\n\tif false && err != nil {"
   },
   {
    "name": "S82 сверка хвоста копии — по первому куску файла",
@@ -1012,8 +1012,8 @@
   {
    "name": "B7 окно: токен метки на участке не проверяется",
    "file": "internal/proof/window.go",
-   "old": "info, err := tsa.Verify(l.Payload, HeadImprint(head, root), trust)\n\t\t\tif err != nil {",
-   "new": "info, err := tsa.Verify(l.Payload, HeadImprint(head, root), trust)\n\t\t\tif false {"
+   "old": "info, err := sc.verify(l.Payload, head, root, sl.seq, fmt.Sprintf(\"the time-stamp in link %d\", sl.seq))\n\t\t\tif err != nil {",
+   "new": "info, err := sc.verify(l.Payload, head, root, sl.seq, fmt.Sprintf(\"the time-stamp in link %d\", sl.seq))\n\t\t\tif false {"
   },
   {
    "name": "B9 окно: нижняя метка — над более поздней головой",
@@ -1300,8 +1300,8 @@
   {
    "name": "U17 источник: метка края не проверяется",
    "file": "internal/proof/source.go",
-   "old": "\tinfo, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, root), trust)\n\tif err != nil {",
-   "new": "\tinfo, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, root), trust)\n\tif false {"
+   "old": "\tinfo, err := sc.verify(e.Token.Leaf.chain().Payload, e.Head, root, e.Token.LinkSeq, fmt.Sprintf(\"%s (token in link %d)\", what, e.Token.LinkSeq))\n\tif err != nil {",
+   "new": "\tinfo, err := sc.verify(e.Token.Leaf.chain().Payload, e.Head, root, e.Token.LinkSeq, fmt.Sprintf(\"%s (token in link %d)\", what, e.Token.LinkSeq))\n\tif false {"
   },
   {
    "name": "U18 источник: T1 не запоминается",
@@ -1744,8 +1744,8 @@
   {
    "name": "V12 пакет по источнику: T2 — время метки края, а не закрывающей",
    "file": "internal/proof/source.go",
-   "old": "r.Upper, err = closingStamp(b, linkAt, trust.TSA)",
-   "new": "_, err = closingStamp(b, linkAt, trust.TSA); r.Upper = edgeAt"
+   "old": "r.Upper, err = closingStamp(b, linkAt, sc)",
+   "new": "_, err = closingStamp(b, linkAt, sc); r.Upper = edgeAt"
   },
   {
    "name": "V13 хранилище: край — хвосты любой следующей метки, хоть над звеном до закрывающего токена",
@@ -2236,8 +2236,8 @@
   {
    "name": "D10 свидетелю уходит голова без корня",
    "file": "internal/store/witness.go",
-   "old": "\th := witnessHead{size: s.tree.size(), root: s.tree.root(), stamped: stamped}",
-   "new": "\th := witnessHead{size: s.tree.size(), stamped: stamped}"
+   "old": "\ts.queueWitnessHeadLocked(witnessHead{size: s.tree.size(), root: s.tree.root(), stamped: stamped})",
+   "new": "\ts.queueWitnessHeadLocked(witnessHead{size: s.tree.size(), stamped: stamped})"
   },
   {
    "name": "D11 подъём берёт голову под чужим номером",
@@ -2314,8 +2314,8 @@
   {
    "name": "N12 голова сборщику дальше копии",
    "file": "internal/store/witness.go",
-   "old": "\t\tm = min(m, s.replicaShipped.Load())",
-   "new": "\t\t_ = s.replicaShipped.Load()"
+   "old": "func (s *Store) servedHeadLocked() (proof.Checkpoint, bool, error) {\n\tn := s.tree.size()\n\tm := n\n\tif s.replicaRemote != nil {\n\t\tm = min(m, s.replicaShipped.Load())",
+   "new": "func (s *Store) servedHeadLocked() (proof.Checkpoint, bool, error) {\n\tn := s.tree.size()\n\tm := n\n\tif s.replicaRemote != nil {\n\t\t_ = s.replicaShipped.Load()"
   },
   {
    "name": "N13 доказательство сборщику не сверяется до отдачи",
