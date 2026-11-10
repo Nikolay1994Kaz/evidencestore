@@ -33,6 +33,8 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		metrics.One("evidencestore_tsa_errors_total", "failed time-stamp attempts", metrics.Counter, float64(s.stampErrors.Load())),
 		metrics.One("evidencestore_replica_last_success_timestamp_seconds", "end of the last successful copy to replica.url, 0 if none since start", metrics.Gauge, seconds(time.Unix(0, s.replicaOK.Load()))),
 		metrics.One("evidencestore_replica_errors_total", "failed copy attempts", metrics.Counter, float64(s.replicaErrors.Load())),
+		metrics.One("evidencestore_replica_cosign_journal_skipped", "1 when data_dir/cosign/cosignatures.jsonl does not continue the one in the copy (removed or replaced): the copy goes on without new witness cosignatures until replica.url points at a new location", metrics.Gauge, metrics.Bool(s.cosignSkipped.Load())),
+		metrics.One("evidencestore_replica_archive_journal_skipped", "1 when data_dir/tsa/archive.jsonl does not continue the one in the copy (removed or replaced): the copy goes on without new time-stamps of the second TSA until replica.url points at a new location", metrics.Gauge, metrics.Bool(s.archiveSkipped.Load())),
 		metrics.One("evidencestore_witness_last_success_timestamp_seconds", "when the last signed head reached witness.url, 0 if none since start", metrics.Gauge, seconds(time.Unix(0, s.witnessOK.Load()))),
 		metrics.One("evidencestore_witness_errors_total", "failed attempts to send a signed head to witness.url", metrics.Counter, float64(s.witnessErrors.Load())),
 	}
@@ -71,7 +73,30 @@ func (s *Store) Metrics(now time.Time) []metrics.Family {
 		}
 	}
 	s.mu.Unlock()
-	return append(fams, records, last, silent, lost, contact, dups, conflicts, noSubject, epochs, gw)
+	fams = append(fams, records, last, silent, lost, contact, dups, conflicts, noSubject, epochs, gw)
+	if len(st.Cosigners) > 0 {
+		head := metrics.Family{Name: "evidencestore_cosigner_head", Help: "the last head the C2SP witness cosigned for this store, 0 if none known", Type: metrics.Gauge}
+		ok := metrics.Family{Name: "evidencestore_cosigner_last_success_timestamp_seconds", Help: "when the C2SP witness last returned a cosignature that verified (after a start: the time its last cosignature in the journal carries), 0 if none", Type: metrics.Gauge}
+		errs := metrics.Family{Name: "evidencestore_cosigner_errors_total", Help: "failed rounds of sending heads to the C2SP witness", Type: metrics.Counter}
+		refused := metrics.Family{Name: "evidencestore_cosigner_refused", Help: "1 when the C2SP witness refused the consistency proof from the last head it cosigned: it holds another history of this store's chain", Type: metrics.Gauge}
+		lost := metrics.Family{Name: "evidencestore_cosigner_lost_state", Help: "1 when the C2SP witness reports an older head than it cosigned for this store: it lost its state and would cosign a second history under the same key", Type: metrics.Gauge}
+		for _, c := range st.Cosigners {
+			l := [][2]string{{"witness", c.Name}}
+			head.Samples = append(head.Samples, metrics.Sample{Labels: l, Value: float64(c.Head)})
+			ok.Samples = append(ok.Samples, metrics.Sample{Labels: l, Value: seconds(c.LastAt)})
+			errs.Samples = append(errs.Samples, metrics.Sample{Labels: l, Value: float64(c.Errors)})
+			refused.Samples = append(refused.Samples, metrics.Sample{Labels: l, Value: metrics.Bool(c.Refused)})
+			lost.Samples = append(lost.Samples, metrics.Sample{Labels: l, Value: metrics.Bool(c.LostState)})
+		}
+		fams = append(fams, head, ok, errs, refused, lost)
+	}
+	if a := st.TSAArchive; a != nil {
+		fams = append(fams,
+			metrics.One("evidencestore_tsa_archive_head", "the last head the second TSA (tsa.archive) time-stamped, 0 if none", metrics.Gauge, float64(a.Head)),
+			metrics.One("evidencestore_tsa_archive_last_success_timestamp_seconds", "when the second TSA last returned a time-stamp that verified, 0 if none since start", metrics.Gauge, seconds(a.LastAt)),
+			metrics.One("evidencestore_tsa_archive_errors_total", "failed attempts to get a time-stamp of the second TSA", metrics.Counter, float64(a.Errors)))
+	}
+	return fams
 }
 
 // receiveAhead — насколько последнее время приёма впереди часов хоста.

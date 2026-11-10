@@ -1,12 +1,15 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
@@ -88,6 +91,7 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	from := n
 
 	// T2: первая метка над головой не раньше звена улики.
+	var upperLeaf proof.Inclusion
 	for _, t := range s.tokens {
 		if t.head >= n {
 			token, err := s.leafPayloadLocked(t.leaf)
@@ -95,6 +99,9 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 				return proof.Bundle{}, err
 			}
 			b.Upper = &proof.Upper{HeadSeq: t.head, Token: token}
+			if upperLeaf, err = s.inclusionLocked(t.leaf); err != nil {
+				return proof.Bundle{}, err
+			}
 			break
 		}
 	}
@@ -144,6 +151,15 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 		}
 		to = toHead
 	}
+	// Лист токена T2 — где лежит токен (proof.revoked): по нему метку
+	// отозванного по компрометации сертификата спасает поздняя метка второй
+	// службы или подпись свидетеля над головой его звена. Пакет доходит до
+	// этого звена, только если есть то или другое или пакет и так туда
+	// доходит: иначе лист нечем было бы подкрепить.
+	if b.Upper != nil && (s.archiveOn || len(s.cosigners) > 0 || to >= upperLeaf.LinkSeq) {
+		b.Upper.Inclusion = &upperLeaf
+		to = max(to, upperLeaf.LinkSeq)
+	}
 	links, err := auditchain.ReadLinks(s.chainDir, from, to)
 	if err != nil {
 		return proof.Bundle{}, err
@@ -156,6 +172,36 @@ func (s *Store) proofTo(source string, seq uint64, withDEK bool, toHead uint64, 
 	if b.Frontier, b.Checkpoint, err = s.bundleHeadLocked(links); err != nil {
 		return proof.Bundle{}, err
 	}
+	// Подписи свидетелей C2SP: голова не раньше звена улики — и не раньше
+	// звена токена T2: подпись над ней — POE для T2, если сертификат службы
+	// отзовут по компрометации (proof.revoked). Хранилище отдаёт свидетелям
+	// голову звена каждого токена, так что обычно это она и есть.
+	if b.Cosignatures, err = s.cosignaturesForLocked(links[0].Seq, links[len(links)-1].Seq, n); err != nil {
+		return proof.Bundle{}, err
+	}
+	if b.Upper != nil && b.Upper.Inclusion != nil {
+		more, err := s.cosignaturesForLocked(links[0].Seq, links[len(links)-1].Seq, b.Upper.Inclusion.LinkSeq)
+		if err != nil {
+			return proof.Bundle{}, err
+		}
+		for _, c := range more {
+			if !slices.ContainsFunc(b.Cosignatures, func(o proof.Cosignature) bool { return o.Name == c.Name && bytes.Equal(o.Sig, c.Sig) }) {
+				b.Cosignatures = append(b.Cosignatures, c)
+			}
+		}
+	}
+	// Метки второй службы над головами не раньше токенов T1 и T2.
+	var tokens []uint64
+	if b.Lower != nil {
+		tokens = append(tokens, b.Lower.Inclusion.LinkSeq)
+	}
+	if b.Upper != nil && b.Upper.Inclusion != nil {
+		tokens = append(tokens, b.Upper.Inclusion.LinkSeq)
+	}
+	if b.Archive, err = s.archiveForLocked(tokens, links[len(links)-1].Seq); err != nil {
+		return proof.Bundle{}, err
+	}
+	b.Seal = s.bundleSeal()
 
 	if withDEK {
 		sealed, err := evidence.Unmarshal(data)
@@ -245,14 +291,17 @@ type SourceStatus struct {
 
 // Status — сводка для оператора.
 type Status struct {
-	Records    uint64         `json:"records"`
-	HeadSeq    uint64         `json:"head_seq"`
-	HeadHash   string         `json:"head_hash"`
-	Leaves     uint64         `json:"leaves"`
-	Stamps     int            `json:"tsa_stamps"`
-	LastStamp  time.Time      `json:"last_stamp,omitempty"`
-	StampedTo  uint64         `json:"stamped_head"`
-	PublicKey  string         `json:"public_key"`
+	Records   uint64    `json:"records"`
+	HeadSeq   uint64    `json:"head_seq"`
+	HeadHash  string    `json:"head_hash"`
+	Leaves    uint64    `json:"leaves"`
+	Stamps    int       `json:"tsa_stamps"`
+	LastStamp time.Time `json:"last_stamp,omitempty"`
+	StampedTo uint64    `json:"stamped_head"`
+	PublicKey string    `json:"public_key"`
+	// LogKey — ключ проверки хранилища в виде vkey C2SP (имя — его
+	// происхождение, тип 0x01): его просит свидетель другого проекта.
+	LogKey     string         `json:"log_vkey"`
 	Sources    []SourceStatus `json:"sources"`
 	LogFailure string         `json:"log_failure,omitempty"`
 	// ChainFailure — цепь защёлкнута ошибкой записи (входит и в LogFailure:
@@ -273,6 +322,13 @@ type Status struct {
 	// RootsUnreachable — каталоги корней не перечисляются (зеркало на
 	// упавшей машине): сирот не видно, уничтожение не окончательно.
 	RootsUnreachable string `json:"roots_unreachable,omitempty"`
+	// Cosigners — свидетели C2SP: последняя подписанная голова, ошибки,
+	// отказ (cosign.go).
+	Cosigners []CosignerStatus `json:"cosigners,omitempty"`
+	// TSAArchive — вторая служба меток (tsa.archive), nil — её нет.
+	TSAArchive *ArchiveStatus `json:"tsa_archive,omitempty"`
+	// Seal — печать организации на ключ хранилища (seal.file), nil — её нет.
+	Seal *SealStatus `json:"seal,omitempty"`
 }
 
 func (s *Store) Status() Status {
@@ -297,6 +353,7 @@ func (s *Store) Status() Status {
 	}
 	s.chainMu.Unlock()
 	out.PublicKey = s.signer.PublicKeyString()
+	out.LogKey = cosign.LogVerifierKey(proof.OriginFor(s.signer.PublicKey()), s.signer.PublicKey())
 	if err := s.Healthy(); err != nil {
 		out.LogFailure = err.Error()
 	}
@@ -311,6 +368,9 @@ func (s *Store) Status() Status {
 	} else {
 		out.OrphanRoots = orphans
 	}
+	out.Cosigners = s.cosignerStatus()
+	out.TSAArchive = s.archiveStatus()
+	out.Seal = s.sealStatus()
 	return out
 }
 

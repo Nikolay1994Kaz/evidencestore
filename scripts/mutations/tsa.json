@@ -42,8 +42,8 @@
   {
    "name": "T7 signingCertificateV2 не сверяется",
    "file": "internal/tsa/tsa.go",
-   "old": "\t\tif err := checkSigningCert(raw, signer); err != nil {",
-   "new": "\t\tif err := checkSigningCert(raw, signer); err != nil && false {"
+   "old": "\t\t\terr = checkSigningCert(raw, c)",
+   "new": "\t\t\t_, err = raw, nil"
   },
   {
    "name": "T8 статус отказа принимается",
@@ -66,8 +66,8 @@
   {
    "name": "T11 метка без атрибута сертификата подписанта принимается",
    "file": "internal/tsa/tsa.go",
-   "old": "\t} else {\n\t\treturn Info{}, fmt.Errorf(\"%w: no signing-certificate attribute\", ErrInvalid)\n\t}",
-   "new": "\t}"
+   "old": "\t\t\terr = fmt.Errorf(\"%w: no signing-certificate attribute\", ErrInvalid)",
+   "new": "\t\t\terr = nil"
   },
   {
    "name": "T12 signingCertificate v1 не сверяется",

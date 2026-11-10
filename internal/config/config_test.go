@@ -1,11 +1,16 @@
 package config
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 )
 
 // Путь сокета длиннее предела ловится при проверке конфига, а не
@@ -149,5 +154,133 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 	c.Chain.Tick = Duration(3 * time.Second)
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "chain.tick must be at most 2.5s") {
 		t.Fatalf("tick 3s: %v", err)
+	}
+}
+
+func TestValidateCosigners(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := cosign.NewSigner("witness.example/w1", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := signer.Verifier().String()
+	twice := rekey(t, "witness.example/w1-before")
+	bad := map[string][]Cosigner{
+		"ftp":        {{URL: "ftp://w.example/", Key: key}},
+		"без хоста":  {{URL: "https:///x", Key: key}},
+		"с запросом": {{URL: "https://w.example/?a=1", Key: key}},
+		"не ключ":    {{URL: "https://w.example/", Key: "witness.example/w1"}},
+		"дважды":     {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: key}},
+		// Два текущих ключа одного свидетеля: прежний — в old_keys.
+		"имя дважды": {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: rekey(t, "witness.example/w1")}},
+		// Прежний ключ — не ключ, тот же, что текущий, или текущий другого
+		// свидетеля; больше предела.
+		"прежний не ключ":     {{URL: "https://w.example/", Key: key, OldKeys: []string{"witness.example/w1"}}},
+		"прежний = текущий":   {{URL: "https://w.example/", Key: key, OldKeys: []string{key}}},
+		"прежний у другого":   {{URL: "https://a.example/", Key: other(t)}, {URL: "https://b.example/", Key: rekey(t, "witness.example/w3"), OldKeys: []string{key}}, {URL: "https://c.example/", Key: key}},
+		"прежних больше пяти": {{URL: "https://w.example/", Key: key, OldKeys: []string{rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1"), rekey(t, "witness.example/w1")}}},
+		// Прежний ключ сам повторяет уже названный: текущий ключ раньше в
+		// списке или такой же прежний.
+		"прежний = текущий выше": {{URL: "https://a.example/", Key: key}, {URL: "https://b.example/", Key: rekey(t, "witness.example/w3"), OldKeys: []string{key}}},
+		"прежний дважды":         {{URL: "https://a.example/", Key: rekey(t, "witness.example/w1"), OldKeys: []string{twice, twice}}},
+	}
+	// Девять разных свидетелей — больше предела, даже без повторов.
+	var nine []Cosigner
+	for i := range MaxCosigners + 1 {
+		_, priv, _ := ed25519.GenerateKey(rand.Reader)
+		w, err := cosign.NewSigner(fmt.Sprintf("witness.example/n%d", i), priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nine = append(nine, Cosigner{URL: "https://w.example/", Key: w.Verifier().String()})
+	}
+	bad["девять"] = nine
+	for name, cs := range bad {
+		c := Config{Witness: Witness{Cosigners: cs}}
+		if errs := c.validateCosigners(); len(errs) == 0 {
+			t.Errorf("%s: принято", name)
+		}
+	}
+	good := Config{Witness: Witness{Cosigners: []Cosigner{{URL: "https://w.example/sub/", Key: key}, {URL: "http://127.0.0.1:8444", Key: other(t)}}}}
+	if errs := good.validateCosigners(); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	// Свидетель начат заново с новым ключом: прежний — в old_keys.
+	good.Witness.Cosigners[0] = Cosigner{URL: "https://w.example/", Key: rekey(t, "witness.example/w1"), OldKeys: []string{key, rekey(t, "witness.example/w1-before")}}
+	if errs := good.validateCosigners(); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+}
+
+// rekey — новый ключ проверки свидетеля name.
+func rekey(t *testing.T, name string) string {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	s, err := cosign.NewSigner(name, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Verifier().String()
+}
+
+func other(t *testing.T) string {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	s, err := cosign.NewSigner("witness.example/w2", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Verifier().String()
+}
+
+// ca свидетеля C2SP — путь от каталога конфигурации, как у прочих файлов.
+func TestCosignerCAResolved(t *testing.T) {
+	c := Config{Witness: Witness{Cosigners: []Cosigner{{CA: "witness-ca.pem"}, {CA: "/etc/ca.pem"}, {}}}}
+	c.resolve("/etc/evidencestore")
+	if got := c.Witness.Cosigners; got[0].CA != "/etc/evidencestore/witness-ca.pem" || got[1].CA != "/etc/ca.pem" || got[2].CA != "" {
+		t.Fatalf("пути ca: %+v", got)
+	}
+}
+
+// Вторая служба меток: адрес http(s), не та же служба, есть основная и
+// доверие к её токенам; пути доверия — от каталога конфигурации.
+func TestTSAArchive(t *testing.T) {
+	base := func() *Config {
+		c := &Config{DataDir: "/var/lib/es", RootsDir: "/var/lib/es-roots", Listen: ":8443",
+			TSA:     TSA{URL: "http://tsa.one.example", Trust: []string{"/etc/one.pem"}, Archive: TSAArchive{URL: "https://tsa.two.example/tsr", Trust: []string{"/etc/two.pem"}}},
+			Sources: []Source{{Name: "abs-core", ContentType: "syslog"}}}
+		c.Defaults()
+		return c
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// Разные службы на одном хосте — другой порт или запрос — не одна служба.
+	for _, u := range []string{"http://tsa.one.example:8002/", "http://tsa.one.example/?svc=b", "https://tsa.one.example/"} {
+		c := base()
+		c.TSA.Archive.URL = u
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: %v", u, err)
+		}
+	}
+	for name, spoil := range map[string]func(*Config){
+		"ftp":          func(c *Config) { c.TSA.Archive.URL = "ftp://tsa.two.example/" },
+		"local":        func(c *Config) { c.TSA.Archive.URL = "local" },
+		"та же служба": func(c *Config) { c.TSA.Archive.URL = c.TSA.URL + "/" },
+		"та же: регистр, порт по умолчанию": func(c *Config) { c.TSA.Archive.URL = "http://TSA.one.example:80/" },
+		"без основной":                      func(c *Config) { c.TSA.URL, c.TSA.Trust = "", nil },
+		"без доверия":                       func(c *Config) { c.TSA.Archive.Trust = nil },
+	} {
+		c := base()
+		spoil(c)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "tsa.archive") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	c := Config{TSA: TSA{Archive: TSAArchive{Trust: []string{"two.pem", "/etc/abs.pem"}}}}
+	c.resolve("/etc/evidencestore")
+	if got := c.TSA.Archive.Trust; got[0] != "/etc/evidencestore/two.pem" || got[1] != "/etc/abs.pem" {
+		t.Fatalf("пути доверия второй службы: %v", got)
 	}
 }

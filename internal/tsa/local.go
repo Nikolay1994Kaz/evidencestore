@@ -11,12 +11,16 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -35,6 +39,9 @@ type Authority struct {
 	ctype   asn1.ObjectIdentifier // тесты: тип содержимого в подписанных атрибутах
 	essV1   int                   // тесты: 1 — атрибут signingCertificate (v1, SHA-1) вместо v2, -1 — никакого
 	acc     accuracy              // тесты: точность метки
+	carry   []*x509.Certificate   // Carry: сертификаты в токене помимо своего
+	byKeyID bool                  // тесты: SID — номер ключа (subjectKeyIdentifier), SignerInfo v3
+	noCert  bool                  // тесты: свой сертификат в токен не кладётся
 
 	mu     sync.Mutex
 	serial int64
@@ -59,16 +66,39 @@ func NewAuthority(rsaKey bool) (*Authority, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Имя и номера — свои у каждой службы: имя издателя и номер называют один
+	// сертификат (RFC 5280, 4.1.2.2), и CRL одной демо-службы не должен
+	// называть сертификат другой.
+	var id [4]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, err
+	}
+	name := "evidencestore demo TSA " + hex.EncodeToString(id[:])
+	serial := func() (*big.Int, error) {
+		n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 63))
+		if err != nil {
+			return nil, err
+		}
+		return n.Add(n, big.NewInt(1)), nil
+	}
+	rootSerial, err := serial()
+	if err != nil {
+		return nil, err
+	}
+	tsaSerial, err := serial()
+	if err != nil {
+		return nil, err
+	}
 	// Срок действия широкий: службе всё равно не доверяют, а тесты и демо
 	// гоняют часы в прошлое и будущее.
 	now := time.Now()
 	notBefore := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	rootTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "evidencestore demo TSA root"},
+		SerialNumber:          rootSerial,
+		Subject:               pkix.Name{CommonName: name + " root"},
 		NotBefore:             notBefore,
 		NotAfter:              now.AddDate(20, 0, 0),
-		KeyUsage:              x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
@@ -82,8 +112,8 @@ func NewAuthority(rsaKey bool) (*Authority, error) {
 		return nil, err
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "evidencestore demo TSA"},
+		SerialNumber: tsaSerial,
+		Subject:      pkix.Name{CommonName: name},
 		NotBefore:    notBefore,
 		NotAfter:     now.AddDate(20, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -99,6 +129,178 @@ func NewAuthority(rsaKey bool) (*Authority, error) {
 
 // Root — корневой сертификат: его проверяющий закрепляет у себя.
 func (a *Authority) Root() *x509.Certificate { return a.root }
+
+// Cert — сертификат службы, которым подписаны её токены.
+func (a *Authority) Cert() *x509.Certificate { return a.cert }
+
+// RevocationList выпускает CRL корня службы (DER) с записями revoked: тесты
+// отзыва. Только у службы, созданной в этом процессе (NewAuthority).
+func (a *Authority) RevocationList(thisUpdate, nextUpdate time.Time, revoked ...x509.RevocationListEntry) ([]byte, error) {
+	if a.rootKey == nil {
+		return nil, errors.New("tsa: the root key is not in this process")
+	}
+	return x509.CreateRevocationList(rand.Reader, &x509.RevocationList{
+		Number:                    big.NewInt(thisUpdate.Unix()),
+		ThisUpdate:                thisUpdate,
+		NextUpdate:                nextUpdate,
+		RevokedCertificateEntries: revoked,
+	}, a.root, a.rootKey)
+}
+
+// Reissue — та же служба (тот же ключ) с новым сертификатом от того же
+// корня: номер serial, срок до notAfter. Тесты отзыва: перевыпуск на тот же
+// ключ. Только у службы, созданной в этом процессе.
+func (a *Authority) Reissue(serial int64, notAfter time.Time) (*Authority, error) {
+	if a.rootKey == nil {
+		return nil, errors.New("tsa: the root key is not in this process")
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(serial),
+		Subject:      a.cert.Subject,
+		NotBefore:    a.cert.NotBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, a.root, a.key.Public(), a.rootKey)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, err
+	}
+	return &Authority{key: a.key, cert: cert, root: a.root, rootKey: a.rootKey, policy: a.policy}, nil
+}
+
+// SignByKeyID — тесты: подписант в токене назван номером ключа
+// (subjectKeyIdentifier), а не издателем и номером.
+func (a *Authority) SignByKeyID() { a.byKeyID = true }
+
+// WithoutCert — тесты: токены не несут сертификат службы (его берут из
+// доверия, как у служб, что его не кладут).
+func (a *Authority) WithoutCert() { a.noCert = true }
+
+// Carry — сертификаты, которые токены службы несут помимо её собственного
+// (служба может класть всю цепочку и прежние сертификаты ключа): тесты.
+func (a *Authority) Carry(certs ...*x509.Certificate) { a.carry = append(a.carry, certs...) }
+
+// Seal ставит печать на content: CMS SignedData с содержимым внутри, подпись
+// ключом key, сертификат cert (и extra — промежуточные) в печати, signingTime
+// — at. Для тестов и учебного стенда: печать организации ставится её
+// средствами (openssl cms -sign -nodetach, NCALayer).
+func Seal(key crypto.Signer, cert *x509.Certificate, extra []*x509.Certificate, content []byte, at time.Time) ([]byte, error) {
+	return sealShaped(key, cert, extra, content, at, sealShape{})
+}
+
+// sealShape — тесты: печать, отступающая от правил в одном месте; нулевая —
+// правильная.
+type sealShape struct {
+	sdVersion, siVersion int                   // 0 — 1
+	signers              int                   // 0 — 1
+	noAttrs              bool                  // без подписанных атрибутов
+	twice                bool                  // атрибут contentType дважды
+	attrType             asn1.ObjectIdentifier // значение атрибута contentType; nil — data
+	eType                asn1.ObjectIdentifier // тип вложенного содержимого; nil — data
+	declared             asn1.ObjectIdentifier // перечень digestAlgorithms; nil — SHA-256
+	algsSequence         bool                  // digestAlgorithms — SEQUENCE вместо SET
+	digestParams         bool                  // у digestAlgorithm параметры (не NULL)
+	essCert              *x509.Certificate     // signingCertificateV2 с хэшем этого сертификата
+}
+
+func sealShaped(key crypto.Signer, cert *x509.Certificate, extra []*x509.Certificate, content []byte, at time.Time, sh sealShape) ([]byte, error) {
+	or := func(v, def int) int {
+		if v == 0 {
+			return def
+		}
+		return v
+	}
+	oidOr := func(v, def asn1.ObjectIdentifier) asn1.ObjectIdentifier {
+		if v == nil {
+			return def
+		}
+		return v
+	}
+	digest := sha256.Sum256(content)
+	attrList := []rawAttr{attr(oidContentType, oidOr(sh.attrType, oidData)), attr(oidMessageDigst, digest[:]), attr(oidSigningTime, at.UTC())}
+	if sh.twice {
+		attrList = append(attrList, attr(oidContentType, oidData))
+	}
+	if sh.essCert != nil {
+		h := sha256.Sum256(sh.essCert.Raw)
+		attrList = append(attrList, attr(oidSigningCertV2, signingCertificateV2{Certs: []essCertIDv2{{CertHash: h[:]}}}))
+	}
+	attrs, err := attributesSet(attrList...)
+	if err != nil {
+		return nil, err
+	}
+	signed := sha256.Sum256(attrs)
+	if sh.noAttrs {
+		signed = digest
+	}
+	sig, err := key.Sign(rand.Reader, signed[:], crypto.SHA256)
+	if err != nil {
+		return nil, err
+	}
+	sigAlg := x509.SHA256WithRSA
+	if _, ok := key.(*ecdsa.PrivateKey); ok {
+		sigAlg = x509.ECDSAWithSHA256
+	}
+	digestAlg := pkix.AlgorithmIdentifier{Algorithm: oidSHA256}
+	if sh.digestParams {
+		digestAlg.Parameters = asn1.RawValue{Tag: asn1.TagInteger, Bytes: []byte{1}}
+	}
+	var si []byte
+	for _, v := range []any{or(sh.siVersion, 1), issuerAndSerial{Issuer: asn1.RawValue{FullBytes: cert.RawIssuer}, Serial: cert.SerialNumber}, digestAlg} {
+		der, err := asn1.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		si = append(si, der...)
+	}
+	if !sh.noAttrs {
+		si = append(si, append([]byte{0xA0}, attrs[1:]...)...)
+	}
+	for _, v := range []any{pkix.AlgorithmIdentifier{Algorithm: sigAlgOID(sigAlg)}, sig} {
+		der, err := asn1.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		si = append(si, der...)
+	}
+	si = tlv(0x30, si)
+	var infos []byte
+	for range or(sh.signers, 1) {
+		infos = append(infos, si...)
+	}
+	eContent, _ := asn1.Marshal(content)
+	dataType, _ := asn1.Marshal(oidOr(sh.eType, oidData))
+	version, _ := asn1.Marshal(or(sh.sdVersion, 1))
+	digestAlgs, _ := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: oidOr(sh.declared, oidSHA256)})
+	algsTag := byte(0x31)
+	if sh.algsSequence {
+		algsTag = 0x30
+	}
+	var certs []byte
+	for _, c := range append([]*x509.Certificate{cert}, extra...) {
+		certs = append(certs, c.Raw...)
+	}
+	var sd []byte
+	sd = append(sd, version...)
+	sd = append(sd, tlv(algsTag, digestAlgs)...)
+	sd = append(sd, tlv(0x30, append(dataType, tlv(0xA0, eContent)...))...)
+	sd = append(sd, tlv(0xA0, certs)...)
+	sd = append(sd, tlv(0x31, infos)...)
+	sdType, _ := asn1.Marshal(oidSignedData)
+	return tlv(0x30, append(sdType, tlv(0xA0, tlv(0x30, sd))...)), nil
+}
+
+// AuthorityWith — служба с готовым ключом и сертификатом (выпущенным root или
+// центром под ним): тесты отзыва со своим УЦ. Токен несёт только сертификат
+// службы, промежуточные центры проверяющий берёт из своего доверия.
+func AuthorityWith(key crypto.Signer, cert, root *x509.Certificate) *Authority {
+	return &Authority{key: key, cert: cert, root: root, policy: demoPolicy}
+}
 
 // Trust — доверие к этой службе для Verify.
 func (a *Authority) Trust() Trust {
@@ -171,16 +373,24 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 	if _, ok := a.key.(*ecdsa.PrivateKey); ok {
 		sigAlg = x509.ECDSAWithSHA256
 	}
+	sid, err := asn1.Marshal(issuerAndSerial{Issuer: asn1.RawValue{FullBytes: a.cert.RawIssuer}, Serial: a.cert.SerialNumber})
+	if err != nil {
+		return nil, err
+	}
+	siVersion, sidRaw := 1, asn1.RawValue{FullBytes: sid}
+	if a.byKeyID {
+		siVersion, sidRaw = 3, asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, Bytes: a.cert.SubjectKeyId}
+	}
 	si, err := asn1.Marshal(struct {
 		Version            int
-		SID                issuerAndSerial
+		SID                asn1.RawValue
 		DigestAlgorithm    pkix.AlgorithmIdentifier
 		SignedAttrs        asn1.RawValue
 		SignatureAlgorithm pkix.AlgorithmIdentifier
 		Signature          []byte
 	}{
-		Version:            1,
-		SID:                issuerAndSerial{Issuer: asn1.RawValue{FullBytes: a.cert.RawIssuer}, Serial: a.cert.SerialNumber},
+		Version:            siVersion,
+		SID:                sidRaw,
 		DigestAlgorithm:    pkix.AlgorithmIdentifier{Algorithm: oidSHA256},
 		SignedAttrs:        asn1.RawValue{FullBytes: append([]byte{0xA0}, attrs[1:]...)}, // [0] IMPLICIT
 		SignatureAlgorithm: pkix.AlgorithmIdentifier{Algorithm: sigAlgOID(sigAlg)},
@@ -200,7 +410,16 @@ func (a *Authority) Sign(imprint []byte, nonce *big.Int) ([]byte, error) {
 	sd = append(sd, version...)
 	sd = append(sd, tlv(0x31, digestAlgs)...)
 	sd = append(sd, encap...)
-	sd = append(sd, tlv(0xA0, a.cert.Raw)...) // certificates [0] IMPLICIT
+	var certs []byte
+	if !a.noCert {
+		certs = slices.Clone(a.cert.Raw)
+	}
+	for _, c := range a.carry {
+		certs = append(certs, c.Raw...)
+	}
+	if len(certs) > 0 {
+		sd = append(sd, tlv(0xA0, certs)...) // certificates [0] IMPLICIT
+	}
 	sd = append(sd, tlv(0x31, si)...)
 	sdType, _ := asn1.Marshal(oidSignedData)
 	return tlv(0x30, append(sdType, tlv(0xA0, tlv(0x30, sd))...)), nil
@@ -319,4 +538,36 @@ func tlv(tag byte, content []byte) []byte {
 		out = append(out, 0x83, byte(n>>16), byte(n>>8), byte(n))
 	}
 	return append(out, content...)
+}
+
+// ServeHTTP отвечает на запросы RFC 3161, как настоящая служба. Продукт
+// зовёт встроенную службу напрямую (Sign); по HTTP её зовут тесты: Request на
+// настоящем обмене RFC 3161 и вторая служба хранилища (tsa.archive).
+func (a *Authority) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req timeStampReq
+	if _, err := asn1.Unmarshal(body, &req); err != nil || !req.MessageImprint.HashAlgorithm.Algorithm.Equal(oidSHA256) {
+		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}}) // rejection
+		return
+	}
+	token, err := a.Sign(req.MessageImprint.HashedMessage, req.Nonce)
+	if err != nil {
+		writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 2}})
+		return
+	}
+	writeResp(w, timeStampResp{Status: pkiStatusInfo{Status: 0}, Token: asn1.RawValue{FullBytes: token}})
+}
+
+func writeResp(w http.ResponseWriter, resp timeStampResp) {
+	der, err := asn1.Marshal(resp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/timestamp-reply")
+	w.Write(der)
 }

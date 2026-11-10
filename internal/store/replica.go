@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
@@ -25,6 +26,8 @@ import (
 //	evidence/seg_….log/<начало>-<конец>   журнал улик (только подтверждённое fsync)
 //	chain/chain.log/<начало>-<конец>      звенья цепи
 //	chain/leaves_….log/<начало>-<конец>   листья цепи
+//	cosign/cosignatures.jsonl/<начало>-<конец>  подписи свидетелей C2SP (cosign.go)
+//	tsa/archive.jsonl/<начало>-<конец>          метки второй службы (archive.go)
 //	heads/<номер головы>.json             подписанная голова (контрольная точка) на момент копии
 //
 // Объекты неизменяемы и не удаляются никогда: копия улик тоже улика.
@@ -56,6 +59,32 @@ type replicaState struct {
 	Prefix  string // поколение, в которое пишет хранилище: "" (первое) или gen/<номер>/
 	Offsets map[string]int64
 	Head    uint64
+	// Skip — журналы (isJournal), которые в data_dir не продолжают
+	// скопированный (их удалили или заменили): они больше не копируются, а
+	// журнал улик и цепь — копируются (P-121 R2).
+	Skip map[string]bool
+}
+
+// isJournal — дописываемый журнал data_dir, который едет в копию наружу
+// рядом с журналом улик и цепью, но без которого копия улик полна: подписи
+// свидетелей (cosign.go) и метки второй службы (archive.go). Читается из
+// открытого файла (journalRange): удалённый на ходу журнал хранилище
+// дописывает, и копия его дочитывает.
+func isJournal(name string) bool { return name == cosignFile || name == archiveFile }
+
+func (s *Store) journalRange(name string, from, end int64) ([]byte, error) {
+	if name == archiveFile {
+		return s.archiveRange(from, end)
+	}
+	return s.cosignRange(from, end)
+}
+
+// journalSkipped — тревога «журнал больше не едет в копию».
+func (s *Store) journalSkipped(name string) *atomic.Bool {
+	if name == archiveFile {
+		return &s.archiveSkipped
+	}
+	return &s.cosignSkipped
 }
 
 // replicaSnapshot — что можно копировать сейчас: размер каждого
@@ -99,6 +128,20 @@ func (s *Store) replicaFiles() (replicaSnapshot, error) {
 	for _, seg := range s.evlog.Segments() {
 		snap.sizes["evidence/"+filepath.Base(seg.Path)] = seg.Size
 	}
+	// Подписи свидетелей — только для голов, которые копия уже держит (их
+	// свидетелям отдают не дальше replicaShipped), так что после подъёма они
+	// не дальше поднятой цепи.
+	if size, ok, err := s.cosignLogSize(); err != nil {
+		return snap, err
+	} else if ok {
+		snap.sizes[cosignFile] = size
+	}
+	// Метки второй службы — так же: она заверяет только головы копии.
+	if size, ok, err := s.archiveLogSize(); err != nil {
+		return snap, err
+	} else if ok {
+		snap.sizes[archiveFile] = size
+	}
 	return snap, nil
 }
 
@@ -117,10 +160,11 @@ func (s *Store) loadReplicaState(ctx context.Context, r ship.Remote) error {
 	if err != nil {
 		return err
 	}
-	if err := s.checkReplicaTail(ctx, r, files); err != nil {
+	skip, err := s.checkReplicaTail(ctx, r, files)
+	if err != nil {
 		return err
 	}
-	st := &replicaState{Prefix: prefix, Offsets: map[string]int64{}}
+	st := &replicaState{Prefix: prefix, Offsets: map[string]int64{}, Skip: skip}
 	for name, chunks := range files {
 		for _, c := range chunks {
 			st.Offsets[name] = max(st.Offsets[name], c.end)
@@ -141,7 +185,8 @@ const divergedHint = "data_dir lost data after it was copied (a disk that lied a
 // checkReplicaTail сверяет с data_dir последний кусок новейшего файла
 // каждого вида в копии. Разойтись файлы могли только в хвосте: закрытые
 // сегменты не меняются.
-func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[string][]chunk) error {
+func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[string][]chunk) (skip map[string]bool, err error) {
+	skip = map[string]bool{}
 	newest := map[string]string{}
 	for name := range files {
 		kind := name
@@ -161,18 +206,30 @@ func (s *Store) checkReplicaTail(ctx context.Context, r ship.Remote, files map[s
 		}
 		sealed, err := r.Get(ctx, last.key)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		copied, err := openCopy(s.copyKey, last.key, sealed)
 		if err != nil {
-			return fmt.Errorf("%w: %v; another installation wrote this copy, or copy.key is not this store's: point replica.url at a new location (the old copy stays as evidence), or put the right copy.key back from keys.backup_dir", ErrReplicaDiverged, err)
+			return nil, fmt.Errorf("%w: %v; another installation wrote this copy, or copy.key is not this store's: point replica.url at a new location (the old copy stays as evidence), or put the right copy.key back from keys.backup_dir", ErrReplicaDiverged, err)
 		}
-		local, err := readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(name)), last.start, last.end)
+		var local []byte
+		if isJournal(name) {
+			local, err = s.journalRange(name, last.start, last.end)
+		} else {
+			local, err = readRange(filepath.Join(s.cfg.DataDir, filepath.FromSlash(name)), last.start, last.end)
+		}
 		if err != nil || !bytes.Equal(local, copied) {
-			return fmt.Errorf("%w: its %s holds bytes %d-%d that data_dir lacks or has otherwise; %s", ErrReplicaDiverged, name, last.start, last.end, divergedHint)
+			if isJournal(name) {
+				// Журнал подписей или меток не повод останавливать копию улик.
+				s.log.Error("replica: data_dir/"+name+" does not continue the one in the copy (removed or replaced?): it is not copied any more until replica.url points at a new location; the evidence log and the chain still are", "copy holds", last.end)
+				skip[name] = true
+				s.journalSkipped(name).Store(true)
+				continue
+			}
+			return nil, fmt.Errorf("%w: its %s holds bytes %d-%d that data_dir lacks or has otherwise; %s", ErrReplicaDiverged, name, last.start, last.end, divergedHint)
 		}
 	}
-	return nil
+	return skip, nil
 }
 
 // headSeqOf — номер головы из имени …heads/<номер>.json.
@@ -268,15 +325,27 @@ func (s *Store) ShipOnce(ctx context.Context, r ship.Remote) (_ int64, err error
 	var total int64
 	for _, name := range names {
 		size, from := snap.sizes[name], s.replica.Offsets[name]
+		if isJournal(name) && (s.replica.Skip[name] || size < from) {
+			if !s.replica.Skip[name] {
+				s.log.Error("replica: data_dir/"+name+" is shorter than what the copy holds (removed or truncated?): it is not copied any more until replica.url points at a new location; the evidence log and the chain still are", "size", size, "copied", from)
+				s.replica.Skip[name] = true
+				s.journalSkipped(name).Store(true)
+			}
+			continue
+		}
 		if size < from {
 			// Файл стал короче отправленного: так бывает, только если его
 			// обрезали. Молча догонять нельзя — кусок в копии уже другой.
 			return total, fmt.Errorf("%w: %s is %d bytes, %d already copied — file was truncated; %s", ErrReplicaDiverged, name, size, from, divergedHint)
 		}
 		local := filepath.Join(s.cfg.DataDir, filepath.FromSlash(name))
+		read := func(from, end int64) ([]byte, error) { return readRange(local, from, end) }
+		if isJournal(name) {
+			read = func(from, end int64) ([]byte, error) { return s.journalRange(name, from, end) }
+		}
 		for from < size {
 			end := min(size, from+s.replicaChunk)
-			data, err := readRange(local, from, end)
+			data, err := read(from, end)
 			if err != nil {
 				return total, err
 			}
@@ -346,7 +415,7 @@ func listReplica(ctx context.Context, r ship.Remote, prefix string) (map[string]
 
 // parseReplica разбирает ключи поколения prefix: имена файлов — без prefix,
 // ключи кусков и голов — полные. Ключи других поколений пропускаются (у
-// первого поколения — как чужие: не под evidence/, chain/ или heads/).
+// первого поколения — как чужие: не под evidence/, chain/, cosign/, tsa/ или heads/).
 func parseReplica(keys []string, prefix string) (map[string][]chunk, []string, error) {
 	files := map[string][]chunk{}
 	var heads []string
@@ -361,7 +430,7 @@ func parseReplica(keys []string, prefix string) (map[string][]chunk, []string, e
 		}
 		dir, base := path.Split(rel)
 		se := strings.SplitN(base, "-", 2)
-		if len(se) != 2 || (!strings.HasPrefix(dir, "evidence/") && !strings.HasPrefix(dir, "chain/")) {
+		if len(se) != 2 || (!strings.HasPrefix(dir, "evidence/") && !strings.HasPrefix(dir, "chain/") && !strings.HasPrefix(dir, "cosign/") && !strings.HasPrefix(dir, "tsa/")) {
 			continue // чужие объекты в бакете не наши
 		}
 		start, err1 := strconv.ParseInt(se[0], 10, 64)
@@ -401,7 +470,7 @@ func RestoreReplica(ctx context.Context, r ship.Remote, dataDir string, pinned e
 		return rep, err
 	}
 	defer lock.Close()
-	for _, sub := range []string{"evidence", "chain"} {
+	for _, sub := range []string{"evidence", "chain", "cosign", "tsa"} {
 		if entries, err := os.ReadDir(filepath.Join(dataDir, sub)); err == nil && len(entries) > 0 {
 			return rep, fmt.Errorf("replica restore: %s is not empty — refusing to overwrite", filepath.Join(dataDir, sub))
 		}

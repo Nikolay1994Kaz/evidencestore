@@ -43,7 +43,13 @@ type witnessHead struct {
 // Головы под метками остаются все — ими кончаются пакеты, — так что, пока
 // свидетель недоступен, очередь растёт только ими. Зовётся под chainMu.
 func (s *Store) queueWitnessLocked(stamped bool) {
-	h := witnessHead{size: s.tree.size(), root: s.tree.root(), stamped: stamped}
+	s.queueWitnessHeadLocked(witnessHead{size: s.tree.size(), root: s.tree.root(), stamped: stamped})
+}
+
+// queueWitnessHeadLocked ставит голову h в очередь к свидетелю S3 и к
+// свидетелям C2SP. Зовётся под chainMu.
+func (s *Store) queueWitnessHeadLocked(h witnessHead) {
+	s.queueCosignLocked(h) // свидетелям C2SP — те же головы (cosign.go)
 	if s.witnessRemote == nil || h.size == 0 {
 		return
 	}
@@ -67,9 +73,18 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 		return nil
 	}
 	s.chainMu.Lock()
-	s.queueWitnessLocked(false)
+	h, ok, headErr := s.shippedHeadLocked()
+	if ok {
+		s.queueWitnessHeadLocked(h)
+	}
 	queue := append([]witnessHead(nil), s.witnessQueue...)
 	s.chainMu.Unlock()
+	if headErr != nil {
+		// Голову копии не снять (tree.hashes) — очередь (головы под метками,
+		// с корнями из памяти) всё равно уходит; ошибка — в счётчик.
+		s.witnessErrors.Add(1)
+		headErr = fmt.Errorf("witness: the head of the copy: %w", headErr)
+	}
 	limit := ^uint64(0)
 	if s.replicaRemote != nil {
 		limit = s.replicaShipped.Load()
@@ -93,7 +108,36 @@ func (s *Store) WitnessOnce(ctx context.Context) error {
 		s.chainMu.Unlock()
 		s.witnessOK.Store(time.Now().UnixNano())
 	}
-	return nil
+	return headErr
+}
+
+// shippedHeadLocked — текущая голова для свидетелей: с копией наружу — не
+// дальше той, что копия держит (P-11). Под нагрузкой текущая голова всегда
+// дальше копии, и, ставь её в очередь как есть, она вытесняла бы прежнюю
+// текущую каждый обход и не уходила никогда: до свидетеля доходили бы только
+// головы под метками, раз в tsa.every. ok = false — головы нет (копия с
+// запуска ещё не прошла или цепь пуста). Звать под chainMu.
+func (s *Store) shippedHeadLocked() (witnessHead, bool, error) {
+	n := s.tree.size()
+	m := n
+	if s.replicaRemote != nil {
+		m = min(m, s.replicaShipped.Load())
+	}
+	if m == 0 {
+		return witnessHead{}, false, nil
+	}
+	root := s.tree.root()
+	if m < n {
+		h, err := tlog.TreeHash(int64(m), s.tree)
+		if err != nil {
+			return witnessHead{}, false, err
+		}
+		if err := s.tree.agreesLocked(m, h); err != nil {
+			return witnessHead{}, false, err
+		}
+		root = h
+	}
+	return witnessHead{size: m, root: root}, true, nil
 }
 
 // servedHeadLocked — голова, которую хранилище отдаёт наружу: сборщикам и

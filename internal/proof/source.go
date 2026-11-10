@@ -13,7 +13,6 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
-	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // Пакет по источнику (DECISIONS, п. 28): записи одного источника за окно и
@@ -129,6 +128,15 @@ type SourceBundle struct {
 	// только заметки, не вердикт (P-80).
 	WithKeys   bool       `json:"with_keys,omitempty"`
 	Checkpoint Checkpoint `json:"checkpoint"`
+	// Cosignatures — подписи свидетелей C2SP над головой не раньше звена
+	// токена верхнего края (cosigned.go).
+	Cosignatures []Cosignature `json:"cosignatures,omitempty"`
+	// Archive — метки второй службы над головами не раньше токенов пакета
+	// (revoked.go).
+	Archive []ArchiveStamp `json:"archive,omitempty"`
+	// Seal — печать организации на ключ хранилища (seal.go): с ней
+	// проверяющему довольно корня центра её сертификата. Необязательное.
+	Seal *StoreSeal `json:"store_seal,omitempty"`
 }
 
 // ParseSource разбирает пакет по источнику.
@@ -218,6 +226,17 @@ type SourceReport struct {
 	WitnessNone    bool
 	WitnessFork    uint64
 	WitnessRefused int
+	// WitnessReceived, WitnessUntimed — как у пакета одной улики (P-21).
+	WitnessReceived time.Time
+	WitnessUntimed  bool
+	// CosignChecked, Cosigned, CosignUnknown, CosignCarried — как у пакета
+	// одной улики: закрепляется звено токена верхнего края.
+	CosignChecked bool
+	Cosigned      []CosignedHead
+	CosignUnknown int
+	CosignCarried int
+	// TSANotes — заметки об отзыве сертификатов служб меток (revoked.go).
+	TSANotes []string
 }
 
 // Withheld — сколько тел поломанных записей гейтвея не вскрыто нарочно.
@@ -248,6 +267,7 @@ func (r SourceReport) Verdict() string {
 // VerifySource проверяет пакет по источнику. from, to — окно аудитора; оба
 // нуля — сверка с окном из пакета. Итог — Valid().
 func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport {
+	trust = trust.withSealedKey(b.Seal)
 	r := SourceReport{Source: b.Source, From: from, To: to, LowerHead: b.Lower.Head, UpperHead: b.Upper.Head}
 	if from.IsZero() && to.IsZero() {
 		r.From, r.To, r.FromBundle = b.From, b.To, true
@@ -280,6 +300,8 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	// 2. Голова подписана закреплённым ключом и сходится со звеньями пакета.
 	r.HeadSeq = b.Checkpoint.Size
 	add("the head is signed with the store key", checkHead(b.Checkpoint, trust.StoreKey, links, rootAt), fmt.Sprintf("head %d", b.Checkpoint.Size))
+	sc := newStampCheck(trust)
+	sc.checkSeal(b.Seal, trust)
 
 	// 3. Нижний край: хвосты — единственный лист звена, которое заверила
 	// нижняя метка; с начала цепи — первое звено и нули.
@@ -292,7 +314,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 		}
 		add("the bundle starts at the beginning of the chain", err, "there is no time-stamp before the window")
 	} else {
-		start, r.Lower, err = sourceEdge(b.Source, b.Lower, linkAt, trust.TSA)
+		start, r.Lower, err = sourceEdge(b.Source, b.Lower, linkAt, sc, "the time-stamp of the lower tails")
 		add("the lower tails are the only leaf of the link the lower time-stamp certifies (T1)", err,
 			fmt.Sprintf("T1 = %s, link %d", fmtTime(r.Lower), b.Lower.Head))
 	}
@@ -301,9 +323,9 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	// закрывающей метки T2: всё, что S положил в цепь до T2, — до этих
 	// хвостов. Свежая метка над старым звеном хвостов, дописанная в конец
 	// цепи, краем его не делает: токена позже окна перед ним нет.
-	end, edgeAt, err := sourceEdge(b.Source, b.Upper, linkAt, trust.TSA)
+	end, edgeAt, err := sourceEdge(b.Source, b.Upper, linkAt, sc, "the time-stamp of the upper tails")
 	if err == nil {
-		r.Upper, err = closingStamp(b, linkAt, trust.TSA)
+		r.Upper, err = closingStamp(b, linkAt, sc)
 	}
 	r.UpperEdge = edgeAt
 	r.SourceNamed = b.Upper.Open != nil
@@ -361,7 +383,17 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 		var wr Report
 		checkWitness(trust.Witness, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
+		r.WitnessReceived, r.WitnessUntimed = wr.WitnessReceived, wr.WitnessUntimed
 	}
+	r.CosignCarried = len(b.Cosignatures)
+	if len(trust.Cosigners) > 0 {
+		r.CosignChecked = true
+		var err error
+		r.Cosigned, r.CosignUnknown, err = checkCosigned(b.Cosignatures, trust.Cosigners, trust.StoreKey, b.Upper.Token.LinkSeq, links, rootAt)
+		add(cosignCheckName, err, cosignDetail(r.Cosigned))
+	}
+	sc.finish(b.Archive, b.Cosignatures, trust.Cosigners, trust.StoreKey, links[len(links)-1].Seq, rootAt, add)
+	r.TSANotes = sc.notes
 	return r
 }
 
@@ -369,7 +401,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 // токен лежит в цепи листом e.Token, заверяет это звено. Возвращает хэш
 // последнего листа источника к этому месту (нули — записей ещё не было) и
 // время метки.
-func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) ([32]byte, time.Time, error) {
+func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Record, [32]byte, bool), sc *stampCheck, what string) ([32]byte, time.Time, error) {
 	link, root, ok := linkAt(e.Head)
 	switch {
 	case !ok:
@@ -400,7 +432,7 @@ func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Rec
 	if tok := e.Token.Leaf.chain(); tok.Type != auditchain.EventTimestamp || tok.Subject != strconv.FormatUint(e.Head, 10) {
 		return [32]byte{}, time.Time{}, fmt.Errorf("the leaf in link %d is not a time-stamp token over link %d", e.Token.LinkSeq, e.Head)
 	}
-	info, err := tsa.Verify(e.Token.Leaf.chain().Payload, HeadImprint(e.Head, root), trust)
+	info, err := sc.verify(e.Token.Leaf.chain().Payload, e.Head, root, e.Token.LinkSeq, fmt.Sprintf("%s (token in link %d)", what, e.Token.LinkSeq))
 	if err != nil {
 		return [32]byte{}, time.Time{}, fmt.Errorf("the time-stamp: %w", err)
 	}
@@ -414,7 +446,7 @@ func sourceEdge(source string, e SourceEdge, linkAt func(uint64) (auditchain.Rec
 // closingStamp — закрывающая метка окна: лист её токена с путём Меркла в
 // звене раньше верхнего края, метка заверяет голову из пакета. Возвращает её
 // время (T2).
-func closingStamp(b SourceBundle, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) (time.Time, error) {
+func closingStamp(b SourceBundle, linkAt func(uint64) (auditchain.Record, [32]byte, bool), sc *stampCheck) (time.Time, error) {
 	c := b.Closing
 	if err := checkInclusion(c, linkAt); err != nil {
 		return time.Time{}, fmt.Errorf("the token of the time-stamp that closes the window: %w", err)
@@ -431,7 +463,7 @@ func closingStamp(b SourceBundle, linkAt func(uint64) (auditchain.Record, [32]by
 	if !ok {
 		return time.Time{}, fmt.Errorf("link %d, which the time-stamp that closes the window certifies, is not in the bundle", head)
 	}
-	info, err := tsa.Verify(tok.Payload, HeadImprint(head, root), trust)
+	info, err := sc.verify(tok.Payload, head, root, c.LinkSeq, fmt.Sprintf("time-stamp T2 that closes the window (token in link %d)", c.LinkSeq))
 	if err != nil {
 		return time.Time{}, fmt.Errorf("the time-stamp that closes the window: %w", err)
 	}
@@ -961,12 +993,18 @@ func (r SourceReport) Notes() []string {
 	switch {
 	case r.WitnessHead != 0:
 		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this part would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
+		if r.WitnessUntimed {
+			n = append(n, WitnessUntimedNote)
+		}
+	case r.WitnessNone && len(r.Cosigned) > 0:
+		n = append(n, "the witness has no head at or after the link that holds the upper time-stamp's token yet")
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after the link that holds the upper time-stamp's token yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
-	default:
-		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the chain: a rewrite after the lower time-stamp needs a fresh upper one, and a T2 more than an hour after the window is a sign of it; a witness (esverify -heads) catches one made sooner")
+	case len(r.Cosigned) == 0:
+		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the chain: a rewrite after the lower time-stamp needs a fresh upper one, and a T2 more than an hour after the window is a sign of it; a witness (esverify -heads or -witness-key) catches one made sooner")
 	}
-	return n
+	n = append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this part", "T2", r.Upper)...)
+	return append(n, r.TSANotes...)
 }
 
 // Text — отчёт человеческим языком, как у пакета за окно: всё из пакета —

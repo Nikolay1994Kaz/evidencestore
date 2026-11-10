@@ -12,12 +12,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
@@ -44,12 +46,21 @@ type Config struct {
 	Keys    Keys     `json:"keys"`
 	Replica Replica  `json:"replica"`
 	Witness Witness  `json:"witness"`
+	Seal    Seal     `json:"seal"`
 	Sources []Source `json:"sources"`
 
 	// Demo — стенд для показа: разрешает короткие сроки (keys.min_wait меньше
 	// часа), чтобы уничтожение ключа уложилось в демо. В бою — никогда:
 	// окно отмены уничтожения тогда — секунды.
 	Demo bool `json:"demo"`
+}
+
+// Seal — печать организации на ключ хранилища (docs/keys.md): заявление,
+// которое печатает evidencestore seal-statement, с печатью сертификатом X.509
+// организации (CMS SignedData, содержимое внутри: openssl cms -sign -nodetach).
+type Seal struct {
+	// File — печать, DER или PEM. Пусто — печати нет.
+	File string `json:"file"`
 }
 
 // Replica — копия журнала улик и цепи наружу (S3 или каталог). keyring.dat
@@ -74,9 +85,39 @@ type Witness struct {
 	// file:///abs/path. Пусто — без свидетеля.
 	URL string `json:"url"`
 	// Every — как часто отправлять текущую голову. По умолчанию 1m. Голова
-	// под каждой меткой TSA уходит и без этого: ею кончается пакет.
+	// под каждой меткой TSA уходит и без этого: ею кончается пакет. Тот же
+	// ритм — у свидетелей C2SP (Cosigners).
 	Every Duration `json:"every"`
+	// Cosigners — свидетели C2SP (tlog-witness, eswitness): им уходят головы
+	// с доказательством продолжения, они возвращают подпись, и она едет в
+	// пакетах (DECISIONS п. 34). Независимо от URL: можно и то и другое.
+	Cosigners []Cosigner `json:"cosigners"`
 }
+
+// Cosigner — свидетель C2SP.
+type Cosigner struct {
+	// URL — адрес приёма свидетеля (submission prefix): хранилище шлёт
+	// POST <url>/add-checkpoint. Только http:// или https://.
+	URL string `json:"url"`
+	// Key — ключ проверки свидетеля (vkey: имя+номер ключа+ключ), как его
+	// печатает eswitness vkey. Берётся у владельца свидетеля: им хранилище
+	// проверяет каждую подпись до того, как положить её в журнал.
+	Key string `json:"key"`
+	// OldKeys — прежние ключи этого свидетеля (он начат заново с новым
+	// ключом). Головы им не уходят, а их подписи из журнала подписей идут в
+	// пакеты по-прежнему: аудитор, закрепивший прежний ключ, проверяет им
+	// историю до смены.
+	OldKeys []string `json:"old_keys"`
+	// CA — сертификаты УЦ для HTTPS свидетеля (PEM). Пусто — системные.
+	CA string `json:"ca"`
+}
+
+// MaxCosigners — предел свидетелей C2SP: каждый — запрос на каждую голову.
+const MaxCosigners = 8
+
+// MaxOldKeys — предел прежних ключей у свидетеля: каждый — ещё подпись в
+// каждом пакете.
+const MaxOldKeys = 4
 
 // TLS — сертификаты приёма.
 type TLS struct {
@@ -107,6 +148,20 @@ type TSA struct {
 	Every Duration `json:"every"`
 	// Trust — сертификаты, которым верит проверка токенов (у НУЦ:
 	// root_rsa_2020.cer и nca_rsa_2022.cer). Для "local" не нужен.
+	Trust []string `json:"trust"`
+	// Archive — вторая служба меток другого оператора: раз в Every она
+	// заверяет голову цепи отдельно, как свидетель, и её метки служат
+	// доказательством, что метки основной существовали раньше, если
+	// сертификат основной отзовут по компрометации ключа (RFC 3161, 4). На T1,
+	// T2 и время приёма не влияет. Пусто — без неё.
+	Archive TSAArchive `json:"archive"`
+}
+
+// TSAArchive — вторая служба меток (tsa.archive).
+type TSAArchive struct {
+	// URL службы RFC 3161, только http:// или https://.
+	URL string `json:"url"`
+	// Trust — сертификаты, которыми проверяются её токены до записи.
 	Trust []string `json:"trust"`
 }
 
@@ -238,6 +293,13 @@ func (c *Config) resolve(base string) {
 	for i := range c.TSA.Trust {
 		abs(&c.TSA.Trust[i])
 	}
+	for i := range c.TSA.Archive.Trust {
+		abs(&c.TSA.Archive.Trust[i])
+	}
+	for i := range c.Witness.Cosigners {
+		abs(&c.Witness.Cosigners[i].CA)
+	}
+	abs(&c.Seal.File)
 }
 
 // Defaults подставляет значения по умолчанию.
@@ -344,11 +406,25 @@ func (c *Config) Validate() error {
 	if c.Witness.URL != "" && c.Witness.URL == c.Replica.URL {
 		errs = append(errs, errors.New("witness.url must not be replica.url: the witness keeps heads out of the store administrator's reach, the copy is the store's own"))
 	}
+	errs = append(errs, c.validateCosigners()...)
 	if !c.Demo && c.Keys.MinWait > 0 && c.Keys.MinWait.D() < MinWaitFloor {
 		errs = append(errs, fmt.Errorf("keys.min_wait %v is shorter than %v: the window to cancel a key destruction would be too short (set \"demo\": true for a demo stand)", c.Keys.MinWait.D(), MinWaitFloor))
 	}
 	if c.TSA.URL != "" && c.TSA.URL != "local" && len(c.TSA.Trust) == 0 {
 		errs = append(errs, errors.New("tsa.trust is required for a real TSA: tokens are verified before they enter the chain"))
+	}
+	if a := c.TSA.Archive; a.URL != "" {
+		u, err := url.Parse(a.URL)
+		switch {
+		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+			errs = append(errs, fmt.Errorf("tsa.archive.url %q must be http:// or https:// with a host", a.URL))
+		case c.TSA.URL == "":
+			errs = append(errs, errors.New("tsa.archive needs tsa.url: the second TSA vouches for the time-stamps of the first"))
+		case sameService(a.URL, c.TSA.URL):
+			errs = append(errs, errors.New("tsa.archive.url must not be tsa.url: a time-stamp of the same TSA shows nothing once its key is compromised"))
+		case len(a.Trust) == 0:
+			errs = append(errs, errors.New("tsa.archive.trust is required: its tokens are verified before they are kept"))
+		}
 	}
 	seen := map[string]bool{}
 	for i, s := range c.Sources {
@@ -398,6 +474,58 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+// validateCosigners — свидетели C2SP: адрес http(s), ключ проверки
+// разбирается, имена не повторяются; прежние ключи разбираются, и ни один
+// ключ (имя и номер, или сам ключ) не встречается дважды.
+func (c *Config) validateCosigners() []error {
+	var errs []error
+	if len(c.Witness.Cosigners) > MaxCosigners {
+		errs = append(errs, fmt.Errorf("witness.cosigners: %d witnesses, at most %d", len(c.Witness.Cosigners), MaxCosigners))
+	}
+	names := map[string]bool{}
+	type keyID struct {
+		name string
+		id   uint32
+	}
+	ids, keys := map[keyID]bool{}, map[string]bool{}
+	seen := func(i int, v cosign.Verifier) error {
+		if ids[keyID{v.Name, v.ID}] || keys[string(v.Key)] {
+			return fmt.Errorf("witness.cosigners[%d]: key %s+%08x is listed twice", i, v.Name, v.ID)
+		}
+		ids[keyID{v.Name, v.ID}], keys[string(v.Key)] = true, true
+		return nil
+	}
+	for i, w := range c.Witness.Cosigners {
+		u, err := url.Parse(w.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: url %q must be http:// or https:// with a host, without a query: the store posts to <url>/add-checkpoint", i, w.URL))
+		}
+		if len(w.OldKeys) > MaxOldKeys {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: %d old_keys, at most %d", i, len(w.OldKeys), MaxOldKeys))
+		}
+		for j, k := range w.OldKeys {
+			v, err := cosign.ParseVerifier(k)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("witness.cosigners[%d].old_keys[%d]: %w", i, j, err))
+			} else if err := seen(i, v); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		v, err := cosign.ParseVerifier(w.Key)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: %w (eswitness vkey prints it)", i, err))
+			continue
+		}
+		if names[v.Name] {
+			errs = append(errs, fmt.Errorf("witness.cosigners[%d]: witness %s is listed twice", i, v.Name))
+		} else if err := seen(i, v); err != nil {
+			errs = append(errs, err)
+		}
+		names[v.Name] = true
+	}
+	return errs
+}
+
 // nested — один каталог совпадает с другим или лежит внутри него.
 func nested(a, b string) bool {
 	if a == "" || b == "" {
@@ -424,4 +552,27 @@ func (c *Config) Source(name string) (Source, bool) {
 func CertFingerprint(der []byte) string {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:])
+}
+
+// sameService — две ссылки на одну службу меток: тот же хост (без учёта
+// регистра), порт (явный или по умолчанию для схемы), путь (без косой черты
+// в конце) и запрос. Та же служба под другим именем или портом — забота
+// ArchiveOnce: он сверяет ключ, которым подписаны метки.
+func sameService(a, b string) bool {
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	if errA != nil || errB != nil {
+		return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if u.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	return strings.EqualFold(ua.Hostname(), ub.Hostname()) && port(ua) == port(ub) &&
+		strings.TrimRight(ua.EscapedPath(), "/") == strings.TrimRight(ub.EscapedPath(), "/") && ua.RawQuery == ub.RawQuery
 }

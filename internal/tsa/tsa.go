@@ -41,6 +41,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -60,6 +61,10 @@ var (
 var (
 	ErrRejected = errors.New("tsa: request rejected")
 	ErrInvalid  = errors.New("tsa: invalid token")
+	// ErrNoSigner — сертификата, которым подписан токен, нет ни в токене, ни
+	// среди данных (служба может не класть его в токен). Всегда вместе с
+	// ErrInvalid.
+	ErrNoSigner = errors.New("signer certificate not found")
 )
 
 // MaxTokenSize — предел ответа TSA и токена в цепи.
@@ -262,6 +267,13 @@ type Info struct {
 	Serial  *big.Int
 	Policy  asn1.ObjectIdentifier
 	Signer  *x509.Certificate
+	// Chains — цепочки от сертификата службы до корня из Trust, по которым
+	// он проверен: по ним сверяется отзыв (Assessment.Add).
+	Chains [][]*x509.Certificate
+	// Certs — сертификаты, которые несёт сам токен (поле certificates в CMS
+	// не подписано): журнал второй службы по ним решает, какие сертификаты
+	// цепочки хранить рядом с токеном.
+	Certs []*x509.Certificate
 }
 
 // Trust — во что верит проверяющий: корни (у НУЦ — root_rsa_2020) и
@@ -380,87 +392,148 @@ func (p *parsed) attr(oid asn1.ObjectIdentifier) ([]byte, bool) {
 // TSTInfo, хэш внутри TSTInfo, цепочку сертификата подписанта до корня из
 // trust и право сертификата ставить метки времени.
 func Verify(token []byte, imprint [32]byte, trust Trust) (Info, error) {
-	p, err := parseToken(token)
+	p, signer, pool, err := verifySigned(token, imprint, trust.Intermediates)
 	if err != nil {
 		return Info{}, err
-	}
-	mi := p.tst.MessageImprint
-	if !mi.HashAlgorithm.Algorithm.Equal(oidSHA256) || !bytes.Equal(mi.HashedMessage, imprint[:]) {
-		return Info{}, fmt.Errorf("%w: token covers another hash", ErrInvalid)
-	}
-
-	hash, err := hashFor(p.signer.DigestAlgorithm.Algorithm)
-	if err != nil {
-		return Info{}, err
-	}
-	ct, ok := p.attr(oidContentType)
-	var ctOID asn1.ObjectIdentifier
-	if !ok {
-		return Info{}, fmt.Errorf("%w: no content-type attribute", ErrInvalid)
-	}
-	if _, err := asn1.Unmarshal(ct, &ctOID); err != nil || !ctOID.Equal(oidTSTInfo) {
-		return Info{}, fmt.Errorf("%w: content-type attribute is not TSTInfo", ErrInvalid)
-	}
-	mdRaw, ok := p.attr(oidMessageDigst)
-	var md []byte
-	if !ok {
-		return Info{}, fmt.Errorf("%w: no message-digest attribute", ErrInvalid)
-	}
-	if _, err := asn1.Unmarshal(mdRaw, &md); err != nil {
-		return Info{}, fmt.Errorf("%w: bad message-digest attribute", ErrInvalid)
-	}
-	h := hash.New()
-	h.Write(p.tstDER)
-	if !bytes.Equal(h.Sum(nil), md) {
-		return Info{}, fmt.Errorf("%w: signed digest does not match TSTInfo", ErrInvalid)
-	}
-
-	pool := append(append([]*x509.Certificate(nil), p.certs...), trust.Intermediates...)
-	signer, err := findSigner(p.signer.SID, pool)
-	if err != nil {
-		return Info{}, err
-	}
-	if err := checkSignature(signer, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature); err != nil {
-		return Info{}, err
-	}
-	// RFC 3161, 2.4.1: сертификат подписанта называется подписанным
-	// атрибутом — signingCertificateV2 (RFC 5816) или signingCertificate
-	// (v1, SHA-1; так подписывает НУЦ РК). Без него подпись можно было бы
-	// приписать другому сертификату с тем же ключом.
-	if raw, ok := p.attr(oidSigningCertV2); ok {
-		if err := checkSigningCert(raw, signer); err != nil {
-			return Info{}, err
-		}
-	} else if raw, ok := p.attr(oidSigningCertV1); ok {
-		if err := checkSigningCertV1(raw, signer); err != nil {
-			return Info{}, err
-		}
-	} else {
-		return Info{}, fmt.Errorf("%w: no signing-certificate attribute", ErrInvalid)
-	}
-	if acc := p.tst.Accuracy; acc.Seconds < 0 || acc.Millis < 0 || acc.Micros < 0 ||
-		time.Duration(acc.Seconds)*time.Second+time.Duration(acc.Millis)*time.Millisecond+time.Duration(acc.Micros)*time.Microsecond > MaxAccuracy {
-		return Info{}, fmt.Errorf("%w: accuracy %ds %dms %dus is worse than %v", ErrInvalid, acc.Seconds, acc.Millis, acc.Micros, MaxAccuracy)
-	}
-	// RFC 3161, 2.3: у сертификата службы ровно одно назначение — метки
-	// времени. Go считает сертификат без EKU годным для всего, поэтому
-	// проверяем явно.
-	if len(signer.ExtKeyUsage) != 1 || signer.ExtKeyUsage[0] != x509.ExtKeyUsageTimeStamping || len(signer.UnknownExtKeyUsage) != 0 {
-		return Info{}, fmt.Errorf("%w: signer certificate is not a time-stamping certificate", ErrInvalid)
 	}
 	inter := x509.NewCertPool()
 	for _, c := range pool {
 		inter.AddCert(c)
 	}
-	if _, err := signer.Verify(x509.VerifyOptions{
+	chains, err := signer.Verify(x509.VerifyOptions{
 		Roots:         trust.Roots,
 		Intermediates: inter,
 		CurrentTime:   p.tst.GenTime,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping},
-	}); err != nil {
+	})
+	if err != nil {
 		return Info{}, fmt.Errorf("%w: signer certificate: %v", ErrInvalid, err)
 	}
-	return Info{GenTime: p.tst.GenTime, Serial: p.tst.SerialNumber, Policy: p.tst.Policy, Signer: signer}, nil
+	return Info{GenTime: p.tst.GenTime, Serial: p.tst.SerialNumber, Policy: p.tst.Policy, Signer: signer, Chains: chains, Certs: p.certs}, nil
+}
+
+// Signed — токен цел: разбирается, заверяет imprint и подписан сертификатом
+// службы меток, который несёт сам (или из intermediates). До какого корня
+// ведёт сертификат, не сверяется: для журнала, чьи токены проверены доверием,
+// когда были записаны, — доверие с тех пор могли сменить, а проверит его
+// аудитор.
+func Signed(token []byte, imprint [32]byte, intermediates ...*x509.Certificate) error {
+	_, err := SignedBy(token, imprint, intermediates...)
+	return err
+}
+
+// SignedBy — Signed и сертификат, которым подписан токен (из токена или
+// intermediates).
+func SignedBy(token []byte, imprint [32]byte, intermediates ...*x509.Certificate) (*x509.Certificate, error) {
+	_, signer, _, err := verifySigned(token, imprint, intermediates)
+	return signer, err
+}
+
+// verifySigned — всё, что Verify проверяет, кроме цепочки до корня: отпечаток,
+// подписанные атрибуты, подпись, сертификат подписанта (из токена и
+// intermediates), его назначение, точность. pool — сертификаты для цепочки.
+func verifySigned(token []byte, imprint [32]byte, intermediates []*x509.Certificate) (*parsed, *x509.Certificate, []*x509.Certificate, error) {
+	fail := func(err error) (*parsed, *x509.Certificate, []*x509.Certificate, error) { return nil, nil, nil, err }
+	p, err := parseToken(token)
+	if err != nil {
+		return fail(err)
+	}
+	mi := p.tst.MessageImprint
+	if !mi.HashAlgorithm.Algorithm.Equal(oidSHA256) || !bytes.Equal(mi.HashedMessage, imprint[:]) {
+		return fail(fmt.Errorf("%w: token covers another hash", ErrInvalid))
+	}
+
+	hash, err := hashFor(p.signer.DigestAlgorithm.Algorithm)
+	if err != nil {
+		return fail(err)
+	}
+	ct, ok := p.attr(oidContentType)
+	var ctOID asn1.ObjectIdentifier
+	if !ok {
+		return fail(fmt.Errorf("%w: no content-type attribute", ErrInvalid))
+	}
+	if _, err := asn1.Unmarshal(ct, &ctOID); err != nil || !ctOID.Equal(oidTSTInfo) {
+		return fail(fmt.Errorf("%w: content-type attribute is not TSTInfo", ErrInvalid))
+	}
+	mdRaw, ok := p.attr(oidMessageDigst)
+	var md []byte
+	if !ok {
+		return fail(fmt.Errorf("%w: no message-digest attribute", ErrInvalid))
+	}
+	if _, err := asn1.Unmarshal(mdRaw, &md); err != nil {
+		return fail(fmt.Errorf("%w: bad message-digest attribute", ErrInvalid))
+	}
+	h := hash.New()
+	h.Write(p.tstDER)
+	if !bytes.Equal(h.Sum(nil), md) {
+		return fail(fmt.Errorf("%w: signed digest does not match TSTInfo", ErrInvalid))
+	}
+
+	pool := append(append([]*x509.Certificate(nil), p.certs...), intermediates...)
+	// Подписант — сертификат, который называют SID, подпись и атрибут
+	// signingCertificate (RFC 3161, 2.4.1: signingCertificateV2, RFC 5816, или
+	// v1 с SHA-1 — так подписывает НУЦ РК; без него подпись можно было бы
+	// приписать другому сертификату с тем же ключом). По номеру ключа (SID —
+	// subjectKeyIdentifier) подходят все сертификаты ключа — и перевыпущенный:
+	// годен тот, кого называет атрибут.
+	candidates := findSigners(p.signer.SID, pool)
+	if len(candidates) == 0 {
+		return fail(fmt.Errorf("%w: %w", ErrInvalid, ErrNoSigner))
+	}
+	var signer *x509.Certificate
+	var firstErr error
+	// Сначала атрибут (хэш сертификата), потом подпись: поле certificates не
+	// подписано, и сертификатов с тем же SID можно подложить сколько угодно, а
+	// подпись сверяется только у названного атрибутом.
+	for _, c := range candidates {
+		var err error
+		if raw, ok := p.attr(oidSigningCertV2); ok {
+			err = checkSigningCert(raw, c)
+		} else if raw, ok := p.attr(oidSigningCertV1); ok {
+			err = checkSigningCertV1(raw, c)
+		} else {
+			err = fmt.Errorf("%w: no signing-certificate attribute", ErrInvalid)
+		}
+		if err == nil {
+			err = checkSignature(c, p.signer.SignatureAlgorithm.Algorithm, hash, p.attrsSet, p.signer.Signature)
+		}
+		if err == nil {
+			signer = c
+			break
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if signer == nil {
+		return fail(firstErr)
+	}
+	if acc := p.tst.Accuracy; acc.Seconds < 0 || acc.Millis < 0 || acc.Micros < 0 ||
+		time.Duration(acc.Seconds)*time.Second+time.Duration(acc.Millis)*time.Millisecond+time.Duration(acc.Micros)*time.Microsecond > MaxAccuracy {
+		return fail(fmt.Errorf("%w: accuracy %ds %dms %dus is worse than %v", ErrInvalid, acc.Seconds, acc.Millis, acc.Micros, MaxAccuracy))
+	}
+	// RFC 3161, 2.3: у сертификата службы ровно одно назначение — метки
+	// времени. Go считает сертификат без EKU годным для всего, поэтому
+	// проверяем явно.
+	if len(signer.ExtKeyUsage) != 1 || signer.ExtKeyUsage[0] != x509.ExtKeyUsageTimeStamping || len(signer.UnknownExtKeyUsage) != 0 {
+		return fail(fmt.Errorf("%w: signer certificate is not a time-stamping certificate", ErrInvalid))
+	}
+	return p, signer, pool, nil
+}
+
+// SignerKey — ключ (SubjectPublicKeyInfo) сертификата, которым подписан
+// токен, без проверки: сравнить две службы меток. Сертификат — из токена или
+// intermediates (служба может не класть его в токен).
+func SignerKey(token []byte, intermediates ...*x509.Certificate) ([]byte, error) {
+	p, err := parseToken(token)
+	if err != nil {
+		return nil, err
+	}
+	c, err := findSigner(p.signer.SID, append(slices.Clone(p.certs), intermediates...))
+	if err != nil {
+		return nil, err
+	}
+	return c.RawSubjectPublicKeyInfo, nil
 }
 
 // GenTime достаёт время из токена без проверки: для показа и поиска.
@@ -486,24 +559,33 @@ func hashFor(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
 }
 
 func findSigner(sid asn1.RawValue, pool []*x509.Certificate) (*x509.Certificate, error) {
+	if cs := findSigners(sid, pool); len(cs) > 0 {
+		return cs[0], nil
+	}
+	return nil, fmt.Errorf("%w: %w", ErrInvalid, ErrNoSigner)
+}
+
+// findSigners — все сертификаты pool, которые называет SID, по порядку.
+func findSigners(sid asn1.RawValue, pool []*x509.Certificate) []*x509.Certificate {
+	var out []*x509.Certificate
 	if sid.Class == asn1.ClassContextSpecific && sid.Tag == 0 {
 		for _, c := range pool {
 			if len(c.SubjectKeyId) > 0 && bytes.Equal(c.SubjectKeyId, sid.Bytes) {
-				return c, nil
+				out = append(out, c)
 			}
 		}
-		return nil, fmt.Errorf("%w: signer certificate not found", ErrInvalid)
+		return out
 	}
 	var ias issuerAndSerial
 	if _, err := asn1.Unmarshal(sid.FullBytes, &ias); err != nil {
-		return nil, fmt.Errorf("%w: bad signer identifier", ErrInvalid)
+		return nil
 	}
 	for _, c := range pool {
 		if bytes.Equal(c.RawIssuer, ias.Issuer.FullBytes) && c.SerialNumber.Cmp(ias.Serial) == 0 {
-			return c, nil
+			out = append(out, c)
 		}
 	}
-	return nil, fmt.Errorf("%w: signer certificate not found", ErrInvalid)
+	return out
 }
 
 var (

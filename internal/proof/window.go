@@ -15,7 +15,6 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/keyring"
-	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
 
 // Пакет за окно времени (DECISIONS, п. 27).
@@ -96,6 +95,15 @@ type WindowBundle struct {
 	// источник, без этой пометки не отличить от пакета без -dek. Пометка не
 	// подписана и меняет только заметки, не вердикт (P-80).
 	KeysFor string `json:"keys_for,omitempty"`
+	// Cosignatures — подписи свидетелей C2SP над головой не раньше конца
+	// участка (cosigned.go).
+	Cosignatures []Cosignature `json:"cosignatures,omitempty"`
+	// Archive — метки второй службы над головами не раньше меток участка
+	// (revoked.go).
+	Archive []ArchiveStamp `json:"archive,omitempty"`
+	// Seal — печать организации на ключ хранилища (seal.go): с ней
+	// проверяющему довольно корня центра её сертификата. Необязательное.
+	Seal *StoreSeal `json:"store_seal,omitempty"`
 }
 
 // WindowRecord — улика с участка и ключ её записи. Ключа нет — ключ месяца
@@ -198,6 +206,17 @@ type WindowReport struct {
 	WitnessNone    bool
 	WitnessFork    uint64
 	WitnessRefused int
+	// WitnessReceived, WitnessUntimed — как у пакета одной улики (P-21).
+	WitnessReceived time.Time
+	WitnessUntimed  bool
+	// CosignChecked, Cosigned, CosignUnknown, CosignCarried — как у пакета
+	// одной улики: закрепляется конец участка.
+	CosignChecked bool
+	Cosigned      []CosignedHead
+	CosignUnknown int
+	CosignCarried int
+	// TSANotes — заметки об отзыве сертификатов служб меток (revoked.go).
+	TSANotes []string
 }
 
 // Valid — все проверки прошли.
@@ -237,6 +256,7 @@ type windowStamp struct {
 // VerifyWindow проверяет пакет за окно. from, to — окно аудитора; оба нуля —
 // сверка с окном из пакета (отчёт об этом говорит). Итог — Valid().
 func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport {
+	trust = trust.withSealedKey(b.Seal)
 	r := WindowReport{From: from, To: to, LowerHead: b.LowerHead, StretchEnd: b.StretchEnd, Leaves: len(b.Leaves)}
 	if from.IsZero() && to.IsZero() {
 		r.From, r.To, r.FromBundle = b.From, b.To, true
@@ -283,7 +303,9 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 	}
 
 	// 4. Токены всех меток участка сходятся с заверенными головами.
-	stamps, err := windowStamps(leaves, stretch, linkAt, trust.TSA)
+	sc := newStampCheck(trust)
+	sc.checkSeal(b.Seal, trust)
+	stamps, err := windowStamps(leaves, stretch, linkAt, sc)
 	if !add("every TSA time-stamp in the stretch verifies", err, fmt.Sprintf("%d time-stamps", len(stamps))) {
 		return r
 	}
@@ -385,7 +407,17 @@ func VerifyWindow(b WindowBundle, trust Trust, from, to time.Time) WindowReport 
 		var wr Report
 		checkWitness(trust.Witness, trust.StoreKey, b.StretchEnd, links, rootAt, &wr, add)
 		r.WitnessChecked, r.WitnessHead, r.WitnessNone, r.WitnessFork, r.WitnessRefused = wr.WitnessChecked, wr.WitnessHead, wr.WitnessNone, wr.WitnessFork, wr.WitnessRefused
+		r.WitnessReceived, r.WitnessUntimed = wr.WitnessReceived, wr.WitnessUntimed
 	}
+	r.CosignCarried = len(b.Cosignatures)
+	if len(trust.Cosigners) > 0 {
+		r.CosignChecked = true
+		var err error
+		r.Cosigned, r.CosignUnknown, err = checkCosigned(b.Cosignatures, trust.Cosigners, trust.StoreKey, b.StretchEnd, links, rootAt)
+		add(cosignCheckName, err, cosignDetail(r.Cosigned))
+	}
+	sc.finish(b.Archive, b.Cosignatures, trust.Cosigners, trust.StoreKey, links[len(links)-1].Seq, rootAt, add)
+	r.TSANotes = sc.notes
 	return r
 }
 
@@ -451,7 +483,7 @@ func batchOf(l auditchain.Record) (auditchain.BatchPayload, error) {
 
 // windowStamps проверяет токены всех меток участка: каждая заверяет голову,
 // которая есть в пакете и лежит раньше звена с токеном.
-func windowStamps(leaves []auditchain.Leaf, stretch []stretchLink, linkAt func(uint64) (auditchain.Record, [32]byte, bool), trust tsa.Trust) ([]windowStamp, error) {
+func windowStamps(leaves []auditchain.Leaf, stretch []stretchLink, linkAt func(uint64) (auditchain.Record, [32]byte, bool), sc *stampCheck) ([]windowStamp, error) {
 	var out []windowStamp
 	for _, sl := range stretch {
 		for _, l := range leaves[sl.at : sl.at+sl.count] {
@@ -469,7 +501,7 @@ func windowStamps(leaves []auditchain.Leaf, stretch []stretchLink, linkAt func(u
 			if !ok {
 				return nil, fmt.Errorf("the time-stamp in link %d certifies head %d, which is not in the bundle", sl.seq, head)
 			}
-			info, err := tsa.Verify(l.Payload, HeadImprint(head, root), trust)
+			info, err := sc.verify(l.Payload, head, root, sl.seq, fmt.Sprintf("the time-stamp in link %d", sl.seq))
 			if err != nil {
 				return nil, fmt.Errorf("the time-stamp in link %d over head %d: %w", sl.seq, head, err)
 			}
@@ -902,12 +934,18 @@ func (r WindowReport) Notes() []string {
 	switch {
 	case r.WitnessHead != 0:
 		n = append(n, fmt.Sprintf("the witness saw head %d, and it fixes the chain up to that head: rewriting this stretch would contradict the witness, as long as the witness is out of the store administrator's reach", r.WitnessHead))
+		if r.WitnessUntimed {
+			n = append(n, WitnessUntimedNote)
+		}
+	case r.WitnessNone && len(r.Cosigned) > 0:
+		n = append(n, "the witness has no head at or after the end of this stretch yet")
 	case r.WitnessNone:
 		n = append(n, "the witness has no head at or after the end of this stretch yet: until it gets one, only the TSA time-stamps stand against the store's owner rewriting the chain")
-	default:
+	case len(r.Cosigned) == 0:
 		n = append(n, "the store's signature proves that THIS store signed the head; only the TSA time-stamps stand against its owner rewriting the whole chain")
 	}
-	return n
+	n = append(n, CosignNotes(r.CosignChecked, r.Cosigned, r.CosignUnknown, r.CosignCarried, "this stretch", "T2", r.Upper)...)
+	return append(n, r.TSANotes...)
 }
 
 // Text — отчёт человеческим языком. Как у пакета одной улики, всё, что

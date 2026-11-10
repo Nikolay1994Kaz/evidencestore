@@ -1636,15 +1636,6 @@ func TestUnopenableNewFileDoesNotBlockDrain(t *testing.T) {
 	}
 }
 
-// onLog — обработчик журнала, который зовёт fn на каждой записи: тест
-// вклинивается в окно между шагами сборщика.
-type onLog struct {
-	slog.Handler
-	fn func(slog.Record)
-}
-
-func (h onLog) Handle(ctx context.Context, r slog.Record) error { h.fn(r); return nil }
-
 // W-06: файл под маской переименован в другое имя под той же маской между
 // листингом и открытием. По устаревшему листингу он не открывается — это
 // повод перечитать каталог, а не «файл пропал»: раньше каждый такой виток

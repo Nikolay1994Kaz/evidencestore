@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -44,13 +45,16 @@ func (s *Store) startBackground() {
 	}
 	if s.witnessRemote != nil {
 		s.loop(s.cfg.Witness.Every.D(), func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			ctx, cancel := s.stopCtx(time.Minute)
 			defer cancel()
 			if err := s.WitnessOnce(ctx); err != nil {
 				s.log.Error("witness", "err", err)
 			}
 		})
 	}
+	s.startCosignLoops()
+	s.startArchiveLoop()
+	s.startSealLoop()
 	s.loop(time.Minute, func() { s.Maintain(s.nowTime()) })
 	s.loop(10*time.Second, func() {
 		now := s.nowTime()
@@ -132,6 +136,20 @@ func (s *Store) keepAnchor() {
 }
 
 func (s *Store) loop(every time.Duration, fn func()) { s.runLoop(every, false, fn) }
+
+// stopCtx — контекст обхода: кончается через d или когда хранилище
+// закрывается.
+func (s *Store) stopCtx(d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	go func() {
+		select {
+		case <-s.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
 
 // loopNow — loop, первый раз сразу.
 func (s *Store) loopNow(every time.Duration, fn func()) { s.runLoop(every, true, fn) }
@@ -382,6 +400,8 @@ func (s *Store) stampOnce(ctx context.Context, force bool) (_ uint64, gen time.T
 	if err != nil {
 		return 0, gen, fmt.Errorf("store: TSA token rejected: %w", err)
 	}
+	mainKey := sha256.Sum256(info.Signer.RawSubjectPublicKeyInfo)
+	s.tsaKey.Store(&mainKey) // ключ основной службы — для tsa.archive (archive.go)
 	// Время TSA позже окна по якорю: монотонные часы стояли (сон хоста,
 	// пауза ВМ), и время приёма отставало на всю паузу. Запись, принятая,
 	// пока шёл запрос, легла после заверенного звена со временем внутри окна,

@@ -17,6 +17,8 @@
 //	evidence/     журнал улик (evlog): сегменты только дописываются
 //	chain/        цепь (auditchain) и ключ подписи хранилища sign.key
 //	tsa-local/    ключи встроенной демо-службы меток, если она включена
+//	cosign/       подписи свидетелей C2SP (cosign.go), если они настроены
+//	tsa/          метки второй службы (archive.go), если она настроена
 //
 // Всё, что меняет кейринг и цепь, идёт через этот процесс: у них один
 // писатель. Администрирование — через unix-сокет (пакет server).
@@ -231,6 +233,40 @@ type Store struct {
 	witnessRemote ship.Remote
 	witnessQueue  []witnessHead
 	witnessQueued uint64 // наибольшая голова, поставленная в очередь
+	// Свидетели C2SP (cosign.go): очереди — под chainMu; журнал подписей и
+	// его указатели — под cosignMu. Порядок захвата: chainMu раньше cosignMu.
+	cosigners []*cosigner
+	cosignMu  sync.Mutex
+	cosignLog *os.File
+	cosignIdx map[cosigKey][]cosigRef // по ключу свидетеля, по возрастанию размера
+	// cosignSkipped, archiveSkipped — журнал подписей свидетелей, журнал меток
+	// второй службы больше не едет в копию наружу: в data_dir он не
+	// продолжает скопированный (replicaState.Skip).
+	cosignSkipped  atomic.Bool
+	archiveSkipped atomic.Bool
+	// Вторая служба меток (archive.go): журнал и его указатели — под
+	// archiveMu. Порядок захвата: chainMu раньше archiveMu.
+	archiver   *archiver
+	archiveMu  sync.Mutex
+	archiveLog *os.File
+	archiveEnd int64        // конец последней целой строки журнала
+	archiveIdx []archiveRef // по возрастанию размера
+	// archiveByKey — строки журнала каждой службы (SHA-256 ключа подписи):
+	// номера в archiveIdx по возрастанию головы; archiveKeyOrder — службы в
+	// порядке первой строки.
+	archiveByKey    map[[32]byte][]int
+	archiveKeyOrder [][32]byte
+	// tsaKey — SHA-256 ключа основной службы по её последней метке: вторая
+	// служба с тем же ключом — та же служба.
+	tsaKey atomic.Pointer[[32]byte]
+	// sealCMS — печать организации на ключ хранилища (seal.file; seal.go),
+	// sealBy — кто её поставил, sealToken — метка над ней (nil — ещё нет).
+	sealCMS   []byte
+	sealBy    string
+	sealToken atomic.Pointer[[]byte]
+	// archiveOn — журнал меток второй службы открыт (с tsa.archive или
+	// оставшийся после неё); не меняется после открытия.
+	archiveOn bool
 	// servedHead — последняя голова, подписанная для сборщиков и statement
 	// (servedHeadLocked), под chainMu: подпись не повторяется на каждый
 	// ответ.
@@ -805,6 +841,15 @@ func (s *Store) open() error {
 	if err := s.reconcileKeys(cs.keyEvents); err != nil {
 		return err
 	}
+	if err := s.openCosigners(); err != nil {
+		return err
+	}
+	if err := s.openArchive(); err != nil {
+		return err
+	}
+	if err := s.openSeal(); err != nil {
+		return err
+	}
 	s.appendEvent(auditchain.EventStart, "", "", []byte(s.signer.PublicKeyString()))
 	if err := s.ensureMonthScopes(s.nowTime()); err != nil {
 		// Копия в резерв не прошла: ключ заведён, но не выдаётся, пока
@@ -923,6 +968,8 @@ func (s *Store) closeFiles() error {
 	if s.tree != nil {
 		err = errors.Join(err, s.tree.close())
 	}
+	err = errors.Join(err, s.closeCosignLog())
+	err = errors.Join(err, s.closeArchiveLog())
 	if s.keys != nil {
 		err = errors.Join(err, s.keys.Close())
 	}

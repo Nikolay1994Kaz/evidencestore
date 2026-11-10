@@ -73,6 +73,10 @@ func verifyWindow(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		out["witness_head"] = win.WitnessHead
 		out["witness_fork"] = win.WitnessFork
 		out["witness_refused"] = win.WitnessRefused
+		out["witness_received"] = witnessReceived(win.WitnessReceived)
+	}
+	if win.CosignChecked {
+		out["cosigned"] = win.Cosigned
 	}
 	// Пакет -window не называет источник, тела которого несёт: что окно пусто,
 	// видно, только если в нём нет записей ни одного источника.
@@ -109,6 +113,15 @@ func verifyWindow(data []byte, trust proof.Trust, from, to time.Time) windowResu
 	}
 	out["leaf_only"], out["leaf_only_months"], out["key_receipts"] = win.LeafOnly, win.LeafOnlyMonths, win.KeyReceipts
 	return windowResult{valid: win.Valid(), text: win.Text(), json: out, bodies: win.Bodies, nothing: nothing, noBodies: noBodies, warn: warn}
+}
+
+// witnessReceived — время получения закрепляющей головы для -json: null, если
+// времени у голов нет (закрепила первая по номеру, P-21).
+func witnessReceived(at time.Time) any {
+	if at.IsZero() {
+		return nil
+	}
+	return at
 }
 
 // leafOnlyWarn — что -bodies не записал, когда часть тел записана, а месяцы
@@ -198,6 +211,10 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		out["witness_head"] = src.WitnessHead
 		out["witness_fork"] = src.WitnessFork
 		out["witness_refused"] = src.WitnessRefused
+		out["witness_received"] = witnessReceived(src.WitnessReceived)
+	}
+	if src.CosignChecked {
+		out["cosigned"] = src.Cosigned
 	}
 	return windowResult{valid: src.Valid(), text: src.Text(), json: out, bodies: src.Bodies, noBodies: noBodies, nothing: nothing, warn: warn}
 }
