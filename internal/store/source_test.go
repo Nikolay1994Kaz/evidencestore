@@ -870,7 +870,7 @@ func TestSourceProofLostRecordsWording(t *testing.T) {
 // выдаёт тело записи, которую хранилище при приёме признало поломанной
 // (хэш записи не сходится): вердиктов гейтвея в пакете по источнику нет
 // вовсе — ни части gateway, ни листьев вердиктов. Пакет одной улики по той
-// же записи — NOT VERIFIED. README («What is proven»): «A gateway record
+// же записи — NOT VERIFIED. `docs/what-is-proven.md`: «A gateway record
 // whose bundle lacks the gateway part does not verify». Пакет за окно хотя
 // бы считает поломки в сводке источника; пакет по источнику — нет.
 func TestSourceProofGatewayVerdicts(t *testing.T) {

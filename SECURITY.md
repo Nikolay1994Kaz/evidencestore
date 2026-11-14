@@ -8,7 +8,7 @@ A useful report names the version or commit, what an attacker needs (which keys,
 
 ## What counts
 
-What the store and `esverify` promise, and what they do not, is in the README ([What is proven, and what is not](README.md#what-is-proven-and-what-is-not)) and in [Known limitations](docs/limitations.md). A vulnerability is a way around those promises, for example:
+What the store and `esverify` promise, and what they do not, is in [What is proven, and what is not](docs/what-is-proven.md) and in [Known limitations](docs/limitations.md). A vulnerability is a way around those promises, for example:
 
 - a forged, rewritten or truncated chain, or a bundle that leaves something out, that `esverify` reports as VERIFIED;
 - a time-stamp of a TSA key revoked for compromise that counts without a proof that it existed earlier;

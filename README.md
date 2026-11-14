@@ -58,7 +58,7 @@ It takes any line-based log: system logs, application and core banking audit log
 
 ## Try it
 
-The demos run on Linux with bash and python3 (the Pipelock one also needs curl). They build the binaries with Go 1.25.4 or newer; with binaries installed from a release, `ES_BIN=/usr/local/bin` runs the demos on those instead ([Install](#install)); the whole-session step at the end of `demo-intruder.sh` needs binaries newer than v0.2.0.
+The demos run on Linux with bash, python3 and Go 1.25.4 or newer (the Pipelock one also needs curl). With binaries from a release, `ES_BIN=/usr/local/bin` runs them without Go ([Install](#install)).
 
 ```sh
 git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore
@@ -77,13 +77,13 @@ The demo runs these steps:
 4. Shows that a one-byte forgery is caught.
 5. Destroys the month key (a single approval is refused) and shows that the proof still verifies while the body is gone.
 
-`scripts/demo-intruder.sh` plays an intrusion on a web server. The collector follows a practice `auth.log` (inside the demo directory; nothing on the host is touched). An intruder logs in as root and then removes every line with their address (`sed -i`). The script pulls every record of that source out of the store, verifies each one offline with `esverify` and writes its body with `-body`: the four deleted lines come back byte for byte, each with the window in which the store received it, and the time-stamps show they were in the store before the file was rewritten. Last, the auditor asks for the whole session of web-1 as one bundle: it holds every line the store received from web-1 in that time, the deleted ones among them, and leaving any out would not verify. A window is closed by a time-stamp taken more than two minutes after its end, and a one-source bundle ends at the source tails of the time-stamp after that one, so the demo waits two minutes and takes two time-stamps. `DEMO_TSA=digicert` takes the time-stamps from the public DigiCert TSA.
+`scripts/demo-intruder.sh` plays an intrusion on a web server: an intruder logs in as root and removes every line with their address from a practice `auth.log` (inside the demo directory; nothing on the host is touched). The script pulls the records of that source out of the store and verifies each one offline: the four deleted lines come back byte for byte, and the time-stamps show they were in the store before the file was rewritten. Last, it asks for the whole session of web-1 as one bundle, which would not verify with any line left out (this waits two minutes for the time-stamps that close the window).
 
 ## Run it yourself
 
-The first three steps of the demo, by hand and on a log of your own. Everything runs on one Linux machine. You need the three binaries on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone. `dev-setup` is in binaries newer than v0.3.0; with v0.3.0, take the steps by hand under "Step by step by hand" instead.
+The first three steps of the demo, by hand and on a log of your own, on one Linux machine. You need `evidencestore`, `escollect` and `esverify` on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone.
 
-`dev-setup` prepares a directory for a try: a demo CA with certificates for the store and for the source `app`, the store's config, `init`, and the collector's config with the store's public key pinned in it. Time-stamps come from a demo TSA built into the store (`"url": "local"`), so nothing leaves the machine; a real TSA is set in `tsa` ([Configuration](docs/configuration.md)). It writes only into a new or empty directory; `-log FILE` points the collector at a log of your own (any file your user can read), and `-port` moves the store off port 8443:
+`dev-setup` prepares a new or empty directory for a try: demo certificates, both configs with the store's public key pinned in the collector's, and `init`. Time-stamps come from a demo TSA built into the store, so nothing leaves the machine. `-log FILE` points the collector at a log of your own, and `-port` moves the store off port 8443:
 
 ```sh
 evidencestore dev-setup -dir ~/es-try -source app
@@ -122,13 +122,13 @@ EOF
 
 </details>
 
-Start the store in a second terminal and leave it running. It warns that `keys.backup_dir` is not set, and two minutes after the collector's last contact it warns that the collector of `app` is lost: a collector run with `-once` sends no heartbeat. Both are fine for a try:
+Start the store in a second terminal and leave it running. Its warnings that `keys.backup_dir` is not set and, two minutes later, that the collector of `app` is lost are fine for a try:
 
 ```sh
 cd ~/es-try && evidencestore serve -config store.json
 ```
 
-Back in the first terminal, a line goes into `app.log` and the collector sends it; with `-log`, skip the `echo`: record 1 is the first line of your log. With `-once` the collector sends what the file holds and exits; a collector running as a service leaves `-once` out and follows the file:
+Back in the first terminal, write a line into `app.log` and send it (with `-log`, skip the `echo`: record 1 is the first line of your log). With `-once` the collector sends what the file holds and exits; as a service it follows the file:
 
 ```sh
 cd ~/es-try
@@ -136,7 +136,7 @@ echo "$(date -Is) user=alice action=login" >> app.log
 escollect -config collector.json -once
 ```
 
-A proof of record 1, checked the way an auditor does it. A bundle verifies only once a time-stamp lies over the chain after its record: the store takes one every `tsa.every` (10 minutes by default), and `stamp` takes one now. `-dek` adds the key of this one record, so `esverify` also prints the body; a bundle without it proves the record and leaves the body closed. `esverify` runs offline, with the store's public key and the TSA certificate:
+Now a proof of record 1, checked the way an auditor does it. A bundle verifies only once a time-stamp lies over the chain after its record: the store takes one every 10 minutes, and `stamp` takes one now. `-dek` adds the key of this one record, so `esverify` also prints the body:
 
 ```sh
 evidencestore stamp -config store.json
@@ -145,15 +145,17 @@ evidencestore tsa-root -config store.json -out tsa-root.crt
 esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt
 ```
 
-`esverify` ends with `VERIFIED` (exit code 0); `evidencestore status -config store.json` shows how many records each source has. A real installation also needs certificates from your own PKI, a real TSA, `keys.backup_dir` and `keys.roots_mirror_dir` on other disks, and the store on another machine than its sources ([Install](#install)). To start over, stop the store and remove `~/es-try`.
+`esverify` ends with `VERIFIED` (exit code 0), and `evidencestore status -config store.json` shows what the store holds. A real installation also needs certificates from your own PKI, a real TSA, key backups on other disks and the store on another machine than its sources: [Installing on hosts](docs/install.md). To start over, stop the store and remove `~/es-try`.
 
 ## How it works
 
-Every record is accepted over mutual TLS, encrypted with its own key, written to disk (the store answers "accepted" only after `fsync`, with a signed promise the collector keeps) and chained by hash. The chain head is time-stamped by an external RFC 3161 authority, and optionally by a second one of another operator, whose time-stamps vouch for the first should its key ever be compromised (`esverify -tsa-crl` checks the revocation of TSA certificates, [Revoked TSA certificates](docs/bundles.md#revoked-tsa-certificates)). For any record the store produces a proof bundle, and an auditor checks it **offline**, without access to the store and without trusting it: the record bytes, a Merkle path into the chain, the chain up to a signed head (a checkpoint: the number of links and the root of a Merkle tree over all of them), and time-stamps from before and after the record. Of the other records in the store the bundle shows only how many there were and when, not whose or what.
-
-Whoever holds the store's signing key could sign a second version of the chain, so the heads also go where that administrator cannot reach: to witnesses that cosign a head only if it extends the last one they cosigned (`eswitness`, C2SP), to an S3 bucket with Object Lock, and to every collector, which checks that each head the store gives it extends the last one and keeps one every few minutes. A rewrite then contradicts what they hold ([Cosigning witnesses](docs/copy-and-witness.md#cosigning-witnesses-c2sp), [Witness of the chain heads](docs/copy-and-witness.md#witness-of-the-chain-heads), [Collectors as witnesses](docs/copy-and-witness.md#collectors-as-witnesses)).
-
-Retention is enforced by destroying keys (crypto-erasure). Every record of a source for a month is encrypted under that month's key. Destroying the key needs a waiting period and two named approvals, which the chain records but the store does not authenticate ([Known limitations](docs/limitations.md)), and it makes those bodies unreadable in every copy (log segments, backups). The chain and the proofs stay intact: you can still prove that record #42 from `abs-core` existed, was received at a given time and was never altered. You can no longer read it.
+1. **Collect.** `escollect` tails the log, numbers every line and keeps it in a spool on disk until the store has signed for it.
+2. **Accept.** The store takes each line over mutual TLS, encrypts it as a record with its own key, writes it to disk and answers only after `fsync`, with a signed promise the collector keeps.
+3. **Chain.** Records are chained by hash. A chain head is a signed checkpoint: the number of links and the root of a Merkle tree over all of them.
+4. **Time-stamp.** An external RFC 3161 authority time-stamps the head; a second one, of another operator, can vouch for the first should its key ever be compromised ([Revoked TSA certificates](docs/bundles.md#revoked-tsa-certificates)).
+5. **Witness.** Whoever holds the store's signing key could sign a second version of the chain, so the heads also go where that administrator cannot reach: to cosigning witnesses, to an S3 bucket with Object Lock and to every collector ([Copy, restore and the witness](docs/copy-and-witness.md)).
+6. **Prove.** For one record, or for a window of time, the store builds a proof bundle, and an auditor checks it offline, without access to the store and without trusting it.
+7. **Forget.** The records of a source for a month share that month's key; destroying it makes those bodies unreadable in every copy, while the chain and the proofs stay intact ([Keys and retention](docs/keys.md)).
 
 ## Components
 
@@ -162,7 +164,7 @@ Retention is enforced by destroying keys (crypto-erasure). Every record of a sou
 | `evidencestore` | the store: `init`, `serve`, `restore`, `dev-pki` (demo certificates), `dev-setup` (a demo store in one directory: certificates, both configs, `init`), plus operator commands over a local admin socket (`status`, `statement`, `stamp`, `proof`, `tsa-root`, `keys …`, `sources bind`) |
 | `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
 | `eswitness` | a witness that cosigns the store's chain heads (C2SP tlog-witness), run by someone other than the store's administrator: `init`, `serve`, `vkey` (the key auditors pass to `esverify -witness-key`) |
-| `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; `-body FILE` writes the record body to a file byte for byte, only once the bundle verifies; a bundle over a window of time (`evidencestore proof -source S -from -to`, or `-window` for every source) is checked for completeness, and `-bodies DIR` writes out the bodies it carries; exit code 0 — verified, 1 — not verified (including an unparsable bundle or a broken promise), 2 — bad usage (including a flag meant for the other kind of bundle, or a bad `-from` or `-to`), an unreadable bundle, key, certificate or promise file or heads directory, `-body` for a bundle without the record key, or `-bodies` for a bundle that opens no body though the window holds records (a window with no records, with none under the subject's label, or with records only in months the bundle names no label for, is an answer: `-bodies` says so, exit code 0) |
+| `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; exit code 0 means verified, 1 not verified, 2 a bad call or an unreadable file ([exit codes in full](docs/what-is-proven.md#exit-codes-of-esverify)) |
 
 `evidencestore version`, `escollect -version`, `eswitness version` and `esverify -version` print the version and the commit a binary was built from.
 
@@ -183,22 +185,14 @@ evidencestore version
 
 **From source.** With Go 1.25.4 or newer: `git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore && go build -o /usr/local/bin/ ./cmd/...`.
 
-**A store host**, with the unit file from [`configs/systemd/`](configs/systemd):
-
-1. Create the service user and its directories: `useradd --system --home-dir /var/lib/evidencestore --shell /usr/sbin/nologin evidencestore`, then `install -d -o evidencestore -g evidencestore -m 0700 /var/lib/evidencestore /var/lib/evidencestore-roots`.
-2. Put `keys.backup_dir` and `keys.roots_mirror_dir` on other disks, better on another machine, and create those directories for the same user before `init`, with the disks mounted. Use a directory on the mounted disk, not the mount point itself: an empty mount point is there even when nothing is mounted on it. Neither `init` nor the store creates these directories, since a missing one looks like an unmounted disk: `init` refuses to run, and the store reports every copy there as failed until the directory is back (`evidencestore_keyring_backup_pending` and `evidencestore_sign_key_backup_pending` for `keys.backup_dir`, `evidencestore_keyring_roots_unreachable` for `keys.roots_mirror_dir`).
-3. Put the config into `/etc/evidencestore/evidencestore.json`, starting from [`configs/evidencestore.example.json`](configs/evidencestore.example.json). Relative paths in it resolve against the config's directory, so copy `configs/tsa/` next to it. Add the server certificate and key (readable by the service user) and the CA that issues collector certificates: your own PKI (`dev-pki` is for demos).
-4. `sudo -u evidencestore evidencestore init -config /etc/evidencestore/evidencestore.json`. It prints the store's public key: collectors pin it as `store_key`, auditors pass it to `esverify -store-key`.
-5. `cp configs/systemd/evidencestore.service /etc/systemd/system/ && systemctl enable --now evidencestore`. The unit sees the file system read-only apart from its own directories (`ProtectSystem=strict`): a `file://` `replica.url` or `witness.url` has to be added to `ReadWritePaths`. Operator commands talk to the admin socket, which belongs to the service user: `sudo -u evidencestore evidencestore status -config /etc/evidencestore/evidencestore.json`.
-
-**A collector host**: one service per source. Create the user (`useradd --system --no-create-home --shell /usr/sbin/nologin escollect`); the unit adds it to group `adm`, which reads `/var/log` on Debian and Ubuntu. For each source put its certificate and `/etc/escollect/<source>.json` (from [`configs/collector.example.json`](configs/collector.example.json), with `spool_dir` set to `/var/lib/escollect/<source>`), then `cp configs/systemd/escollect@.service /etc/systemd/system/ && systemctl enable --now escollect@<source>`.
-
-**A witness host**, run by someone other than the store's administrator: `useradd --system --home-dir /var/lib/eswitness --shell /usr/sbin/nologin eswitness`, `install -d -o eswitness -g eswitness -m 0700 /var/lib/eswitness`, the config in `/etc/eswitness/eswitness.json` from [`configs/eswitness.example.json`](configs/eswitness.example.json) with each store's public key, then `sudo -u eswitness eswitness init -config /etc/eswitness/eswitness.json`: it prints the verifier key for the store's `witness.cosigners` and for auditors. Then `cp configs/systemd/eswitness.service /etc/systemd/system/ && systemctl enable --now eswitness` ([Cosigning witnesses](docs/copy-and-witness.md#cosigning-witnesses-c2sp)).
+**On hosts.** The store, a collector for each source and a witness as systemd services, with the unit files from [`configs/systemd/`](configs/systemd): [Installing on hosts](docs/install.md). The store runs under its own user, with `keys.backup_dir` and `keys.roots_mirror_dir` on other disks; the witness is run by someone other than the store's administrator.
 
 There is no container image yet.
 
 ## Documentation
 
+- [What is proven, and what is not](docs/what-is-proven.md): every claim a verified bundle supports, the flag that gives it, and the exit codes of `esverify`.
+- [Installing on hosts](docs/install.md): the store, collectors and a witness as systemd services.
 - [Configuration](docs/configuration.md): the store and the collector, values refused at start, upgrading.
 - [Keys and retention](docs/keys.md): month keys, their backup and the roots mirror, destruction, a seal of your organization on the store key.
 - [Copy, restore and the witness](docs/copy-and-witness.md): the remote copy, `restore`, the witness of the chain heads, witnesses that cosign them (`eswitness`).
@@ -209,31 +203,25 @@ There is no container image yet.
 
 ## What is proven, and what is not
 
-Proven offline:
-
-- these exact bytes were received from this source;
-- they have not been altered since;
-- they entered the chain between the two time-stamps T1 and T2;
-- with the collector's promise (`esverify -promise`): the store signed for this very record at intake, and no TSA time-stamp taken more than a minute after its receive time lies before the record in the chain;
-- with the record key: the body as received (`esverify -body FILE` writes it out byte for byte, so the original log can be rebuilt from the store); the key is bound to the record's digest, so the store cannot show two auditors two different bodies;
-- for gateway journals: the body is the gateway's own entry, and a checkpoint signed by the gateway covers it — when that signature was checked by the store with the pinned `gateway_key` or by you with `-gateway-key`. A gateway record whose bundle lacks the gateway part does not verify;
-- with `-heads DIR`: the chain in the bundle agrees with every head a witness holds for that part of the chain — the store's witness or a collector's head journal; two versions of a head elsewhere, and heads a collector refused, are named in the report (see [Witness of the chain heads](docs/copy-and-witness.md#witness-of-the-chain-heads));
-- with `-seal-trust CA -seal-subject ATTR=VALUE` instead of `-store-key`: the store key is the one the organization you name sealed with its X.509 certificate under that CA (a seal or a legal entity's signature certificate), and the certificate was in force when the seal was time-stamped; then you need the CA's root and the organization's name, not a key from the store's operator (see [A seal on the store key](docs/keys.md#a-seal-on-the-store-key));
-- with `-witness-key VKEY` for each witness you name: that witness signed a head at or after the record at the time its cosignature names, and the chain in the bundle agrees with that head; a witness cosigns only heads that extend every head it cosigned before, so a later rewrite of that part of the chain contradicts it (see [Cosigning witnesses](docs/copy-and-witness.md#cosigning-witnesses-c2sp));
-- with a bundle over a window of time (`evidencestore proof -source S -from FROM -to TO`, or `-window` for every source): every record the store put into its chain between two TSA time-stamps is in the bundle, so a record received in the window cannot be kept from the auditor unless the store holds it back past the window, and then the deadline the store promised the collector for it is missed and `esverify -promise` shows it (see [Bundles over a window of time](docs/bundles.md)). Only the records of the window open. When the source has `subject_field`, `-subject V` opens only the records under one subject's label, with the same proof that no record of the source is left out; which records are the subject's rests on the label the store set at intake. The window is by the store's receive time, which the collector checks against its own clock to within a minute, and that clock may run up to a minute ahead: this holds for records the collector delivered more than two minutes before the window ends.
-
-T2 is required: a bundle without a time-stamp after the record only carries the store's own signature, and whoever holds `sign.key` can make up a record with any date. `esverify` rejects such a bundle unless told `-allow-no-tsa`. The verdict is printed first and last, and control characters in the body are escaped, so a body cannot paint a false verdict on the auditor's screen.
+| Who could cheat | What shows it | What the auditor brings |
+|---|---|---|
+| Someone on the source host edits or deletes log lines | the store holds every line as it received it, byte for byte, and TSA time-stamps from before and after bound when it entered the chain | the bundle, the store key, the TSA root |
+| Someone changes a record inside the store | the record no longer matches its leaf, its Merkle path or the signed head | the same |
+| The store leaves a record out of its answer | a bundle over a window of time holds every record the store put into its chain in that window; a record held back past the window misses the deadline the store promised the collector | `-from` and `-to`, the collector's promise with `-promise` |
+| The store's administrator rewrites the chain and signs it again | the new chain has only fresh time-stamps and contradicts the heads that witnesses and collectors hold | `-witness-key` or `-heads` |
+| The TSA's key is stolen and its certificate revoked | a second TSA or a witness shows that the time-stamp existed before the revocation | `-tsa-crl`, the root of the second TSA or `-witness-key` |
+| The operator hands the auditor a store key that is not the organization's | a seal of the organization's X.509 certificate on the store key | `-seal-trust` and `-seal-subject` |
 
 Not proven:
 
 - that the content is true: a lying source is recorded faithfully;
-- anything before the record reached the store;
-- anything about records the source never wrote;
-- from a single-record bundle, that you were given every record: it proves that one record only. A bundle over a window of time proves the whole window, by the store's receive time, not by the time written in the lines;
-- from a one-source bundle, that the source tails are true: they are the store's own statements, written when it took the time-stamps, and an understated one shows in a window bundle or in the hidden record's own bundle;
-- that a bundle over a window of time was built from the chain as it was then: a rewrite after the lower time-stamp needs fresh time-stamps after it. A T2 more than an hour after the window is a sign of that (the store takes a time-stamp at least once an hour); a rewrite made sooner is caught only by a witness, with `-witness-key` or `-heads`; the latter takes, for each witness, the head it received first when the heads directory holds the S3 versions list or a collector's head journal (see [Witness of the chain heads](docs/copy-and-witness.md#witness-of-the-chain-heads)).
+- anything before the record reached the store, or about records the source never wrote;
+- from a single-record bundle, that you were given every record;
+- that the store was not rewritten, by the store alone: root on its host can delete or rewrite its files, and nothing prevents that. It leaves traces (fresh time-stamps, the collectors' promises, the heads witnesses hold), and they help only someone who checks them. Keep the store, its remote copy and the sources under different administrators where you can.
 
-Root on the store host can delete or rewrite the store's files, and whoever holds `sign.key` can sign a second version of the chain. That leaves traces: a rewritten chain gets only fresh time-stamps, the collectors hold signed promises for the original records (`esverify -promise` shows a replaced one) and notice that the store's heads stop extending the one they hold, and a witness or a remote copy kept out of that administrator's reach still holds the original signed heads. The traces help only someone who checks them: a collector logs an error when a head does not extend the one it holds (and keeps both) or when for a while none does, `esverify -heads` compares a bundle with a witness's or a collector's heads, nothing compares the collectors' promises by itself, and nothing can prevent the rewrite. Keep the store, its remote copy and the sources under different administrators where you can. With one administrator for everything, only the time-stamps and a witness that administrator does not control stand against them. The pilot cryptography (AES-256-GCM from the Go standard library, root keys in files) is not certified. The design keeps a plug-in point for an HSM.
+A bundle needs a time-stamp after its record: without one only the store's own signature dates the record, and `esverify` rejects such a bundle unless told `-allow-no-tsa`. The pilot cryptography (AES-256-GCM from the Go standard library, root keys in files) is not certified.
+
+Every claim in full, with its conditions: [docs/what-is-proven.md](docs/what-is-proven.md).
 
 ## How it was tested
 
@@ -241,7 +229,7 @@ The test gate with the race detector runs on every push. On the code of v0.4.0, 
 
 ## Known limitations
 
-Each with its cause, in [docs/limitations.md](docs/limitations.md): a file the collector never saw, a file closed after a minute of quiet, long lines, `copytruncate` rotation, the collector epoch is not a secret, gateway receipts inside entries, a gap event lost in a crash, an unreachable key backup at restart, approvals recorded but not enforced, bulk proof export, a stalled `keys.backup_dir`, receive times shifted by up to two minutes, a held-back record shown only by the collector's promise, the heartbeat of a stopped collector, indexes in memory, the witness check by number without receipt times, the witness queue in memory, the witness following the copy, cosignatures after the last copy pass, Ed25519 cosignatures only, a cosigning witness pushed ahead of the copy, a cosigning witness trusted for its clock and key, the store's pace seen by collectors, a collector's head saved every few minutes, heads of different lengths not compared, a head past the copy, a bundle that names its own source, a changed record that stops the start, a seal of the store key, file-only input, failure paths checked only by reading. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
+About thirty, each with its cause: [docs/limitations.md](docs/limitations.md). The ones to read before a pilot: the collector reads files only; the two approvals of a key destruction are recorded but not enforced; indexes are kept in memory; a record changed on disk stops the next start until `data_dir` is restored from a copy; the seal on the store key does not support ГОСТ; the cryptography is not certified. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
 
 ## Development
 
