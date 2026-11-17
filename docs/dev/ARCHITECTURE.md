@@ -226,7 +226,7 @@ python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # демо с настоящим Pipelock
 scripts/demo.sh                                           # демо на бинарниках, без интернета
 scripts/demo-intruder.sh                                  # взломщик почистил auth.log: удалённые строки — из хранилища
-scripts/demo-purchase.sh                                  # покупки ИИ-агента: пакет по одной покупке, отчёт по ней, две подделки (docs/purchases.md)
+scripts/demo-purchase.sh                                  # покупки ИИ-агента: пакет по одной покупке, отчёт по ней с проверкой подписи мандата, две подделки (docs/purchases.md)
 DEMO_TSA=nca scripts/demo.sh                              # то же с настоящей TSA НУЦ РК
 DEMO_TSA=digicert scripts/demo.sh                         # то же с публичной TSA DigiCert
 ES_TSA_URL=http://tsp.pki.gov.kz \

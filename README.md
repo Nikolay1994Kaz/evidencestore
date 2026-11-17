@@ -58,7 +58,7 @@ It takes any line-based log: system logs, application and core banking audit log
 
 ## Try it
 
-The demos run on Linux with bash, python3 and Go 1.25.4 or newer (the Pipelock one also needs curl). With binaries from a release, `ES_BIN=/usr/local/bin` runs them without Go ([Install](#install)).
+The demos run on Linux with bash, python3 and Go 1.25.4 or newer (the Pipelock one also needs curl, the purchase one openssl). With binaries from a release, `ES_BIN=/usr/local/bin` runs them without Go ([Install](#install)).
 
 ```sh
 git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore

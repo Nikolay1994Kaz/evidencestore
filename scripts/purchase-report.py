@@ -7,8 +7,15 @@
 # esverify сверил с листьями цепи). Дальше — пересказ строк по шагам покупки и
 # сверки строк между собой: что в них написано — слово того, кто их писал.
 #
+# Исключение — мандат. С -mandate-key (открытый ключ подписавшего, PEM) скрипт
+# проверяет подпись мандата, если это компактный JWS с ES256 (RFC 7515, 7518),
+# через openssl, и тогда корзина сверяется с подписанными условиями, а не с
+# тем, что написано в строке рядом. Чей это ключ — устанавливает проверяющий.
+# SD-JWT с раскрытиями и привязкой ключа (так несёт мандаты AP2) не разбирается.
+#
 #   python3 scripts/purchase-report.py -proof p-1002.json -store-key store.pub \
-#       -tsa-trust tsa-root.crt -purchase p-1002 [-esverify PATH] [-- флаги esverify]
+#       -tsa-trust tsa-root.crt -purchase p-1002 [-mandate-key customer.pub] \
+#       [-esverify PATH] [-- флаги esverify]
 #
 # Код выхода: 0 — пакет проверен, отчёт напечатан (расхождения строк — в отчёте);
 # 1 — пакет не проверен или он о другой покупке; 2 — неверный вызов, это не
@@ -75,12 +82,89 @@ def num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+B64URL = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+def b64url(part):
+    """Часть компактного JWS: base64url без дополнения. None — не она."""
+    if not part or not set(part) <= B64URL or len(part) % 4 == 1:
+        return None
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+
+def der_int(b):
+    b = b.lstrip(b"\x00") or b"\x00"
+    if b[0] & 0x80:
+        b = b"\x00" + b
+    return b"\x02" + bytes([len(b)]) + b
+
+
+def mandate_jws(credential, keyfile):
+    """Подпись мандата — компактного JWS с ES256 — ключом из keyfile (PEM).
+
+    Отдаёт (ok, kid, claims, why): ok — True (подпись сошлась), False (не
+    сошлась) или None (проверить нельзя, причина — why); claims — подписанное
+    содержимое, только при ok = True: неподписанному верить нечему.
+    """
+    parts = credential.split(".") if isinstance(credential, str) else []
+    raw = [b64url(x) for x in parts]
+    if len(parts) != 3 or None in raw:
+        return None, None, None, "the credential is not a compact JWS (three base64url parts)"
+    try:
+        header = json.loads(raw[0])
+    except ValueError:
+        header = None
+    if not isinstance(header, dict):
+        return None, None, None, "the JWS header is not a JSON object"
+    kid = header.get("kid") if isinstance(header.get("kid"), str) else None
+    if header.get("alg") != "ES256":
+        return None, kid, None, f'its algorithm is "{q(header.get("alg"))}", and this script checks ES256 only'
+    if len(raw[2]) != 64:
+        return False, kid, None, "an ES256 signature is 64 bytes"
+    # r ‖ s (RFC 7518, 3.4) → DER, как его читает openssl.
+    body = der_int(raw[2][:32]) + der_int(raw[2][32:])
+    with tempfile.TemporaryDirectory() as tmp:
+        sig, msg = os.path.join(tmp, "sig.der"), os.path.join(tmp, "signed")
+        with open(sig, "wb") as f:
+            f.write(b"\x30" + bytes([len(body)]) + body)
+        with open(msg, "wb") as f:
+            f.write((parts[0] + "." + parts[1]).encode("ascii"))
+        try:
+            run = subprocess.run(["openssl", "dgst", "-sha256", "-verify", keyfile, "-signature", sig, msg], capture_output=True)
+        except OSError:
+            return None, kid, None, "openssl is not installed"
+    out = run.stdout.decode(errors="replace")
+    if run.returncode == 0 and "Verified OK" in out:
+        try:
+            claims = json.loads(raw[1])
+        except ValueError:
+            claims = None
+        if not isinstance(claims, dict):
+            return None, kid, None, "the signature verifies, but what was signed is not a JSON object"
+        return True, kid, claims, ""
+    if "Verification failure" in out or "Verification Failure" in out:
+        return False, kid, None, ""
+    err = (run.stderr.decode(errors="replace").strip().splitlines() or ["openssl gave no reason"])[0]
+    return None, kid, None, "openssl could not check it: " + err
+
+
+SIGNED_FIELDS = ("purchase_id", "customer", "instruction", "scope")
+
+
+def signed_against_line(claims, line):
+    """Чем строка мандата расходится с подписанным: (расходятся, не подписаны)."""
+    differ = [k for k in SIGNED_FIELDS if k in claims and claims[k] != line.get(k)]
+    unsigned = [k for k in SIGNED_FIELDS if k not in claims]
+    return differ, unsigned
+
+
 def main():
     ap = argparse.ArgumentParser(allow_abbrev=False, description="Print a verified purchase bundle as the story of that purchase.")
     ap.add_argument("-proof", required=True, help="the bundle: evidencestore proof -source S -subject ID -from FROM -to TO")
     ap.add_argument("-store-key", required=True, dest="store_key", help="pinned store public key, as for esverify")
     ap.add_argument("-tsa-trust", required=True, dest="tsa_trust", help="TSA certificates, as for esverify")
     ap.add_argument("-purchase", help="the purchase you asked about: a bundle about another one is refused")
+    ap.add_argument("-mandate-key", dest="mandate_key", help="public key (PEM) of whoever signed the mandate: its signature is checked (a compact JWS with ES256, through openssl), and the cart is compared with what was signed")
     ap.add_argument("-esverify", default="esverify", help="path to esverify (default: from PATH)")
     ap.add_argument("extra", nargs="*", help="after --: more esverify flags, e.g. -from, -to, -witness-key, -tsa-crl")
     a = ap.parse_args()
@@ -147,7 +231,8 @@ def main():
           + (" (as named in the bundle: pass your own after --, with -from and -to)" if rep.get("window_from_bundle") else ""))
     print(f"  Lines of this purchase: {subj.get('records')}, open: {subj.get('opened')}. "
           f"Other lines of the source in the window: {subj.get('others')}, closed: {subj.get('others_closed')}.")
-    print("  What a line says is the word of whoever wrote it; signatures inside a line are not checked here.")
+    print("  What a line says is the word of whoever wrote it. Of the signatures inside the lines only the mandate's is")
+    print("  checked, and only with -mandate-key.")
 
     incomplete = []
     if subj.get("records") != subj.get("opened"):
@@ -168,6 +253,8 @@ def main():
     for seq, obj, raw in lines:
         by.setdefault(obj.get("event") if obj and isinstance(obj.get("event"), str) else None, []).append((seq, obj, raw))
 
+    signed = {}  # номер строки мандата → итог проверки его подписи
+
     def head(title, seq):
         t = f", received {when(received[seq])}" if seq in received else ""
         print(f"\n{title} [record {seq}{t}]")
@@ -181,7 +268,17 @@ def main():
         print(f"  customer {q(o.get('customer'))} asked for: {q(o.get('instruction'))}")
         print(f"  allowed: up to {money(sc.get('price_cap'))} {q(sc.get('currency'))} at {q(', '.join(map(str, sc.get('merchants') or [])) or '—')}, until {stamp(sc.get('expires'))}")
         cred = o.get("credential")
-        print(f"  signed mandate: {'carried in the line, ' + str(len(str(cred))) + ' characters; its signature is not checked here' if cred else 'not in the line'}")
+        if not cred:
+            print("  signed mandate: not in the line")
+        elif not a.mandate_key:
+            print(f"  signed mandate: carried in the line, {len(str(cred))} characters; its signature is not checked (give the signer's public key with -mandate-key)")
+        else:
+            ok, kid, claims, why = signed.setdefault(seq, mandate_jws(cred, a.mandate_key))
+            verdict = "the signature verifies under the key you gave" if ok else "the signature does NOT verify under the key you gave" if ok is False else "not checked: " + why
+            print(f"  signed mandate: carried in the line, {len(str(cred))} characters" + (f', key id "{q(kid)}"' if kid else "") + f"; {verdict}")
+            ssc = claims.get("scope") if ok and isinstance(claims.get("scope"), dict) else None
+            if ssc is not None and ssc != sc:
+                print(f"  SIGNED, and the line differs from it: up to {money(ssc.get('price_cap'))} {q(ssc.get('currency'))} at {q(', '.join(map(str, ssc.get('merchants') or [])) or '—')}, until {stamp(ssc.get('expires'))}")
     for seq, o, _ in by.get("agent_verified", []):
         head("Agent: who acted", seq)
         print(f"  {q(o.get('agent_id'))}, key {q(o.get('key_id'))}, checked by {q(o.get('checked_by'))}: {q(o.get('result'))}")
@@ -218,6 +315,32 @@ def main():
         cart = ([c for c in by["cart"] if not pay or c[0] < pay[0]] or by["cart"])[-1]  # корзина, по которой платили
     sc = m[1].get("scope") if m and isinstance(m[1].get("scope"), dict) else {}
     checks.append((bool(m), "a mandate line is recorded" if m else "no mandate line: nothing here shows what the customer allowed"))
+    the_mandate = "the mandate"  # с чем сверяется корзина: со строкой или с подписанным
+    if m and not a.mandate_key:
+        checks.append((None, "the mandate's signature was not checked (no -mandate-key): what the customer allowed is the line's word"))
+    elif m and not m[1].get("credential"):
+        checks.append((False, "the mandate line carries no signed mandate to check"))
+    elif m:
+        ok, _, claims, why = signed[m[0]]
+        if ok is None:
+            checks.append((None, "the mandate's signature was not checked: " + why))
+        elif not ok:
+            checks.append((False, "the mandate's signature does NOT verify under the key you gave" + (f" ({why})" if why else "") + ": what the customer allowed is only the line's word"))
+        else:
+            checks.append((True, "the mandate's signature verifies under the key you gave"))
+            if "purchase_id" not in claims:
+                checks.append((None, "the signed mandate does not name the purchase: it could have been signed for another one"))
+            elif claims["purchase_id"] != pid:
+                checks.append((False, f'the signed mandate is for another purchase: "{q(claims["purchase_id"])}"'))
+            differ, unsigned = signed_against_line(claims, m[1])
+            if differ:
+                checks.append((False, f"the mandate line differs from what was signed in: {', '.join(differ)}"))
+            else:
+                checks.append((True, "the mandate line says what was signed" + (f" (not covered by the signature: {', '.join(unsigned)})" if unsigned else "")))
+            if isinstance(claims.get("scope"), dict):
+                sc, the_mandate = claims["scope"], "the signed mandate"
+                if differ:
+                    checks.append((None, "the cart is compared below with the signed mandate, not with the line"))
     for event in ("mandate", "cart", "payment"):
         if len(by.get(event, [])) > 1:
             checks.append((None, f"{len(by[event])} {event} lines: the report compares the " + ("first mandate" if event == "mandate" else "last cart before the payment" if event == "cart" else "first payment")))
@@ -230,23 +353,23 @@ def main():
     if m and cart:
         allowed = sc.get("merchants") if isinstance(sc.get("merchants"), list) else None
         if allowed is None:
-            checks.append((None, "the mandate names no merchants to compare the cart with"))
+            checks.append((None, f"{the_mandate} names no merchants to compare the cart with"))
         else:
             ok = cart[1].get("merchant") in allowed
-            checks.append((ok, f"the merchant of the cart is {'one the mandate allows' if ok else 'not among those the mandate allows'} ({q(cart[1].get('merchant'))})"))
+            checks.append((ok, f"the merchant of the cart is {'one ' + the_mandate + ' allows' if ok else 'not among those ' + the_mandate + ' allows'} ({q(cart[1].get('merchant'))})"))
         cap, total = num(sc.get("price_cap")), num(cart[1].get("total"))
         if cap is None or total is None:
             checks.append((None, "the price cap or the cart total is not a number"))
         else:
             same = sc.get("currency") == cart[1].get("currency")
             ok = same and total <= cap
-            checks.append((ok, f"the cart total is {'within' if ok else 'over' if same else 'in another currency than'} the mandate's price cap ({money(total)} {q(cart[1].get('currency'))} against {money(cap)} {q(sc.get('currency'))})"))
+            checks.append((ok, f"the cart total is {'within' if ok else 'over' if same else 'in another currency than'} {the_mandate}'s price cap ({money(total)} {q(cart[1].get('currency'))} against {money(cap)} {q(sc.get('currency'))})"))
         exp = rfc3339(sc.get("expires"))
         if exp is None or cart[0] not in received:
-            checks.append((None, "the mandate's expiry cannot be compared with the time the cart was received"))
+            checks.append((None, f"{the_mandate}'s expiry cannot be compared with the time the cart was received"))
         else:
             ok = received[cart[0]] / 1e9 <= exp.timestamp()
-            checks.append((ok, f"the store received the cart {'before' if ok else 'AFTER'} the mandate expired ({when(received[cart[0]])} against {stamp(sc.get('expires'))})"))
+            checks.append((ok, f"the store received the cart {'before' if ok else 'AFTER'} {the_mandate} expired ({when(received[cart[0]])} against {stamp(sc.get('expires'))})"))
     if cart:
         items = cart[1].get("items") if isinstance(cart[1].get("items"), list) else []
         parts = [num(i.get("qty")) is not None and num(i.get("price")) is not None for i in items if isinstance(i, dict)]
@@ -281,7 +404,7 @@ def main():
         print(f"  {'✔' if ok else '✘' if ok is False else '?'} {text}")
     bad = sum(1 for ok, _ in checks if ok is False)
     print()
-    print(f"{bad} of these comparisons disagree." if bad else "The lines agree with each other.")
+    print(f"{bad} of these comparisons disagree{'s' if bad == 1 else ''}." if bad else "The lines agree with each other.")
     print(f"esverify's notes on what this bundle does not prove: {len(rep.get('notes') or [])} (run esverify on the bundle to read them).")
     sys.exit(0)
 

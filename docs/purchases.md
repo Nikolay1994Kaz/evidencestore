@@ -23,7 +23,7 @@ One JSON object per line, written when the step happens. Every line carries `pur
 `at` in a line is the agent's own clock and proves nothing; what a bundle proves is when the store received the line.
 
 - **`purchase_id`** is a string or a number of at most 256 bytes, spelled the same way in every line of the purchase: values are compared as written, so `P-1002` and `p-1002` are two purchases. A line without it, with it twice or below the top level gets no label and never opens in a purchase bundle (`evidencestore_records_without_subject_total` counts such lines).
-- **Signed objects go in as received.** The mandate credential (an AP2 mandate, for example), the agent's signed request, the merchant's signed cart: put what you got into the line as it came (base64 if it is not text). The store gives a record back byte for byte, so anyone can check those signatures later with the signer's key. The store itself does not check them in this release; the only signatures it checks at intake are those of a Pipelock journal ([Gateway journals](pipelock.md)).
+- **Signed objects go in as received.** The mandate credential (an AP2 mandate, for example), the agent's signed request, the merchant's signed cart: put what you got into the line as it came (base64 if it is not text). The store gives a record back byte for byte, so anyone can check those signatures later with the signer's key. The store itself does not check them in this release; the only signatures it checks at intake are those of a Pipelock journal ([Gateway journals](pipelock.md)). `purchase-report.py` checks one form of the mandate: a compact JWS (RFC 7515) signed with ES256 whose claims repeat the line's `purchase_id`, `customer`, `instruction` and `scope`.
 - **Write the line when the step happens.** A line written after the dispute began is received after it began, and the time-stamps show that.
 - **A line is a record of at most about 1 MiB**; a longer one is cut into several. Keep a page snapshot or a receipt image elsewhere and write its SHA-256 into the line.
 - **No card numbers.** Write the token reference and the network's reference of the payment.
@@ -43,10 +43,12 @@ A source has one `subject_field`, and a record keeps the field it was labelled b
 ```sh
 evidencestore proof -config store.json -source shop-agent -subject p-1002 -from FROM -to TO -out p-1002.json
 esverify -proof p-1002.json -store-key store.pub -tsa-trust tsa-root.crt -bodies p-1002/
-python3 scripts/purchase-report.py -proof p-1002.json -store-key store.pub -tsa-trust tsa-root.crt -purchase p-1002
+python3 scripts/purchase-report.py -proof p-1002.json -store-key store.pub -tsa-trust tsa-root.crt -purchase p-1002 -mandate-key customer.pub
 ```
 
 `FROM` and `TO` (RFC 3339, the store's receive time) must cover the purchase from its mandate to its last line. The window is closed by a time-stamp taken more than two minutes after `TO`, and the bundle is ready one time-stamp later ([Bundles, One subject](bundles.md)). `purchase-report.py` runs `esverify` itself and prints the purchase only when the bundle verifies: the mandate, who the agent was, the cart against the mandate, the notice and the time left to cancel, the payment, the delivery, and where they disagree.
+
+With `-mandate-key`, the public key (PEM) of whoever signed the mandate, the script checks the mandate's signature through `openssl`, and then compares the cart with what was signed, not with what the line next to it says: the price cap, the merchants, the expiry. It also says when the line differs from what was signed, and when the signed mandate names another purchase. Without the key, or for a credential in another form, the report says that the signature was not checked, and the mandate is the line's word.
 
 ## What a purchase bundle proves, and what it does not
 
@@ -60,7 +62,7 @@ Not proven:
 
 - **That a line is true, or that every step was written.** The agent platform writes the lines. A step it never wrote is not in the store, and nothing in a bundle shows that it is missing.
 - **That every line of the purchase is under its label.** The store sets the label when it receives a line, from the `purchase_id` in it; a line that names another purchase, or none, is not in this bundle ([Bundles](bundles.md) says what a store dishonest at intake could do).
-- **Any signature inside a line.** Check the mandate credential and the agent's signature yourself, from the bodies `esverify -bodies` writes.
+- **Any signature inside a line, by the store or by `esverify`.** `purchase-report.py -mandate-key` checks the mandate's when it is a compact JWS with ES256, and whose key that is, is for you to establish: a key the platform hands you proves nothing against the platform. An SD-JWT with disclosures and key binding, which is how AP2 carries mandates, is not parsed, and neither is the agent's signature: check those yourself, from the bodies `esverify -bodies` writes.
 - **Who pays.** A bundle is evidence of what was recorded and when. Whether it settles a dispute is decided by the rules of the payment method and by whoever applies them.
 
 Limits to plan for:
@@ -73,8 +75,8 @@ Limits to plan for:
 ## Try it
 
 ```sh
-scripts/demo-purchase.sh                       # builds everything, runs offline, takes about three minutes
+scripts/demo-purchase.sh                       # builds everything, runs offline, takes about three minutes; needs openssl
 ES_BIN=/usr/local/bin scripts/demo-purchase.sh # the same on installed binaries
 ```
 
-An agent makes three purchases through one log. The script asks the store for the bundle of the second one, verifies it, prints the report, and shows that the lines of the other two purchases stay closed. Then it changes one byte of the cart and, in another copy, takes the notification out of the bundle: neither copy verifies.
+An agent makes three purchases through one log, each under a mandate signed with its customer's key. The script asks the store for the bundle of the second one, verifies it, shows that the lines of the other two purchases stay closed, and prints the report with the mandate checked under the customer's public key; under another customer's key the signature does not verify. Then it changes one byte of the cart and, in another copy, takes the notification out of the bundle: neither copy verifies.
