@@ -1,0 +1,25 @@
+{
+  "data_dir": "/var/lib/evidencestore",
+  "roots_dir": "/var/lib/evidencestore-roots",
+  "listen": ":8443",
+  "metrics_listen": "127.0.0.1:9464",
+  "tls": {
+    "cert": "/etc/evidencestore/server.crt",
+    "key": "/etc/evidencestore/server.key",
+    "client_ca": "/etc/evidencestore/collectors-ca.crt"
+  },
+  "chain": {"tick": "1s", "promise_mmd": "1m"},
+  "tsa": {
+    "url": "http://timestamp.digicert.com",
+    "every": "10m",
+    "trust": ["tsa/digicert/DigiCertTrustedRootG4.crt", "tsa/digicert/DigiCertTrustedG4TimeStampingRSA4096SHA2562025CA1.crt"]
+  },
+  "keys": {
+    "min_wait": "168h",
+    "backup_dir": "/mnt/backup/evidencestore-keyring",
+    "roots_mirror_dir": "/mnt/roots-mirror/evidencestore"
+  },
+  "sources": [
+    {"name": "shop-agent", "content_type": "purchase-events", "subject_field": "purchase_id", "retention_months": 24, "expect_contact": "2m"}
+  ]
+}

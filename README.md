@@ -67,6 +67,7 @@ DEMO_TSA=digicert scripts/demo.sh  # same, time-stamps from the public DigiCert 
 DEMO_TSA=nca scripts/demo.sh       # same, time-stamps from the NCA of Kazakhstan
 scripts/demo-intruder.sh           # an intruder cleans auth.log; every deleted line comes back from the store
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # a real Pipelock gateway, see below
+scripts/demo-purchase.sh           # an AI agent makes three purchases; one of them comes out as a bundle, the others stay closed
 ```
 
 The demo runs these steps:
@@ -198,6 +199,7 @@ There is no container image yet.
 - [Copy, restore and the witness](docs/copy-and-witness.md): the remote copy, `restore`, the witness of the chain heads, witnesses that cosign them (`eswitness`).
 - [Bundles over a window of time](docs/bundles.md): everything received in a window, for one source or for all, for one subject inside a source, and the collector's promise.
 - [Gateway journals (Pipelock)](docs/pipelock.md): the flight recorder of an AI agent gateway, checked at intake.
+- [Evidence for purchases made by AI agents](docs/purchases.md): what an agent writes about a purchase, one purchase as a bundle, and a report of it for a dispute.
 - [Monitoring](docs/monitoring.md): what to alert on.
 - [Known limitations](docs/limitations.md), [How it was tested](docs/testing.md), [release notes](docs/releases/).
 
