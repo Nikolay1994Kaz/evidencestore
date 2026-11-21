@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """undo.py — обратные операции для одной транзакции Postgres по до-образам из хранилища улик.
 
-ОПЫТ, НЕ ПРОДУКТ (см. README.md рядом). Вход — каталог тел, который пишет
-`esverify -bodies DIR` из проверенного пакета по субъекту, где субъект —
-номер транзакции (xid). Каждое тело — одна строка wal2json format-version 2:
+Вход — каталог тел записей, который пишет `esverify -bodies DIR` (пакет по
+субъекту, субъект — номер транзакции xid) или `esverify -body` по одной записи.
+Тела — строки журнала espgtap (internal/pgtap):
 
-    B  начало транзакции          M  сообщение (отметка агента)
-    I  вставка: columns           U  правка: columns (новое) + identity (старое)
-    D  удаление: identity         T  TRUNCATE: строк нет
-    C  конец транзакции
+    {"xid":751,"part":1,"last":true,"gz":"<base64>"}
 
-Старый образ строки целиком есть только у таблиц с REPLICA IDENTITY FULL.
+Поля gz частей 1..k, склеенные по порядку, — один поток gzip со строками JSON:
+H заголовок (кто, отметки действия), R таблица (колонки, типы, первичный ключ),
+I/U/D изменения со старой и новой строкой, T — TRUNCATE, C — итог.
 
     undo.py plan -bodies DIR -xid N [-report FILE] -out DIR
         разобрать транзакцию, написать DIR/plan.json и DIR/check.sql
@@ -22,9 +21,11 @@
 сколько обещала, иначе вся транзакция отменяется.
 
 Коды выхода: 0 — готово, 1 — неверный вызов или ввод, 2 — откат построить
-нельзя (TRUNCATE, неполные образы, пакет не тот), 3 — база ответила не то.
+нельзя (TRUNCATE, неполные образы, транзакция не вся), 3 — база ответила не то.
 """
 import argparse
+import base64
+import gzip
 import json
 import os
 import secrets
@@ -44,7 +45,7 @@ def fail(msg, code=1):
 
 
 def load_bodies(directory):
-    """Тела в порядке номеров записей: [(seq, запись)]. Имя файла — <источник>-<номер>."""
+    """Тела в порядке номеров записей: [(seq, часть)]. Имя файла — <источник>-<номер>."""
     out = []
     for name in os.listdir(directory):
         try:
@@ -54,155 +55,152 @@ def load_bodies(directory):
         with open(os.path.join(directory, name), "rb") as f:
             raw = f.read()
         try:
-            # Числа — как записаны: 800.00 остаётся "800.00", а не float.
-            rec = json.loads(raw, parse_float=str, parse_int=str)
+            part = json.loads(raw)
         except ValueError as e:
-            raise Refused(f"запись {seq} — не JSON ({e}): это не строка wal2json")
-        if not isinstance(rec, dict) or "action" not in rec:
-            raise Refused(f"запись {seq} — не строка wal2json format-version 2")
-        out.append((seq, rec))
+            raise Refused(f"запись {seq} — не JSON ({e}): это не строка журнала espgtap")
+        if not isinstance(part, dict) or not {"xid", "part", "last", "gz"} <= part.keys():
+            raise Refused(f"запись {seq} — не строка журнала espgtap")
+        out.append((seq, part))
     out.sort(key=lambda p: p[0])
     return out
 
 
-def text(v):
-    """Значение колонки текстом, как его примет Postgres с приведением к типу; None — NULL."""
-    if v is None:
-        return None
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    if isinstance(v, str):
-        return v
-    return json.dumps(v, ensure_ascii=False)  # wal2json так не пишет, но пусть будет видно
+def transaction(parts, xid):
+    """Строки потока одной транзакции из её частей.
 
-
-def image(cols):
-    return {c["name"]: text(c.get("value")) for c in cols}
-
-
-def transaction(recs, xid):
-    """Строки одной транзакции между B и C.
-
-    pg_recvlogical после сбоя шлёт транзакцию заново с подтверждённой позиции,
-    и в файле она тогда лежит дважды (первый раз, возможно, оборванной).
-    Берётся последняя пара B..C; resent — была ли пересылка.
+    После перезапуска сборщика транзакция может лежать в журнале дважды (первый
+    раз оборванной): берётся последний целый набор частей 1..k с "last": true.
+    resent — была ли пересылка.
     """
-    for seq, r in recs:
-        if r.get("xid") != str(xid):
-            raise Refused(f"запись {seq} — транзакции {r.get('xid')}, а не {xid}: пакет не по этому субъекту")
-    begins = [i for i, (_, r) in enumerate(recs) if r["action"] == "B"]
-    if not begins:
-        raise Refused("нет строки начала транзакции (B): записи транзакции не все")
-    tail = recs[begins[-1]:]
-    if tail[-1][1]["action"] != "C":
-        raise Refused("нет строки конца транзакции (C): она ещё не доехала целиком, или окно пакета её режет")
-    inner = tail[1:-1]
-    if any(r["action"] in ("B", "C") for _, r in inner):
-        raise Refused("строки B и C идут не парой: журнал транзакции повреждён")
-    return inner, len(begins) > 1
+    run, whole, runs = [], None, 0
+    for seq, p in parts:
+        if p["xid"] != xid:
+            raise Refused(f"запись {seq} — транзакции {p['xid']}, а не {xid}: тела не той транзакции")
+        if p["part"] == 1:
+            run, runs = [], runs + 1
+        if p["part"] != len(run) + 1:
+            raise Refused(f"запись {seq}: часть {p['part']} после части {len(run)} — части транзакции не все")
+        run.append(p)
+        if p["last"]:
+            whole, run = run, []
+    if whole is None:
+        raise Refused("нет последней части транзакции: она ещё не доехала целиком")
+    try:
+        stream = gzip.decompress(b"".join(base64.b64decode(p["gz"], validate=True) for p in whole))
+        lines = [json.loads(l) for l in stream.split(b"\n") if l]
+    except (ValueError, OSError, EOFError) as e:
+        raise Refused(f"поток транзакции не читается: {e}")
+    if len(lines) < 2 or lines[0].get("t") != "H" or lines[-1].get("t") != "C":
+        raise Refused("поток транзакции не идёт от заголовка до итога")
+    if lines[0].get("v") != 1 or lines[0].get("xid") != xid:
+        raise Refused(f"заголовок потока: версия {lines[0].get('v')}, транзакция {lines[0].get('xid')}")
+    return lines, runs > 1
 
 
 class Row:
     """Одна строка таблицы за транзакцию: какой была до и какой стала после."""
 
-    def __init__(self, table, old, seq):
+    def __init__(self, table, old, n):
         self.table = table
         self.old = old  # None — строки до транзакции не было
         self.new = None  # None — строки после транзакции нет
-        self.first_seq = seq
-        self.last_seq = seq
+        self.first = n
         self.touches = 0
 
 
-def build_plan(recs, xid):
-    inner, resent = transaction(recs, xid)
-    tables = {}  # "схема.таблица" -> описание
-    markers, truncated = [], []
-    counts = {}  # (таблица, действие) -> сколько строк журнала
+def build_plan(parts, xid):
+    lines, resent = transaction(parts, xid)
+    head = lines[0]
+    rels, tables = {}, {}  # номер таблицы в потоке -> имя; имя -> описание
+    truncated, counts = [], {}
     live, dead, order = {}, {}, []
+    markers = [{"prefix": "evidence/action", "content": a} for a in head.get("actions") or []]
 
-    def table_of(seq, r, full_images):
-        name = f'{r["schema"]}.{r["table"]}'
-        pk = [p["name"] for p in r.get("pk", [])]
-        if not pk:
-            raise Refused(f"{name}: в записи {seq} нет первичного ключа — строку нечем адресовать")
-        types = {}
-        for c in r.get("columns", []) + r.get("identity", []):
-            types[c["name"]] = c["type"]
-        t = tables.setdefault(name, {"schema": r["schema"], "table": r["table"], "pk": pk, "types": {}, "columns": None})
-        if t["pk"] != pk:
-            raise Refused(f"{name}: первичный ключ в записях транзакции разный")
-        t["types"].update(types)
-        for img in full_images:
-            cols = sorted(img)
-            if t["columns"] is None:
-                t["columns"] = cols
-            elif t["columns"] != cols:
-                raise Refused(
-                    f"{name}: образы строк в записи {seq} неполные (колонки {cols}, раньше {t['columns']}). "
-                    "Старый образ целиком пишется только при REPLICA IDENTITY FULL"
-                )
-        return name, pk
+    def image(seq, name, t, vals):
+        if len(vals) != len(t["columns"]):
+            raise Refused(f"{name}: в изменении {seq} значений {len(vals)}, а колонок {len(t['columns'])}")
+        for c, v in zip(t["columns"], vals):
+            if v is not None and not isinstance(v, str):
+                raise Refused(f"{name}.{c}: значение в журнале не текстом ({v}): такое опыт не возвращает")
+        return dict(zip(t["columns"], vals))
 
-    for seq, r in inner:
-        a = r["action"]
+    n = 0
+    for r in lines[1:-1]:
+        a = r.get("t")
+        if a == "R":
+            name = f'{r["schema"]}.{r["table"]}'
+            if not r["pk"]:
+                raise Refused(f"{name}: у таблицы нет первичного ключа — строку нечем адресовать")
+            if r["identity"] != "f":
+                raise Refused(f"{name}: таблица не REPLICA IDENTITY FULL — старых строк в журнале нет")
+            t = {"schema": r["schema"], "table": r["table"], "pk": r["pk"],
+                 "columns": sorted(r["columns"]), "types": dict(zip(r["columns"], r["types"])), "order": r["columns"]}
+            if name in tables and {k: tables[name][k] for k in ("pk", "columns", "types")} != {k: t[k] for k in ("pk", "columns", "types")}:
+                raise Refused(f"{name}: таблицу изменили посреди транзакции (DDL): такое опыт не разбирает")
+            rels[r["id"]], tables[name] = name, t
+            continue
         if a == "M":
-            markers.append({"prefix": r.get("prefix"), "content": r.get("content"), "seq": seq})
+            markers.append({"prefix": r.get("prefix"), "content": r.get("content")})
             continue
         if a == "T":
-            truncated.append(f'{r["schema"]}.{r["table"]}')
+            truncated += r["tables"]
             continue
         if a not in ("I", "U", "D"):
-            raise Refused(f"запись {seq}: действие {a!r} этому скрипту незнакомо")
-        old = image(r["identity"]) if a in ("U", "D") else None
-        new = image(r["columns"]) if a in ("I", "U") else None
-        if a == "U":
-            # Нетронутое значение, вынесенное в TOAST, в новый образ не попадает: оно равно старому.
-            new = {**old, **new}
-        name, pk = table_of(seq, r, [i for i in (old, new) if i is not None])
+            raise Refused(f"строка потока вида {a!r} этому скрипту незнакома")
+        n += 1
+        name = rels.get(r["r"])
+        if name is None:
+            raise Refused(f"изменение {n} — таблицы {r['r']}, которой в потоке нет")
+        t = tables[name]
+        if r.get("partial"):
+            raise Refused(f"{name}: старая строка в изменении {n} неполная. Целиком она пишется только при REPLICA IDENTITY FULL")
+        by_order = dict(t, columns=t["order"])
+        old = image(n, name, by_order, r["old"]) if a in ("U", "D") else None
+        new = image(n, name, by_order, r["new"]) if a in ("I", "U") else None
         counts[(name, a)] = counts.get((name, a), 0) + 1
-        key = lambda img: (name,) + tuple(img[c] for c in pk)
+        key = lambda img: (name,) + tuple(img[c] for c in t["pk"])
 
         if a == "I":
             k = key(new)
             if k in live:
-                raise Refused(f"{name}: запись {seq} вставляет строку поверх живой — журнал не сходится")
+                raise Refused(f"{name}: изменение {n} вставляет строку поверх живой — журнал не сходится")
             row = dead.pop(k, None)
             if row is None:
-                row = Row(name, None, seq)
+                row = Row(name, None, n)
                 order.append(row)
         elif a == "U":
             ko, k = key(old), key(new)
             row = live.pop(ko, None)
             if row is None:
-                row = Row(name, old, seq)
+                row = Row(name, old, n)
                 order.append(row)
             elif row.new != old:
-                raise Refused(f"{name}: запись {seq} правит не тот образ строки, что оставила прежняя запись")
+                raise Refused(f"{name}: изменение {n} правит не тот образ строки, что оставило прежнее")
             if k != ko and (k in live or k in dead):
-                raise Refused(f"{name}: запись {seq} переносит строку на ключ, занятый в этой же транзакции: такое опыт не разбирает")
+                raise Refused(f"{name}: изменение {n} переносит строку на ключ, занятый в этой же транзакции: такое опыт не разбирает")
         else:
             k = key(old)
             row = live.pop(k, None)
             if row is None:
-                row = Row(name, old, seq)
+                row = Row(name, old, n)
                 order.append(row)
             elif row.new != old:
-                raise Refused(f"{name}: запись {seq} удаляет не тот образ строки, что оставила прежняя запись")
+                raise Refused(f"{name}: изменение {n} удаляет не тот образ строки, что оставило прежнее")
             if k in dead:
-                raise Refused(f"{name}: ключ записи {seq} в этой транзакции удалён дважды разными строками: такое опыт не разбирает")
+                raise Refused(f"{name}: ключ изменения {n} в этой транзакции удалён дважды разными строками: такое опыт не разбирает")
         row.new = new
-        row.last_seq = seq
         row.touches += 1
         (dead if a == "D" else live)[k] = row
 
+    if lines[-1].get("changes") != n:
+        raise Refused(f"итог потока называет {lines[-1].get('changes')} изменений, а в потоке их {n}: журнал транзакции не весь")
     if truncated:
         raise Refused(
             "транзакция сделала TRUNCATE " + ", ".join(sorted(set(truncated))) + ": строк в журнале нет, "
             "до-образов не существует, построчный откат невозможен (нужна резервная копия)"
         )
+    for t in tables.values():
+        del t["order"]
 
     # Обратный порядок: что транзакция тронула последним, возвращается первым
     # (удалил детей, потом родителя — вернуть родителя, потом детей).
@@ -212,15 +210,26 @@ def build_plan(recs, xid):
             noop += 1  # вставил и удалил, или вернул прежние значения сам
             continue
         op = "delete" if row.old is None else "insert" if row.new is None else "update"
-        steps.append({
-            "step": len(steps) + 1, "op": op, "table": row.table, "old": row.old, "new": row.new,
-            "touches": row.touches, "first_seq": row.first_seq, "last_seq": row.last_seq,
-        })
+        steps.append({"step": len(steps) + 1, "op": op, "table": row.table, "old": row.old, "new": row.new, "touches": row.touches})
     return {
-        "xid": str(xid), "records": len(recs), "resent": resent, "markers": markers, "noop": noop,
-        "counts": [{"table": t, "action": a, "lines": n} for (t, a), n in sorted(counts.items())],
+        "xid": str(xid), "records": len(parts), "resent": resent, "who": head.get("who"), "undo": head.get("undo"),
+        "markers": markers, "noop": noop, "changes": n,
+        "counts": [{"table": t, "action": a, "lines": c} for (t, a), c in sorted(counts.items())],
         "tables": tables, "steps": steps,
     }
+
+
+def text(v):
+    """Значение из ответа базы (to_jsonb) текстом; None — NULL."""
+    if v is None:
+        return None
+    if v is True:
+        return "t"  # как PostgreSQL пишет boolean текстом — так он лежит и в журнале
+    if v is False:
+        return "f"
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, ensure_ascii=False)
 
 
 def check_report(report, xid, bodies):
@@ -228,7 +237,7 @@ def check_report(report, xid, bodies):
     s = report.get("subject") or {}
     if not report.get("valid"):
         raise Refused("пакет не прошёл проверку esverify")
-    if report.get("kind") != "source" or s.get("field") != "xid" or s.get("value") != str(xid):
+    if report.get("kind") != "source" or s.get("field") != "xid" or s.get("value") != str(xid):  # пакет по субъекту
         raise Refused(f"пакет не по транзакции {xid}: субъект {s.get('field')}={s.get('value')}")
     if s.get("opened") != bodies or s.get("keyless") or s.get("unbound") or s.get("no_label"):
         raise Refused(
@@ -366,7 +375,7 @@ def undo_sql(plan, ok, marker):
     if tag in text_all:
         raise Refused("метка блока встретилась в данных: запустите ещё раз")
     out = [HEADER, "BEGIN;\n"]
-    out.append(f"SELECT pg_logical_emit_message(true, 'undo', {lit(marker)}) IS NOT NULL AS marked, pg_current_xact_id()::text AS undo_xid \\gset\n")
+    out.append(f"SELECT pg_logical_emit_message(true, 'evidence/undo', {lit(marker)}) IS NOT NULL AS marked, pg_current_xact_id()::text AS undo_xid \\gset\n")
     for title, stmt, n, name in body:
         out.append(
             f"-- {title}\nDO {tag}\nDECLARE undo_rows_ bigint;\nBEGIN\n  {stmt};\n  GET DIAGNOSTICS undo_rows_ = ROW_COUNT;\n"
@@ -395,9 +404,8 @@ def cmd_plan(a):
                 unlabeled = check_report(json.load(f), a.xid, len(recs))
         if unlabeled and not a.allow_unlabeled:
             raise Refused(
-                f"записей без метки субъекта в окне пакета: {unlabeled}. Строка журнала длиннее предела записи режется "
-                "на куски без метки, и до-образ такой строки в пакет транзакции не попадает. Откат был бы неполным "
-                "(-allow-unlabeled — строить всё равно)"
+                f"записей без метки субъекта в окне пакета: {unlabeled}. Чьи они, пакет не говорит, и если среди них "
+                "есть части этой транзакции, откат был бы неполным (-allow-unlabeled — строить всё равно)"
             )
         plan = build_plan(recs, a.xid)
     except Refused as e:
@@ -407,12 +415,17 @@ def cmd_plan(a):
         json.dump(plan, f, ensure_ascii=False)
     with open(os.path.join(a.out, "check.sql"), "w") as f:
         f.write(check_sql(plan))
-    print(f"транзакция {a.xid}: записей в пакете {plan['records']}" + (" (журнал пересылал её заново)" if plan["resent"] else ""))
-    agent = [m for m in plan["markers"] if m["prefix"] == "agent"]
-    for m in agent:
-        print(f"  отметка агента: {m['content']}")
-    if not agent:
-        print("  отметки агента нет: журнал не говорит, чья это транзакция")
+    print(f"транзакция {a.xid}: записей хранилища {plan['records']}, изменений строк {plan['changes']}" + (" (журнал пересылал её заново)" if plan["resent"] else ""))
+    if plan["who"]:
+        print(f"  кто: роль {plan['who'].get('role')}, сессия {plan['who'].get('app')!r}")
+    if plan["undo"]:
+        print(f"  это транзакция отката: {json.dumps(plan['undo'], ensure_ascii=False)}")
+    actions = [m["content"] for m in plan["markers"] if m["prefix"] == "evidence/action"]
+    for m in actions:
+        info = m.get("info") or {}
+        print(f"  действие {info.get('action_id')}: агент {info.get('agent')}, инструмент {info.get('tool')}, причина: {info.get('reason') or '—'}")
+    if plan["who"] and not actions:
+        print("  отметки действия нет: транзакция пришла в базу в обход MCP-сервера")
     names = {"I": "вставок", "U": "правок", "D": "удалений"}
     for c in plan["counts"]:
         print(f"  {c['table']}: {names[c['action']]} {c['lines']}")
@@ -425,8 +438,7 @@ def cmd_plan(a):
         f"убрать вставленные {by.get('delete', 0)}; строк, тронутых больше раза, {twice}; без итогового изменения {plan['noop']}"
     )
     if not plan["steps"]:
-        print("  откатывать нечего: изменений строк этой транзакции в журнале нет. Это не значит, что она ничего")
-        print("  не сделала: DROP TABLE и остальной DDL в журнал wal2json не попадают вовсе")
+        print("  откатывать нечего: изменений строк в этой транзакции нет")
 
 
 STATUS = {
