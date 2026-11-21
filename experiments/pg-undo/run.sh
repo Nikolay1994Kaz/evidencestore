@@ -9,6 +9,9 @@
 #     → пакеты записей транзакции → esverify → esundo: обратные операции, сверка с базой,
 #                одна транзакция отката; сам откат тоже ложится в хранилище
 #   Сборщик один: тот же процесс escollect вторым источником читает файл квитанций MCP.
+#   Тревоги сборщик несёт людям сам: Telegram, Slack-совместимый веб-хук, свой адрес в JSON
+#   (здесь все три — местный приёмник hook_server.py). В тревоге — готовая команда отката.
+#   У MCP-сервера — предел строк на действие: больше — откат до фиксации и тревога.
 #   Откат делают двое: оператор командой esundo и сам агент инструментом MCP undo_apply.
 #
 # Что происходит: агент делает хорошее действие и плохое (обнуляет треть счетов,
@@ -36,6 +39,7 @@ WORK=$(cd "$WORK" && pwd)
 BIN=${ES_BIN:-$WORK/bin}
 PORT=${PORT:-18443}
 PGPORT=${PGPORT:-55432}
+HOOKPORT=${HOOKPORT:-$((PORT + 1))}
 ROWS=${ROWS:-2000}
 WINDOW=${WINDOW:-0}
 SRC=pg-agent
@@ -72,7 +76,7 @@ mkdir -p "$WORK/pg" "$WORK/sock"
 [ ${#AS_PG[@]} -eq 0 ] || chown postgres "$WORK/pg" "$WORK/sock"
 
 cleanup() {
-  kill "${SERVER:-}" "${COLLECT:-}" 2>/dev/null || true
+  kill "${SERVER:-}" "${COLLECT:-}" "${HOOK:-}" 2>/dev/null || true
   as_pg "$PGBIN/pg_ctl" -D "$WORK/pg" -m fast stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -164,7 +168,15 @@ cat >"$WORK/collector.json" <<EOF
        "alert_rows": 500,
        "require_action": true,
        "canaries": [{"table": "public.accounts", "column": "id", "value": "3"}],
-       "status_every": "1s"}},
+       "status_every": "1s",
+       "down_after": "1s",
+       "notify": {
+         "undo_hint": "$BIN/esundo check -config $WORK/undo.json -xid {xid}",
+         "to": [
+           {"type": "telegram", "url": "http://127.0.0.1:$HOOKPORT", "token": "123456:DEMO-TOKEN", "chat": "-1001234567890"},
+           {"type": "slack", "url": "http://127.0.0.1:$HOOKPORT/services/T0/B0/DEMO"},
+           {"type": "json", "url": "http://127.0.0.1:$HOOKPORT/alerts"}
+         ]}}},
     {"cert": "pki/agent-mcp.crt", "key": "pki/agent-mcp.key", "spool_dir": "spool-agent-mcp",
      "file": "mcp/receipts.jsonl", "from_start": true}
   ]
@@ -174,6 +186,28 @@ EOF
 PGOPTIONS='-c client_min_messages=warning' "${OWNER[@]}" -q -f "$WORK/setup.sql"
 grep -c . "$WORK/setup.sql" | sed 's/$/ строк SQL (escollect -setup-sql): права роли agent_bot, триггер отметки на трёх таблицах, публикация, роль сборщика/'
 touch "$WORK/mcp/receipts.jsonl"
+# Получатель тревог: местный приёмник вместо Telegram, Slack и своего адреса.
+HOOKS=$WORK/hooks.jsonl
+: >"$HOOKS"
+python3 -I "$HERE/hook_server.py" "$HOOKPORT" "$HOOKS" &
+HOOK=$!
+# hooked ПУТЬ СЛОВО: дождаться сообщения по этому пути со словом в тексте, напечатать текст.
+hooked() {
+  for _ in $(seq 150); do
+    if python3 -I - "$HOOKS" "$1" "$2" <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    m = json.loads(line)
+    if sys.argv[2] in m["path"] and sys.argv[3] in m["body"].get("text", ""):
+        print(m["body"]["text"])
+        sys.exit(0)
+sys.exit(1)
+PY
+    then return 0; fi
+    sleep 0.1
+  done
+  die "тревога со словом «$2» не пришла на $1: $(tail -2 "$WORK/collect.log")"
+}
 # Сборщик работает постоянно, как в жизни: запись уезжает сама.
 start_collector() {
   "$BIN/escollect" -config "$WORK/collector.json" 2>>"$WORK/collect.log" &
@@ -190,6 +224,7 @@ cat >"$WORK/mcp.json" <<EOF
   "dsn": "host=$WORK/sock port=$PGPORT user=agent_bot dbname=shop",
   "agent": "support-bot",
   "receipts": "mcp/receipts.jsonl",
+  "action_row_limit": $ROWS,
   "undo": {
     "index": "pg-index/index.jsonl",
     "stamp": ["$BIN/evidencestore", "stamp", "-config", "$CFG"],
@@ -199,6 +234,17 @@ cat >"$WORK/mcp.json" <<EOF
 }
 EOF
 "$BIN/evidencestore" tsa-root -config "$CFG" -out "$WORK/tsa-root.crt" >/dev/null 2>&1
+# Настройки оператора для esundo: база и то, как достать записи из хранилища.
+OPDSN="host=$WORK/sock port=$PGPORT user=postgres dbname=shop"
+cat >"$WORK/undo.json" <<EOF
+{
+  "dsn": "$OPDSN",
+  "index": "pg-index/index.jsonl",
+  "stamp": ["$BIN/evidencestore", "stamp", "-config", "$CFG"],
+  "proof": ["$BIN/evidencestore", "proof", "-config", "$CFG", "-source", "$SRC", "-dek"],
+  "verify": ["$BIN/esverify", "-store-key", "$STORE_KEY", "-tsa-trust", "$WORK/tsa-root.crt"]
+}
+EOF
 
 INDEX=$WORK/pg-index/index.jsonl
 ALERTS=$WORK/pg-index/alerts.jsonl
@@ -222,9 +268,8 @@ shipped() {
 ship() { shipped "$SRC" "$(field "$(tail -1 "$INDEX")" last_seq)"; }
 # Квитанции — обычный файл, читается с начала: номер записи = номер строки.
 ship_receipts() { shipped agent-mcp "$(wc -l <"$WORK/mcp/receipts.jsonl")"; }
-OPDSN="host=$WORK/sock port=$PGPORT user=postgres dbname=shop"
 stamp() { "$BIN/evidencestore" stamp -config "$CFG" >/dev/null; }
-alerts() { [ -s "$ALERTS" ] && python3 -I -c 'import json,sys; print(" ".join(sorted({json.loads(l)["kind"] for l in open(sys.argv[1]) if json.loads(l)["xid"] == int(sys.argv[2])})))' "$ALERTS" "$1" || true; }
+alerts() { [ -s "$ALERTS" ] && python3 -I -c 'import json,sys; print(" ".join(sorted({s["kind"] for e in map(json.loads, open(sys.argv[1])) if e.get("xid") == int(sys.argv[2]) for s in e["signals"]})))' "$ALERTS" "$1" || true; }
 # owner_tx: транзакция владельца (человека) из stdin, печатает её xid.
 owner_tx() {
   local body
@@ -287,7 +332,9 @@ BYPASS=$("${OWNER[@]}" -Atc "select xmin from accounts where id = 12")
 wait_tx "$BYPASS"
 echo "транзакция $BYPASS записана и без MCP (отметку ставит база): $(field "$(entry "$BYPASS")" who)"
 [ "$(alerts "$BYPASS")" = "no-action" ] || die "ждали тревогу no-action, получили: $(alerts "$BYPASS")"
-echo "тревога: no-action — у транзакции роли агента нет отметки действия"
+echo "тревога no-action — у транзакции роли агента нет отметки действия. Как она пришла в Telegram:"
+hooked /bot123456:DEMO-TOKEN/sendMessage "agent transaction $BYPASS" | sed 's/^/    /'
+
 # Снимок «как было до плохого действия» — только чтобы в конце сверить итог.
 "${OWNER[@]}" -q -c "create table snap.accounts as table accounts" -c "create table snap.orders as table orders" -c "create table snap.docs as table docs"
 
@@ -322,7 +369,18 @@ PARTS=$(($(field "$BAD_ENTRY" last_seq) - $(field "$BAD_ENTRY" first_seq) + 1))
 echo "изменений строк $CHANGES, записей $PARTS; в буфере сборщика через $T_TAP с после фиксации, в хранилище — ещё через $T_SHIP с"
 "${OWNER[@]}" -At -F ' ' -c "select 'счетов с нулём:', count(*) from accounts where balance = 0" -c "select 'заказов осталось:', count(*) from orders" -c "select 'документ 1, байт:', length(body) from docs where id = 1"
 [ "$(alerts "$BAD")" = "canary mass-change" ] || die "ждали тревоги canary и mass-change, получили: $(alerts "$BAD")"
-echo "тревоги: mass-change (изменений не меньше 500) и canary (тронута строка-ловушка accounts id=3)"
+[ "$(grep -c "\"xid\":$BAD," "$ALERTS")" = 1 ] || die "на транзакцию $BAD должна быть одна строка тревоги"
+echo "тревоги mass-change (изменений не меньше 500) и canary (тронута строка-ловушка accounts id=3) — одним сообщением."
+ALERT_TEXT=$(hooked /services/T0/B0/DEMO "agent transaction $BAD")
+echo "Как оно пришло в Slack-совместимый веб-хук (через $(since "$T_ACTION") с после действия):"
+sed 's/^/    /' <<<"$ALERT_TEXT"
+grep -q "action: $BAD_ACTION, agent support-bot" <<<"$ALERT_TEXT" || die "в тревоге нет действия $BAD_ACTION"
+[ "$(grep -c '• canary' <<<"$ALERT_TEXT")" = 1 ] || die "ловушка в сообщении должна быть названа один раз"
+hooked /bot123456:DEMO-TOKEN/sendMessage "agent transaction $BAD" >/dev/null
+hooked /alerts "agent transaction $BAD" >/dev/null
+# Команда отката — прямо из текста тревоги.
+UNDO_CMD=$(sed -n 's/^undo preview: //p' <<<"$ALERT_TEXT")
+[ -n "$UNDO_CMD" ] || die "в тревоге нет команды отката"
 sleep 0.5
 E1=$(size "$WORK/data/evidence"); C1=$(size "$WORK/data/chain")
 TO=$(date -u +%FT%T.%NZ)
@@ -350,10 +408,15 @@ T_FETCH=$(since "$T")
 echo "записей $N, каждая VERIFIED; выдача и проверка — $T_FETCH с; от действия агента прошло $(since "$T_ACTION") с"
 BUNDLE_BYTES=$(size "$U/bundles")
 
-step "оператор, esundo check: план отката и сверка с базой — что сейчас на месте каждой строки"
+step "оператор выполняет команду из тревоги: записи из хранилища, план отката, сверка с базой"
+echo "\$ $UNDO_CMD -out plan.json"
 T=$(now)
-"$BIN/esundo" check -bodies "$U/bodies" -xid "$BAD" -dsn "$OPDSN" -out "$U/plan.json" | tee "$U/check.txt"
+# shellcheck disable=SC2086
+$UNDO_CMD -out "$U/plan.json" >"$U/check.txt"
 T_CHECK=$(since "$T")
+cat "$U/check.txt"
+grep -q "^fetched from the store and verified: $N records" "$U/check.txt" || die "esundo не достал записи из хранилища сам"
+grep -q "^to apply it: $BIN/esundo apply -config $WORK/undo.json -plan $U/plan.json" "$U/check.txt" || die "esundo не подсказал команду применения"
 grep -q "action $BAD_ACTION: agent support-bot" "$U/check.txt" || die "в до-образах нет отметки действия $BAD_ACTION"
 grep -q 'already as before 1, conflicts 2$' "$U/check.txt" || die "ждали два конфликта (счёт 6 и заказ 1) и один шаг «уже сделано» (заказ-возврат человек удалил сам)"
 
@@ -362,17 +425,18 @@ state() { "${OWNER[@]}" -At -F ' ' -c "select (select count(*) from accounts whe
 BEFORE=$(state)
 owner_tx >/dev/null <<<"update accounts set note = 'late human edit' where id = 9;"
 RC=0
-"$BIN/esundo" apply -plan "$U/plan.json" -dsn "$OPDSN" -by nikolay -reason "action $BAD_ACTION closed live accounts" >"$U/race.txt" 2>&1 || RC=$?
+"$BIN/esundo" apply -config "$WORK/undo.json" -plan "$U/plan.json" -by nikolay -reason "action $BAD_ACTION closed live accounts" >"$U/race.txt" 2>&1 || RC=$?
 [ "$RC" = 3 ] || die "ждали отказ с кодом 3 (строка изменилась после сверки), получили $RC: $(cat "$U/race.txt")"
 cat "$U/race.txt"
 [ "$(state)" = "$BEFORE" ] || die "сорванный откат что-то применил: было $BEFORE, стало $(state)"
 echo "откат не применён вовсе: по-прежнему $BEFORE. Сверка заново:"
-"$BIN/esundo" check -bodies "$U/bodies" -xid "$BAD" -dsn "$OPDSN" -out "$U/plan.json" -show 0 | grep '^checked' | tee "$U/check.txt"
+"$BIN/esundo" check -config "$WORK/undo.json" -xid "$BAD" -out "$U/plan.json" -show 0 >"$U/check.txt"
+grep '^checked against' "$U/check.txt"
 grep -q 'conflicts 3$' "$U/check.txt" || die "после правки счёта 9 ждали три конфликта"
 
 step "оператор, esundo apply: одна транзакция"
 T=$(now)
-"$BIN/esundo" apply -plan "$U/plan.json" -dsn "$OPDSN" -by nikolay -reason "action $BAD_ACTION closed live accounts" | tee "$U/apply.txt"
+"$BIN/esundo" apply -config "$WORK/undo.json" -plan "$U/plan.json" -by nikolay -reason "action $BAD_ACTION closed live accounts" | tee "$U/apply.txt"
 T_APPLY=$(since "$T")
 UNDO=$(sed -n 's/.* in transaction //p' "$U/apply.txt")
 [ -n "$UNDO" ] || die "откат не применился"
@@ -467,6 +531,22 @@ print(f"план из пакета по окну совпал с планом и
 PY
 fi
 
+# ---------------------------------------------------------------- предохранитель
+
+step "предохранитель: агент хочет изменить больше строк, чем разрешено одному действию ($ROWS)"
+NOTES=$("${OWNER[@]}" -Atc "select md5(string_agg(coalesce(note, '') || id, ',' order by id)) from accounts")
+INDEX_BEFORE=$(wc -l <"$INDEX")
+if R=$(mcp execute "$(sql_arg "normalize everything" <<<"update accounts set note = 'normalized'; update orders set item = upper(item)")"); then die "действие сверх предела прошло: $R"; fi
+cut -c1-250 <<<"$R"
+grep -q "was refused and rolled back, nothing changed" <<<"$R" || die "ждали отказ"
+[ "$("${OWNER[@]}" -Atc "select md5(string_agg(coalesce(note, '') || id, ',' order by id)) from accounts")" = "$NOTES" ] || die "отказанное действие изменило строки"
+grep -q '"outcome":"refused"' "$WORK/mcp/receipts.jsonl" || die "нет квитанции с исходом refused"
+REFUSED=$(hooked /services/T0/B0/DEMO "• refused:")
+sed 's/^/    /' <<<"$REFUSED"
+grep -q 'reason given: "normalize everything"' <<<"$REFUSED" || die "в тревоге об отказе нет причины действия"
+[ "$(wc -l <"$INDEX")" = "$INDEX_BEFORE" ] || die "отказанное действие попало в хранилище как транзакция"
+echo "в базе ничего не изменилось, записей в хранилище нет; люди узнали из тревоги, квитанция — с исходом refused"
+
 # ---------------------------------------------------------------- живучесть
 
 step "сборщик убит (kill -9), пока агент работает; потом перезапущена база"
@@ -486,6 +566,8 @@ as_pg "$PGBIN/pg_ctl" -D "$WORK/pg" -l "$WORK/pg/server.log" -m fast -w restart 
 X4=$(tick "after the database restart")
 wait_tx "$X4"; ship
 kill -0 "$COLLECT" 2>/dev/null || die "сборщик не пережил перезапуск базы: $(tail -3 "$WORK/collect.log")"
+hooked /alerts "• db-down:" | cut -c1-150 | sed 's/^/    /'
+hooked /alerts "• db-up:" | sed 's/^/    /' 
 grep -q 'msg="the database connection is down' "$WORK/collect.log" || die "сборщик не заметил обрыва соединения с базой"
 echo "база перезапущена: сборщик не остановился, подключился сам и прочитал транзакцию $X4"
 # Ни потерь, ни повторов: каждая транзакция в справочнике один раз, номера её

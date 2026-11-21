@@ -6,12 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgtap"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -124,11 +129,51 @@ func TestLive(t *testing.T) {
 	exec(admin, "CREATE TABLE public.pgin_churn (pad text)")
 	exec(admin, "INSERT INTO public.pgin_accounts SELECT g, 'note ' || g FROM generate_series(1, 20) g")
 
+	// Получатель тревог: веб-хук на этой же машине.
+	var hookMu sync.Mutex
+	var hooked []string
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Text string `json:"text"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		hookMu.Lock()
+		hooked = append(hooked, body.Text)
+		hookMu.Unlock()
+	}))
+	defer hook.Close()
+	// message ждёт сообщение со словом want и отдаёт его; пока ждёт, вход src
+	// (если задан) читает базу, как в цикле сборщика.
+	message := func(src *Source, want string) string {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			if src != nil {
+				if _, err := src.Read(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hookMu.Lock()
+			for _, text := range hooked {
+				if strings.Contains(text, want) {
+					hookMu.Unlock()
+					return text
+				}
+			}
+			n := len(hooked)
+			hookMu.Unlock()
+			if time.Now().After(deadline) {
+				t.Fatalf("no alert with %q among %d delivered", want, n)
+			}
+		}
+	}
+
 	cfg := Config{DSN: base + " user=pgin_tap", Slot: "pgin_slot", Publication: "pgin_pub", Dir: t.TempDir(),
-		Roles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}}
+		Roles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}, RequireAction: true,
+		Notify: &Notify{To: []alert.Target{{Type: alert.TypeSlack, URL: hook.URL}}}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	cfg.DownAfter = config.Duration(200 * time.Millisecond) // в жизни — не меньше секунды
 	setup, err := SetupSQL(&cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -210,6 +255,28 @@ func TestLive(t *testing.T) {
 	if st := s.Stats(); st.Captured != 1 || st.Skipped < 1 {
 		t.Fatalf("stats %+v", st)
 	}
+	// Агент пришёл мимо MCP-сервера (отметки действия нет): тревога дошла до
+	// получателя одним сообщением — с ролью, числом строк, номером записи и
+	// командой, которой смотрят откат.
+	text := message(nil, fmt.Sprintf("agent transaction %d", x1))
+	for _, want := range []string{"evidencestore, database live:", "• no-action:", "who: role pgin_agent", "changed: 1 row — public.pgin_accounts (updated 1)",
+		"store record: 1", fmt.Sprintf("undo preview: esundo check -config undo.json -xid %d", x1)} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the alert lacks %q:\n%s", want, text)
+		}
+	}
+	// MCP-сервер остановил действие пределом строк: отметка об отказе — не
+	// транзакционное сообщение, и откат транзакции её не стирает. Сборщик
+	// узнаёт о том, чего в базе не случилось.
+	// (Откат не сбрасывает журнал базы на диск сразу — это делает её фоновый
+	// процесс за доли секунды, — поэтому сообщение приходит чуть погодя.)
+	exec(agent, `BEGIN; UPDATE public.pgin_accounts SET note = 'too many'; SELECT evidence.mark_refused('{"action_id":"act-9","agent":"bot","rows":20,"limit":5}'::json); ROLLBACK`)
+	if text := message(s, "• refused:"); !strings.Contains(text, "would change 20 rows (the limit for one action is 5)") || !strings.Contains(text, "action: act-9, agent bot") {
+		t.Fatalf("refused alert:\n%s", text)
+	}
+	if one("SELECT count(*) FROM public.pgin_accounts WHERE note = 'too many'") != "0" {
+		t.Fatal("the refused action changed rows")
+	}
 
 	// 2. База оборвала соединение: вход не останавливается, подключается
 	// снова и продолжает с места — без повторов и без потерь.
@@ -228,6 +295,11 @@ func TestLive(t *testing.T) {
 	if xid, old := last(); xid != x2 || old != "one" {
 		t.Fatalf("after the reconnect: transaction %d with old note %q", xid, old)
 	}
+	// Связи не было дольше down_after: тревога, и вторая — когда вернулась.
+	if text := message(nil, "• db-down:"); !strings.Contains(text, "no connection to the database for") || strings.Contains(text, "undo preview") {
+		t.Fatalf("db-down alert:\n%s", text)
+	}
+	message(nil, "• db-up: the connection to the database is back after")
 
 	// 3. Перезапуск сборщика: новый вход с местом из буфера.
 	s.Close()
@@ -248,6 +320,7 @@ func TestLive(t *testing.T) {
 	if len(sink.gaps) != 1 || !strings.Contains(sink.gaps[0], "is gone") {
 		t.Fatalf("gaps %q", sink.gaps)
 	}
+	message(nil, "• gap: replication slot pgin_slot is gone from the server")
 	x5 := change(1, "five")
 	readAll(s, 1)
 	if xid, old := last(); xid != x5 || old != "lost with the slot" {

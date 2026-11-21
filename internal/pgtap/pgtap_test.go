@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
 )
 
@@ -160,13 +161,26 @@ func (h *harness) index() []IndexEntry {
 	return out
 }
 
+// alerts — строки alerts.jsonl: по событию на транзакцию.
+func (h *harness) alerts() []alert.Event {
+	h.t.Helper()
+	var out []alert.Event
+	for _, l := range h.lines("alerts.jsonl") {
+		var e alert.Event
+		if err := json.Unmarshal(l, &e); err != nil {
+			h.t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// alertKinds — поводы всех тревог подряд.
 func (h *harness) alertKinds() []string {
 	h.t.Helper()
 	var out []string
-	for _, l := range h.lines("alerts.jsonl") {
-		var a Alert
-		json.Unmarshal(l, &a)
-		out = append(out, a.Kind)
+	for _, e := range h.alerts() {
+		out = append(out, e.Kinds()...)
 	}
 	return out
 }
@@ -514,6 +528,58 @@ func TestAlerts(t *testing.T) {
 	}
 	if len(h.index()) != 2 {
 		t.Fatal("the late-marked transaction was journaled in part")
+	}
+	// Одна строка на транзакцию: все её поводы и сводка — то, что уйдёт
+	// человеку одним сообщением. Ловушку тронули дважды одинаково — повод один.
+	h.run(4, action("agent", "9"), who("agent"), accounts, ins("7"), ins("7"), ins("8"))
+	ev := h.alerts()
+	last := ev[len(ev)-1]
+	idx := h.index()
+	if len(ev) != 3 || last.XID != 4 || strings.Join(last.Kinds(), " ") != "canary mass-change" {
+		t.Fatalf("%d alert lines, the last: %+v", len(ev), last)
+	}
+	if last.Changes != 3 || last.Tables["public.accounts"].I != 3 || last.FirstSeq != idx[2].FirstSeq || last.LastSeq != idx[2].LastSeq ||
+		!strings.Contains(string(last.Who), `"agent"`) || len(last.Actions) != 1 || last.Time == "" {
+		t.Fatalf("the alert lacks the summary of its transaction: %+v", last)
+	}
+	// У транзакции с поздней отметкой записей в хранилище нет — и номеров нет.
+	if late := ev[1]; late.XID != 3 || late.FirstSeq != 0 || late.Changes != 0 {
+		t.Fatalf("late-marker alert: %+v", late)
+	}
+}
+
+// MCP-сервер остановил действие пределом строк и откатил его: в журнале базы
+// от него осталось только не транзакционное сообщение. Сборщик поднимает
+// тревогу — о том, чего в базе не случилось.
+func TestRefusedActionRaisesAnAlert(t *testing.T) {
+	h := open(t, t.TempDir(), nil)
+	refused := func(lsn uint64, role string) pgoutput.Message {
+		return pgoutput.Message{LSN: lsn, Prefix: PrefixRefused,
+			Content: []byte(`{"role":"` + role + `","info":{"action_id":"a-7","agent":"support-bot","reason":"close all","rows":3000,"limit":500}}`)}
+	}
+	for _, m := range []pgoutput.Message{
+		refused(900, "agent"),
+		refused(900, "agent"),    // база прислала его ещё раз после обрыва связи
+		refused(950, "postgres"), // не наблюдаемая роль
+		{LSN: 960, Prefix: "someone/else", Content: []byte(`{"role":"agent"}`)},
+		{LSN: 970, Prefix: PrefixWho, Content: []byte(`{"role":"agent"}`)}, // отметка «кто» вне транзакции ничего не значит
+	} {
+		if f, err := h.tap.Handle(m); err != nil || f != 0 {
+			t.Fatalf("%v %d", err, f)
+		}
+	}
+	ev := h.alerts()
+	if len(ev) != 1 || ev[0].XID != 0 || strings.Join(ev[0].Kinds(), " ") != "refused" || len(ev[0].Actions) != 1 {
+		t.Fatalf("alerts %+v", ev)
+	}
+	if d := ev[0].Signals[0].Detail; !strings.Contains(d, "3000 rows") || !strings.Contains(d, "limit for one action is 500") {
+		t.Fatalf("detail %q", d)
+	}
+	if len(h.sink.bodies) != 0 || len(h.index()) != 0 || h.tap.InTransaction() {
+		t.Fatal("a refused action left records")
+	}
+	if text := alert.Text(ev[0], alert.TextOptions{Title: "database shop"}); !strings.Contains(text, "action: a-7, agent support-bot") {
+		t.Fatalf("text:\n%s", text)
 	}
 }
 

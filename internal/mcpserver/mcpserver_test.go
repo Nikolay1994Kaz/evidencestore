@@ -334,3 +334,110 @@ func TestUndoPreviewAndApply(t *testing.T) {
 		t.Fatalf("%v %s", isErr, out)
 	}
 }
+
+// limited — сервер с пределом строк на действие; stat — что база отвечает на
+// вопрос, сколько строк изменила транзакция.
+func limited(t *testing.T, limit int, stat string) (*Server, *fakeDB, string) {
+	t.Helper()
+	db := &fakeDB{answers: func(sql string) ([]pgwire.Result, bool) {
+		if strings.Contains(sql, "pg_stat_xact_user_tables") && stat != "" {
+			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
+		}
+		return nil, false
+	}}
+	s, path := newServer(t, db)
+	s.cfg.RowLimit = limit
+	return s, db, path
+}
+
+// Предохранитель: действие, которое меняет больше строк, чем разрешено,
+// откатывается до фиксации. Агент получает отказ, в журнале базы остаётся
+// отметка для тревоги, в квитанциях — исход refused.
+func TestRowLimitRefusesBeforeCommit(t *testing.T) {
+	s, db, path := limited(t, 500, "700")
+	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET balance = 0","reason":"close inactive accounts"}`)
+	if !isErr {
+		t.Fatalf("an action over the limit went through: %s", text)
+	}
+	for _, want := range []string{"action a-1 was refused and rolled back, nothing changed", "would change 700 rows", "at most 500", "Do not split"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the refusal lacks %q: %s", want, text)
+		}
+	}
+	// Порядок: изменения, счёт строк, отметка об отказе, откат. Фиксации нет.
+	n := len(db.log)
+	if n != 7 || !strings.HasPrefix(db.log[3], "UPDATE") || !strings.Contains(db.log[4], "pg_stat_xact_user_tables") ||
+		!strings.HasPrefix(db.log[5], "SELECT evidence.mark_refused('{") || db.log[6] != "ROLLBACK" {
+		t.Fatalf("%q", db.log)
+	}
+	for _, want := range []string{`"action_id":"a-1"`, `"agent":"support-bot"`, `"rows":700`, `"limit":500`, `"reason":"close inactive accounts"`} {
+		if !strings.Contains(db.log[5], want) {
+			t.Fatalf("the refusal marker lacks %s: %s", want, db.log[5])
+		}
+	}
+	data, _ := os.ReadFile(path)
+	var rc Receipt
+	if err := json.Unmarshal(bytes.TrimSpace(data), &rc); err != nil {
+		t.Fatal(err)
+	}
+	if rc.Outcome != "refused" || rc.Rows != 700 || !strings.Contains(rc.Error, "at most 500") || rc.Tags[0] != "UPDATE 3" {
+		t.Fatalf("receipt %+v", rc)
+	}
+	// Отменять нечего: действие не зафиксировано.
+	s.cfg.Fetch = func(uint32) ([][]byte, error) { return nil, errors.New("must not be asked") }
+	if text, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`); !isErr || !strings.Contains(text, "did not commit (refused)") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+}
+
+func TestRowLimitLetsSmallActionsThrough(t *testing.T) {
+	s, db, path := limited(t, 500, "500") // ровно предел — можно
+	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id < 501"}`)
+	if isErr || !strings.Contains(text, `"outcome":"committed"`) {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if db.log[len(db.log)-1] != "COMMIT" || strings.Contains(strings.Join(db.log, "\n"), "mark_refused") {
+		t.Fatalf("%q", db.log)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"rows":500`) {
+		t.Fatalf("%s", data)
+	}
+	// Агент узнаёт о пределе из описания инструмента, а не из первого отказа.
+	list := ask(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`)
+	raw, _ := json.Marshal(list)
+	if !strings.Contains(string(raw), "at most 500 rows") {
+		t.Fatalf("the tool description does not name the limit: %s", raw)
+	}
+	plain, _ := newServer(t, &fakeDB{})
+	raw, _ = json.Marshal(ask(t, plain, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`))
+	if strings.Contains(string(raw), "at most") {
+		t.Fatal("a server without a limit names one")
+	}
+}
+
+// Статистика в базе выключена и говорит «ноль»: тогда считают ответы на
+// операторы. А если сосчитать нельзя вовсе, действие не фиксируется.
+func TestRowLimitDoesNotFailOpen(t *testing.T) {
+	s, db, _ := limited(t, 2, "0")
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`); !isErr || !strings.Contains(text, "would change 3 rows") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if db.log[len(db.log)-1] != "ROLLBACK" {
+		t.Fatalf("%q", db.log)
+	}
+
+	s, db, path := limited(t, 2, "")
+	db.fail = map[string]error{"pg_stat_xact_user_tables": &pgwire.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied for view pg_stat_xact_user_tables"}}
+	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`)
+	if !isErr || !strings.Contains(text, "could not be counted") || !strings.Contains(text, "rolled back") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if db.log[len(db.log)-1] != "ROLLBACK" || strings.Contains(strings.Join(db.log, "\n"), "COMMIT") {
+		t.Fatalf("%q", db.log)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"outcome":"failed"`) {
+		t.Fatalf("%s", data)
+	}
+}

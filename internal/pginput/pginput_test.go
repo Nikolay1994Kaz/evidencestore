@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 )
 
@@ -17,8 +18,13 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if c.Slot != "evidence_tap" || c.Publication != "evidence_pub" || c.StatusEvery.D() != 5*time.Second {
+	if c.Slot != "evidence_tap" || c.Publication != "evidence_pub" || c.StatusEvery.D() != 5*time.Second || c.DownAfter.D() != time.Minute {
 		t.Fatalf("defaults: %+v", c)
+	}
+	n := good()
+	n.Notify = &Notify{To: []alert.Target{{Type: alert.TypeTelegram, Token: "1:T", Chat: "5"}}}
+	if err := n.Validate(); err != nil || n.Notify.UndoHint != DefaultUndoHint || n.Notify.To[0].Name != "telegram" {
+		t.Fatalf("notify defaults: %v %+v", err, n.Notify)
 	}
 	for name, spoil := range map[string]func(*Config){
 		"no dsn":               func(c *Config) { c.DSN = "" },
@@ -30,6 +36,14 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 		"status_every 100ms":   func(c *Config) { c.StatusEvery = config.Duration(100 * time.Millisecond) },
 		"status_every 2m":      func(c *Config) { c.StatusEvery = config.Duration(2 * time.Minute) },
 		"alert_rows -1":        func(c *Config) { c.AlertRows = -1 },
+		"down_after 10ms":      func(c *Config) { c.DownAfter = config.Duration(10 * time.Millisecond) },
+		"notify to nobody":     func(c *Config) { c.Notify = &Notify{} },
+		"notify to a bad target": func(c *Config) {
+			c.Notify = &Notify{To: []alert.Target{{Type: alert.TypeSlack, URL: "http://example.com/hook"}}}
+		},
+		"undo hint without {xid}": func(c *Config) {
+			c.Notify = &Notify{UndoHint: "esundo check", To: []alert.Target{{Type: alert.TypeSlack, URL: "https://example.com/hook"}}}
+		},
 	} {
 		c := good()
 		spoil(&c)
@@ -62,6 +76,8 @@ func TestSetupSQL(t *testing.T) {
 		`ALTER TABLE "sales"."orders" REPLICA IDENTITY FULL;`,
 		`CREATE TRIGGER evidence_who BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON "public"."accounts"`,
 		`REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC`,
+		`PERFORM pg_logical_emit_message(false, 'evidence/refused',`,
+		`evidence.mark_refused(json) TO "agent ""x""";`,
 		`CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders";`,
 		`CREATE ROLE "evidence_tap" LOGIN REPLICATION;`,
 	} {

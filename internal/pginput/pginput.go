@@ -22,6 +22,12 @@
 // изменения за это время не вернуть. Вход не молчит: сборщик пропускает номер
 // записи, хранилище записывает в цепь пропуск, слот заводится заново, и чтение
 // идёт дальше.
+//
+// ТРЕВОГИ. Поводы по транзакциям находит internal/pgtap; вход добавляет свои,
+// служебные: связи с базой нет дольше down_after, связь вернулась, записи
+// потеряны. Все они ложатся в alerts.jsonl, а оттуда, если в настройках есть
+// "notify", уходят человеку (internal/alert): в Telegram, в Slack-совместимый
+// веб-хук или на свой адрес.
 package pginput
 
 import (
@@ -37,6 +43,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/input"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
@@ -71,7 +78,29 @@ type Config struct {
 	// StatusEvery — как часто сообщать базе подтверждённую позицию, когда
 	// изменений нет. По умолчанию 5s; должно быть меньше wal_sender_timeout (60 с).
 	StatusEvery config.Duration `json:"status_every"`
+	// DownAfter — связи с базой нет дольше этого — тревога db-down (и db-up,
+	// когда связь вернётся). По умолчанию 1m.
+	DownAfter config.Duration `json:"down_after"`
+	// Notify — кому нести тревоги. Нет раздела — тревоги только в alerts.jsonl
+	// и в журнале сборщика.
+	Notify *Notify `json:"notify"`
 }
+
+// Notify — раздел "notify": получатели тревог.
+type Notify struct {
+	// To — получатели: {"type": "telegram", "token": "…", "chat": "…"},
+	// {"type": "slack", "url": "…"} (и совместимые веб-хуки), {"type": "json",
+	// "url": "…"}. У каждого своя очередь: недоступность одного не держит
+	// остальных.
+	To []alert.Target `json:"to"`
+	// UndoHint — команда в тексте тревоги, которой оператор смотрит откат
+	// транзакции; {xid} заменяется её номером. По умолчанию
+	// "esundo check -config undo.json -xid {xid}".
+	UndoHint string `json:"undo_hint"`
+}
+
+// DefaultUndoHint — команда отката в тексте тревоги, если не задана своя.
+const DefaultUndoHint = "esundo check -config undo.json -xid {xid}"
 
 // Validate ставит умолчания и проверяет настройки.
 func (c *Config) Validate() error {
@@ -106,6 +135,26 @@ func (c *Config) Validate() error {
 	}
 	if c.AlertRows < 0 {
 		errs = append(errs, fmt.Errorf("postgres.alert_rows %d: must not be negative", c.AlertRows))
+	}
+	if c.DownAfter == 0 {
+		c.DownAfter = config.Duration(time.Minute)
+	}
+	if c.DownAfter.D() < time.Second {
+		errs = append(errs, fmt.Errorf("postgres.down_after %v: a second at least", c.DownAfter.D()))
+	}
+	if n := c.Notify; n != nil {
+		if n.UndoHint == "" {
+			n.UndoHint = DefaultUndoHint
+		}
+		if !strings.Contains(n.UndoHint, "{xid}") {
+			errs = append(errs, errors.New("postgres.notify.undo_hint: write {xid} where the transaction number goes"))
+		}
+		if len(n.To) == 0 {
+			errs = append(errs, errors.New("postgres.notify.to: name at least one target"))
+		}
+		if err := alert.ValidateTargets(n.To); err != nil {
+			errs = append(errs, fmt.Errorf("postgres.notify: %w", err))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -159,6 +208,14 @@ func SetupSQL(c *Config) (string, error) {
 	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixUndo))
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_undo(json) FROM PUBLIC;")
+	p("-- Отказ: MCP-сервер остановил действие пределом строк и откатывает его. Сообщение не")
+	p("-- транзакционное (false): откат транзакции его из журнала не убирает, и сборщик о нём узнаёт.")
+	p("CREATE OR REPLACE FUNCTION evidence.mark_refused(info json) RETURNS void")
+	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $evidence$")
+	p("BEGIN")
+	p("  PERFORM pg_logical_emit_message(false, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixRefused))
+	p("END $evidence$;")
+	p("REVOKE ALL ON FUNCTION evidence.mark_refused(json) FROM PUBLIC;")
 	p("")
 	p("-- Напрямую писать отметки больше не может никто, кроме владельца функций выше:")
 	p("-- иначе агент подложил бы отметку с чужой ролью.")
@@ -190,7 +247,7 @@ func SetupSQL(c *Config) (string, error) {
 		}
 		p("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s;", strings.Join(tables, ", "), id(r))
 		p("GRANT USAGE ON SCHEMA evidence TO %s;", id(r))
-		p("GRANT EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json) TO %s;", id(r))
+		p("GRANT EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json), evidence.mark_refused(json) TO %s;", id(r))
 	}
 	p("")
 	p("-- Таблицы: старая строка в журнал целиком, отметка «кто» перед каждым оператором.")
@@ -253,6 +310,14 @@ type Source struct {
 
 	emitted int   // записей легло в буфер за проход
 	sinkErr error // буфер отказал: дальше только выход
+
+	// notifier несёт тревоги получателям (nil — не настроен или ещё не начат).
+	notifier *alert.Notifier
+	// downSince — с каких пор нет связи с базой (ноль — связь есть); downErr —
+	// последняя причина; downSaid — тревога db-down об этом уже поднята.
+	downSince time.Time
+	downErr   error
+	downSaid  bool
 
 	partSize int // размер части pgtap; 0 — его умолчание (меняют тесты)
 }
@@ -391,6 +456,10 @@ func (s *Source) connect(ctx context.Context) (err error) {
 		return fmt.Errorf("start replication: %w", err)
 	}
 	s.tap.Reset()
+	if s.downSaid {
+		s.raise(alert.KindDBUp, fmt.Sprintf("the connection to the database is back after %s", time.Since(s.downSince).Round(time.Second)))
+	}
+	s.downSince, s.downErr, s.downSaid = time.Time{}, nil, false
 	s.cat, s.repl = cat, repl
 	start = max(start, from)
 	s.flushed, s.reported, s.lastReport = start, start, time.Now()
@@ -434,6 +503,7 @@ func (s *Source) ensureSlot(cat *pgwire.Conn) (pgwire.LSN, error) {
 			s.sinkErr = err
 			return 0, err
 		}
+		s.raise(alert.KindGap, lost+": the store records a gap in the numbering of this source")
 		if exists {
 			if _, err := cat.Query("SELECT pg_drop_replication_slot(" + name + ")"); err != nil {
 				return 0, fmt.Errorf("drop the lost slot %s: %w", s.cfg.Slot, err)
@@ -494,6 +564,10 @@ func (s *Source) drop(why error) {
 		}
 	}
 	s.repl, s.cat = nil, nil
+	if s.downSince.IsZero() {
+		s.downSince = time.Now()
+	}
+	s.downErr = why
 	s.backoff = min(max(s.backoff*2, time.Second), maxBackoff)
 	s.retryAt = time.Now().Add(s.backoff)
 	s.log.Warn("the database connection is down; what is spooled is still delivered", "err", why, "retry_in", s.backoff)
@@ -583,10 +657,52 @@ func (s *Source) fail(err error) error {
 	return nil
 }
 
+// raise пишет служебную тревогу входа в alerts.jsonl; оттуда её несёт
+// получателям notifier.
+func (s *Source) raise(kind, detail string) {
+	ev := alert.Event{}
+	ev.Add(kind, detail)
+	if err := s.tap.Alerts().Append(ev); err != nil {
+		s.log.Error("alert not written", "kind", kind, "detail", detail, "err", err)
+	}
+}
+
+// watchDown поднимает тревогу, когда связи с базой нет дольше down_after.
+func (s *Source) watchDown() {
+	if s.downSaid || s.downSince.IsZero() || time.Since(s.downSince) < s.cfg.DownAfter.D() {
+		return
+	}
+	s.downSaid = true
+	detail := fmt.Sprintf("no connection to the database for %s (%v): changes made meanwhile are read when it is back, as long as the server keeps its log for the slot",
+		time.Since(s.downSince).Round(time.Second), s.downErr)
+	s.log.Error("alert", "kind", alert.KindDBDown, "detail", detail)
+	s.raise(alert.KindDBDown, detail)
+}
+
+// notify начинает доставку тревог — при первом чтении, а не в Open: к этому
+// времени у входа уже его окончательный журнал (SetLogger).
+func (s *Source) notify() {
+	if s.notifier != nil || s.cfg.Notify == nil {
+		return
+	}
+	n, err := alert.Start(alert.Options{File: s.tap.Alerts().Path(), Dir: s.cfg.Dir, Targets: s.cfg.Notify.To,
+		Text: alert.TextOptions{Title: "database " + s.dsn.Database, UndoHint: s.cfg.Notify.UndoHint}}, s.log)
+	if err != nil {
+		// Тревоги остаются в файле; сбор записей из-за доставки не встаёт.
+		s.log.Error("alerts are not delivered: the notifier did not start", "err", err)
+		s.cfg.Notify = nil
+		return
+	}
+	s.notifier = n
+	s.tap.Alerts().OnAppend(n.Wake)
+}
+
 // Read — input.Input: один проход без ожидания.
 func (s *Source) Read() (int, error) {
 	s.emitted = 0
+	s.notify()
 	if s.repl == nil {
+		s.watchDown()
 		if time.Now().Before(s.retryAt) {
 			return 0, nil
 		}
@@ -607,6 +723,7 @@ func (s *Source) Read() (int, error) {
 // ReadAll — input.Input: всё, что было в журнале базы к моменту вызова.
 func (s *Source) ReadAll(ctx context.Context) (int, error) {
 	s.emitted = 0
+	s.notify()
 	if err := s.connect(ctx); err != nil {
 		if s.sinkErr == nil {
 			s.drop(err)
@@ -697,6 +814,10 @@ func (s *Source) Close() error {
 		}
 	}
 	s.repl, s.cat = nil, nil
+	if s.notifier != nil {
+		s.notifier.Close() // неотправленное ждёт в файле до следующего запуска
+		s.notifier = nil
+	}
 	if s.tap == nil {
 		return nil
 	}

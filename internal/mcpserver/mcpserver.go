@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -62,6 +63,11 @@ type DB interface {
 type Config struct {
 	Agent   string // имя агента для отметок и квитанций
 	MaxRows int    // сколько строк отдавать агенту из query; 0 — 200
+	// RowLimit — предохранитель: сколько строк может изменить одно действие
+	// execute. Больше — действие откатывается до фиксации, агент получает
+	// отказ, а в журнале базы остаётся отметка, по которой сборщик поднимает
+	// тревогу. 0 — без предела.
+	RowLimit int
 	// Dial открывает соединение ролью агента. Зовётся при первом запросе и
 	// заново после обрыва.
 	Dial func() (DB, error)
@@ -84,8 +90,9 @@ type Receipt struct {
 	SQL      string          `json:"sql"`
 	Reason   string          `json:"reason,omitempty"`
 	XID      string          `json:"xid,omitempty"`
-	Outcome  string          `json:"outcome"` // committed или failed
+	Outcome  string          `json:"outcome"` // committed, failed или refused (остановлено пределом строк)
 	Tags     []string        `json:"tags,omitempty"`
+	Rows     int             `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
 	Error    string          `json:"error,omitempty"`
 	Undoes   string          `json:"undoes,omitempty"` // у отката: какое действие он возвращает
 	Client   json.RawMessage `json:"client,omitempty"`
@@ -299,10 +306,22 @@ var tools = []map[string]any{
 
 // tools — список инструментов: откат есть, только если сервер умеет достать до-образы.
 func (s *Server) tools() []map[string]any {
-	if s.cfg.Fetch == nil {
-		return tools
+	list := slices.Clone(tools)
+	if s.cfg.RowLimit > 0 {
+		// Агент должен знать о пределе заранее, а не из отказа.
+		for i, t := range list {
+			if t["name"] == "execute" {
+				t = maps.Clone(t)
+				t["description"] = t["description"].(string) + fmt.Sprintf(" One action may change at most %d rows: a larger one is rolled back, nothing changes, "+
+					"and the operators are alerted. Do not split such a change into smaller actions; ask a person.", s.cfg.RowLimit)
+				list[i] = t
+			}
+		}
 	}
-	return append(slices.Clone(tools), undoTools...)
+	if s.cfg.Fetch == nil {
+		return list
+	}
+	return append(list, undoTools...)
 }
 
 var undoTools = []map[string]any{
@@ -539,6 +558,9 @@ func (s *Server) execute(sql, reason string) (string, error) {
 		s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
 		return "", fmt.Errorf("action %s is %s, but its receipt could not be written: %v", rc.ActionID, rc.Outcome, werr)
 	}
+	if err != nil && rc.Outcome == "refused" {
+		return "", fmt.Errorf("action %s was refused and rolled back, nothing changed: %w", rc.ActionID, err)
+	}
 	if err != nil {
 		return "", fmt.Errorf("action %s failed and was rolled back: %w", rc.ActionID, err)
 	}
@@ -573,11 +595,65 @@ func (s *Server) transaction(rc *Receipt) error {
 	if err != nil {
 		return fail(err)
 	}
+	if s.cfg.RowLimit > 0 {
+		// Предохранитель: до фиксации известно, сколько строк действие изменило.
+		// Не сосчитать — не фиксировать: предел, который молча не работает, хуже
+		// его отсутствия.
+		rows, err := s.changed(rc.Tags)
+		if err != nil {
+			return fail(fmt.Errorf("the rows the action changed could not be counted, so the limit of %d rows cannot be checked: %w", s.cfg.RowLimit, err))
+		}
+		if rc.Rows = rows; rows > s.cfg.RowLimit {
+			// Отметка об отказе — не транзакционное сообщение журнала базы:
+			// откат её не стирает, и сборщик поднимет тревогу для людей.
+			mark, _ := json.Marshal(map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "reason": rc.Reason, "rows": rows, "limit": s.cfg.RowLimit})
+			if _, err := s.run("SELECT evidence.mark_refused(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
+				s.log.Error("the refusal is not marked in the database log, so no alert is raised for it (is the database prepared with the current escollect -setup-sql?)",
+					"action", rc.ActionID, "err", err)
+			}
+			s.run("ROLLBACK")
+			rc.Outcome = "refused"
+			return fmt.Errorf("it would change %d rows, and one action may change at most %d. Do not split it into smaller actions: ask a person to do it or to raise the limit",
+				rows, s.cfg.RowLimit)
+		}
+	}
 	if _, err := s.run("COMMIT"); err != nil {
 		return fail(err)
 	}
 	rc.Outcome = "committed"
 	return nil
+}
+
+// changed — сколько строк изменила текущая транзакция. Счёт ведёт сама база
+// (статистика транзакции): в него входят и строки, изменённые внутри WITH,
+// триггерами и каскадом, чего по ответам на операторы не видно. Ответы
+// операторов — второе мнение на случай, если статистика в базе выключена
+// (track_counts = off): берётся большее.
+func (s *Server) changed(tags []string) (int, error) {
+	res, err := s.run("SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint FROM pg_stat_xact_user_tables")
+	if err != nil {
+		return 0, err
+	}
+	if len(res) != 1 || len(res[0].Rows) != 1 || res[0].Rows[0][0] == nil {
+		return 0, errors.New("the server did not answer the question about the transaction's statistics")
+	}
+	rows, err := strconv.Atoi(*res[0].Rows[0][0])
+	if err != nil {
+		return 0, err
+	}
+	byTags := 0
+	for _, tag := range tags {
+		f := strings.Fields(tag)
+		if len(f) < 2 {
+			continue
+		}
+		switch f[0] {
+		case "INSERT", "UPDATE", "DELETE", "MERGE":
+			n, _ := strconv.Atoi(f[len(f)-1])
+			byTags += n
+		}
+	}
+	return max(rows, byTags), nil
 }
 
 func (s *Server) keep(rc Receipt) error {

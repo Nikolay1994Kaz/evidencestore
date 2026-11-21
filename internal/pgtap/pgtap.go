@@ -3,7 +3,8 @@
 // отката, складывает каждую в сжатый поток и режет его на части-записи, которые
 // сразу ложатся в буфер сборщика (Sink). Своего файла с записями у пакета нет:
 // рядом он ведёт только справочник (index.jsonl — какая транзакция под какими
-// номерами записей лежит) и тревоги (alerts.jsonl).
+// номерами записей лежит) и тревоги (alerts.jsonl, internal/alert): одна строка
+// на транзакцию — все её поводы и сводка; оттуда их несёт человеку Notifier.
 //
 // ЧЬЯ ТРАНЗАКЦИЯ. В журнале PostgreSQL нет ни роли, ни application_name. Их
 // кладёт туда сама база: триггер на оператор зовёт pg_logical_emit_message с
@@ -54,6 +55,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -63,6 +65,11 @@ const (
 	PrefixWho    = "evidence/who"    // ставит триггер: роль сессии
 	PrefixAction = "evidence/action" // ставит MCP-сервер через evidence.mark_action
 	PrefixUndo   = "evidence/undo"   // ставит транзакция отката
+	// PrefixRefused — MCP-сервер остановил действие пределом строк и откатил
+	// его (evidence.mark_refused). Сообщение не транзакционное: откат
+	// транзакции его из журнала базы не убирает, и сборщик поднимает тревогу о
+	// том, чего в базе не случилось.
+	PrefixRefused = "evidence/refused"
 )
 
 // FormatVersion — версия формата потока (поле v заголовка).
@@ -106,11 +113,7 @@ type Catalog interface {
 }
 
 // Counts — сколько строк транзакция вставила, поправила, удалила в таблице.
-type Counts struct {
-	I int `json:"I"`
-	U int `json:"U"`
-	D int `json:"D"`
-}
+type Counts = alert.Counts
 
 // Sink — буфер сборщика (input.Sink): сюда идут части.
 type Sink interface {
@@ -138,14 +141,6 @@ type IndexEntry struct {
 	EndLSN     string            `json:"end_lsn"`
 }
 
-// Alert — строка alerts.jsonl.
-type Alert struct {
-	Time   string `json:"time"`
-	Kind   string `json:"kind"`
-	XID    uint32 `json:"xid"`
-	Detail string `json:"detail"`
-}
-
 // Stats — счётчики с запуска.
 type Stats struct {
 	Captured, Skipped         uint64 // транзакции
@@ -162,7 +157,11 @@ type Tap struct {
 	now   func() time.Time
 	roles map[string]bool
 
-	index, alerts *os.File
+	index  *os.File
+	alerts *alert.Log
+	// lastRefused — позиция последнего сообщения об отказе: после обрыва
+	// связи база может прислать его ещё раз.
+	lastRefused uint64
 	// lastCommit — место входа: позиция фиксации (FinalLSN) последней
 	// транзакции, которая лежит в буфере целиком. Транзакции не новее база
 	// может прислать заново — они пропускаются.
@@ -187,7 +186,7 @@ type txState struct {
 	tables    map[string]Counts
 	truncated []string
 	written   map[uint32]bool
-	alerts    []Alert
+	alert     alert.Event // поводы тревоги этой транзакции
 
 	buf      bytes.Buffer
 	gz       *gzip.Writer
@@ -227,14 +226,18 @@ func Open(cfg Config, cat Catalog, sink Sink, cursor uint64, log *slog.Logger) (
 			t.Close()
 		}
 	}()
-	if t.index, err = openLines(filepath.Join(cfg.Dir, IndexFile)); err != nil {
+	if t.index, err = alert.OpenLines(filepath.Join(cfg.Dir, IndexFile)); err != nil {
 		return nil, err
 	}
-	if t.alerts, err = openLines(filepath.Join(cfg.Dir, AlertsFile)); err != nil {
+	if t.alerts, err = alert.OpenLog(filepath.Join(cfg.Dir, AlertsFile)); err != nil {
 		return nil, err
 	}
 	return t, nil
 }
+
+// Alerts — файл тревог: вход дописывает в него служебные события (нет связи с
+// базой, записи потеряны) и подключает к нему доставку.
+func (t *Tap) Alerts() *alert.Log { return t.alerts }
 
 // Файлы справочника в Config.Dir.
 const (
@@ -242,58 +245,14 @@ const (
 	AlertsFile = "alerts.jsonl"
 )
 
-// openLines открывает файл строк на дозапись. Оборванный хвост без перевода
-// строки отрезается (падение посреди записи): иначе следующая строка
-// приклеилась бы к обрывку.
-func openLines(path string) (_ *os.File, err error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			f.Close()
-		}
-	}()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	// Строка справочника — сотни байт, с длинным списком таблиц — килобайты:
-	// конец последней целой строки ищется в хвосте файла, а не чтением всего.
-	size := fi.Size()
-	good := size
-	for step := int64(64 << 10); good > 0; step *= 16 {
-		tail := make([]byte, min(size, step))
-		if _, err := f.ReadAt(tail, size-int64(len(tail))); err != nil {
-			return nil, err
-		}
-		if i := bytes.LastIndexByte(tail, '\n'); i >= 0 {
-			good = size - int64(len(tail)) + int64(i) + 1
-			break
-		}
-		if int64(len(tail)) == size {
-			good = 0
-		}
-	}
-	if good != size {
-		if err := f.Truncate(good); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := f.Seek(good, io.SeekStart); err != nil {
-		return nil, err
-	}
-	return f, nil
-}
-
 // Close закрывает файлы справочника.
 func (t *Tap) Close() error {
 	var errs []error
-	for _, f := range []*os.File{t.index, t.alerts} {
-		if f != nil {
-			errs = append(errs, f.Close())
-		}
+	if t.index != nil {
+		errs = append(errs, t.index.Close())
+	}
+	if t.alerts != nil {
+		errs = append(errs, t.alerts.Close())
 	}
 	return errors.Join(errs...)
 }
@@ -340,7 +299,10 @@ func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 	case pgoutput.Other:
 		return 0, nil
 	case pgoutput.Message:
-		if !m.Transactional || t.tx == nil || t.tx.dup {
+		if !m.Transactional {
+			return 0, t.refused(m)
+		}
+		if t.tx == nil || t.tx.dup {
 			return 0, nil
 		}
 		return 0, t.mark(m)
@@ -436,7 +398,7 @@ func (t *Tap) mark(m pgoutput.Message) error {
 		// Изменения до отметки уже пропущены: такая транзакция в журнале не вся.
 		tx.late = true
 		t.alert(tx, "late-marker", fmt.Sprintf("a %s marker came after %d changes of the transaction had been skipped: they are not in the journal", m.Prefix, tx.skipped))
-		return t.flushAlerts(tx)
+		return t.flushAlerts(tx, nil)
 	}
 	if tx.late {
 		return nil
@@ -456,26 +418,58 @@ func (t *Tap) mark(m pgoutput.Message) error {
 	return nil
 }
 
-func (t *Tap) alert(tx *txState, kind, detail string) {
-	tx.alerts = append(tx.alerts, Alert{Time: t.now().UTC().Format(time.RFC3339Nano), Kind: kind, XID: tx.begin.XID, Detail: detail})
-}
-
-func (t *Tap) flushAlerts(tx *txState) error {
-	if len(tx.alerts) == 0 {
+// refused — не транзакционное сообщение: MCP-сервер остановил действие агента
+// пределом строк и откатил его. В базе ничего не изменилось, записей в
+// хранилище нет — есть тревога: человек должен знать, что агент пытался.
+func (t *Tap) refused(m pgoutput.Message) error {
+	if m.Prefix != PrefixRefused || m.LSN <= t.lastRefused {
 		return nil
 	}
-	var buf bytes.Buffer
-	for _, a := range tx.alerts {
-		line, _ := json.Marshal(a)
-		buf.Write(append(line, '\n'))
-		t.log.Warn("alert", "kind", a.Kind, "xid", a.XID, "detail", a.Detail)
+	var c struct {
+		Role string `json:"role"`
+		Info struct {
+			Rows  int `json:"rows"`
+			Limit int `json:"limit"`
+		} `json:"info"`
+	}
+	if json.Unmarshal(m.Content, &c) != nil || !t.roles[c.Role] {
+		return nil
+	}
+	t.lastRefused = m.LSN
+	ev := alert.Event{Time: t.now().UTC().Format(time.RFC3339Nano), Actions: []json.RawMessage{m.Content}}
+	ev.Add(alert.KindRefused, fmt.Sprintf("the MCP server stopped an action that would change %d rows (the limit for one action is %d): it was rolled back, nothing changed",
+		c.Info.Rows, c.Info.Limit))
+	return t.raise(ev)
+}
+
+// raise пишет тревогу в файл и в журнал сборщика.
+func (t *Tap) raise(ev alert.Event) error {
+	for _, s := range ev.Signals {
+		t.log.Warn("alert", "kind", s.Kind, "xid", ev.XID, "detail", s.Detail)
 		t.stats.Alerts++
 	}
-	tx.alerts = nil
-	if _, err := t.alerts.Write(buf.Bytes()); err != nil {
-		return err
+	return t.alerts.Append(ev)
+}
+
+func (t *Tap) alert(tx *txState, kind, detail string) {
+	tx.alert.Add(kind, detail)
+}
+
+// flushAlerts пишет тревогу транзакции одной строкой: все поводы и сводка.
+// entry — строка справочника транзакции, если она записана (у транзакции с
+// поздней отметкой её нет).
+func (t *Tap) flushAlerts(tx *txState, entry *IndexEntry) error {
+	if len(tx.alert.Signals) == 0 {
+		return nil
 	}
-	return t.alerts.Sync()
+	ev := tx.alert
+	tx.alert = alert.Event{}
+	ev.Time, ev.XID = t.now().UTC().Format(time.RFC3339Nano), tx.begin.XID
+	ev.Who, ev.Actions, ev.Undo = tx.who, tx.actions, tx.undo
+	if entry != nil {
+		ev.Changes, ev.Tables, ev.FirstSeq, ev.LastSeq = entry.Changes, entry.Tables, entry.FirstSeq, entry.LastSeq
+	}
+	return t.raise(ev)
 }
 
 // start пишет заголовок потока: к первому изменению отметки уже прочитаны.
@@ -742,7 +736,7 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 	if t.cfg.RequireAction && tx.who != nil && len(tx.actions) == 0 && tx.undo == nil {
 		t.alert(tx, "no-action", "a transaction of a watched role carries no action marker: it did not come through the MCP server")
 	}
-	return t.flushAlerts(tx)
+	return t.flushAlerts(tx, &entry)
 }
 
 // Record — строка потока транзакции после распаковки.

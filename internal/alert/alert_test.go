@@ -1,0 +1,547 @@
+package alert
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode/utf8"
+)
+
+// hook — получатель тревог: помнит принятые запросы; fail — столько
+// следующих запросов отклонить ответом reject.
+type hook struct {
+	mu     sync.Mutex
+	srv    *httptest.Server
+	got    []call // принятые (ответ 200)
+	tried  []time.Time
+	fail   int
+	reject func(w http.ResponseWriter)
+}
+
+type call struct {
+	path string
+	body map[string]any
+}
+
+func newHook(t *testing.T) *hook {
+	h := &hook{reject: func(w http.ResponseWriter) { http.Error(w, "down", http.StatusBadGateway) }}
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.tried = append(h.tried, time.Now())
+		if h.fail != 0 {
+			if h.fail > 0 {
+				h.fail--
+			}
+			h.reject(w)
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil || r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		h.got = append(h.got, call{r.URL.Path, body})
+		w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	t.Cleanup(h.srv.Close)
+	return h
+}
+
+func (h *hook) calls() []call {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]call(nil), h.got...)
+}
+
+func (h *hook) texts() []string {
+	var out []string
+	for _, c := range h.calls() {
+		out = append(out, c.body["text"].(string))
+	}
+	return out
+}
+
+func (h *hook) setFail(n int) {
+	h.mu.Lock()
+	h.fail = n
+	h.mu.Unlock()
+}
+
+func waitFor(t *testing.T, what string, ok func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !ok(); {
+		if time.Now().After(deadline) {
+			t.Fatalf("not within 10 s: %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// rig — файл тревог и доставка одному получателю.
+type rig struct {
+	t   *testing.T
+	dir string
+	log *Log
+	n   *Notifier
+	out *syncWriter // журнал доставки
+}
+
+func newRig(t *testing.T, dir string, targets ...Target) *rig {
+	t.Helper()
+	l, err := OpenLog(filepath.Join(dir, "alerts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &rig{t: t, dir: dir, log: l, out: &syncWriter{}}
+	r.start(targets...)
+	t.Cleanup(func() { r.stop(); l.Close() })
+	return r
+}
+
+type syncWriter struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (r *rig) start(targets ...Target) {
+	r.t.Helper()
+	if err := ValidateTargets(targets); err != nil {
+		r.t.Fatal(err)
+	}
+	n, err := Start(Options{File: r.log.Path(), Dir: r.dir, Targets: targets,
+		Text: TextOptions{Title: "database shop", UndoHint: "esundo check -config undo.json -xid {xid}"},
+		Pace: time.Millisecond, Poll: 20 * time.Millisecond, Retry: 5 * time.Millisecond},
+		slog.New(slog.NewTextHandler(r.out, nil)))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	r.n = n
+	r.log.OnAppend(n.Wake)
+}
+
+func (r *rig) stop() {
+	if r.n != nil {
+		r.n.Close()
+		r.n = nil
+	}
+}
+
+func (r *rig) raise(xid uint32, kind, detail string) {
+	r.t.Helper()
+	e := Event{XID: xid}
+	e.Add(kind, detail)
+	if err := r.log.Append(e); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+func txEvent() Event {
+	e := Event{XID: 749, Changes: 1173, FirstSeq: 3, LastSeq: 4,
+		Tables:  map[string]Counts{"public.accounts": {U: 667, D: 1}, "public.orders": {I: 1, D: 504}, "public.docs": {U: 1}},
+		Who:     json.RawMessage(`{"role":"agent_bot","app":"esmcp/support-bot","op":"UPDATE","table":"public.accounts"}`),
+		Actions: []json.RawMessage{json.RawMessage(`{"role":"agent_bot","info":{"action_id":"20261121T142008Z-11ad","agent":"support-bot","reason":"close inactive accounts"}}`)},
+	}
+	e.Add(KindCanary, "public.accounts: the canary row id=3 was touched (U)")
+	e.Add(KindCanary, "public.accounts: the canary row id=3 was touched (U)") // тот же оператор тронул её дважды
+	e.Add(KindMassChange, "1173 row changes in one transaction (the threshold is 500)")
+	return e
+}
+
+// Одно сообщение на транзакцию: все поводы, кто, какое действие, сколько строк
+// и готовая команда — посмотреть откат.
+func TestTextOfATransactionAlert(t *testing.T) {
+	got := Text(txEvent(), TextOptions{Title: "database shop", UndoHint: "esundo check -config undo.json -xid {xid}"})
+	want := strings.Join([]string{
+		"evidencestore, database shop: agent transaction 749",
+		"• canary: public.accounts: the canary row id=3 was touched (U)",
+		"• mass-change: 1173 row changes in one transaction (the threshold is 500)",
+		"who: role agent_bot, application esmcp/support-bot",
+		`action: 20261121T142008Z-11ad, agent support-bot — reason given: "close inactive accounts"`,
+		"changed: 1173 rows — public.accounts (updated 667, deleted 1); public.orders (inserted 1, deleted 504); public.docs (updated 1)",
+		"store records: 3–4",
+		"undo preview: esundo check -config undo.json -xid 749",
+	}, "\n")
+	if got != want {
+		t.Fatalf("text:\n%s\nwant:\n%s", got, want)
+	}
+	// Служебное событие — без транзакции и без команды отката.
+	down := Event{}
+	down.Add(KindDBDown, "no connection to the database for 1m0s")
+	if got := Text(down, TextOptions{Title: "database shop", UndoHint: "x {xid}"}); got != "evidencestore, database shop\n• db-down: no connection to the database for 1m0s" {
+		t.Fatalf("service text: %q", got)
+	}
+	// Откат откатом не предлагается; транзакция, которой в хранилище нет
+	// (отметка пришла поздно), — тоже.
+	undo := txEvent()
+	undo.Undo = json.RawMessage(`{"info":{}}`)
+	late := Event{XID: 5}
+	late.Add(KindLateMarker, "…")
+	for _, e := range []Event{undo, late} {
+		if strings.Contains(Text(e, TextOptions{UndoHint: "esundo {xid}"}), "undo preview") {
+			t.Fatalf("an undo is offered for %+v", e)
+		}
+	}
+	// Сотни таблиц и поводов, длинные имена и причины: сообщение короче
+	// предела Telegram (4096 знаков) и всё равно доходит до команды отката.
+	big := txEvent()
+	for i := 0; i < 300; i++ {
+		big.Tables[fmt.Sprintf("schema_%d.%s", i, strings.Repeat("t", 600))] = Counts{U: 1000 + i}
+		big.Add(KindCanary, fmt.Sprint(i)+strings.Repeat("ж", 900))
+	}
+	big.Actions = []json.RawMessage{json.RawMessage(`{"info":{"action_id":"a1","reason":"` + strings.Repeat("because ", 500) + `"}}`)}
+	text := Text(big, TextOptions{UndoHint: "esundo check -xid {xid}"})
+	for _, want := range []string{"and 290 more signals", "store records: 3–4\nundo preview: esundo check -xid 749"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the long alert lacks %q", want)
+		}
+	}
+	wide := txEvent()
+	for i := 0; i < 300; i++ {
+		wide.Tables[fmt.Sprintf("schema_%d.t", i)] = Counts{U: 1000 + i}
+	}
+	if got := Text(wide, TextOptions{}); !strings.Contains(got, "schema_299.t (updated 1299); schema_298.t") || !strings.Contains(got, "and 295 more tables") || strings.Contains(got, "cut:") {
+		t.Fatalf("the wide alert:\n%s", got)
+	}
+	if n := utf8.RuneCountInString(text); n > maxText || !utf8.ValidString(text) || !strings.Contains(text, "cut:") {
+		t.Fatalf("%d characters, valid UTF-8: %v, cut: %v", n, utf8.ValidString(text), strings.Contains(text, "cut:"))
+	}
+}
+
+// Три вида получателей: что именно уходит по сети.
+func TestTargetFormats(t *testing.T) {
+	h := newHook(t)
+	r := newRig(t, t.TempDir(),
+		Target{Type: TypeTelegram, URL: h.srv.URL, Token: "123456:SECRET", Chat: "-1001234567890"},
+		Target{Type: TypeSlack, URL: h.srv.URL + "/services/T0/B0/KEY"},
+		Target{Type: TypeJSON, URL: h.srv.URL + "/my/hook"},
+		Target{Name: "channel", Type: TypeTelegram, URL: h.srv.URL + "/", Token: "7:OTHER", Chat: "@ops_alerts"})
+	if err := r.log.Append(txEvent()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "four deliveries", func() bool { return len(h.calls()) == 4 })
+	by := map[string]map[string]any{}
+	for _, c := range h.calls() {
+		by[c.path] = c.body
+	}
+	text := Text(txEvent(), TextOptions{Title: "database shop", UndoHint: "esundo check -config undo.json -xid {xid}"})
+	tg := by["/bot123456:SECRET/sendMessage"]
+	if tg == nil || tg["chat_id"] != float64(-1001234567890) || tg["text"] != text || tg["link_preview_options"].(map[string]any)["is_disabled"] != true {
+		t.Fatalf("telegram: %v", tg)
+	}
+	if ch := by["/bot7:OTHER/sendMessage"]; ch == nil || ch["chat_id"] != "@ops_alerts" {
+		t.Fatalf("telegram channel: %v", ch)
+	}
+	if sl := by["/services/T0/B0/KEY"]; len(sl) != 1 || sl["text"] != text {
+		t.Fatalf("slack: %v", sl)
+	}
+	js := by["/my/hook"]
+	if js == nil || js["text"] != text || js["title"] != "database shop" {
+		t.Fatalf("json: %v", js)
+	}
+	ev := js["events"].([]any)[0].(map[string]any)
+	if ev["xid"] != float64(749) || len(ev["signals"].([]any)) != 2 || ev["first_seq"] != float64(3) {
+		t.Fatalf("json event: %v", ev)
+	}
+}
+
+// Файл — очередь: тревога уходит один раз. Прежние тревоги новому получателю
+// не идут; после перезапуска отправленное не повторяется, а то, что легло в
+// файл, пока доставка стояла, уходит.
+func TestQueueSendsEachAlertOnce(t *testing.T) {
+	h := newHook(t)
+	dir := t.TempDir()
+	l, _ := OpenLog(filepath.Join(dir, "alerts.jsonl"))
+	old := Event{XID: 1}
+	old.Add(KindNoAction, "before the channel was set up")
+	l.Append(old)
+	l.Close()
+
+	target := Target{Type: TypeSlack, URL: h.srv.URL}
+	r := newRig(t, dir, target)
+	r.raise(2, KindNoAction, "first")
+	r.raise(3, KindNoAction, "second")
+	waitFor(t, "two deliveries", func() bool { return len(h.calls()) == 2 })
+	r.stop()
+	r.raise(4, KindNoAction, "while delivery was down")
+	r.start(target)
+	waitFor(t, "the third delivery", func() bool { return len(h.calls()) == 3 })
+	time.Sleep(60 * time.Millisecond) // три прохода опроса: лишнего не пришло
+	var xids []string
+	for _, text := range h.texts() {
+		xids = append(xids, strings.Fields(strings.SplitN(text, "\n", 2)[0])[5])
+	}
+	if got := strings.Join(xids, " "); got != "2 3 4" {
+		t.Fatalf("delivered transactions %s", got)
+	}
+	var c cursorFile
+	data, _ := os.ReadFile(filepath.Join(dir, "notify-slack.json"))
+	fi, _ := os.Stat(filepath.Join(dir, "alerts.jsonl"))
+	if json.Unmarshal(data, &c) != nil || c.Offset != fi.Size() {
+		t.Fatalf("cursor %s, the file is %d bytes", data, fi.Size())
+	}
+}
+
+// Получатель отказал: тревога ждёт в файле и уходит позже, порядок не
+// меняется, вторая не обгоняет первую.
+func TestFailedDeliveryIsRetriedInOrder(t *testing.T) {
+	h := newHook(t)
+	h.setFail(3)
+	r := newRig(t, t.TempDir(), Target{Type: TypeJSON, URL: h.srv.URL})
+	r.raise(1, KindMassChange, "first")
+	r.raise(2, KindMassChange, "second")
+	waitFor(t, "both deliveries", func() bool { return len(h.calls()) == 2 })
+	got := h.texts()
+	if !strings.Contains(got[0], "transaction 1") || !strings.Contains(got[1], "transaction 2") {
+		t.Fatalf("order: %q", got)
+	}
+	h.mu.Lock()
+	tried := len(h.tried)
+	h.mu.Unlock()
+	if tried != 5 {
+		t.Fatalf("%d requests for two alerts after three refusals", tried)
+	}
+	waitFor(t, "the log says delivery is back", func() bool {
+		return strings.Contains(r.logText(), "alerts are delivered again")
+	})
+	if n := strings.Count(r.logText(), "alert not delivered"); n != 1 {
+		t.Fatalf("%d complaints about three refusals in a row:\n%s", n, r.logText())
+	}
+}
+
+func (r *rig) logText() string {
+	r.out.mu.Lock()
+	defer r.out.mu.Unlock()
+	return r.out.b.String()
+}
+
+// Telegram при потоке сообщений отвечает 429 и говорит, сколько ждать:
+// следующая попытка — не раньше.
+func TestTelegramRetryAfterIsHonoured(t *testing.T) {
+	h := newHook(t)
+	h.reject = func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1","parameters":{"retry_after":1}}`))
+	}
+	h.setFail(1)
+	r := newRig(t, t.TempDir(), Target{Type: TypeTelegram, URL: h.srv.URL, Token: "1:T", Chat: "5"})
+	r.raise(1, KindCanary, "x")
+	waitFor(t, "the delivery", func() bool { return len(h.calls()) == 1 })
+	h.mu.Lock()
+	gap := h.tried[1].Sub(h.tried[0])
+	h.mu.Unlock()
+	if gap < time.Second {
+		t.Fatalf("retried %v after a 429 that asked for a second", gap)
+	}
+	if !strings.Contains(r.logText(), "Too Many Requests: retry after 1") {
+		t.Fatalf("the reason is not in the log:\n%s", r.logText())
+	}
+}
+
+// Ответ 200 без ok: true у Telegram — не доставка.
+func TestTelegramOKFalseIsNotDelivery(t *testing.T) {
+	h := newHook(t)
+	h.reject = func(w http.ResponseWriter) { w.Write([]byte(`{"ok":false,"description":"chat not found"}`)) }
+	h.setFail(2)
+	r := newRig(t, t.TempDir(), Target{Type: TypeTelegram, URL: h.srv.URL, Token: "1:T", Chat: "5"})
+	r.raise(1, KindCanary, "x")
+	waitFor(t, "the delivery", func() bool { return len(h.calls()) == 1 })
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.tried) != 3 {
+		t.Fatalf("%d requests", len(h.tried))
+	}
+}
+
+// Получатель долго был недоступен: старые тревоги уходят одной сводкой,
+// последние — по одной.
+func TestBacklogBecomesADigest(t *testing.T) {
+	h := newHook(t)
+	h.setFail(-1) // отказывать, пока не починят
+	r := newRig(t, t.TempDir(), Target{Type: TypeSlack, URL: h.srv.URL})
+	for i := 1; i <= 25; i++ {
+		kind := KindNoAction
+		if i%5 == 0 {
+			kind = KindMassChange
+		}
+		r.raise(uint32(100+i), kind, fmt.Sprint("alert ", i))
+	}
+	waitFor(t, "a refused attempt", func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(h.tried) > 0 })
+	h.setFail(0)
+	waitFor(t, "the digest and the latest ten", func() bool { return len(h.calls()) == 11 })
+	time.Sleep(60 * time.Millisecond)
+	got := h.texts()
+	if len(got) != 11 {
+		t.Fatalf("%d messages", len(got))
+	}
+	for _, want := range []string{"15 alerts were waiting for this channel", "mass-change ×3, no-action ×12", "transactions: 101, 102,", "115"} {
+		if !strings.Contains(got[0], want) {
+			t.Fatalf("the digest lacks %q:\n%s", want, got[0])
+		}
+	}
+	if strings.Contains(got[0], "116") || !strings.Contains(got[1], "transaction 116") || !strings.Contains(got[10], "transaction 125") {
+		t.Fatalf("after the digest: %q … %q", got[1], got[10])
+	}
+}
+
+// Адрес получателя — секрет: ни ключ бота, ни адрес веб-хука не попадают в
+// журнал — ни при отказе сети, ни при ответе с ошибкой.
+func TestSecretsStayOutOfTheLog(t *testing.T) {
+	h := newHook(t)
+	h.reject = func(w http.ResponseWriter) {
+		http.Error(w, `{"ok":false,"description":"Unauthorized"}`, http.StatusUnauthorized)
+	}
+	h.setFail(-1)
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close() // по этому адресу никто не слушает
+	r := newRig(t, t.TempDir(),
+		Target{Type: TypeTelegram, URL: h.srv.URL, Token: "123456:TOKENSECRET", Chat: "5"},
+		Target{Type: TypeSlack, URL: closed.URL + "/services/HOOKSECRET"})
+	r.raise(1, KindCanary, "x")
+	waitFor(t, "both complaints", func() bool { return strings.Count(r.logText(), "alert not delivered") == 2 })
+	log := r.logText()
+	for _, secret := range []string{"TOKENSECRET", "HOOKSECRET", "/bot", closed.URL, h.srv.URL} {
+		if strings.Contains(log, secret) {
+			t.Fatalf("%q is in the log:\n%s", secret, log)
+		}
+	}
+	if !strings.Contains(log, "level=ERROR") || !strings.Contains(log, "check the notify settings") || !strings.Contains(log, "Unauthorized") {
+		t.Fatalf("a refused key must be an error that names the settings:\n%s", log)
+	}
+	if !strings.Contains(log, "notify=telegram") || !strings.Contains(log, "notify=slack") || !strings.Contains(log, "connection refused") {
+		t.Fatalf("the log does not say which target failed and why:\n%s", log)
+	}
+	// И проверка настроек адрес не повторяет.
+	bad := Target{Type: TypeSlack, URL: "http://example.com/services/HOOKSECRET"}
+	if err := bad.Validate(); err == nil || strings.Contains(err.Error(), "HOOKSECRET") {
+		t.Fatalf("validate: %v", err)
+	}
+}
+
+// Тревога, поднятая перед самым выходом (escollect -once), уходит до выхода;
+// получателя, который не отвечает, выход не ждёт.
+func TestCloseDeliversWhatIsQueued(t *testing.T) {
+	h := newHook(t)
+	dead := newHook(t)
+	dead.setFail(-1)
+	r := newRig(t, t.TempDir(), Target{Type: TypeSlack, URL: h.srv.URL}, Target{Type: TypeJSON, URL: dead.srv.URL})
+	for i := 1; i <= 5; i++ {
+		r.raise(uint32(i), KindCanary, "on the way out")
+	}
+	start := time.Now()
+	r.stop()
+	if len(h.calls()) != 5 {
+		t.Fatalf("%d of 5 alerts were delivered before the exit", len(h.calls()))
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("the exit waited %v for a target that does not answer", took)
+	}
+}
+
+func TestValidateTargets(t *testing.T) {
+	good := []Target{
+		{Type: TypeTelegram, Token: "1:T", Chat: "@ops"},
+		{Type: TypeSlack, URL: "https://hooks.slack.com/services/T/B/X"},
+		{Type: TypeJSON, URL: "http://127.0.0.1:9000/hook"},
+		{Name: "second", Type: TypeJSON, URL: "http://localhost/hook"},
+	}
+	if err := ValidateTargets(good); err != nil {
+		t.Fatal(err)
+	}
+	if good[0].Name != "telegram" || good[3].Name != "second" {
+		t.Fatalf("names: %+v", good)
+	}
+	for name, bad := range map[string][]Target{
+		"telegram without chat":     {{Type: TypeTelegram, Token: "1:T"}},
+		"telegram without token":    {{Type: TypeTelegram, Chat: "5"}},
+		"slack without url":         {{Type: TypeSlack}},
+		"http to another machine":   {{Type: TypeJSON, URL: "http://alerts.example.com/hook"}},
+		"not an address":            {{Type: TypeJSON, URL: "alerts"}},
+		"ftp":                       {{Type: TypeJSON, URL: "ftp://127.0.0.1/x"}},
+		"unknown type":              {{Type: "email", URL: "https://x"}},
+		"no type":                   {{URL: "https://x"}},
+		"token for slack":           {{Type: TypeSlack, URL: "https://x", Token: "t"}},
+		"two targets with one name": {{Type: TypeJSON, URL: "https://a"}, {Type: TypeJSON, URL: "https://b"}},
+		"name with a slash":         {{Name: "../x", Type: TypeJSON, URL: "https://a"}},
+	} {
+		if err := ValidateTargets(bad); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// Падение посреди записи тревоги: обрывок без перевода строки отрезается при
+// открытии, а доставка недописанную строку не читает.
+func TestTornTail(t *testing.T) {
+	h := newHook(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alerts.jsonl")
+	r := newRig(t, dir, Target{Type: TypeSlack, URL: h.srv.URL})
+	r.raise(1, KindCanary, "whole")
+	waitFor(t, "the delivery", func() bool { return len(h.calls()) == 1 })
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(`{"time":"x","xid":2,"signals":[{"kind":"can`)
+	f.Close()
+	r.n.Wake()
+	time.Sleep(60 * time.Millisecond)
+	if len(h.calls()) != 1 {
+		t.Fatal("a torn line was sent")
+	}
+	r.stop()
+	r.log.Close()
+	l, err := OpenLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	e := Event{XID: 3}
+	e.Add(KindCanary, "after the restart")
+	l.Append(e)
+	data, _ := os.ReadFile(path)
+	if lines := strings.Split(strings.TrimSpace(string(data)), "\n"); len(lines) != 2 || !strings.Contains(lines[1], `"xid":3`) {
+		t.Fatalf("the file after the restart:\n%s", data)
+	}
+	if err := l.Append(Event{}); err == nil {
+		t.Fatal("an event without a signal was written")
+	}
+}
+
+// Файл тревог заменили коротким (ротация): в нём всё новое, и оно уходит.
+func TestReplacedFileIsReadFromItsStart(t *testing.T) {
+	h := newHook(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alerts.jsonl")
+	r := newRig(t, dir, Target{Type: TypeSlack, URL: h.srv.URL})
+	r.raise(1, KindCanary, strings.Repeat("long ", 50))
+	r.raise(2, KindCanary, strings.Repeat("long ", 50))
+	waitFor(t, "two deliveries", func() bool { return len(h.calls()) == 2 })
+	if err := os.WriteFile(path, []byte(`{"time":"t","xid":9,"signals":[{"kind":"canary","detail":"new file"}]}`+"\nnot an alert\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.n.Wake()
+	waitFor(t, "the alert of the new file", func() bool { return len(h.calls()) == 3 })
+	if text := h.texts()[2]; !strings.Contains(text, "transaction 9") {
+		t.Fatalf("%q", text)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if len(h.calls()) != 3 {
+		t.Fatal("the line that is not an alert was sent, or the alert was sent twice")
+	}
+}

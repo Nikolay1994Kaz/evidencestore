@@ -12,12 +12,23 @@
 //	    применить сверенный план одной транзакцией. Строка, изменившаяся
 //	    после сверки, отменяет откат целиком: сверьте заново
 //
+// С файлом настроек (-config undo.json) записи транзакции программа достаёт из
+// хранилища сама — командами выдачи пакета и проверки из настроек, — и от
+// тревоги до отката остаются две команды:
+//
+//	esundo check -config undo.json -xid N       сверить и записать план undo-N.json
+//	esundo apply -config undo.json -plan undo-N.json -by WHO
+//
+// undo.json: {"dsn": "…", "index": "…/index.jsonl", "stamp": […], "proof": […],
+// "verify": […], "wait": "15s"} — подключение к базе и раздел pgundo.Fetcher.
+//
 // Коды выхода: 0 — готово, 1 — ошибка вызова или базы, 2 — откат построить
 // нельзя (TRUNCATE, таблица без REPLICA IDENTITY FULL, транзакция не вся),
 // 3 — строка изменилась после сверки, ничего не применено.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,8 +62,33 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage:\n  esundo check -bodies DIR -xid N [-dsn DSN] [-out plan.json]\n  esundo apply -plan plan.json -dsn DSN -by WHO [-reason WHY]\n  esundo version")
+	fmt.Fprintln(os.Stderr, "usage:\n  esundo check -config undo.json -xid N [-out plan.json]\n  esundo check -bodies DIR -xid N [-dsn DSN] [-out plan.json]\n"+
+		"  esundo apply [-config undo.json] -plan plan.json [-dsn DSN] -by WHO [-reason WHY]\n  esundo version")
 	os.Exit(1)
+}
+
+// Config — undo.json: подключение к базе и то, как достать записи транзакции
+// из хранилища.
+type Config struct {
+	// DSN — подключение ролью, которой можно менять таблицы (владелец):
+	// "host=db user=owner dbname=shop sslmode=verify-full".
+	DSN string `json:"dsn"`
+	pgundo.Fetcher
+}
+
+func loadConfig(path string) *Config {
+	data, err := os.ReadFile(path)
+	fail(err)
+	var c Config
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		fail(fmt.Errorf("%s: %w", path, err))
+	}
+	if err := c.Validate(filepath.Dir(path)); err != nil {
+		fail(fmt.Errorf("%s: %w", path, err))
+	}
+	return &c
 }
 
 func fail(err error) {
@@ -113,17 +149,34 @@ func dial(dsn string) *pgwire.Conn {
 
 func check(args []string) {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
-	dir := fs.String("bodies", "", "directory of record bodies written by esverify")
+	cfgPath := fs.String("config", "", "undo.json: fetch the records from the store and take the database from there")
+	dir := fs.String("bodies", "", "directory of record bodies written by esverify (instead of -config)")
 	xid := fs.Uint("xid", 0, "the transaction to undo")
 	dsn := fs.String("dsn", "", "database to check the plan against; without it the plan is only printed")
-	out := fs.String("out", "", "write the checked plan here, for esundo apply")
+	out := fs.String("out", "", "write the checked plan here, for esundo apply (with -config: undo-<xid>.json)")
 	show := fs.Int("show", 10, "how many conflicts to print")
 	fs.Parse(args)
-	if *dir == "" || *xid == 0 {
+	if (*dir == "") == (*cfgPath == "") || *xid == 0 {
 		usage()
 	}
-	lines, err := bodies(*dir)
-	fail(err)
+	var lines [][]byte
+	var err error
+	if *cfgPath != "" {
+		// Записи — из хранилища: пакет на каждую, проверка — командой из настроек.
+		cfg := loadConfig(*cfgPath)
+		if *dsn == "" {
+			*dsn = cfg.DSN
+		}
+		if *out == "" && *dsn != "" {
+			*out = fmt.Sprintf("undo-%d.json", *xid)
+		}
+		lines, err = cfg.Fetch(uint32(*xid))
+		fail(err)
+		fmt.Printf("fetched from the store and verified: %d records\n", len(lines))
+	} else {
+		lines, err = bodies(*dir)
+		fail(err)
+	}
 	p, err := pgundo.Build(uint32(*xid), lines)
 	fail(err)
 
@@ -193,16 +246,25 @@ func check(args []string) {
 		fail(err)
 		fail(os.WriteFile(*out, data, 0o600))
 		fmt.Printf("checked plan written to %s\n", *out)
+		if *cfgPath != "" && ok > 0 {
+			// Как звали эту программу, так и подсказывать: команда должна
+			// сработать как есть.
+			fmt.Printf("to apply it: %s apply -config %s -plan %s -by YOUR_NAME -reason \"…\"\n", os.Args[0], *cfgPath, *out)
+		}
 	}
 }
 
 func apply(args []string) {
 	fs := flag.NewFlagSet("apply", flag.ExitOnError)
-	path := fs.String("plan", "", "the checked plan written by esundo check -out")
+	cfgPath := fs.String("config", "", "undo.json: take the database from there")
+	path := fs.String("plan", "", "the checked plan written by esundo check")
 	dsn := fs.String("dsn", "", "database to apply the undo to")
 	by := fs.String("by", "", "who undoes (goes into the journal)")
 	reason := fs.String("reason", "", "why (goes into the journal)")
 	fs.Parse(args)
+	if *cfgPath != "" && *dsn == "" {
+		*dsn = loadConfig(*cfgPath).DSN
+	}
 	if *path == "" || *dsn == "" || *by == "" {
 		usage()
 	}
