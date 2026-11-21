@@ -6,8 +6,9 @@
 #     → espgtap: логическая репликация (pgoutput), только транзакции агента и отката,
 #                сжатые части в journal.jsonl, тревоги
 #     → escollect → evidencestore: источник с "subject_field": "xid"   (хранилище не изменено)
-#     → пакеты записей транзакции → esverify → undo.py: обратные операции, сверка с базой,
+#     → пакеты записей транзакции → esverify → esundo: обратные операции, сверка с базой,
 #                одна транзакция отката; сам откат тоже ложится в журнал
+#   Откат делают двое: оператор командой esundo и сам агент инструментом MCP undo_apply.
 #
 # Что происходит: агент делает хорошее действие и плохое (обнуляет треть счетов,
 # удаляет заказы, удаляет счёт, портит документ в 1,5 МБ). Человек после него
@@ -48,7 +49,7 @@ field() { python3 -I -c 'import json,sys; v=json.loads(sys.argv[1])[sys.argv[2]]
 
 step "сборка"
 if [ -n "${ES_BIN:-}" ]; then "$BIN/evidencestore" version; else go build -o "$BIN/" ./cmd/...; fi
-for b in evidencestore escollect esverify espgtap esmcp; do [ -x "$BIN/$b" ] || die "нет $BIN/$b"; done
+for b in evidencestore escollect esverify espgtap esmcp esundo; do [ -x "$BIN/$b" ] || die "нет $BIN/$b"; done
 
 if [ -z "${PGBIN:-}" ]; then
   PGBIN=$(pg_config --bindir 2>/dev/null || true)
@@ -68,7 +69,7 @@ mkdir -p "$WORK/pg" "$WORK/sock"
 [ ${#AS_PG[@]} -eq 0 ] || chown postgres "$WORK/pg" "$WORK/sock"
 
 cleanup() {
-  kill "${SERVER:-}" "${TAP:-}" 2>/dev/null || true
+  kill "${SERVER:-}" "${TAP:-}" "${COLLECT:-}" "${COLLECT_MCP:-}" 2>/dev/null || true
   as_pg "$PGBIN/pg_ctl" -D "$WORK/pg" -m fast stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -132,13 +133,6 @@ TAP=$!
 for _ in $(seq 100); do grep -q 'msg=streaming' "$WORK/pgtap.log" 2>/dev/null && break; sleep 0.1; done
 grep -q 'msg=streaming' "$WORK/pgtap.log" || die "espgtap не начал читать журнал: $(cat "$WORK/pgtap.log")"
 
-cat >"$WORK/mcp.json" <<EOF
-{
-  "dsn": "host=$WORK/sock port=$PGPORT user=agent_bot dbname=shop",
-  "agent": "support-bot",
-  "receipts": "mcp/receipts.jsonl"
-}
-EOF
 # mcp ИНСТРУМЕНТ JSON: вызов инструмента так, как его делает агент (stdio, ревизия MCP 2026-07-28).
 mcp() { python3 -I "$HERE/mcp_call.py" "$BIN/esmcp" "$WORK/mcp.json" "$1" "$2" 2>>"$WORK/mcp.log"; }
 sql_arg() { python3 -I -c 'import json,sys; print(json.dumps({"sql": sys.stdin.read(), "reason": sys.argv[1]}))' "$1"; }
@@ -174,10 +168,31 @@ for s in "$SRC:pgtap/journal.jsonl" "agent-mcp:mcp/receipts.jsonl"; do
   "server": "https://127.0.0.1:$PORT",
   "ca": "pki/ca.crt", "cert": "pki/${s%%:*}.crt", "key": "pki/${s%%:*}.key",
   "store_key": "$STORE_KEY",
-  "spool_dir": "spool-${s%%:*}", "file": "${s##*:}", "from_start": true
+  "spool_dir": "spool-${s%%:*}", "file": "${s##*:}", "from_start": true, "flush_every": "200ms"
 }
 EOF
 done
+# Сборщики хранилища работают постоянно, как в жизни: строка журнала уезжает сама.
+touch "$WORK/pgtap/journal.jsonl" "$WORK/mcp/receipts.jsonl"
+"$BIN/escollect" -config "$WORK/collector-$SRC.json" 2>"$WORK/collect.log" &
+COLLECT=$!
+"$BIN/escollect" -config "$WORK/collector-agent-mcp.json" 2>"$WORK/collect-mcp.log" &
+COLLECT_MCP=$!
+# MCP-сервер агента. Секция undo — как ему достать до-образы из хранилища и
+# чем их проверить: ключ хранилища и доверие к меткам времени заданы здесь.
+cat >"$WORK/mcp.json" <<EOF
+{
+  "dsn": "host=$WORK/sock port=$PGPORT user=agent_bot dbname=shop",
+  "agent": "support-bot",
+  "receipts": "mcp/receipts.jsonl",
+  "undo": {
+    "index": "pgtap/index.jsonl",
+    "stamp": ["$BIN/evidencestore", "stamp", "-config", "$CFG"],
+    "proof": ["$BIN/evidencestore", "proof", "-config", "$CFG", "-source", "$SRC", "-dek"],
+    "verify": ["$BIN/esverify", "-store-key", "$STORE_KEY", "-tsa-trust", "$WORK/tsa-root.crt"]
+  }
+}
+EOF
 "$BIN/evidencestore" tsa-root -config "$CFG" -out "$WORK/tsa-root.crt" >/dev/null 2>&1
 
 INDEX=$WORK/pgtap/index.jsonl
@@ -188,8 +203,20 @@ wait_tx() {
   die "транзакция $1 не дошла до журнала сборщика: $(tail -3 "$WORK/pgtap.log")"
 }
 entry() { grep "^{\"xid\":$1," "$INDEX" | tail -1; }
-ship() { "$BIN/escollect" -config "$WORK/collector-$SRC.json" -once 2>&1 | tail -1; }
-ship_receipts() { "$BIN/escollect" -config "$WORK/collector-agent-mcp.json" -once >/dev/null 2>&1; }
+max_seq() {
+  "$BIN/evidencestore" status -config "$CFG" |
+    python3 -I -c 'import json,sys; print(next((s["max_seq"] for s in json.load(sys.stdin)["sources"] if s["name"]==sys.argv[1]), 0))' "$1"
+}
+# shipped ИСТОЧНИК ФАЙЛ: дождаться, пока хранилище примет все строки файла.
+shipped() {
+  local want
+  want=$(wc -l <"$2")
+  for _ in $(seq 3000); do [ "$(max_seq "$1")" -ge "$want" ] && return 0; sleep 0.1; done
+  die "хранилище не получило записи источника $1: есть $(max_seq "$1"), ждали $want"
+}
+ship() { shipped "$SRC" "$WORK/pgtap/journal.jsonl"; }
+ship_receipts() { shipped agent-mcp "$WORK/mcp/receipts.jsonl"; }
+OPDSN="host=$WORK/sock port=$PGPORT user=postgres dbname=shop"
 stamp() { "$BIN/evidencestore" stamp -config "$CFG" >/dev/null; }
 alerts() { [ -s "$ALERTS" ] && python3 -I -c 'import json,sys; print(" ".join(sorted({json.loads(l)["kind"] for l in open(sys.argv[1]) if json.loads(l)["xid"] == int(sys.argv[2])})))' "$ALERTS" "$1" || true; }
 # owner_tx: транзакция владельца (человека) из stdin, печатает её xid.
@@ -207,7 +234,7 @@ SQL
 # fetch XID DIR: записи транзакции пакетами одной записи — готовы сразу после
 # метки времени, окно ждать не надо. Номера записей — из индекса сборщика
 # (строка журнала = запись источника); что это части именно этой транзакции и
-# что они все, проверяет undo.py по самим телам.
+# что они все, проверяет esundo по самим телам.
 fetch() {
   local e first last n
   e=$(entry "$1"); first=$(field "$e" first_line); last=$(field "$e" last_line)
@@ -318,36 +345,33 @@ T_FETCH=$(since "$T")
 echo "записей $N, каждая VERIFIED; выдача и проверка — $T_FETCH с; от действия агента прошло $(since "$T_ACTION") с"
 BUNDLE_BYTES=$(size "$U/bundles")
 
-step "план отката: обратные операции в обратном порядке"
-python3 -I "$HERE/undo.py" plan -bodies "$U/bodies" -xid "$BAD" -out "$U" | tee "$U/plan.txt"
-grep -q "действие $BAD_ACTION: агент support-bot" "$U/plan.txt" || die "в до-образах нет отметки действия $BAD_ACTION"
-
-step "сверка с базой: что сейчас на месте каждой строки"
+step "оператор, esundo check: план отката и сверка с базой — что сейчас на месте каждой строки"
 T=$(now)
-"${OWNER[@]}" -f "$U/check.sql" >"$U/check.tsv"
-python3 -I "$HERE/undo.py" sql -plan "$U" -check "$U/check.tsv" -by "nikolay" -reason "action $BAD_ACTION closed live accounts" | tee "$U/sql.txt"
+"$BIN/esundo" check -bodies "$U/bodies" -xid "$BAD" -dsn "$OPDSN" -out "$U/plan.json" | tee "$U/check.txt"
 T_CHECK=$(since "$T")
-grep -q 'конфликтов 2$' "$U/sql.txt" || die "ждали два конфликта (счёт 6 и заказ 1)"
-grep -q 'уже в нужном виде 1,' "$U/sql.txt" || die "ждали один шаг «уже сделано» (заказ-возврат человек удалил сам)"
+grep -q "action $BAD_ACTION: agent support-bot" "$U/check.txt" || die "в до-образах нет отметки действия $BAD_ACTION"
+grep -q 'already as before 1, conflicts 2$' "$U/check.txt" || die "ждали два конфликта (счёт 6 и заказ 1) и один шаг «уже сделано» (заказ-возврат человек удалил сам)"
 
 step "гонка: между сверкой и откатом человек правит ещё одну строку (счёт 9)"
 state() { "${OWNER[@]}" -At -F ' ' -c "select (select count(*) from accounts where balance = 0), 'счетов с нулём,', (select count(*) from orders), 'заказов'"; }
 BEFORE=$(state)
 owner_tx >/dev/null <<<"update accounts set note = 'late human edit' where id = 9;"
-if "${OWNER[@]}" -f "$U/undo.sql" >"$U/race.txt" 2>&1; then die "откат прошёл поверх строки, изменённой после сверки"; fi
-grep -m1 -o 'undo: .*' "$U/race.txt" || die "откат упал не на своей проверке: $(cat "$U/race.txt")"
+RC=0
+"$BIN/esundo" apply -plan "$U/plan.json" -dsn "$OPDSN" -by nikolay -reason "action $BAD_ACTION closed live accounts" >"$U/race.txt" 2>&1 || RC=$?
+[ "$RC" = 3 ] || die "ждали отказ с кодом 3 (строка изменилась после сверки), получили $RC: $(cat "$U/race.txt")"
+cat "$U/race.txt"
 [ "$(state)" = "$BEFORE" ] || die "сорванный откат что-то применил: было $BEFORE, стало $(state)"
 echo "откат не применён вовсе: по-прежнему $BEFORE. Сверка заново:"
-"${OWNER[@]}" -f "$U/check.sql" >"$U/check.tsv"
-python3 -I "$HERE/undo.py" sql -plan "$U" -check "$U/check.tsv" -by "nikolay" -reason "action $BAD_ACTION closed live accounts" -show 0 | tee "$U/sql.txt"
-grep -q 'конфликтов 3$' "$U/sql.txt" || die "после правки счёта 9 ждали три конфликта"
+"$BIN/esundo" check -bodies "$U/bodies" -xid "$BAD" -dsn "$OPDSN" -out "$U/plan.json" -show 0 | grep '^checked' | tee "$U/check.txt"
+grep -q 'conflicts 3$' "$U/check.txt" || die "после правки счёта 9 ждали три конфликта"
 
-step "откат: одна транзакция"
+step "оператор, esundo apply: одна транзакция"
 T=$(now)
-UNDO=$("${OWNER[@]}" -f "$U/undo.sql" | sed -n 's/^undo_xid=//p')
+"$BIN/esundo" apply -plan "$U/plan.json" -dsn "$OPDSN" -by nikolay -reason "action $BAD_ACTION closed live accounts" | tee "$U/apply.txt"
 T_APPLY=$(since "$T")
+UNDO=$(sed -n 's/.* in transaction //p' "$U/apply.txt")
 [ -n "$UNDO" ] || die "откат не применился"
-echo "применён за $T_APPLY с, транзакция отката $UNDO; от действия агента до возврата данных — $(since "$T_ACTION") с"
+echo "применён за $T_APPLY с; от действия агента до возврата данных — $(since "$T_ACTION") с"
 
 step "итог: база против снимка до плохого действия"
 "${OWNER[@]}" -At -F ' ' >"$U/diff.txt" <<'SQL'
@@ -362,21 +386,23 @@ cat "$U/diff.txt"
 [ "$(tr '\n' ';' <"$U/diff.txt")" = "accounts 1;accounts 6;accounts 9;orders 1;" ] || die "отличаться должны только счета 1, 6 и 9 (правки человека) и заказ 1 (заведён человеком)"
 echo "отличаются от снимка только четыре строки, которые после агента тронул человек; документ в 1,5 МБ вернулся"
 
-step "повторный откат: применять нечего"
-"${OWNER[@]}" -f "$U/check.sql" >"$U/check2.tsv"
-python3 -I "$HERE/undo.py" sql -plan "$U" -check "$U/check2.tsv" -show 0 | tee "$U/sql2.txt"
-grep -q 'применить 0,' "$U/sql2.txt" || die "второй откат нашёл, что применять"
+step "повторная сверка: применять нечего"
+"$BIN/esundo" check -bodies "$U/bodies" -xid "$BAD" -dsn "$OPDSN" -show 0 | grep '^checked' | tee "$U/check2.txt"
+grep -q 'to apply 0,' "$U/check2.txt" || die "вторая сверка нашла, что применять"
 
 step "сам откат — тоже транзакция в журнале: кто, что и почему откатил"
 wait_tx "$UNDO"
-ship >/dev/null
+ship
 stamp
 mkdir -p "$WORK/undo-tx"
 fetch "$UNDO" "$WORK/undo-tx" >/dev/null
-python3 -I "$HERE/undo.py" plan -bodies "$WORK/undo-tx/bodies" -xid "$UNDO" -out "$WORK/undo-tx" | head -2 | tee "$WORK/undo-tx/plan.txt"
-grep -q "\"undoes_xid\": \"$BAD\"" "$WORK/undo-tx/plan.txt" || die "в записи отката нет ссылки на транзакцию $BAD"
+"$BIN/esundo" check -bodies "$WORK/undo-tx/bodies" -xid "$UNDO" >"$WORK/undo-tx/plan.txt"
+head -2 "$WORK/undo-tx/plan.txt" | cut -c1-230
+grep -q "\"undoes_xid\":\"$BAD\"" "$WORK/undo-tx/plan.txt" || die "в записи отката нет ссылки на транзакцию $BAD"
 
 step "квитанция действия из источника agent-mcp: что агент просил"
+ship_receipts
+stamp
 RSEQ=$(grep -n "\"action_id\":\"$BAD_ACTION\"" "$WORK/mcp/receipts.jsonl" | cut -d: -f1)
 "$BIN/evidencestore" proof -config "$CFG" -source agent-mcp -seq "$RSEQ" -dek -out "$WORK/receipt.json" >/dev/null 2>&1 || die "пакет квитанции не выдан"
 "$BIN/esverify" -proof "$WORK/receipt.json" -store-key "$STORE_KEY" -tsa-trust "$WORK/tsa-root.crt" -body "$WORK/receipt.txt" >/dev/null 2>&1 || die "квитанция не прошла проверку"
@@ -387,12 +413,33 @@ assert r["action_id"] == sys.argv[2] and r["xid"] == sys.argv[3] and r["outcome"
 print(f"VERIFIED: действие {r['action_id']}, агент {r['agent']}, транзакция {r['xid']}, причина «{r['reason']}», запрос на {len(r['sql'])} байт")
 PY
 
+# ---------------------------------------------------------------- откат через MCP
+
+step "агент ошибается ещё раз и откатывает себя сам: инструменты MCP undo_preview и undo_apply"
+R=$(mcp execute "$(sql_arg "double the bonus" <<<"update accounts set balance = balance * 2 where id between 100 and 199")") || die "действие не прошло"
+ACT2=$(field "$R" action_id); XID2=$(field "$R" xid)
+T_ACTION2=$(now)
+echo "действие $ACT2, транзакция $XID2: балансы ста счетов удвоены"
+"${OWNER[@]}" -qc "update accounts set note = 'human touched 150' where id = 150"
+P=$(mcp undo_preview "{\"action_id\": \"$ACT2\"}") || die "undo_preview: $P"
+python3 -I "$HERE/preview_check.py" "$P"
+A=$(mcp undo_apply "{\"action_id\": \"$ACT2\", \"reason\": \"bonus applied twice\"}") || die "undo_apply: $A"
+UNDO2=$(field "$A" undo_xid)
+echo "undo_apply: возвращено $(field "$A" applied) строк транзакцией $UNDO2, действие отката $(field "$A" undo_action_id); от ошибки до возврата — $(since "$T_ACTION2") с"
+[ "$("${OWNER[@]}" -Atc "select count(*) from accounts a join snap.accounts s using (id) where a.id between 100 and 199 and a.balance <> s.balance")" = 1 ] ||
+  die "после отката через MCP отличаться от снимка должен только счёт 150 (его правил человек)"
+wait_tx "$UNDO2"
+E=$(entry "$UNDO2")
+[ "$(alerts "$UNDO2")" = "" ] || die "откат через MCP поднял тревогу: $(alerts "$UNDO2")"
+echo "в журнале сборщика откат — транзакция роли $(python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); print(e["who"]["role"], "с отметкой отката действия", e["undo"]["info"]["undoes_action"])' "$E")"
+grep -q "\"tool\":\"undo_apply\".*\"undoes\":\"$ACT2\"" "$WORK/mcp/receipts.jsonl" || die "нет квитанции отката"
+
 # ---------------------------------------------------------------- окно времени
 
 if [ "$WINDOW" = 1 ]; then
   step "пакет по окну времени (доказывает, что записей транзакции больше нет): ждём 135 с"
   sleep 135
-  tick() { wait_tx "$(field "$(mcp execute "$(sql_arg tick <<<"update docs set body = '$1' where id = 2")")" xid)"; ship >/dev/null; }
+  tick() { wait_tx "$(field "$(mcp execute "$(sql_arg tick <<<"update docs set body = '$1' where id = 2")")" xid)"; ship; }
   tick "tick 1"
   stamp # закрывающая метка
   tick "tick 2"
@@ -403,12 +450,13 @@ if [ "$WINDOW" = 1 ]; then
   "$BIN/esverify" -proof "$W/bundle.json" -store-key "$STORE_KEY" -tsa-trust "$WORK/tsa-root.crt" -json >"$W/report.json"
   "$BIN/esverify" -proof "$W/bundle.json" -store-key "$STORE_KEY" -tsa-trust "$WORK/tsa-root.crt" -bodies "$W/bodies" >"$W/esverify.txt" 2>&1
   grep -q '^VERIFIED' "$W/esverify.txt" || die "пакет по окну не прошёл проверку"
-  python3 -I "$HERE/undo.py" plan -bodies "$W/bodies" -xid "$BAD" -report "$W/report.json" -out "$W" >/dev/null
+  "$BIN/esundo" check -bodies "$W/bodies" -xid "$BAD" -dsn "$OPDSN" -out "$W/plan.json" >/dev/null
   python3 -I - "$U/plan.json" "$W/plan.json" "$W/report.json" "$(stat -c %s "$W/bundle.json")" <<'PY'
 import json, sys
 a, b, rep = (json.load(open(p)) for p in sys.argv[1:4])
 assert a["steps"] == b["steps"] and a["changes"] == b["changes"], "планы по пакетам записей и по окну разошлись"
 s = rep["subject"]
+assert s["unlabeled"] == 0 and s["opened"] == s["records"], s
 print(f"VERIFIED: в окне записей источника {rep['records_in_window']}, этой транзакции {s['records']} (открыто {s['opened']}), чужих закрытых {s['others_closed']}, без метки {s['unlabeled']}")
 print(f"план из пакета по окну совпал с планом из пакетов записей: {len(a['steps'])} шагов; пакет — {int(sys.argv[4]) // 1024} КБ")
 PY

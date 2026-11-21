@@ -2,8 +2,11 @@ package mcpserver
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,12 +17,18 @@ import (
 
 // fakeDB записывает запросы и отвечает по подстроке.
 type fakeDB struct {
-	log  []string
-	fail map[string]error
+	log     []string
+	fail    map[string]error
+	answers func(sql string) ([]pgwire.Result, bool)
 }
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
 	d.log = append(d.log, sql)
+	if d.answers != nil {
+		if res, ok := d.answers(sql); ok {
+			return res, nil
+		}
+	}
 	for sub, err := range d.fail {
 		if strings.Contains(sql, sub) {
 			return nil, err
@@ -233,5 +242,95 @@ func TestServeAnswersLineByLine(t *testing.T) {
 	}
 	if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); len(lines) != 2 || !strings.Contains(lines[1], `"id":2`) {
 		t.Fatalf("%q", out.String())
+	}
+}
+
+// journalLine — транзакция 751 одной записью журнала espgtap: строка 6 была "a", стала "b".
+func journalLine() []byte {
+	stream := `{"t":"H","v":1,"xid":751}
+{"t":"R","id":1,"schema":"public","table":"accounts","identity":"f","columns":["id","note"],"types":["integer","text"],"pk":["id"]}
+{"t":"U","r":1,"old":["6","a"],"new":["6","b"]}
+{"t":"U","r":1,"old":["7","a"],"new":["7","b"]}
+{"t":"C","changes":2}
+`
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	gz.Write([]byte(stream))
+	gz.Close()
+	return fmt.Appendf(nil, `{"xid":751,"part":1,"last":true,"gz":"%s"}`, base64.StdEncoding.EncodeToString(buf.Bytes()))
+}
+
+func TestUndoPreviewAndApply(t *testing.T) {
+	text := func(s string) *string { return &s }
+	db := &fakeDB{}
+	s, path := newServer(t, db)
+	s.cfg.ReceiptsPath = path
+	fetched := 0
+	s.cfg.Fetch = func(xid uint32) ([][]byte, error) {
+		fetched++
+		if xid != 751 {
+			return nil, errors.New("wrong xid")
+		}
+		return [][]byte{journalLine()}, nil
+	}
+	// Без настройки хранилища инструментов отката нет вовсе.
+	if n := len(ask(t, New(Config{Agent: "a"}, nil), `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)["result"].(map[string]any)["tools"].([]any)); n != 3 {
+		t.Fatalf("%d tools without a store", n)
+	}
+	if n := len(ask(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)["result"].(map[string]any)["tools"].([]any)); n != 5 {
+		t.Fatalf("%d tools", n)
+	}
+	if _, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'b'"}`); isErr {
+		t.Fatal("execute failed")
+	}
+	// База: строка 7 всё ещё такая, какой её оставило действие; строку 6 потом поправил человек.
+	db.answers = func(sql string) ([]pgwire.Result, bool) {
+		switch {
+		case strings.Contains(sql, "to_regclass"):
+			return []pgwire.Result{{Rows: [][]*string{{text("t"), text("t")}}}}, true
+		case strings.HasPrefix(sql, "SELECT w.step"):
+			return []pgwire.Result{{Rows: [][]*string{{text("1"), text("ok"), nil}, {text("2"), text("changed"), text(`{"id":6,"note":"human"}`)}}}}, true
+		case strings.HasPrefix(sql, `UPDATE "public"."accounts" t SET`):
+			return []pgwire.Result{{Tag: "UPDATE 1"}}, true
+		}
+		return nil, false
+	}
+	out, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`)
+	if isErr {
+		t.Fatal(out)
+	}
+	var pv map[string]any
+	json.Unmarshal([]byte(out), &pv)
+	c := pv["conflicts"].([]any)[0].(map[string]any)
+	if pv["to_apply"] != float64(1) || pv["conflicts_total"] != float64(1) || c["key"] != "id=6" || c["state"] != "changed" ||
+		c["columns"].([]any)[0].(map[string]any)["now"] != "human" {
+		t.Fatalf("%s", out)
+	}
+	before := len(db.log)
+	s.newID = func() string { return "u-1" }
+	out, isErr = callText(t, s, "undo_apply", `{"action_id":"a-1","reason":"wrong rows"}`)
+	if isErr || !strings.Contains(out, `"undo_action_id":"u-1"`) || !strings.Contains(out, `"applied":1`) {
+		t.Fatalf("%v %s", isErr, out)
+	}
+	// Откат — отметка с номером своего действия и того, что он возвращает; одна команда на годный шаг.
+	var mark, update string
+	for _, q := range db.log[before:] {
+		if strings.Contains(q, "evidence.mark_undo") {
+			mark = q
+		}
+		if strings.HasPrefix(q, "UPDATE") {
+			update = q
+		}
+	}
+	if !strings.Contains(mark, `"action_id":"u-1"`) || !strings.Contains(mark, `"undoes_action":"a-1"`) || !strings.Contains(update, "(1, '7'::integer") || strings.Contains(update, "'6'") {
+		t.Fatalf("mark %s\nupdate %s", mark, update)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"tool":"undo_apply"`) || !strings.Contains(string(data), `"undoes":"a-1"`) || fetched != 2 {
+		t.Fatalf("fetched %d\n%s", fetched, data)
+	}
+	// Чужое и несостоявшееся действие откатить нельзя.
+	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"nope"}`); !isErr || !strings.Contains(out, "not in this server's receipts") {
+		t.Fatalf("%v %s", isErr, out)
 	}
 }

@@ -1,7 +1,8 @@
 // Package mcpserver — MCP-сервер, через который ИИ-агент ходит в PostgreSQL.
 //
-// Агент получает три инструмента: query (чтение), execute (изменение) и
-// actions (что он уже делал). Каждый вызов execute — одно действие: сервер
+// Агент получает инструменты: query (чтение), execute (изменение), actions
+// (что он уже делал) и, если сервер настроен на хранилище, undo_preview и
+// undo_apply (откат своего действия по до-образам из хранилища). Каждый вызов execute — одно действие: сервер
 // открывает транзакцию, кладёт в неё отметку действия (evidence.mark_action —
 // она уходит в журнал базы под тем же номером транзакции, что и изменения
 // строк), исполняет запрос и пишет квитанцию: кто, что, какая транзакция, чем
@@ -29,9 +30,11 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
@@ -62,9 +65,14 @@ type Config struct {
 	// Dial открывает соединение ролью агента. Зовётся при первом запросе и
 	// заново после обрыва.
 	Dial func() (DB, error)
-	// Receipts — журнал квитанций (строки JSON, fsync на строку).
-	Receipts *os.File
-	Version  string // версия программы для serverInfo
+	// Receipts — журнал квитанций (строки JSON, fsync на строку). ReceiptsPath —
+	// он же для чтения: по нему действие находится и после перезапуска сервера.
+	Receipts     *os.File
+	ReceiptsPath string
+	// Fetch отдаёт тела записей транзакции из хранилища, выписанные esverify из
+	// проверенных пакетов. nil — инструментов отката у агента нет.
+	Fetch   func(xid uint32) ([][]byte, error)
+	Version string // версия программы для serverInfo
 }
 
 // Receipt — квитанция одного действия.
@@ -79,6 +87,7 @@ type Receipt struct {
 	Outcome  string          `json:"outcome"` // committed или failed
 	Tags     []string        `json:"tags,omitempty"`
 	Error    string          `json:"error,omitempty"`
+	Undoes   string          `json:"undoes,omitempty"` // у отката: какое действие он возвращает
 	Client   json.RawMessage `json:"client,omitempty"`
 }
 
@@ -229,7 +238,7 @@ func (s *Server) dispatch(req request, modern bool) (map[string]any, *rpcError) 
 		}
 		return map[string]any{}, nil
 	case "tools/list":
-		res := map[string]any{"tools": tools}
+		res := map[string]any{"tools": s.tools()}
 		if modern {
 			res["ttlMs"], res["cacheScope"] = 3_600_000, "public"
 		}
@@ -288,11 +297,42 @@ var tools = []map[string]any{
 	},
 }
 
+// tools — список инструментов: откат есть, только если сервер умеет достать до-образы.
+func (s *Server) tools() []map[string]any {
+	if s.cfg.Fetch == nil {
+		return tools
+	}
+	return append(slices.Clone(tools), undoTools...)
+}
+
+var undoTools = []map[string]any{
+	{
+		"name":  "undo_preview",
+		"title": "Preview the undo of an action",
+		"description": "Show what undoing one `execute` action would do: how many rows would get their previous values back, " +
+			"and which rows were changed by someone after the action (conflicts — the undo leaves those alone). Changes nothing.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"action_id"}, "additionalProperties": false,
+			"properties": map[string]any{"action_id": map[string]any{"type": "string", "description": "The action id returned by `execute`."}}},
+	},
+	{
+		"name":  "undo_apply",
+		"title": "Undo an action",
+		"description": "Put back the previous values of the rows one `execute` action changed, in a single transaction, using the row images kept in the evidence store. " +
+			"Rows changed by someone after the action are left alone and listed. The undo is itself recorded as an action.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"action_id"}, "additionalProperties": false,
+			"properties": map[string]any{
+				"action_id": map[string]any{"type": "string", "description": "The action id returned by `execute`."},
+				"reason":    map[string]any{"type": "string", "description": "Why the action is undone, in a sentence. Kept with the undo."},
+			}},
+	},
+}
+
 func (s *Server) call(name string, args json.RawMessage) (string, error) {
 	var a struct {
-		SQL    string `json:"sql"`
-		Reason string `json:"reason"`
-		Limit  int    `json:"limit"`
+		SQL      string `json:"sql"`
+		Reason   string `json:"reason"`
+		Limit    int    `json:"limit"`
+		ActionID string `json:"action_id"`
 	}
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -316,14 +356,118 @@ func (s *Server) call(name string, args json.RawMessage) (string, error) {
 		if n <= 0 || n > 50 {
 			n = 10
 		}
-		list := s.recent
+		list := s.history()
 		if len(list) > n {
 			list = list[len(list)-n:]
 		}
 		out, _ := json.Marshal(map[string]any{"actions": list})
 		return string(out), nil
+	case "undo_preview", "undo_apply":
+		if s.cfg.Fetch == nil {
+			break
+		}
+		if a.ActionID == "" {
+			return "", errors.New("action_id is empty")
+		}
+		return s.undo(a.ActionID, a.Reason, name == "undo_apply")
 	}
 	return "", errUnknownTool(name)
+}
+
+// history — квитанции из журнала (или из памяти, если журнала на чтение нет).
+func (s *Server) history() []Receipt {
+	if s.cfg.ReceiptsPath == "" {
+		return s.recent
+	}
+	data, err := os.ReadFile(s.cfg.ReceiptsPath)
+	if err != nil {
+		return s.recent
+	}
+	var out []Receipt
+	for _, line := range strings.Split(string(data), "\n") {
+		var rc Receipt
+		if line != "" && json.Unmarshal([]byte(line), &rc) == nil {
+			out = append(out, rc)
+		}
+	}
+	return out
+}
+
+// undo показывает или применяет откат действия. До-образы — только из
+// хранилища (Fetch): локальной копии журнала сервер не верит.
+func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
+	var target *Receipt
+	for _, rc := range s.history() {
+		if rc.ActionID == actionID {
+			target = &rc
+		}
+	}
+	switch {
+	case target == nil:
+		return "", fmt.Errorf("action %s is not in this server's receipts", actionID)
+	case target.Outcome != "committed":
+		return "", fmt.Errorf("action %s did not commit (%s): there is nothing to undo", actionID, target.Outcome)
+	}
+	xid, err := strconv.ParseUint(target.XID, 10, 32)
+	if err != nil {
+		return "", fmt.Errorf("action %s has no transaction id in its receipt", actionID)
+	}
+	lines, err := s.cfg.Fetch(uint32(xid))
+	if err != nil {
+		return "", fmt.Errorf("the row images of action %s could not be taken from the evidence store: %w", actionID, err)
+	}
+	plan, err := pgundo.Build(uint32(xid), lines)
+	if err != nil {
+		return "", err
+	}
+	if s.db == nil {
+		if _, err := s.run("SELECT 1"); err != nil {
+			return "", err
+		}
+	}
+	statuses, err := plan.Check(s.db)
+	if err != nil {
+		return "", err
+	}
+	ok, done, bad := pgundo.Tally(statuses)
+	conflicts := plan.Conflicts(statuses)
+	if len(conflicts) > 20 {
+		conflicts = conflicts[:20]
+	}
+	out := map[string]any{"action_id": actionID, "xid": target.XID, "row_changes": plan.Changes, "undo_steps": len(plan.Steps),
+		"to_apply": ok, "already_as_before": done, "conflicts_total": bad, "conflicts": conflicts}
+	if !apply {
+		text, _ := json.Marshal(out)
+		return string(text), nil
+	}
+	if ok == 0 {
+		return "", fmt.Errorf("nothing to apply for action %s: %d steps are already as before, %d are conflicts", actionID, done, bad)
+	}
+	rc := Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "undo_apply",
+		Reason: reason, Undoes: actionID, Client: s.client, Outcome: "failed"}
+	// Откат — тоже действие: его отметка несёт и номер действия, и что он возвращает.
+	undoXID, err := plan.Apply(s.db, map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": reason,
+		"undoes_action": actionID, "undoes_xid": target.XID, "steps_applied": ok, "conflicts_left": bad})
+	rc.XID = undoXID
+	if err == nil {
+		rc.Outcome = "committed"
+	} else {
+		rc.Error = err.Error()
+	}
+	if werr := s.keep(rc); werr != nil {
+		s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
+		return "", fmt.Errorf("undo %s is %s, but its receipt could not be written: %v", rc.ActionID, rc.Outcome, werr)
+	}
+	if errors.Is(err, pgundo.ErrChanged) {
+		return "", fmt.Errorf("%w. Preview the undo again", err)
+	}
+	if err != nil {
+		return "", err
+	}
+	out["undo_action_id"], out["undo_xid"], out["applied"] = rc.ActionID, undoXID, ok
+	delete(out, "to_apply")
+	text, _ := json.Marshal(out)
+	return string(text), nil
 }
 
 // run исполняет запрос; соединение, сломавшееся не по вине запроса, бросает,
