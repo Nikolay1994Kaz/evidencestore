@@ -3,11 +3,12 @@
 #
 #   ИИ-агент → esmcp (MCP-сервер): запрос идёт ролью агента, в транзакции — отметка действия
 #   Postgres: триггер пишет в журнал роль сессии; права роли — то, что агенту можно
-#     → espgtap: логическая репликация (pgoutput), только транзакции агента и отката,
-#                сжатые части в journal.jsonl, тревоги
-#     → escollect → evidencestore: источник с "subject_field": "xid"   (хранилище не изменено)
+#     → escollect, источник "postgres": логическая репликация (pgoutput), только транзакции
+#                агента и отката, сжатые части прямо в буфер сборщика, тревоги
+#     → evidencestore: источник с "subject_field": "xid"   (хранилище не изменено)
 #     → пакеты записей транзакции → esverify → esundo: обратные операции, сверка с базой,
-#                одна транзакция отката; сам откат тоже ложится в журнал
+#                одна транзакция отката; сам откат тоже ложится в хранилище
+#   Сборщик один: тот же процесс escollect вторым источником читает файл квитанций MCP.
 #   Откат делают двое: оператор командой esundo и сам агент инструментом MCP undo_apply.
 #
 # Что происходит: агент делает хорошее действие и плохое (обнуляет треть счетов,
@@ -15,6 +16,8 @@
 # правит несколько строк руками, одну — между сверкой и откатом. Откат плохого
 # действия возвращает всё, кроме тронутого человеком. По дороге: агенту отказано
 # в TRUNCATE, DROP и подделке отметки; транзакция в обход MCP поднимает тревогу.
+# В конце сборщик убивают (kill -9) и перезапускают базу: записи не теряются и
+# не двоятся, сборщик подключается к базе сам.
 # Каждый шаг сверяется с ожидаемым: расхождение — ненулевой код выхода.
 #
 #   WORK=/tmp/pg-undo experiments/pg-undo/run.sh   # каталог стенда (по умолчанию mktemp)
@@ -49,7 +52,7 @@ field() { python3 -I -c 'import json,sys; v=json.loads(sys.argv[1])[sys.argv[2]]
 
 step "сборка"
 if [ -n "${ES_BIN:-}" ]; then "$BIN/evidencestore" version; else go build -o "$BIN/" ./cmd/...; fi
-for b in evidencestore escollect esverify espgtap esmcp esundo; do [ -x "$BIN/$b" ] || die "нет $BIN/$b"; done
+for b in evidencestore escollect esverify esmcp esundo; do [ -x "$BIN/$b" ] || die "нет $BIN/$b"; done
 
 if [ -z "${PGBIN:-}" ]; then
   PGBIN=$(pg_config --bindir 2>/dev/null || true)
@@ -69,7 +72,7 @@ mkdir -p "$WORK/pg" "$WORK/sock"
 [ ${#AS_PG[@]} -eq 0 ] || chown postgres "$WORK/pg" "$WORK/sock"
 
 cleanup() {
-  kill "${SERVER:-}" "${TAP:-}" "${COLLECT:-}" "${COLLECT_MCP:-}" 2>/dev/null || true
+  kill "${SERVER:-}" "${COLLECT:-}" 2>/dev/null || true
   as_pg "$PGBIN/pg_ctl" -D "$WORK/pg" -m fast stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -111,28 +114,6 @@ create schema snap;
 SQL
 echo "accounts: $ROWS строк, orders: $((ROWS / 2 + 2))"
 
-step "настройка базы: роль агента, отметка «кто», публикация (espgtap -setup-sql)"
-mkdir -p "$WORK/pgtap" "$WORK/mcp"
-cat >"$WORK/pgtap.json" <<EOF
-{
-  "dsn": "host=$WORK/sock port=$PGPORT user=evidence_tap dbname=shop",
-  "dir": "pgtap",
-  "roles": ["agent_bot"],
-  "tables": ["public.accounts", "public.orders", "public.docs"],
-  "alert_rows": 500,
-  "require_action": true,
-  "canaries": [{"table": "public.accounts", "column": "id", "value": "3"}],
-  "status_every": "1s"
-}
-EOF
-"$BIN/espgtap" -config "$WORK/pgtap.json" -setup-sql >"$WORK/setup.sql"
-PGOPTIONS='-c client_min_messages=warning' "${OWNER[@]}" -q -f "$WORK/setup.sql"
-grep -c . "$WORK/setup.sql" | sed 's/$/ строк SQL: права роли agent_bot, триггер отметки на трёх таблицах, публикация, роль сборщика/'
-"$BIN/espgtap" -config "$WORK/pgtap.json" 2>"$WORK/pgtap.log" &
-TAP=$!
-for _ in $(seq 100); do grep -q 'msg=streaming' "$WORK/pgtap.log" 2>/dev/null && break; sleep 0.1; done
-grep -q 'msg=streaming' "$WORK/pgtap.log" || die "espgtap не начал читать журнал: $(cat "$WORK/pgtap.log")"
-
 # mcp ИНСТРУМЕНТ JSON: вызов инструмента так, как его делает агент (stdio, ревизия MCP 2026-07-28).
 mcp() { python3 -I "$HERE/mcp_call.py" "$BIN/esmcp" "$WORK/mcp.json" "$1" "$2" 2>>"$WORK/mcp.log"; }
 sql_arg() { python3 -I -c 'import json,sys; print(json.dumps({"sql": sys.stdin.read(), "reason": sys.argv[1]}))' "$1"; }
@@ -150,7 +131,7 @@ cat >"$WORK/evidencestore.json" <<EOF
   "demo": true,
   "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},
   "sources": [
-    {"name": "$SRC", "content_type": "pg/espgtap-v1", "subject_field": "xid", "retention_months": 1, "expect_every": "1h"},
+    {"name": "$SRC", "content_type": "pg/before-images-v1", "subject_field": "xid", "retention_months": 1, "expect_every": "1h"},
     {"name": "agent-mcp", "content_type": "mcp/receipt-v1", "subject_field": "action_id", "retention_months": 12, "expect_every": "1h"}
   ]
 }
@@ -162,22 +143,46 @@ STORE_KEY=$(tail -1 "$WORK/init.txt")
 "$BIN/evidencestore" serve -config "$CFG" 2>"$WORK/server.log" &
 SERVER=$!
 for _ in $(seq 50); do [ -S "$WORK/data/admin.sock" ] && break; sleep 0.1; done
-for s in "$SRC:pgtap/journal.jsonl" "agent-mcp:mcp/receipts.jsonl"; do
-  cat >"$WORK/collector-${s%%:*}.json" <<EOF
+
+step "сборщик: один escollect, два источника — журнал базы и файл квитанций MCP"
+# Общее (сервер, УЦ, ключ хранилища) — наверху; у источника свои сертификат,
+# буфер и вход. Раздел "postgres" — он же вход для -setup-sql.
+mkdir -p "$WORK/mcp"
+cat >"$WORK/collector.json" <<EOF
 {
   "server": "https://127.0.0.1:$PORT",
-  "ca": "pki/ca.crt", "cert": "pki/${s%%:*}.crt", "key": "pki/${s%%:*}.key",
+  "ca": "pki/ca.crt",
   "store_key": "$STORE_KEY",
-  "spool_dir": "spool-${s%%:*}", "file": "${s##*:}", "from_start": true, "flush_every": "200ms"
+  "flush_every": "200ms",
+  "sources": [
+    {"cert": "pki/$SRC.crt", "key": "pki/$SRC.key", "spool_dir": "spool-$SRC",
+     "postgres": {
+       "dsn": "host=$WORK/sock port=$PGPORT user=evidence_tap dbname=shop",
+       "dir": "pg-index",
+       "roles": ["agent_bot"],
+       "tables": ["public.accounts", "public.orders", "public.docs"],
+       "alert_rows": 500,
+       "require_action": true,
+       "canaries": [{"table": "public.accounts", "column": "id", "value": "3"}],
+       "status_every": "1s"}},
+    {"cert": "pki/agent-mcp.crt", "key": "pki/agent-mcp.key", "spool_dir": "spool-agent-mcp",
+     "file": "mcp/receipts.jsonl", "from_start": true}
+  ]
 }
 EOF
-done
-# Сборщики хранилища работают постоянно, как в жизни: строка журнала уезжает сама.
-touch "$WORK/pgtap/journal.jsonl" "$WORK/mcp/receipts.jsonl"
-"$BIN/escollect" -config "$WORK/collector-$SRC.json" 2>"$WORK/collect.log" &
-COLLECT=$!
-"$BIN/escollect" -config "$WORK/collector-agent-mcp.json" 2>"$WORK/collect-mcp.log" &
-COLLECT_MCP=$!
+"$BIN/escollect" -config "$WORK/collector.json" -setup-sql >"$WORK/setup.sql"
+PGOPTIONS='-c client_min_messages=warning' "${OWNER[@]}" -q -f "$WORK/setup.sql"
+grep -c . "$WORK/setup.sql" | sed 's/$/ строк SQL (escollect -setup-sql): права роли agent_bot, триггер отметки на трёх таблицах, публикация, роль сборщика/'
+touch "$WORK/mcp/receipts.jsonl"
+# Сборщик работает постоянно, как в жизни: запись уезжает сама.
+start_collector() {
+  "$BIN/escollect" -config "$WORK/collector.json" 2>>"$WORK/collect.log" &
+  COLLECT=$!
+}
+start_collector
+for _ in $(seq 100); do grep -q 'msg="reading the database log"' "$WORK/collect.log" 2>/dev/null && break; sleep 0.1; done
+grep -q 'msg="reading the database log"' "$WORK/collect.log" || die "сборщик не начал читать журнал базы: $(cat "$WORK/collect.log")"
+ls "$WORK" | grep -c '^spool-' | sed 's/$/ буфера, процесс один; отдельной программы для базы и файла-посредника между ними нет/'
 # MCP-сервер агента. Секция undo — как ему достать до-образы из хранилища и
 # чем их проверить: ключ хранилища и доверие к меткам времени заданы здесь.
 cat >"$WORK/mcp.json" <<EOF
@@ -186,7 +191,7 @@ cat >"$WORK/mcp.json" <<EOF
   "agent": "support-bot",
   "receipts": "mcp/receipts.jsonl",
   "undo": {
-    "index": "pgtap/index.jsonl",
+    "index": "pg-index/index.jsonl",
     "stamp": ["$BIN/evidencestore", "stamp", "-config", "$CFG"],
     "proof": ["$BIN/evidencestore", "proof", "-config", "$CFG", "-source", "$SRC", "-dek"],
     "verify": ["$BIN/esverify", "-store-key", "$STORE_KEY", "-tsa-trust", "$WORK/tsa-root.crt"]
@@ -195,27 +200,28 @@ cat >"$WORK/mcp.json" <<EOF
 EOF
 "$BIN/evidencestore" tsa-root -config "$CFG" -out "$WORK/tsa-root.crt" >/dev/null 2>&1
 
-INDEX=$WORK/pgtap/index.jsonl
-ALERTS=$WORK/pgtap/alerts.jsonl
-# wait_tx XID: дождаться, пока сборщик допишет транзакцию в журнал (строка индекса).
+INDEX=$WORK/pg-index/index.jsonl
+ALERTS=$WORK/pg-index/alerts.jsonl
+# wait_tx XID: дождаться, пока сборщик прочитает транзакцию (строка справочника).
 wait_tx() {
   for _ in $(seq 6000); do grep -q "^{\"xid\":$1," "$INDEX" 2>/dev/null && return 0; sleep 0.1; done
-  die "транзакция $1 не дошла до журнала сборщика: $(tail -3 "$WORK/pgtap.log")"
+  die "транзакция $1 не дошла до сборщика: $(tail -3 "$WORK/collect.log")"
 }
 entry() { grep "^{\"xid\":$1," "$INDEX" | tail -1; }
 max_seq() {
   "$BIN/evidencestore" status -config "$CFG" |
     python3 -I -c 'import json,sys; print(next((s["max_seq"] for s in json.load(sys.stdin)["sources"] if s["name"]==sys.argv[1]), 0))' "$1"
 }
-# shipped ИСТОЧНИК ФАЙЛ: дождаться, пока хранилище примет все строки файла.
+# shipped ИСТОЧНИК НОМЕР: дождаться, пока хранилище примет запись с этим номером.
 shipped() {
-  local want
-  want=$(wc -l <"$2")
-  for _ in $(seq 3000); do [ "$(max_seq "$1")" -ge "$want" ] && return 0; sleep 0.1; done
-  die "хранилище не получило записи источника $1: есть $(max_seq "$1"), ждали $want"
+  for _ in $(seq 3000); do [ "$(max_seq "$1")" -ge "$2" ] && return 0; sleep 0.1; done
+  die "хранилище не получило записи источника $1: есть $(max_seq "$1"), ждали $2"
 }
-ship() { shipped "$SRC" "$WORK/pgtap/journal.jsonl"; }
-ship_receipts() { shipped agent-mcp "$WORK/mcp/receipts.jsonl"; }
+# ship: всё, что сборщик прочитал из базы, — в хранилище. Номера записей
+# транзакции сборщик пишет в справочник сам: это номера, под которыми он их шлёт.
+ship() { shipped "$SRC" "$(field "$(tail -1 "$INDEX")" last_seq)"; }
+# Квитанции — обычный файл, читается с начала: номер записи = номер строки.
+ship_receipts() { shipped agent-mcp "$(wc -l <"$WORK/mcp/receipts.jsonl")"; }
 OPDSN="host=$WORK/sock port=$PGPORT user=postgres dbname=shop"
 stamp() { "$BIN/evidencestore" stamp -config "$CFG" >/dev/null; }
 alerts() { [ -s "$ALERTS" ] && python3 -I -c 'import json,sys; print(" ".join(sorted({json.loads(l)["kind"] for l in open(sys.argv[1]) if json.loads(l)["xid"] == int(sys.argv[2])})))' "$ALERTS" "$1" || true; }
@@ -232,12 +238,12 @@ commit;
 SQL
 }
 # fetch XID DIR: записи транзакции пакетами одной записи — готовы сразу после
-# метки времени, окно ждать не надо. Номера записей — из индекса сборщика
-# (строка журнала = запись источника); что это части именно этой транзакции и
-# что они все, проверяет esundo по самим телам.
+# метки времени, окно ждать не надо. Номера записей — из справочника сборщика;
+# что это части именно этой транзакции и что они все, проверяет esundo по
+# самим телам.
 fetch() {
   local e first last n
-  e=$(entry "$1"); first=$(field "$e" first_line); last=$(field "$e" last_line)
+  e=$(entry "$1"); first=$(field "$e" first_seq); last=$(field "$e" last_seq)
   mkdir -p "$2/bodies" "$2/bundles"
   for n in $(seq "$first" "$last"); do
     "$BIN/evidencestore" proof -config "$CFG" -source "$SRC" -seq "$n" -dek -out "$2/bundles/$n.json" >/dev/null 2>&1 || die "пакет записи $n не выдан"
@@ -286,7 +292,7 @@ echo "тревога: no-action — у транзакции роли агент�
 "${OWNER[@]}" -q -c "create table snap.accounts as table accounts" -c "create table snap.orders as table orders" -c "create table snap.docs as table docs"
 
 step "действие агента через MCP (плохое): «закрыть неактивные счета»"
-E0=$(size "$WORK/data/evidence"); C0=$(size "$WORK/data/chain"); J0=$(stat -c %s "$WORK/pgtap/journal.jsonl")
+E0=$(size "$WORK/data/evidence"); C0=$(size "$WORK/data/chain")
 T=$(now)
 R=$(sql_arg "close inactive accounts" <<SQL | { mcp execute "$(cat)" || die "действие не прошло"; }
 update accounts set balance = 0, note = 'closed by support-bot' where id % 3 = 0;
@@ -312,9 +318,8 @@ T_SHIP=$(since "$T")
 ship_receipts
 BAD_ENTRY=$(entry "$BAD")
 CHANGES=$(field "$BAD_ENTRY" changes)
-PARTS=$(($(field "$BAD_ENTRY" last_line) - $(field "$BAD_ENTRY" first_line) + 1))
-J1=$(stat -c %s "$WORK/pgtap/journal.jsonl")
-echo "изменений строк $CHANGES; в журнале сборщика $PARTS записей, $(((J1 - J0) / 1024)) КБ; сборщик — $T_TAP с, доставка в хранилище — $T_SHIP с"
+PARTS=$(($(field "$BAD_ENTRY" last_seq) - $(field "$BAD_ENTRY" first_seq) + 1))
+echo "изменений строк $CHANGES, записей $PARTS; в буфере сборщика через $T_TAP с после фиксации, в хранилище — ещё через $T_SHIP с"
 "${OWNER[@]}" -At -F ' ' -c "select 'счетов с нулём:', count(*) from accounts where balance = 0" -c "select 'заказов осталось:', count(*) from orders" -c "select 'документ 1, байт:', length(body) from docs where id = 1"
 [ "$(alerts "$BAD")" = "canary mass-change" ] || die "ждали тревоги canary и mass-change, получили: $(alerts "$BAD")"
 echo "тревоги: mass-change (изменений не меньше 500) и canary (тронута строка-ловушка accounts id=3)"
@@ -331,8 +336,8 @@ delete from orders where id = $((ROWS + 3));
 update accounts set note = 'called the client' where id = 1;
 SQL
 sleep 1.5
-[ "$(wc -l <"$INDEX")" = "$LINES_BEFORE" ] || die "транзакция владельца попала в журнал до-образов"
-echo "транзакции владельца в журнал до-образов не идут: транзакций в индексе по-прежнему $LINES_BEFORE"
+[ "$(wc -l <"$INDEX")" = "$LINES_BEFORE" ] || die "транзакция владельца попала в записи до-образов"
+echo "транзакции владельца в хранилище не идут: транзакций в справочнике по-прежнему $LINES_BEFORE"
 
 # ---------------------------------------------------------------- до-образы и откат
 
@@ -390,7 +395,7 @@ step "повторная сверка: применять нечего"
 "$BIN/esundo" check -bodies "$U/bodies" -xid "$BAD" -dsn "$OPDSN" -show 0 | grep '^checked' | tee "$U/check2.txt"
 grep -q 'to apply 0,' "$U/check2.txt" || die "вторая сверка нашла, что применять"
 
-step "сам откат — тоже транзакция в журнале: кто, что и почему откатил"
+step "сам откат — тоже запись в хранилище: кто, что и почему откатил"
 wait_tx "$UNDO"
 ship
 stamp
@@ -431,7 +436,7 @@ echo "undo_apply: возвращено $(field "$A" applied) строк тран
 wait_tx "$UNDO2"
 E=$(entry "$UNDO2")
 [ "$(alerts "$UNDO2")" = "" ] || die "откат через MCP поднял тревогу: $(alerts "$UNDO2")"
-echo "в журнале сборщика откат — транзакция роли $(python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); print(e["who"]["role"], "с отметкой отката действия", e["undo"]["info"]["undoes_action"])' "$E")"
+echo "в справочнике сборщика откат — транзакция роли $(python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); print(e["who"]["role"], "с отметкой отката действия", e["undo"]["info"]["undoes_action"])' "$E")"
 grep -q "\"tool\":\"undo_apply\".*\"undoes\":\"$ACT2\"" "$WORK/mcp/receipts.jsonl" || die "нет квитанции отката"
 
 # ---------------------------------------------------------------- окно времени
@@ -439,10 +444,10 @@ grep -q "\"tool\":\"undo_apply\".*\"undoes\":\"$ACT2\"" "$WORK/mcp/receipts.json
 if [ "$WINDOW" = 1 ]; then
   step "пакет по окну времени (доказывает, что записей транзакции больше нет): ждём 135 с"
   sleep 135
-  tick() { wait_tx "$(field "$(mcp execute "$(sql_arg tick <<<"update docs set body = '$1' where id = 2")")" xid)"; ship; }
-  tick "tick 1"
+  wtick() { wait_tx "$(field "$(mcp execute "$(sql_arg tick <<<"update docs set body = '$1' where id = 2")")" xid)"; ship; }
+  wtick "tick 1"
   stamp # закрывающая метка
-  tick "tick 2"
+  wtick "tick 2"
   stamp # её хвосты источников — верхний край пакета
   W=$WORK/window
   mkdir -p "$W"
@@ -462,22 +467,61 @@ print(f"план из пакета по окну совпал с планом и
 PY
 fi
 
+# ---------------------------------------------------------------- живучесть
+
+step "сборщик убит (kill -9), пока агент работает; потом перезапущена база"
+tick() { field "$(mcp execute "$(sql_arg "$1" <<<"update docs set body = '$1' where id = 2")")" xid; }
+X1=$(tick "before the kill"); wait_tx "$X1"
+kill -9 "$COLLECT"; wait "$COLLECT" 2>/dev/null || true
+X2=$(tick "while the collector is dead")
+X3=$(tick "still dead")
+# Сначала разовый проход (-once): дочитать, что накопилось, отправить и выйти.
+"$BIN/escollect" -config "$WORK/collector.json" -once 2>>"$WORK/collect.log" >"$WORK/once.txt" || die "escollect -once: $(tail -3 "$WORK/collect.log")"
+sed 's/^/escollect -once → /' "$WORK/once.txt"
+grep -q "^$SRC: read 2 new records, .* pending 0$" "$WORK/once.txt" || die "разовый проход должен был дочитать из базы две транзакции"
+start_collector
+wait_tx "$X2"; wait_tx "$X3"; ship
+echo "транзакции $X2 и $X3, сделанные без сборщика, дочитаны из журнала базы; сборщик снова работает постоянно"
+as_pg "$PGBIN/pg_ctl" -D "$WORK/pg" -l "$WORK/pg/server.log" -m fast -w restart >/dev/null
+X4=$(tick "after the database restart")
+wait_tx "$X4"; ship
+kill -0 "$COLLECT" 2>/dev/null || die "сборщик не пережил перезапуск базы: $(tail -3 "$WORK/collect.log")"
+grep -q 'msg="the database connection is down' "$WORK/collect.log" || die "сборщик не заметил обрыва соединения с базой"
+echo "база перезапущена: сборщик не остановился, подключился сам и прочитал транзакцию $X4"
+# Ни потерь, ни повторов: каждая транзакция в справочнике один раз, номера её
+# записей идут сразу за предыдущей, и хранилище держит ровно столько записей.
+python3 -I - "$INDEX" "$(max_seq "$SRC")" "$X1" "$X2" "$X3" "$X4" <<'PY'
+import json, sys
+entries = [json.loads(l) for l in open(sys.argv[1])]
+want = [int(x) for x in sys.argv[3:]]
+tail = [e for e in entries if e["xid"] in want]
+assert [e["xid"] for e in tail] == want, f"в справочнике {[e['xid'] for e in tail]}, ждали {want}"
+for a, b in zip(entries, entries[1:]):
+    assert b["first_seq"] == a["last_seq"] + 1, f"между транзакциями {a['xid']} и {b['xid']} номера записей идут не подряд"
+assert entries[-1]["last_seq"] == int(sys.argv[2]), f"в хранилище {sys.argv[2]} записей, по справочнику {entries[-1]['last_seq']}"
+print(f"транзакций в справочнике {len(entries)}, записей в хранилище {sys.argv[2]}: каждая один раз, номера подряд, пропусков нет")
+PY
+stamp
+mkdir -p "$WORK/after-kill"
+fetch "$X3" "$WORK/after-kill" >/dev/null
+"$BIN/esundo" check -bodies "$WORK/after-kill/bodies" -xid "$X3" >"$WORK/after-kill/plan.txt"
+head -1 "$WORK/after-kill/plan.txt" | cut -c1-160
+
 # ---------------------------------------------------------------- числа
 
 step "объём плохого действия"
 TABLES=$("${OWNER[@]}" -Atc "select pg_total_relation_size('accounts') + pg_total_relation_size('orders') + pg_total_relation_size('docs')")
-python3 -I - "$CHANGES" "$((J1 - J0))" "$((E1 - E0))" "$((C1 - C0))" "$BUNDLE_BYTES" "$T_TAP" "$T_SHIP" "$T_FETCH" "$T_CHECK" "$T_APPLY" "$TABLES" "$PARTS" <<'PY'
+python3 -I - "$CHANGES" "$((E1 - E0))" "$((C1 - C0))" "$BUNDLE_BYTES" "$T_TAP" "$T_SHIP" "$T_FETCH" "$T_CHECK" "$T_APPLY" "$TABLES" "$PARTS" <<'PY'
 import sys
-ch, journal, ev, chain, bundles, tap, ship, fetch, check, apply, tables, parts = [float(x) for x in sys.argv[1:]]
+ch, ev, chain, bundles, tap, ship, fetch, check, apply, tables, parts = [float(x) for x in sys.argv[1:]]
 print(f"изменений строк: {int(ch)}, записей хранилища: {int(parts)}")
-print(f"журнал сборщика: {journal/1024:.0f} КБ ({journal/ch:.0f} байт на изменение)")
 print(f"хранилище, журнал улик: +{ev/1024:.0f} КБ ({ev/ch:.0f} байт на изменение); цепь: +{chain/1024:.1f} КБ")
-print(f"сборщик: {tap:.2f} с; доставка в хранилище: {ship:.2f} с")
+print(f"от фиксации в базе до буфера сборщика: {tap:.2f} с; оттуда до хранилища: {ship:.2f} с")
 print(f"пакеты записей: {bundles/1024:.0f} КБ; выдача и проверка: {fetch:.2f} с")
 print(f"сверка с базой: {check:.2f} с; применение отката: {apply:.2f} с")
 print(f"для масштаба: три таблицы целиком, с индексами, — {tables/1024:.0f} КБ; действие заняло в хранилище {(ev+chain)/tables:.2f} такого объёма")
 PY
-kill "$TAP" 2>/dev/null; wait "$TAP" 2>/dev/null || true
-grep -o 'msg=stopped.*' "$WORK/pgtap.log" | sed 's/^msg=stopped/сборщик за прогон:/'
+kill "$COLLECT" 2>/dev/null; wait "$COLLECT" 2>/dev/null || true
+grep -o 'msg="database input closed".*' "$WORK/collect.log" | tail -1 | sed 's/^msg="database input closed"/вход «postgres» с последнего запуска:/'
 echo
 echo "каталог стенда: $WORK"

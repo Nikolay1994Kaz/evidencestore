@@ -68,7 +68,7 @@ func TestLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.StartReplication(slot, "proto_version", "1", "publication_names", "pgwire_live_pub", "messages", "true"); err != nil {
+	if err := r.StartReplication(slot, 0, "proto_version", "1", "publication_names", "pgwire_live_pub", "messages", "true"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Query("SELECT 1"); err == nil {

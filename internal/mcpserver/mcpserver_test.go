@@ -245,7 +245,7 @@ func TestServeAnswersLineByLine(t *testing.T) {
 	}
 }
 
-// journalLine — транзакция 751 одной записью журнала espgtap: строка 6 была "a", стала "b".
+// journalLine — транзакция 751 одной записью сборщика: строка 6 была "a", стала "b".
 func journalLine() []byte {
 	stream := `{"t":"H","v":1,"xid":751}
 {"t":"R","id":1,"schema":"public","table":"accounts","identity":"f","columns":["id","note"],"types":["integer","text"],"pk":["id"]}

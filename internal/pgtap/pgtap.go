@@ -1,7 +1,9 @@
-// Package pgtap превращает поток pgoutput в журнал до-образов для хранилища
+// Package pgtap превращает поток pgoutput в записи до-образов для хранилища
 // улик: берёт только транзакции наблюдаемых ролей (агентов) и транзакции
-// отката, складывает каждую в сжатый поток и режет его на строки-записи, которые
-// читает обычный escollect.
+// отката, складывает каждую в сжатый поток и режет его на части-записи, которые
+// сразу ложатся в буфер сборщика (Sink). Своего файла с записями у пакета нет:
+// рядом он ведёт только справочник (index.jsonl — какая транзакция под какими
+// номерами записей лежит) и тревоги (alerts.jsonl).
 //
 // ЧЬЯ ТРАНЗАКЦИЯ. В журнале PostgreSQL нет ни роли, ни application_name. Их
 // кладёт туда сама база: триггер на оператор зовёт pg_logical_emit_message с
@@ -9,7 +11,7 @@
 // изменениями своего оператора, поэтому к первому изменению транзакции уже
 // известно, брать её или пропустить, и чужие транзакции в память не копятся.
 //
-// ФОРМАТ. Запись журнала — строка JSON:
+// ФОРМАТ. Запись — строка JSON:
 //
 //	{"xid":751,"part":1,"last":true,"gz":"<base64>"}
 //
@@ -20,6 +22,19 @@
 // TRUNCATE, M для отметок после первого изменения и итог C. Часть — не больше
 // PartSize сжатых байт, так что строка влезает в запись хранилища (1 МиБ), а
 // значение любой длины просто занимает несколько частей.
+//
+// Части уходят в буфер по мере готовности, не дожидаясь конца транзакции:
+// память занята одной частью, какой бы большой транзакция ни была. Оборвалась
+// связь или сборщик упал посреди транзакции — в буфере остаются её первые
+// части без последней, а база присылает транзакцию заново, и она ложится
+// целиком под новыми номерами. Читатель (ReadTransaction) берёт последний
+// целый набор частей.
+//
+// СПРАВОЧНИК — не улика, а удобство: по нему запись транзакции достаётся из
+// хранилища сразу, по номерам. Строка справочника пишется раньше последней
+// части транзакции: упади сборщик между ними, транзакция придёт заново и
+// получит новую строку, поэтому верна последняя строка с этим xid. Без
+// справочника транзакцию находят по метке субъекта (xid) в хранилище.
 package pgtap
 
 import (
@@ -35,6 +50,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -64,9 +80,9 @@ type Canary struct {
 	Value  string `json:"value"`
 }
 
-// Config — настройки журнала.
+// Config — настройки.
 type Config struct {
-	Dir   string   // каталог журнала: journal.jsonl, index.jsonl, alerts.jsonl
+	Dir   string   // каталог справочника: index.jsonl, alerts.jsonl
 	Roles []string // роли, чьи транзакции брать
 	// AlertRows — транзакция с таким числом изменений строк и больше поднимает
 	// тревогу «массовое изменение». 0 — не следить.
@@ -96,11 +112,21 @@ type Counts struct {
 	D int `json:"D"`
 }
 
-// IndexEntry — строка index.jsonl: одна взятая транзакция и где она в журнале.
+// Sink — буфер сборщика (input.Sink): сюда идут части.
+type Sink interface {
+	// Emit кладёт записи в буфер и возвращается после fsync; first — номер
+	// первой, cursor — место входа после последней.
+	Emit(bodies [][]byte, cursor uint64) (first uint64, err error)
+	// Next — номер, который получит следующая запись.
+	Next() uint64
+}
+
+// IndexEntry — строка index.jsonl: одна взятая транзакция и номера её записей
+// у источника в хранилище (части лежат подряд).
 type IndexEntry struct {
 	XID        uint32            `json:"xid"`
-	FirstLine  uint64            `json:"first_line"` // номера строк journal.jsonl, с единицы
-	LastLine   uint64            `json:"last_line"`
+	FirstSeq   uint64            `json:"first_seq"`
+	LastSeq    uint64            `json:"last_seq"`
 	Changes    int               `json:"changes"`
 	Tables     map[string]Counts `json:"tables,omitempty"`
 	Truncated  []string          `json:"truncated,omitempty"`
@@ -127,21 +153,24 @@ type Stats struct {
 	Parts, Alerts, Duplicates uint64
 }
 
-// Tap — журнал до-образов.
+// Tap — поток pgoutput → записи до-образов.
 type Tap struct {
 	cfg   Config
 	cat   Catalog
+	sink  Sink
 	log   *slog.Logger
 	now   func() time.Time
 	roles map[string]bool
 
-	journal, index, alerts *os.File
-	lines                  uint64 // строк в journal.jsonl
-	lastCommit             uint64 // CommitLSN последней транзакции в индексе
-	rels                   map[uint32]pgoutput.Relation
-	info                   map[uint32]RelInfo
-	tx                     *txState
-	stats                  Stats
+	index, alerts *os.File
+	// lastCommit — место входа: позиция фиксации (FinalLSN) последней
+	// транзакции, которая лежит в буфере целиком. Транзакции не новее база
+	// может прислать заново — они пропускаются.
+	lastCommit uint64
+	rels       map[uint32]pgoutput.Relation
+	info       map[uint32]RelInfo
+	tx         *txState
+	stats      Stats
 }
 
 type txState struct {
@@ -160,14 +189,16 @@ type txState struct {
 	written   map[uint32]bool
 	alerts    []Alert
 
-	buf       bytes.Buffer
-	gz        *gzip.Writer
-	parts     int
-	firstLine uint64
+	buf      bytes.Buffer
+	gz       *gzip.Writer
+	parts    int
+	firstSeq uint64 // номер записи первой части
 }
 
-// Open открывает (или заводит) журнал в cfg.Dir.
-func Open(cfg Config, cat Catalog, log *slog.Logger) (_ *Tap, err error) {
+// Open открывает (или заводит) справочник в cfg.Dir. cursor — место, которое
+// сборщик прочитал из своего буфера: позиция фиксации последней транзакции,
+// лежащей там целиком (0 — ещё ни одной).
+func Open(cfg Config, cat Catalog, sink Sink, cursor uint64, log *slog.Logger) (_ *Tap, err error) {
 	if cfg.PartSize == 0 {
 		cfg.PartSize = 700_000
 	}
@@ -177,13 +208,16 @@ func Open(cfg Config, cat Catalog, log *slog.Logger) (_ *Tap, err error) {
 	if len(cfg.Roles) == 0 {
 		return nil, errors.New("pgtap: name at least one role to watch")
 	}
+	if sink == nil {
+		return nil, errors.New("pgtap: no sink")
+	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	t := &Tap{cfg: cfg, cat: cat, log: log, now: time.Now, roles: map[string]bool{},
+	t := &Tap{cfg: cfg, cat: cat, sink: sink, log: log, now: time.Now, roles: map[string]bool{}, lastCommit: cursor,
 		rels: map[uint32]pgoutput.Relation{}, info: map[uint32]RelInfo{}}
 	for _, r := range cfg.Roles {
 		t.roles[r] = true
@@ -193,72 +227,70 @@ func Open(cfg Config, cat Catalog, log *slog.Logger) (_ *Tap, err error) {
 			t.Close()
 		}
 	}()
-	if t.journal, t.lines, _, err = openLines(filepath.Join(cfg.Dir, "journal.jsonl")); err != nil {
+	if t.index, err = openLines(filepath.Join(cfg.Dir, IndexFile)); err != nil {
 		return nil, err
 	}
-	var last []byte
-	if t.index, _, last, err = openLines(filepath.Join(cfg.Dir, "index.jsonl")); err != nil {
+	if t.alerts, err = openLines(filepath.Join(cfg.Dir, AlertsFile)); err != nil {
 		return nil, err
-	}
-	if t.alerts, _, _, err = openLines(filepath.Join(cfg.Dir, "alerts.jsonl")); err != nil {
-		return nil, err
-	}
-	if len(last) > 0 {
-		var e IndexEntry
-		if err := json.Unmarshal(last, &e); err != nil {
-			return nil, fmt.Errorf("pgtap: last line of index.jsonl: %w", err)
-		}
-		lsn, err := pgwire.ParseLSN(e.CommitLSN)
-		if err != nil {
-			return nil, fmt.Errorf("pgtap: last line of index.jsonl: %w", err)
-		}
-		t.lastCommit = uint64(lsn)
 	}
 	return t, nil
 }
 
-// openLines открывает файл строк на дозапись, считает строки и отдаёт последнюю.
-// Оборванный хвост без перевода строки отрезается: его транзакция серверу не
-// подтверждена и придёт заново, а следующая строка иначе приклеилась бы к обрывку.
-func openLines(path string) (_ *os.File, lines uint64, last []byte, err error) {
+// Файлы справочника в Config.Dir.
+const (
+	IndexFile  = "index.jsonl"
+	AlertsFile = "alerts.jsonl"
+)
+
+// openLines открывает файл строк на дозапись. Оборванный хвост без перевода
+// строки отрезается (падение посреди записи): иначе следующая строка
+// приклеилась бы к обрывку.
+func openLines(path string) (_ *os.File, err error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, err
 	}
 	defer func() {
 		if err != nil {
 			f.Close()
 		}
 	}()
-	r := bufio.NewReaderSize(f, 1<<20)
-	var good int64
-	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 0 && line[len(line)-1] == '\n' {
-			good += int64(len(line))
-			lines++
-			last = append(last[:0], line[:len(line)-1]...)
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	// Строка справочника — сотни байт, с длинным списком таблиц — килобайты:
+	// конец последней целой строки ищется в хвосте файла, а не чтением всего.
+	size := fi.Size()
+	good := size
+	for step := int64(64 << 10); good > 0; step *= 16 {
+		tail := make([]byte, min(size, step))
+		if _, err := f.ReadAt(tail, size-int64(len(tail))); err != nil {
+			return nil, err
 		}
-		if err == io.EOF {
+		if i := bytes.LastIndexByte(tail, '\n'); i >= 0 {
+			good = size - int64(len(tail)) + int64(i) + 1
 			break
 		}
-		if err != nil {
-			return nil, 0, nil, err
+		if int64(len(tail)) == size {
+			good = 0
 		}
 	}
-	if err := f.Truncate(good); err != nil {
-		return nil, 0, nil, err
+	if good != size {
+		if err := f.Truncate(good); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := f.Seek(good, io.SeekStart); err != nil {
-		return nil, 0, nil, err
+		return nil, err
 	}
-	return f, lines, last, nil
+	return f, nil
 }
 
-// Close закрывает файлы журнала.
+// Close закрывает файлы справочника.
 func (t *Tap) Close() error {
 	var errs []error
-	for _, f := range []*os.File{t.journal, t.index, t.alerts} {
+	for _, f := range []*os.File{t.index, t.alerts} {
 		if f != nil {
 			errs = append(errs, f.Close())
 		}
@@ -269,13 +301,30 @@ func (t *Tap) Close() error {
 // Stats — счётчики с запуска.
 func (t *Tap) Stats() Stats { return t.stats }
 
+// Cursor — место входа: позиция фиксации последней транзакции, которая лежит в
+// буфере целиком (0 — ещё ни одной).
+func (t *Tap) Cursor() uint64 { return t.lastCommit }
+
 // InTransaction — между Begin и Commit: подтверждать серверу позицию дальше
 // последнего Commit сейчас нельзя.
 func (t *Tap) InTransaction() bool { return t.tx != nil }
 
+// Reset — соединение с базой оборвалось: недочитанную транзакцию база пришлёт
+// заново с начала, а описания таблиц — заново в новом соединении. Части,
+// которые от неё уже легли в буфер, остаются там без последней.
+func (t *Tap) Reset() {
+	if t.tx != nil && t.tx.parts > 0 {
+		t.log.Warn("the connection broke inside a transaction: its first parts stay in the spool without the last one; the server sends it again",
+			"xid", t.tx.begin.XID, "parts", t.tx.parts)
+	}
+	t.tx = nil
+	clear(t.rels)
+	clear(t.info)
+}
+
 // Handle принимает очередное сообщение pgoutput. flushed != 0 — транзакция
-// закончена и всё, что от неё нужно, лежит на диске: эту позицию можно
-// подтвердить серверу.
+// закончена и всё, что от неё нужно, лежит в буфере сборщика на диске: эту
+// позицию можно подтвердить серверу.
 func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 	switch m := msg.(type) {
 	case pgoutput.Begin:
@@ -435,7 +484,6 @@ func (t *Tap) start(tx *txState) error {
 	tx.gz = gzip.NewWriter(&tx.buf)
 	tx.tables = map[string]Counts{}
 	tx.written = map[uint32]bool{}
-	tx.firstLine = t.lines + 1
 	return t.write(tx, struct {
 		T          string            `json:"t"`
 		V          int               `json:"v"`
@@ -465,16 +513,30 @@ func (t *Tap) write(tx *txState, v any) error {
 	return nil
 }
 
+// part кладёт очередную часть в буфер сборщика. Место входа сдвигает только
+// последняя часть: пока транзакция в буфере не вся, после падения она должна
+// прийти заново.
 func (t *Tap) part(tx *txState, data []byte, last bool) error {
-	tx.parts++
 	line := make([]byte, 0, base64.StdEncoding.EncodedLen(len(data))+80)
-	line = fmt.Appendf(line, `{"xid":%d,"part":%d,"last":%t,"gz":"`, tx.begin.XID, tx.parts, last)
+	line = fmt.Appendf(line, `{"xid":%d,"part":%d,"last":%t,"gz":"`, tx.begin.XID, tx.parts+1, last)
 	line = base64.StdEncoding.AppendEncode(line, data)
-	line = append(line, '"', '}', '\n')
-	if _, err := t.journal.Write(line); err != nil {
+	line = append(line, '"', '}')
+	cursor := t.lastCommit
+	if last {
+		cursor = tx.begin.FinalLSN
+	}
+	seq, err := t.sink.Emit([][]byte{line}, cursor)
+	if err != nil {
 		return err
 	}
-	t.lines++
+	tx.parts++
+	if tx.parts == 1 {
+		tx.firstSeq = seq
+	} else if want := tx.firstSeq + uint64(tx.parts-1); seq != want {
+		// Части транзакции лежат подряд: по номерам первой и последней её
+		// достают из хранилища.
+		return fmt.Errorf("pgtap: transaction %d: part %d got record number %d, expected %d", tx.begin.XID, tx.parts, seq, want)
+	}
 	t.stats.Parts++
 	return nil
 }
@@ -616,8 +678,9 @@ func value(v pgoutput.Value) (any, error) {
 	}
 }
 
-// finish дописывает транзакцию: итог, остаток потока частями, индекс, тревоги.
-// Возвращается после fsync журнала и индекса.
+// finish дописывает транзакцию: итог, остаток потока частями, строка
+// справочника, последняя часть, тревоги. Возвращается, когда транзакция лежит в
+// буфере сборщика на диске.
 func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 	if !tx.header {
 		// Отметки есть, изменений нет (оператор не тронул ни одной строки).
@@ -640,14 +703,15 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 			return err
 		}
 	}
-	if err := t.part(tx, tx.buf.Bytes(), true); err != nil {
-		return err
-	}
-	if err := t.journal.Sync(); err != nil {
-		return err
+	// Строка справочника — раньше последней части (см. заголовок пакета).
+	// Номер последней части известен заранее: она следующая в буфере.
+	lastSeq := t.sink.Next()
+	firstSeq := tx.firstSeq
+	if tx.parts == 0 {
+		firstSeq = lastSeq
 	}
 	entry := IndexEntry{
-		XID: tx.begin.XID, FirstLine: tx.firstLine, LastLine: t.lines, Changes: tx.changes, Tables: tx.tables,
+		XID: tx.begin.XID, FirstSeq: firstSeq, LastSeq: lastSeq, Changes: tx.changes, Tables: tx.tables,
 		Truncated: tx.truncated, Who: tx.who, Actions: tx.actions, Undo: tx.undo,
 		CommitTime: tx.begin.CommitTime.UTC().Format(time.RFC3339Nano),
 		CommitLSN:  pgwire.LSN(tx.begin.FinalLSN).String(), EndLSN: pgwire.LSN(c.EndLSN).String(),
@@ -661,6 +725,13 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 	}
 	if err := t.index.Sync(); err != nil {
 		return err
+	}
+	if err := t.part(tx, tx.buf.Bytes(), true); err != nil {
+		return err
+	}
+	if tx.firstSeq != firstSeq || tx.firstSeq+uint64(tx.parts-1) != lastSeq {
+		return fmt.Errorf("pgtap: transaction %d: the index says records %d-%d, the spool gave %d-%d",
+			tx.begin.XID, firstSeq, lastSeq, tx.firstSeq, tx.firstSeq+uint64(tx.parts-1))
 	}
 	t.lastCommit = tx.begin.FinalLSN
 	t.stats.Captured++
@@ -677,10 +748,10 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 // Record — строка потока транзакции после распаковки.
 type Record map[string]any
 
-// ReadTransaction собирает транзакцию из строк журнала (тел записей хранилища)
-// по порядку: берёт последний целый набор частей 1..k с "last": true — после
-// перезапуска сборщика транзакция может лежать дважды, первый раз оборванной, —
-// и распаковывает поток. Строки другой транзакции — ошибка.
+// ReadTransaction собирает транзакцию из тел записей хранилища по порядку:
+// берёт последний целый набор частей 1..k с "last": true — после обрыва связи
+// или перезапуска сборщика транзакция может лежать дважды, первый раз
+// оборванной, — и распаковывает поток. Записи другой транзакции — ошибка.
 func ReadTransaction(xid uint32, lines [][]byte) ([]Record, error) {
 	type part struct {
 		XID  uint32 `json:"xid"`
@@ -736,3 +807,36 @@ func ReadTransaction(xid uint32, lines [][]byte) ([]Record, error) {
 	}
 	return out, nil
 }
+
+// Lookup ищет транзакцию в справочнике (index.jsonl): последняя строка с этим
+// xid. found == false — такой транзакции в справочнике нет.
+func Lookup(indexPath string, xid uint32) (e IndexEntry, found bool, err error) {
+	f, err := os.Open(indexPath)
+	if err != nil {
+		return e, false, err
+	}
+	defer f.Close()
+	needle := []byte(`"xid":` + strconv.FormatUint(uint64(xid), 10) + ",")
+	r := bufio.NewReaderSize(f, 1<<20)
+	for {
+		line, rerr := r.ReadBytes('\n')
+		if len(line) > 0 && line[len(line)-1] == '\n' && bytes.Contains(line, needle) {
+			var c IndexEntry
+			if err := json.Unmarshal(line, &c); err != nil {
+				return e, false, fmt.Errorf("pgtap: %s: %w", filepath.Base(indexPath), err)
+			}
+			if c.XID == xid {
+				e, found = c, true
+			}
+		}
+		if rerr == io.EOF {
+			return e, found, nil
+		}
+		if rerr != nil {
+			return e, false, rerr
+		}
+	}
+}
+
+// SetLogger меняет журнал, в который идут тревоги и предупреждения.
+func (t *Tap) SetLogger(log *slog.Logger) { t.log = log }

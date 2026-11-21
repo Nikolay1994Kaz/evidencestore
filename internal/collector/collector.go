@@ -1,11 +1,19 @@
 // Package collector — лёгкий сборщик рядом с источником.
 //
-// Читает файл журнала построчно, нумерует строки (Seq по порядку), кладёт в
-// дисковый буфер и отправляет пачками в хранилище по HTTPS с клиентским
-// сертификатом. Запись доставлена, только когда хранилище ответило «принято»
-// и подписало обещание, которое сходится с закреплённым ключом. Доставка
-// «хотя бы один раз»: повтор хранилище узнаёт по (источник, номер) и сверяет
-// тело.
+// У сборщика две половины. ДОСТАВКА одна на все источники: записи получают
+// номера (Seq по порядку), ложатся в дисковый буфер и уходят пачками в
+// хранилище по HTTPS с клиентским сертификатом. Запись доставлена, только
+// когда хранилище ответило «принято» и подписало обещание, которое сходится с
+// закреплённым ключом. Доставка «хотя бы один раз»: повтор хранилище узнаёт
+// по (источник, номер) и сверяет тело.
+//
+// ВХОД — откуда записи берутся, и он выбирается в настройках: файл журнала
+// ("file"), файлы по маске ("glob") или вход из internal/input — сейчас это
+// журнал PostgreSQL ("postgres", internal/pginput). Файлы сборщик читает сам,
+// построчно, и всё про них — ниже в этом заголовке и в коде чтения. Любой
+// другой вход отдаёт готовые тела записей через input.Sink (input.go) и про
+// доставку ничего не знает; новый вид источника — это новый input.Input и
+// строка в newInput, а не вторая программа рядом.
 //
 // БУФЕР — свой экземпляр журнала evlog, того же, что у журнала улик
 // хранилища: запись только после fsync, после первой ошибки записи журнал
@@ -13,7 +21,9 @@
 // Доставленные сегменты удаляются целиком (Release). Тела ждут отправки на
 // диске, в памяти — только счётчики.
 //
-// ПОЧЕМУ ПОЗИЦИЯ В ФАЙЛЕ ЛЕЖИТ В КАЖДОЙ ЗАПИСИ БУФЕРА. Если хранить
+// ПОЧЕМУ ПОЗИЦИЯ В ФАЙЛЕ ЛЕЖИТ В КАЖДОЙ ЗАПИСИ БУФЕРА (у входа из
+// internal/input на её месте лежит его «место», cursor, — по той же причине).
+// Если хранить
 // «докуда прочитан файл» отдельно, падение между записью в буфер и
 // сохранением позиции перечитает строки и выдаст им НОВЫЕ номера — у
 // хранилища окажется две улики об одном событии. Позиция внутри записи
@@ -70,6 +80,8 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/input"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pginput"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 
 	"golang.org/x/sys/unix"
@@ -90,6 +102,9 @@ type Config struct {
 	// Glob — маска файлов (filepath.Match) вместо file, когда источник
 	// пишет новые файлы: "/var/lib/pipelock/recorder/evidence-*.jsonl".
 	Glob string `json:"glob"`
+	// Postgres — вместо file и glob: до-образы строк из журнала PostgreSQL
+	// (internal/pginput). Ровно один из трёх входов.
+	Postgres *pginput.Config `json:"postgres"`
 	// FromStart — читать файл с начала (иначе — только новые строки).
 	FromStart  bool            `json:"from_start"`
 	Batch      int             `json:"batch"`       // записей в пачке, 1–512; 0 — 256
@@ -103,6 +118,9 @@ type Config struct {
 	// журнал голов (checkpoints.jsonl) и в checkpoint.json. 0 — 10 мин, не
 	// меньше секунды.
 	CheckpointEvery config.Duration `json:"checkpoint_every"`
+
+	// in — готовый вход вместо file, glob и postgres (только тесты).
+	in input.Input
 }
 
 const (
@@ -124,13 +142,86 @@ func LoadConfig(path string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("collector config %s: %w", path, err)
 	}
-	base := filepath.Dir(path)
-	for _, p := range []*string{&c.CA, &c.Cert, &c.Key, &c.SpoolDir, &c.File, &c.Glob} {
+	c.resolve(filepath.Dir(path))
+	return &c, c.validate()
+}
+
+// resolve делает относительные пути настроек путями от base.
+func (c *Config) resolve(base string) {
+	paths := []*string{&c.CA, &c.Cert, &c.Key, &c.SpoolDir, &c.File, &c.Glob}
+	if c.Postgres != nil {
+		paths = append(paths, &c.Postgres.Dir)
+	}
+	for _, p := range paths {
 		if *p != "" && !filepath.IsAbs(*p) {
 			*p = filepath.Join(base, *p)
 		}
 	}
-	return &c, c.validate()
+}
+
+// LoadConfigs читает настройки одного сборщика или нескольких. Несколько —
+// когда в файле есть "sources": список источников, у каждого свой сертификат,
+// буфер и вход; настройки верхнего уровня (сервер, УЦ, ключ хранилища, паузы)
+// — общие умолчания, источник может задать своё. Один процесс escollect ведёт
+// их все, каждый — независимо от остальных.
+//
+//	{"server": "https://store:8443", "ca": "ca.crt", "store_key": "...",
+//	 "sources": [
+//	   {"cert": "app.crt", "key": "app.key", "spool_dir": "spool-app", "file": "/var/log/app.log"},
+//	   {"cert": "pg.crt",  "key": "pg.key",  "spool_dir": "spool-pg",  "postgres": {...}}]}
+func LoadConfigs(path string) ([]*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var probe struct {
+		Sources []json.RawMessage `json:"sources"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, fmt.Errorf("collector config %s: %w", path, err)
+	}
+	if probe.Sources == nil {
+		c, err := LoadConfig(path)
+		if err != nil {
+			return nil, err
+		}
+		return []*Config{c}, nil
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		return nil, fmt.Errorf("collector config %s: %w", path, err)
+	}
+	delete(top, "sources")
+	shared, err := json.Marshal(top)
+	if err != nil {
+		return nil, err
+	}
+	if len(probe.Sources) == 0 {
+		return nil, fmt.Errorf("collector config %s: sources is empty", path)
+	}
+	var out []*Config
+	spools := map[string]int{}
+	for i, raw := range probe.Sources {
+		var c Config
+		// Сначала общее, поверх — своё: что источник не назвал, остаётся общим.
+		for _, part := range [][]byte{shared, raw} {
+			dec := json.NewDecoder(bytes.NewReader(part))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&c); err != nil {
+				return nil, fmt.Errorf("collector config %s: source %d: %w", path, i+1, err)
+			}
+		}
+		c.resolve(filepath.Dir(path))
+		if err := c.validate(); err != nil {
+			return nil, fmt.Errorf("collector config %s: source %d: %w", path, i+1, err)
+		}
+		if j, taken := spools[c.SpoolDir]; taken {
+			return nil, fmt.Errorf("collector config %s: sources %d and %d share spool_dir %s: each source keeps its own", path, j, i+1, c.SpoolDir)
+		}
+		spools[c.SpoolDir] = i + 1
+		out = append(out, &c)
+	}
+	return out, nil
 }
 
 // validate проверяет настройки и ставит умолчания. Опасное значение —
@@ -181,8 +272,25 @@ func (c *Config) validate() error {
 	if c.CheckpointEvery.D() < time.Second {
 		errs = append(errs, fmt.Errorf("checkpoint_every %v: must be at least a second (each saved head costs two fsyncs)", c.CheckpointEvery.D()))
 	}
-	if (c.File == "") == (c.Glob == "") {
-		errs = append(errs, errors.New("exactly one of file and glob is required"))
+	inputs := 0
+	for _, set := range []bool{c.File != "", c.Glob != "", c.Postgres != nil, c.in != nil} {
+		if set {
+			inputs++
+		}
+	}
+	if inputs != 1 {
+		errs = append(errs, errors.New("exactly one of file, glob and postgres is required"))
+	}
+	if c.Postgres != nil {
+		if c.Postgres.Dir == "" {
+			c.Postgres.Dir = c.SpoolDir // справочник — рядом с буфером
+		}
+		if err := c.Postgres.Validate(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if c.FromStart && c.File == "" && c.Glob == "" {
+		errs = append(errs, errors.New("from_start is about files: it does not apply to this input"))
 	}
 	if c.Glob != "" {
 		// Каталог маски — один и без подстановок: его сборщик читает целиком
@@ -204,9 +312,14 @@ func parseStoreKey(s string) (ed25519.PublicKey, error) {
 	return raw, nil
 }
 
-// Collector — один источник: файл или файлы по маске.
+// Collector — один источник: файл, файлы по маске или вход из internal/input.
 type Collector struct {
-	cfg      *Config
+	cfg *Config
+	// input — вход не из файлов (nil — читаются файлы); cursor — его место,
+	// которое легло в буфер с последней записью (input.go).
+	input  input.Input
+	cursor uint64
+
 	log      *slog.Logger
 	http     *http.Client
 	storeKey ed25519.PublicKey
@@ -335,6 +448,9 @@ func New(cfg *Config, log *slog.Logger) (_ *Collector, err error) {
 	if c.storeKey, err = parseStoreKey(cfg.StoreKey); err != nil {
 		return nil, fmt.Errorf("collector: %w", err)
 	}
+	if c.input, err = newInput(cfg, log); err != nil {
+		return nil, fmt.Errorf("collector: %w", err)
+	}
 	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
 	if err != nil {
 		return nil, fmt.Errorf("collector certificate: %w", err)
@@ -375,6 +491,11 @@ func New(cfg *Config, log *slog.Logger) (_ *Collector, err error) {
 	if err := c.load(); err != nil {
 		return nil, err
 	}
+	if c.input != nil {
+		if err := c.input.Open(c.cursor, sink{c}); err != nil {
+			return nil, fmt.Errorf("collector: input: %w", err)
+		}
+	}
 	return c, nil
 }
 
@@ -382,6 +503,7 @@ func (c *Collector) spoolDir() string     { return filepath.Join(c.cfg.SpoolDir,
 func (c *Collector) statePath() string    { return filepath.Join(c.cfg.SpoolDir, "state.json") }
 func (c *Collector) filesPath() string    { return filepath.Join(c.cfg.SpoolDir, "files.json") }
 func (c *Collector) startPath() string    { return filepath.Join(c.cfg.SpoolDir, "start-files.json") }
+func (c *Collector) inputPath() string    { return filepath.Join(c.cfg.SpoolDir, "input.json") }
 func (c *Collector) promisesPath() string { return filepath.Join(c.cfg.SpoolDir, "promises.jsonl") }
 func (c *Collector) epochPath() string    { return filepath.Join(c.cfg.SpoolDir, "epoch.json") }
 
@@ -430,6 +552,25 @@ func (c *Collector) load() error {
 			return err
 		}
 	}
+	// Буфер помнит места своего входа, и другому входу они ничего не говорят:
+	// spool_dir, начатый с файлами, с другим входом не открывается, и наоборот.
+	// Снимок места входа — input.json, как files.json у файлов.
+	var in inputState
+	inputFound, err := readJSON(c.inputPath(), &in)
+	if err != nil {
+		return err
+	}
+	switch {
+	case c.input != nil && (filesFound || startFound):
+		return errors.New("collector: spool_dir was started by a collector reading files (files.json is there): another input needs its own spool_dir")
+	case c.input == nil && inputFound:
+		return errors.New("collector: spool_dir was started by a collector with another input (input.json is there): reading files needs its own spool_dir")
+	case c.input != nil:
+		// Дальше «снимок мест» — это input.json: до записи «старт» он играет
+		// роль start-files.json, после неё — files.json (inputState).
+		filesFound, startFound = inputFound && in.Started, inputFound
+		c.cursor = in.Cursor
+	}
 	c.acked = st.Acked
 	for _, f := range files {
 		c.files[f.Inode] = &tracked{ino: f.Inode, off: f.Offset, mtime: f.MTime, head: f.Head, path: f.Path, birth: f.Birth, idle: f.Idle, size: -1}
@@ -451,27 +592,33 @@ func (c *Collector) load() error {
 			// нельзя.
 			return fmt.Errorf("collector spool position %d: seq %d after %d", p, r.seq, last.seq)
 		}
-		switch r.kind {
-		case kindStart:
-			started = true
-			c.acked = max(c.acked, r.seq)
-		case kindPos:
-			if r.pos.Inode != 0 {
-				t := c.track(r.pos.Inode)
-				parts := strings.SplitN(string(r.body), "\n", 3)
-				t.off, t.head, t.idle = r.pos.Offset, parts[0], false
-				if len(parts) > 1 && parts[1] != "" {
-					t.path = parts[1]
-				}
-				if len(parts) > 2 {
-					t.birth, _ = strconv.ParseInt(parts[2], 10, 64)
-				}
+		if c.input != nil {
+			if err := c.replayInput(p, r, &started); err != nil {
+				return err
 			}
-		case kindLine:
-			t := c.track(r.pos.Inode)
-			t.off, t.idle = r.pos.Offset, false
-		case kindDone:
-			delete(c.files, r.pos.Inode)
+		} else {
+			switch r.kind {
+			case kindStart:
+				started = true
+				c.acked = max(c.acked, r.seq)
+			case kindPos:
+				if r.pos.Inode != 0 {
+					t := c.track(r.pos.Inode)
+					parts := strings.SplitN(string(r.body), "\n", 3)
+					t.off, t.head, t.idle = r.pos.Offset, parts[0], false
+					if len(parts) > 1 && parts[1] != "" {
+						t.path = parts[1]
+					}
+					if len(parts) > 2 {
+						t.birth, _ = strconv.ParseInt(parts[2], 10, 64)
+					}
+				}
+			case kindLine:
+				t := c.track(r.pos.Inode)
+				t.off, t.idle = r.pos.Offset, false
+			case kindDone:
+				delete(c.files, r.pos.Inode)
+			}
 		}
 		if r.seq <= c.acked {
 			c.sentPos = p
@@ -486,7 +633,7 @@ func (c *Collector) load() error {
 	}
 	switch {
 	case n == 0 && (stateFound || filesFound):
-		return errors.New("collector: the spool is empty, but state.json or files.json is there: the spool was lost, and the read positions with it. " +
+		return errors.New("collector: the spool is empty, but state.json or files.json (input.json) is there: the spool was lost, and the read positions with it. " +
 			"Restore spool_dir from a backup if there is one. Emptying spool_dir starts over: numbering continues from the store, " +
 			"lines not yet delivered are skipped — or, with from_start, the whole log is delivered again under new numbers (duplicates). " +
 			"An emptied spool_dir is a new collector installation: the store refuses it until the operator binds it (the command is in the refusal)")
@@ -494,9 +641,9 @@ func (c *Collector) load() error {
 		c.sentPos = c.spool.Next() - 1 // первый запуск
 		clear(c.files)
 	case !filesFound && !started:
-		return errors.New("collector: files.json is missing and the spool no longer holds the start record: read positions are unknown")
+		return errors.New("collector: files.json (input.json) is missing and the spool no longer holds the start record: read positions are unknown")
 	case !filesFound && !startFound:
-		return errors.New("collector: files.json and start-files.json are both missing: read positions are unknown")
+		return errors.New("collector: files.json and start-files.json (input.json) are missing: read positions are unknown")
 	case c.acked > last.seq:
 		return fmt.Errorf("collector: state.json says seq %d is delivered, but the spool ends at %d", c.acked, last.seq)
 	default:
@@ -593,6 +740,10 @@ func (c *Collector) Close() error {
 		}
 	}
 	var errs []error
+	if c.input != nil {
+		errs = append(errs, c.input.Close())
+		c.input = nil
+	}
 	if c.spool != nil {
 		errs = append(errs, c.spool.Close())
 		c.spool = nil
@@ -718,14 +869,22 @@ func (c *Collector) Bootstrap(ctx context.Context) error {
 		c.log.Warn("from_start, but the store already holds records of this source: lines it has will come again under new numbers",
 			"store_last_seq", st.LastSeq)
 	}
-	if err := c.registerExisting(); err != nil {
-		return err
-	}
-	// Реестр первого запуска — в отдельный файл до записи «старт»: он нужен,
-	// если упасть после «старт», до files.json, а в запись буфера тысячи
-	// файлов под маской не уместились бы.
-	if err := c.persist("start", func() error { return writeJSON(c.startPath(), c.fileList()) }); err != nil {
-		return err
+	if c.input != nil {
+		// Место входа на первом запуске — ноль; снимок — до записи «старт»,
+		// как реестр файлов: по нему видно, чей это буфер.
+		if err := c.saveInput(false); err != nil {
+			return err
+		}
+	} else {
+		if err := c.registerExisting(); err != nil {
+			return err
+		}
+		// Реестр первого запуска — в отдельный файл до записи «старт»: он нужен,
+		// если упасть после «старт», до files.json, а в запись буфера тысячи
+		// файлов под маской не уместились бы.
+		if err := c.persist("start", func() error { return writeJSON(c.startPath(), c.fileList()) }); err != nil {
+			return err
+		}
 	}
 	// Старт — первая запись буфера: с ним запуск уже не первый.
 	if err := c.appendSpool([]spoolRecord{{kind: kindStart, seq: st.LastSeq}}); err != nil {
@@ -733,7 +892,7 @@ func (c *Collector) Bootstrap(ctx context.Context) error {
 	}
 	c.sentPos = c.spool.Next() - 1
 	c.log.Info("collector bootstrap", "next_seq", c.nextSeq)
-	return c.saveFiles()
+	return c.savePositions()
 }
 
 // registerExisting — первый запуск: файлы на пути (под маской) — в реестр,
@@ -756,7 +915,7 @@ func (c *Collector) registerExisting() error {
 	return nil
 }
 
-// Run читает файл и отправляет пачки до отмены ctx.
+// Run читает вход и отправляет пачки до отмены ctx.
 func (c *Collector) Run(ctx context.Context) error {
 	if err := c.Bootstrap(ctx); err != nil {
 		return err
@@ -791,6 +950,14 @@ func (c *Collector) Run(ctx context.Context) error {
 			} else {
 				backoff = 0
 			}
+		}
+		if c.input != nil {
+			// Вход ждёт сам: появились данные — проход сразу, а не через паузу.
+			c.input.Wait(ctx, c.cfg.FlushEvery.D())
+			if ctx.Err() != nil {
+				return nil
+			}
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -829,7 +996,13 @@ func (c *Collector) Run(ctx context.Context) error {
 // не прочитать (права, нехватка дескрипторов, сбой ФС), — не «файлов нет»:
 // по такому листингу ничего не решается, открытые файлы читаются дальше, а
 // проход возвращает ошибку (Z-03).
+//
+// С входом из internal/input проход — его Read: что вход уже получил, то и
+// легло в буфер (input.go).
 func (c *Collector) ReadOnce() (int, error) {
+	if c.input != nil {
+		return c.input.Read()
+	}
 	seen, listErr := c.list()
 	if listErr == nil {
 		if err := c.reconcile(seen); err != nil {
@@ -1515,8 +1688,9 @@ func (c *Collector) SendOnce(ctx context.Context) error {
 		}
 		c.sentPos, c.pending = last, c.pending-len(batch)
 		// Снимок реестра — раньше, чем доставленное уйдёт из буфера: места
-		// файлов из освобождённых записей остаются в files.json.
-		if err := c.saveFiles(); err != nil {
+		// файлов из освобождённых записей остаются в files.json (место входа —
+		// в input.json).
+		if err := c.savePositions(); err != nil {
 			return err
 		}
 		if err := c.spool.Release(c.sentPos); err != nil {

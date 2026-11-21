@@ -3,6 +3,7 @@ package pgtap
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,27 +37,72 @@ func action(role, id string) pgoutput.Message {
 	return pgoutput.Message{Transactional: true, Prefix: PrefixAction, Content: []byte(`{"role":"` + role + `","info":{"action_id":"` + id + `"}}`)}
 }
 
+// fakeSink — буфер сборщика: помнит записи, номера с единицы и место входа.
+// failAt — на этом по счёту вызове Emit «процесс падает»: запись не ложится.
+type fakeSink struct {
+	bodies [][]byte
+	cursor uint64
+	emits  int
+	failAt int
+}
+
+var errCrash = errors.New("crash")
+
+func (s *fakeSink) Next() uint64 { return uint64(len(s.bodies)) + 1 }
+
+func (s *fakeSink) Emit(bodies [][]byte, cursor uint64) (uint64, error) {
+	if s.emits++; s.emits == s.failAt {
+		return 0, errCrash
+	}
+	first := s.Next()
+	for _, b := range bodies {
+		s.bodies = append(s.bodies, bytes.Clone(b))
+	}
+	s.cursor = cursor
+	return first, nil
+}
+
 type harness struct {
-	t   *testing.T
-	dir string
-	tap *Tap
-	cat *fakeCatalog
-	lsn uint64
+	t    *testing.T
+	dir  string
+	tap  *Tap
+	cat  *fakeCatalog
+	sink *fakeSink
+	lsn  uint64
 }
 
 func open(t *testing.T, dir string, mod func(*Config)) *harness {
+	t.Helper()
+	return openOn(t, dir, &fakeSink{}, mod)
+}
+
+// openOn поднимает Tap над буфером, который пережил «падение»: место входа —
+// то, что в нём лежит.
+func openOn(t *testing.T, dir string, sink *fakeSink, mod func(*Config)) *harness {
 	t.Helper()
 	cfg := Config{Dir: dir, Roles: []string{"agent"}}
 	if mod != nil {
 		mod(&cfg)
 	}
 	cat := &fakeCatalog{}
-	tap, err := Open(cfg, cat, nil)
+	tap, err := Open(cfg, cat, sink, sink.cursor, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { tap.Close() })
-	return &harness{t: t, dir: dir, tap: tap, cat: cat, lsn: 1000}
+	return &harness{t: t, dir: dir, tap: tap, cat: cat, sink: sink, lsn: 1000}
+}
+
+// feed подаёт транзакцию и отдаёт ошибку Handle, если она была.
+func (h *harness) feed(xid uint32, commit uint64, msgs ...any) error {
+	all := append([]any{pgoutput.Begin{FinalLSN: commit, CommitTime: time.Unix(1_800_000_000, 0), XID: xid}}, msgs...)
+	all = append(all, pgoutput.Commit{CommitLSN: commit, EndLSN: commit + 50})
+	for _, m := range all {
+		if _, err := h.tap.Handle(m); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // run подаёт транзакцию: Begin, сообщения, Commit; отдаёт подтверждённую позицию.
@@ -82,6 +128,9 @@ func (h *harness) runAt(xid uint32, commit uint64, msgs ...any) uint64 {
 	}
 	return flushed
 }
+
+// parts — записи, которые легли в буфер сборщика.
+func (h *harness) parts() [][]byte { return h.sink.bodies }
 
 func (h *harness) lines(name string) [][]byte {
 	h.t.Helper()
@@ -132,7 +181,7 @@ func TestAgentTransactionIsJournaled(t *testing.T) {
 	if flushed != h.lsn+50 {
 		t.Fatalf("flushed %d", flushed)
 	}
-	lines := h.lines("journal.jsonl")
+	lines := h.parts()
 	if len(lines) != 1 || !bytes.HasPrefix(lines[0], []byte(`{"xid":751,"part":1,"last":true,"gz":"`)) {
 		t.Fatalf("journal: %d lines, %.60s", len(lines), lines[0])
 	}
@@ -160,12 +209,18 @@ func TestAgentTransactionIsJournaled(t *testing.T) {
 		t.Fatalf("delete %v", d)
 	}
 	idx := h.index()
-	if len(idx) != 1 || idx[0].XID != 751 || idx[0].FirstLine != 1 || idx[0].LastLine != 1 || idx[0].Changes != 3 ||
+	if len(idx) != 1 || idx[0].XID != 751 || idx[0].FirstSeq != 1 || idx[0].LastSeq != 1 || idx[0].Changes != 3 ||
 		idx[0].Tables["public.accounts"] != (Counts{I: 1, U: 1, D: 1}) || len(idx[0].Actions) != 1 {
 		t.Fatalf("index %+v", idx)
 	}
 	if h.cat.calls != 1 {
 		t.Fatalf("catalog asked %d times", h.cat.calls)
+	}
+	if h.sink.cursor != h.lsn {
+		t.Fatalf("cursor %d, the commit is at %d", h.sink.cursor, h.lsn)
+	}
+	if bytes.HasSuffix(lines[0], []byte("\n")) {
+		t.Fatal("a record body ends with a newline")
 	}
 }
 
@@ -177,7 +232,7 @@ func TestOtherTransactionsAreSkipped(t *testing.T) {
 	}
 	h.run(2, accounts, ins)                // без отметки вовсе
 	h.run(3, action("postgres", "1"), ins) // отметка действия не от наблюдаемой роли
-	if n := len(h.lines("journal.jsonl")); n != 0 {
+	if n := len(h.parts()); n != 0 {
 		t.Fatalf("%d journal lines", n)
 	}
 	if s := h.tap.Stats(); s.Skipped != 3 || s.SkippedChanges != 3 || s.Captured != 0 {
@@ -201,7 +256,7 @@ func TestBigValueSpansParts(t *testing.T) {
 	}
 	h.run(9, who("agent"), accounts, pgoutput.Update{RelID: 7, OldKind: 'O',
 		Old: []pgoutput.Value{txt("1"), txt("small")}, New: []pgoutput.Value{txt("1"), txt(big.String())}})
-	lines := h.lines("journal.jsonl")
+	lines := h.parts()
 	if len(lines) < 10 {
 		t.Fatalf("%d parts", len(lines))
 	}
@@ -222,7 +277,7 @@ func TestBigValueSpansParts(t *testing.T) {
 	if recs[2]["new"].([]any)[1] != big.String() {
 		t.Fatal("the big value did not survive the parts")
 	}
-	if idx := h.index(); idx[0].FirstLine != 1 || idx[0].LastLine != uint64(len(lines)) {
+	if idx := h.index(); idx[0].FirstSeq != 1 || idx[0].LastSeq != uint64(len(lines)) {
 		t.Fatalf("index %+v", idx[0])
 	}
 	// Без любой из частей транзакция не читается.
@@ -250,7 +305,7 @@ func TestUnchangedToastComesFromTheOldRow(t *testing.T) {
 	h := open(t, t.TempDir(), nil)
 	h.run(5, who("agent"), accounts, pgoutput.Update{RelID: 7, OldKind: 'O',
 		Old: []pgoutput.Value{txt("1"), txt("long text")}, New: []pgoutput.Value{txt("2"), {Kind: pgoutput.Unchanged}}})
-	recs, _ := ReadTransaction(5, h.lines("journal.jsonl"))
+	recs, _ := ReadTransaction(5, h.parts())
 	if got := recs[2]["new"].([]any); got[0] != "2" || got[1] != "long text" {
 		t.Fatalf("new %v", got)
 	}
@@ -263,7 +318,7 @@ func TestKeyOnlyOldRowIsMarkedPartial(t *testing.T) {
 	h.run(5, who("agent"), rel,
 		pgoutput.Update{RelID: 7, New: []pgoutput.Value{txt("1"), txt("b")}},
 		pgoutput.Delete{RelID: 7, OldKind: 'K', Old: []pgoutput.Value{txt("1"), {Kind: pgoutput.Null}}})
-	recs, _ := ReadTransaction(5, h.lines("journal.jsonl"))
+	recs, _ := ReadTransaction(5, h.parts())
 	for _, r := range recs[2:4] {
 		if r["partial"] != true || r["old"] != nil {
 			t.Fatalf("%v", r)
@@ -274,43 +329,150 @@ func TestKeyOnlyOldRowIsMarkedPartial(t *testing.T) {
 	}
 }
 
-func TestRestartSkipsWhatIsJournaledAndCutsATornTail(t *testing.T) {
+// Падение посреди транзакции: её первые части остались в буфере без последней,
+// место входа не сдвинулось. После перезапуска база шлёт заново с подтверждённой
+// позиции: уже лежащая целиком транзакция пропускается, оборванная ложится
+// целиком под новыми номерами, и справочник называет именно их.
+func TestRestartSkipsWhatIsSpooledAndResendsTheTornTransaction(t *testing.T) {
 	dir := t.TempDir()
-	h := open(t, dir, nil)
+	small := func(c *Config) { c.PartSize = 64 }
+	h := open(t, dir, small)
 	up := pgoutput.Update{RelID: 7, OldKind: 'O', Old: []pgoutput.Value{txt("1"), txt("a")}, New: []pgoutput.Value{txt("1"), txt("b")}}
+	big := pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("2"), txt(strings.Repeat("abcdefgh", 60))}}
 	h.runAt(10, 2000, who("agent"), accounts, up)
+	whole := len(h.sink.bodies)
+	h.sink.failAt = h.sink.emits + 3 // третья часть транзакции 11 не ляжет
+	if err := h.feed(11, 2100, who("agent"), accounts, big); !errors.Is(err, errCrash) {
+		t.Fatalf("no crash: %v", err)
+	}
 	h.tap.Close()
-	// Падение посреди следующей транзакции: в журнале обрывок строки.
-	f, _ := os.OpenFile(filepath.Join(dir, "journal.jsonl"), os.O_APPEND|os.O_WRONLY, 0)
-	f.WriteString(`{"xid":11,"part":1,"last":fal`)
-	f.Close()
+	torn := len(h.sink.bodies) - whole
+	if torn != 2 || h.sink.cursor != 2000 {
+		t.Fatalf("%d torn parts in the spool, cursor %d", torn, h.sink.cursor)
+	}
+	if len(h.index()) != 1 {
+		t.Fatal("the torn transaction is in the index")
+	}
 
-	h = open(t, dir, nil)
-	// Сервер шлёт заново с подтверждённой позиции: транзакция 10 уже в журнале.
+	h = openOn(t, dir, h.sink, small)
 	if f := h.runAt(10, 2000, who("agent"), accounts, up); f != 2050 {
 		t.Fatalf("flushed %d", f)
 	}
-	h.runAt(11, 2100, who("agent"), accounts, up)
-	lines := h.lines("journal.jsonl")
-	if len(lines) != 2 {
-		t.Fatalf("%d journal lines: the duplicate or the torn tail stayed", len(lines))
+	if len(h.sink.bodies) != whole+torn {
+		t.Fatal("the transaction already in the spool was spooled again")
 	}
-	if _, err := ReadTransaction(11, lines[1:]); err != nil {
+	h.runAt(11, 2100, who("agent"), accounts, big)
+	idx := h.index()
+	if len(idx) != 2 || idx[1].XID != 11 || idx[1].FirstSeq != uint64(whole+torn+1) || idx[1].LastSeq != uint64(len(h.sink.bodies)) {
+		t.Fatalf("index %+v, %d records in the spool", idx, len(h.sink.bodies))
+	}
+	// По номерам из справочника — ровно целая копия; по метке xid в хранилище
+	// придут и обрывки, и читатель берёт последний целый набор.
+	if _, err := ReadTransaction(11, h.sink.bodies[idx[1].FirstSeq-1:idx[1].LastSeq]); err != nil {
 		t.Fatal(err)
 	}
-	idx := h.index()
-	if len(idx) != 2 || idx[1].XID != 11 || idx[1].FirstLine != 2 {
-		t.Fatalf("index %+v", idx)
+	if _, err := ReadTransaction(11, h.sink.bodies[whole:]); err != nil {
+		t.Fatal(err)
 	}
 	if s := h.tap.Stats(); s.Duplicates != 1 || s.Captured != 1 {
 		t.Fatalf("%+v", s)
+	}
+	if h.sink.cursor != 2100 {
+		t.Fatalf("cursor %d", h.sink.cursor)
+	}
+}
+
+// Падение между строкой справочника и последней частью: строка есть, а
+// транзакция в буфере не вся. Она приходит заново, ложится под новыми номерами
+// и получает новую строку; верна последняя, и Lookup отдаёт её. По номерам из
+// прежней строки транзакция не читается: ошибка, а не чужие данные.
+func TestCrashBetweenIndexAndLastPart(t *testing.T) {
+	dir := t.TempDir()
+	small := func(c *Config) { c.PartSize = 64 }
+	ins := pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("1"), txt("x")}}
+	big := pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("2"), txt(strings.Repeat("abcdefgh", 60))}}
+	// Сколько частей в большой транзакции — на отдельном стенде.
+	probe := open(t, t.TempDir(), small)
+	probe.runAt(21, 3100, who("agent"), accounts, big)
+	k := len(probe.sink.bodies)
+	if k < 3 {
+		t.Fatalf("%d parts", k)
+	}
+
+	h := open(t, dir, small)
+	h.runAt(20, 3000, who("agent"), accounts, ins)
+	whole := len(h.sink.bodies)
+	h.sink.failAt = h.sink.emits + k // последняя часть не ляжет
+	if err := h.feed(21, 3100, who("agent"), accounts, big); !errors.Is(err, errCrash) {
+		t.Fatalf("no crash: %v", err)
+	}
+	h.tap.Close()
+	if len(h.sink.bodies) != whole+k-1 || h.sink.cursor != 3000 {
+		t.Fatalf("%d records in the spool, cursor %d", len(h.sink.bodies), h.sink.cursor)
+	}
+	stale, found, err := Lookup(filepath.Join(dir, IndexFile), 21)
+	if err != nil || !found || stale.FirstSeq != uint64(whole+1) || stale.LastSeq != uint64(whole+k) {
+		t.Fatalf("the index line written before the last part: %+v %v %v", stale, found, err)
+	}
+	// Обрыв посреди записи справочника тоже бывает: хвост без перевода строки.
+	f, _ := os.OpenFile(filepath.Join(dir, IndexFile), os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(`{"xid":22,"first_seq":9`)
+	f.Close()
+
+	h = openOn(t, dir, h.sink, small)
+	h.runAt(20, 3000, who("agent"), accounts, ins) // повтор
+	h.runAt(21, 3100, who("agent"), accounts, big)
+	idx := h.index()
+	if len(idx) != 3 || idx[1].XID != 21 || idx[2].XID != 21 {
+		t.Fatalf("index %+v", idx)
+	}
+	e, found, err := Lookup(filepath.Join(dir, IndexFile), 21)
+	if err != nil || !found || e.FirstSeq != uint64(whole+k) || e.LastSeq != uint64(whole+2*k-1) {
+		t.Fatalf("lookup %+v %v %v", e, found, err)
+	}
+	if _, err := ReadTransaction(21, h.sink.bodies[e.FirstSeq-1:e.LastSeq]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadTransaction(21, h.sink.bodies[stale.FirstSeq-1:stale.LastSeq]); err == nil {
+		t.Fatal("the records named by the stale index line were read as a whole transaction")
+	}
+	if _, found, _ := Lookup(filepath.Join(dir, IndexFile), 2); found {
+		t.Fatal("found a transaction that is not in the index (xid 2 is a prefix of 20, 21)")
+	}
+	if _, found, _ := Lookup(filepath.Join(dir, IndexFile), 22); found {
+		t.Fatal("the torn index line was read")
+	}
+}
+
+// Обрыв связи посреди транзакции: Reset, и транзакция принимается заново с
+// начала вместе с описанием таблицы.
+func TestResetDropsTheOpenTransaction(t *testing.T) {
+	h := open(t, t.TempDir(), nil)
+	ins := pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("1"), txt("x")}}
+	for _, m := range []any{pgoutput.Begin{FinalLSN: 500, XID: 30}, who("agent"), accounts, ins} {
+		if _, err := h.tap.Handle(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.tap.Reset()
+	if h.tap.InTransaction() {
+		t.Fatal("still in the transaction")
+	}
+	if err := h.feed(30, 500, who("agent"), ins); err == nil {
+		t.Fatal("a change of a table that this connection never described was taken")
+	}
+	h.tap.Reset()
+	h.runAt(30, 500, who("agent"), accounts, ins)
+	recs, err := ReadTransaction(30, h.sink.bodies)
+	if err != nil || recs[len(recs)-1]["changes"] != float64(1) {
+		t.Fatalf("%v %v", recs, err)
 	}
 }
 
 func TestResentTransactionReadsFromItsLastWholeCopy(t *testing.T) {
 	h := open(t, t.TempDir(), func(c *Config) { c.PartSize = 64 })
 	h.run(4, who("agent"), accounts, pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("1"), txt(strings.Repeat("abcdefgh", 60))}})
-	lines := h.lines("journal.jsonl")
+	lines := h.parts()
 	if len(lines) < 3 {
 		t.Fatalf("%d parts", len(lines))
 	}
@@ -371,7 +533,7 @@ func TestUndoTransactionIsJournaled(t *testing.T) {
 func TestTransactionWithoutChangesIsStillRecorded(t *testing.T) {
 	h := open(t, t.TempDir(), nil)
 	h.run(6, action("agent", "7"), who("agent")) // UPDATE, не тронувший ни одной строки
-	recs, err := ReadTransaction(6, h.lines("journal.jsonl"))
+	recs, err := ReadTransaction(6, h.parts())
 	if err != nil || len(recs) != 2 || recs[1]["changes"] != float64(0) {
 		t.Fatalf("%v %v", recs, err)
 	}
@@ -379,7 +541,7 @@ func TestTransactionWithoutChangesIsStillRecorded(t *testing.T) {
 
 func TestOpenRefusesBadConfig(t *testing.T) {
 	for _, cfg := range []Config{{Dir: t.TempDir()}, {Dir: t.TempDir(), Roles: []string{"a"}, PartSize: MaxPartSize + 1}} {
-		if _, err := Open(cfg, &fakeCatalog{}, nil); err == nil {
+		if _, err := Open(cfg, &fakeCatalog{}, &fakeSink{}, 0, nil); err == nil {
 			t.Errorf("opened with %+v", cfg)
 		}
 	}

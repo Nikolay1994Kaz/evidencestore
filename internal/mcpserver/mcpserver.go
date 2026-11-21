@@ -6,7 +6,7 @@
 // открывает транзакцию, кладёт в неё отметку действия (evidence.mark_action —
 // она уходит в журнал базы под тем же номером транзакции, что и изменения
 // строк), исполняет запрос и пишет квитанцию: кто, что, какая транзакция, чем
-// кончилось. Сборщик espgtap по отметке связывает до-образы с действием, а
+// кончилось. Сборщик (escollect, источник "postgres") по отметке связывает до-образы с действием, а
 // транзакция роли агента без отметки значит, что агент пришёл в базу в обход.
 //
 // Запреты держит не этот сервер, а база: он подключается ролью агента, и что
@@ -557,7 +557,7 @@ func (s *Server) transaction(rc *Receipt) error {
 	mark, _ := json.Marshal(map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": rc.Reason, "client": rc.Client})
 	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
 	if _, err := s.run("SELECT evidence.mark_action(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
-		return fail(fmt.Errorf("the action marker could not be set (is the database prepared with espgtap -setup-sql?): %w", err))
+		return fail(fmt.Errorf("the action marker could not be set (is the database prepared with escollect -setup-sql?): %w", err))
 	}
 	res, err := s.run("SELECT pg_current_xact_id()::text")
 	if err != nil {

@@ -1,5 +1,5 @@
 // Package pgundo строит и применяет откат одной транзакции PostgreSQL по
-// до-образам из журнала espgtap (internal/pgtap).
+// до-образам, которые сборщик записал из журнала базы (internal/pgtap).
 //
 // Три шага, каждый отдельно:
 //
@@ -96,8 +96,8 @@ type row struct {
 	touches  int
 }
 
-// Build разбирает транзакцию xid из тел записей хранилища (строк журнала
-// espgtap по порядку номеров) и строит план.
+// Build разбирает транзакцию xid из тел записей хранилища (частей, которые
+// записал сборщик, по порядку номеров) и строит план.
 func Build(xid uint32, lines [][]byte) (*Plan, error) {
 	recs, err := pgtap.ReadTransaction(xid, lines)
 	if err != nil {
@@ -559,7 +559,7 @@ func (p *Plan) Apply(db DB, marker any) (xid string, err error) {
 	}()
 	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
 	if _, err := db.Query("SELECT evidence.mark_undo(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
-		return "", fmt.Errorf("the undo marker could not be set (is the database prepared with espgtap -setup-sql?): %w", err)
+		return "", fmt.Errorf("the undo marker could not be set (is the database prepared with escollect -setup-sql?): %w", err)
 	}
 	res, err := db.Query("SELECT pg_current_xact_id()::text")
 	if err != nil {

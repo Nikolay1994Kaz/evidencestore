@@ -34,7 +34,7 @@ func ch(kind string, r int, old, fresh []any) m {
 	return line
 }
 
-// journal — строки журнала espgtap для транзакции 7: поток в gzip, порезанный по size байт.
+// journal — записи сборщика для транзакции 7: поток в gzip, порезанный по size байт.
 func journal(size int, header m, lines ...m) [][]byte {
 	n := 0
 	for _, l := range lines {

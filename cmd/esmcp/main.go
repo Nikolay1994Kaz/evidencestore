@@ -5,7 +5,7 @@
 //	esmcp -config mcp.json
 //
 // Подключается ролью агента: права этой роли и есть то, что агенту можно.
-// Базу готовит скрипт espgtap -setup-sql (роль, функция отметки действия).
+// Базу готовит скрипт escollect -setup-sql (роль, функция отметки действия).
 package main
 
 import (
@@ -49,8 +49,8 @@ type Config struct {
 // Undo — как достать из хранилища записи транзакции и проверить их. Команды —
 // списком аргументов, без оболочки; пути в них — от каталога, где запущен сервер.
 type Undo struct {
-	// Index — индекс сборщика espgtap (index.jsonl): в каких записях
-	// источника лежит транзакция.
+	// Index — справочник сборщика (index.jsonl источника "postgres"): под
+	// какими номерами записей источника лежит транзакция.
 	Index string `json:"index"`
 	// Proof — команда выдачи пакета одной записи; сервер дописывает
 	// "-seq N -out FILE": ["evidencestore", "proof", "-config", "…", "-source", "pg-agent", "-dek"].
@@ -109,23 +109,28 @@ func loadConfig(path string) (*Config, error) {
 	return &c, nil
 }
 
-// fetch достаёт из хранилища записи транзакции xid: по индексу сборщика узнаёт
-// их номера, на каждую берёт пакет и отдаёт его esverify. Запись, которая до
-// хранилища ещё не дошла, ждёт до u.Wait.
+// fetch достаёт из хранилища записи транзакции xid: по справочнику сборщика
+// узнаёт их номера, на каждую берёт пакет и отдаёт его esverify. Транзакция,
+// которую сборщик ещё не прочитал, и запись, которая до хранилища ещё не дошла,
+// ждут до u.Wait.
 func (u *Undo) fetch(xid uint32) ([][]byte, error) {
-	data, err := os.ReadFile(u.Index)
-	if err != nil {
-		return nil, err
-	}
-	var entry *pgtap.IndexEntry
-	for _, line := range strings.Split(string(data), "\n") {
-		var e pgtap.IndexEntry
-		if line != "" && json.Unmarshal([]byte(line), &e) == nil && e.XID == xid {
-			entry = &e // после пересылки транзакция лежит дважды: годна последняя запись индекса
+	deadline := time.Now().Add(u.Wait.D())
+	var entry pgtap.IndexEntry
+	for {
+		// После пересылки транзакция лежит в справочнике дважды: Lookup отдаёт
+		// последнюю строку.
+		e, found, err := pgtap.Lookup(u.Index, xid)
+		if err != nil {
+			return nil, err
 		}
-	}
-	if entry == nil {
-		return nil, fmt.Errorf("transaction %d is not in the collector's index: it changed no watched table, or the collector has not read it yet", xid)
+		if found {
+			entry = e
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("transaction %d is not in the collector's index: it changed no watched table, or the collector has not read it yet", xid)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	dir, err := os.MkdirTemp("", "esmcp-undo-")
 	if err != nil {
@@ -139,9 +144,8 @@ func (u *Undo) fetch(xid uint32) ([][]byte, error) {
 		}
 		return nil
 	}
-	deadline := time.Now().Add(u.Wait.D())
 	var lines [][]byte
-	for seq := entry.FirstLine; seq <= entry.LastLine; seq++ {
+	for seq := entry.FirstSeq; seq <= entry.LastSeq; seq++ {
 		bundle := filepath.Join(dir, fmt.Sprintf("%d.json", seq))
 		body := filepath.Join(dir, fmt.Sprintf("%d.body", seq))
 		for {

@@ -558,10 +558,12 @@ var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 // Time — время протокола (микросекунды от 2000-01-01) как time.Time.
 func Time(micros int64) time.Time { return pgEpoch.Add(time.Duration(micros) * time.Microsecond) }
 
-// StartReplication начинает поток логической репликации из слота с того места,
-// которое слот подтвердил. options — параметры плагина парами "имя", "значение".
-// Соединение должно быть открыто с Replication.
-func (c *Conn) StartReplication(slot string, options ...string) error {
+// StartReplication начинает поток логической репликации из слота. from — с
+// какой позиции: сервер берёт большее из неё и той, что слот подтвердил, и не
+// шлёт транзакции, зафиксированные раньше; 0 — с подтверждённой слотом.
+// options — параметры плагина парами "имя", "значение". Соединение должно быть
+// открыто с Replication.
+func (c *Conn) StartReplication(slot string, from LSN, options ...string) error {
 	if len(options)%2 != 0 {
 		return errors.New("pgwire: plugin options come in pairs")
 	}
@@ -569,7 +571,7 @@ func (c *Conn) StartReplication(slot string, options ...string) error {
 	for i := 0; i < len(options); i += 2 {
 		opts = append(opts, Ident(options[i])+" "+Literal(options[i+1]))
 	}
-	sql := "START_REPLICATION SLOT " + Ident(slot) + " LOGICAL 0/0"
+	sql := "START_REPLICATION SLOT " + Ident(slot) + " LOGICAL " + from.String()
 	if len(opts) > 0 {
 		sql += " (" + strings.Join(opts, ", ") + ")"
 	}
@@ -640,13 +642,31 @@ func (c *Conn) ReadReplication(timeout time.Duration) (ReplMessage, error) {
 			}
 		case 'E':
 			return ReplMessage{}, parseError(msg)
-		case 'c':
+		case 'c', 'C':
+			// CopyDone; при остановке сервера — сразу CommandComplete.
 			return ReplMessage{}, io.EOF // сервер закончил поток
 		case 'N', 'S':
 		default:
 			return ReplMessage{}, fmt.Errorf("pgwire: unexpected message %q in the replication stream", typ)
 		}
 	}
+}
+
+// WaitReplication ждёт, пока в потоке появится что читать, не дольше timeout.
+// Ничего не читает: nil — следующий ReadReplication вернётся сразу; нет
+// данных — ErrTimeout.
+func (c *Conn) WaitReplication(timeout time.Duration) error {
+	if !c.stream {
+		return errors.New("pgwire: replication is not started")
+	}
+	c.nc.SetReadDeadline(time.Now().Add(timeout))
+	_, err := c.r.Peek(1)
+	c.nc.SetReadDeadline(time.Time{})
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return ErrTimeout
+	}
+	return err
 }
 
 // SendStandbyStatus сообщает серверу, до какой позиции журнал у нас надёжно
