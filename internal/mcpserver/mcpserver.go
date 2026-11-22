@@ -46,6 +46,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
@@ -234,7 +235,7 @@ func (s *Server) Handle(line []byte) []byte {
 		}
 		modern = true
 		if c, ok := params.Meta[metaClient]; ok {
-			s.client = c
+			s.client = clientInfo(c)
 		}
 	}
 	result, rerr := s.dispatch(req, modern)
@@ -287,7 +288,7 @@ func (s *Server) dispatch(req request, modern bool) (map[string]any, *rpcError) 
 			version = p.ProtocolVersion // знакомую версию клиента повторяем, иначе предлагаем свою последнюю
 		}
 		if len(p.ClientInfo) > 0 {
-			s.client = p.ClientInfo
+			s.client = clientInfo(p.ClientInfo)
 		}
 		return map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]any{}},
 			"serverInfo": s.serverInfo(), "instructions": instructions}, nil
@@ -655,6 +656,18 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	if errors.As(err, &lim) {
 		return refuse(lim.cause, lim.info, lim.why)
 	}
+	if errors.Is(err, pgundo.ErrCommitUnknown) {
+		// Как у execute (P-258): откат мог зафиксироваться — строки в окно,
+		// людям — отметка, агенту — не повторять (R1, R2 заход 3).
+		s.drop()
+		rc.XID, rc.Outcome, rc.Cause, rc.Rows, rc.Error = applied.XID, "unknown", CauseUnknown, applied.Rows, err.Error()
+		s.markRefused(&rc, map[string]any{"xid": rc.XID, "rows": rc.Rows, "tool": rc.Tool})
+		if werr := s.keep(rc); werr != nil {
+			s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
+		}
+		return "", fmt.Errorf("undo %s: lost the connection to the database during COMMIT: the undo may have been committed (transaction %s). "+
+			"Do not repeat it: the operators are alerted to check the transaction", rc.ActionID, rc.XID)
+	}
 	if err == nil {
 		rc.XID, rc.Outcome, rc.Rows = applied.XID, "committed", applied.Rows
 	} else {
@@ -731,6 +744,29 @@ const maxStatements = 100
 
 // maxReason — предел длины причины действия или отката, в байтах.
 const maxReason = 2000
+
+// clientInfo — сведения о клиенте MCP для отметки и квитанции: имя и версия,
+// каждое не длиннее 200 байт. Их шлёт сам агент, и в мегабайты они делали
+// строку тревоги «слишком длинной» (dropped) вместо настоящей — как причина
+// до предела maxReason (R1, R2, T заход 3).
+func clientInfo(raw json.RawMessage) json.RawMessage {
+	var c struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	if json.Unmarshal(raw, &c) != nil {
+		return nil
+	}
+	cut := func(s string) string {
+		for len(s) > 200 {
+			_, n := utf8.DecodeLastRuneInString(s)
+			s = s[:len(s)-n]
+		}
+		return s
+	}
+	out, _ := json.Marshal(map[string]string{"name": cut(c.Name), "version": cut(c.Version)})
+	return out
+}
 
 // statements — команды вызова: одна в sql или несколько в list, ни одной
 // пустой. Режет на команды не сервер: разбор оставлен базе (prepared).

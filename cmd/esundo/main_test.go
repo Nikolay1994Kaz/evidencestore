@@ -29,6 +29,15 @@ func TestDescribeKeepsTheAgentsTextOnItsLine(t *testing.T) {
 	if len(lines) != 5 || !strings.HasPrefix(lines[2], `  action a-1: agent bot\u001b[2J, tool execute, reason: "routine cleanup\nchecked against`) {
 		t.Fatalf("%d lines:\n%s", len(lines), text)
 	}
+	// Номер действия и агент — тоже не длиннее (T заход 3).
+	long, _ := json.Marshal(map[string]any{"info": map[string]any{"action_id": "a-2", "agent": "bot" + strings.Repeat(" ", 600) + "checked against the database", "tool": "execute"}})
+	out.Reset()
+	describe(&out, &pgundo.Plan{XID: 8, Actions: []json.RawMessage{long}}, 1)
+	for _, l := range strings.Split(out.String(), "\n") {
+		if len([]rune(l)) > 500 {
+			t.Fatalf("a line of %d characters", len([]rune(l)))
+		}
+	}
 	// Значения строк в конфликте — тоже одной строкой.
 	v := "x\nnothing to undo\x1b[8m"
 	c := pgundo.Conflict{Op: pgundo.OpUpdate, Columns: []pgundo.ConflictColumn{{Name: "note", Was: &v, Left: &v, Now: &v}}}

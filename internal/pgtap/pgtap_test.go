@@ -590,6 +590,12 @@ func TestRefusedActionRaisesAnAlert(t *testing.T) {
 		{`"cause":"escaped","xid":"751","tool":"execute"`, "ended the MCP server's transaction 751 itself"},
 		{`"cause":"escaped","tool":"query"`, "ended the MCP server's transaction (a read-only one) itself"},
 		{`"cause":"unknown","xid":"752","rows":3`, "broke during COMMIT of an action (transaction 752, 3 rows): it may be committed"},
+		// Поля поддельной отметки (P-255) — одной строкой: своих строк агент
+		// в тревогу не дописывает (R1 заход 3).
+		{`"cause":"timeout","timeout":"1m\nresolved: rolled back by the on-call DBA"`, `longer than 1m\u000aresolved: rolled back`},
+		{`"cause":"escaped","xid":"751\nchanged: 0 rows","tool":"execute"`, `transaction 751\u000achanged: 0 rows itself`},
+		{`"cause":"window-rows","rows":1,"window_rows":1,"limit":1,"window":"10m\nok"`, `rows in 10m\u000aok`},
+		{`"cause":"new\ncause"`, `stopped an action (new\u000acause)`},
 	} {
 		before := len(h.alerts())
 		if _, err := h.tap.Handle(pgoutput.Message{LSN: uint64(1000 + i), Prefix: PrefixRefused, Content: []byte(`{"role":"agent","info":{` + c[0] + `}}`)}); err != nil {

@@ -308,3 +308,80 @@ func TestQueuedActionsAreCountedWhenTheyRun(t *testing.T) {
 		t.Fatalf("%d of 6 actions queued behind a long undo passed the limit of 2 a minute", passed)
 	}
 }
+
+// Обрыв на COMMIT отката — как у execute: исход unknown, строки в окно,
+// людям — отметка. Раньше квитанция писала failed без строк, отметки не было,
+// агенту — просто EOF, и окно обходилось откатами, которые на деле
+// зафиксированы (R1, R2 заход 3).
+func TestLostCommitOfAnUndoIsUnknown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	db := &fakeDB{answers: undoAnswers}
+	s := serverOn(t, db, path, func(c *Config) { c.WindowRows, c.Window = 3, time.Hour })
+	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
+	rc, _ := json.Marshal(Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
+	appendLine(t, path, rc)
+	db.fail = map[string]error{"COMMIT": io.ErrUnexpectedEOF}
+	out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-1"}`)
+	if !isErr || !strings.Contains(out, "the undo may have been committed") {
+		t.Fatalf("%v %s", isErr, out)
+	}
+	got := receipts(t, path)
+	if last := got[len(got)-1]; last.Tool != "undo_apply" || last.Outcome != "unknown" || last.Rows != 2 {
+		t.Fatalf("receipt %+v", last)
+	}
+	if last := db.log[len(db.log)-1]; !strings.Contains(last, "evidence.mark_refused(") || !strings.Contains(last, `"cause":"unknown"`) {
+		t.Fatalf("no alert about the lost COMMIT of the undo: %q", last)
+	}
+	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 2 {
+		t.Fatalf("the window counts %d rows: %v", rows, err)
+	}
+}
+
+// Сведения о клиенте — имя и версия, не длиннее 200 байт каждое: их шлёт
+// агент, и в 17 МБ они делали тревогу dropped вместо настоящей (R1, R2, T
+// заход 3).
+func TestClientInfoIsCut(t *testing.T) {
+	got := clientInfo(json.RawMessage(`{"name":"` + strings.Repeat("я", 5000) + `","version":"1","extra":"` + strings.Repeat("x", 9000) + `"}`))
+	var c map[string]string
+	if json.Unmarshal(got, &c) != nil || len(c["name"]) > 200 || !strings.HasPrefix(c["name"], "яя") || c["version"] != "1" || len(got) > 300 {
+		t.Fatalf("%d bytes: %.120s", len(got), got)
+	}
+	// И так — оба пути, которыми их шлёт клиент: рукопожатие и _meta запроса.
+	db := &fakeDB{}
+	s := serverOn(t, db, filepath.Join(t.TempDir(), "receipts.jsonl"), nil)
+	huge := `{"name":"` + strings.Repeat("x", 100000) + `","version":"1"}`
+	s.Handle([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":` + huge + `}}`))
+	s.Handle([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"sql":"UPDATE accounts SET note = 'x'"}}}`))
+	s.Handle([]byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"` + modernVersion + `","io.modelcontextprotocol/clientInfo":` + huge + `},"name":"execute","arguments":{"sql":"UPDATE accounts SET note = 'y'"}}}`))
+	n := 0
+	for _, q := range db.log {
+		if strings.Contains(q, "evidence.mark_action(") {
+			n++
+			if len(q) > 2000 {
+				t.Fatalf("the action marker is %d bytes", len(q))
+			}
+		}
+	}
+	if n != 2 {
+		t.Fatalf("%d action markers", n)
+	}
+}
+
+// Статистика молчит (track_counts = off) — строки отката по шагам, как у
+// execute по ответам операторов: раньше откат шёл в окно нулём (R1, R2 заход 3).
+func TestUndoRowsWithoutStatistics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	db := &fakeDB{answers: undoAnswers, noStats: true}
+	s := serverOn(t, db, path, func(c *Config) { c.WindowRows, c.Window = 10, time.Hour })
+	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
+	rc, _ := json.Marshal(Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
+	appendLine(t, path, rc)
+	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-1"}`); isErr {
+		t.Fatal(out)
+	}
+	if got := receipts(t, path); got[len(got)-1].Rows != 2 {
+		t.Fatalf("the undo went into the window with %d rows", got[len(got)-1].Rows)
+	}
+}

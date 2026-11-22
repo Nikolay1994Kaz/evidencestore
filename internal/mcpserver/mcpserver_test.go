@@ -26,8 +26,10 @@ type fakeDB struct {
 	// prepared — команды агента по именам PREPARE: EXECUTE отвечает за них.
 	prepared map[string]string
 	// changed — строк, которые изменили команды отката (по их тегам): это
-	// отвечает статистика транзакции (pgundo.XactRows) вне execute.
+	// отвечает статистика транзакции (pgundo.XactRows) вне execute. noStats —
+	// статистика молчит (track_counts = off): всегда 0.
 	changed int
+	noStats bool
 }
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
@@ -111,6 +113,9 @@ func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 	}
 	if sql == "SELECT "+xactRows {
 		v := strconv.Itoa(d.changed)
+		if d.noStats {
+			v = "0"
+		}
 		return []pgwire.Result{{Columns: []string{"int8"}, Rows: [][]*string{{&v}}, Tag: "SELECT 1"}}, nil
 	}
 	for sub, err := range d.fail {

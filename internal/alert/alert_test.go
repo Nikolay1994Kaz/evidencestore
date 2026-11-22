@@ -280,6 +280,12 @@ func TestMarkerFieldsStayOnTheirLine(t *testing.T) {
 	if !strings.Contains(text, `a-1\u000achanged: 1 row`) || len(text) > 3000 {
 		t.Fatalf("%d bytes:\n%s", len(text), text)
 	}
+	// Экранированное поле — тоже не длиннее строки тревоги: раньше предел шёл
+	// до экранирования, и тысяча управляющих символов давала 6000 знаков
+	// (R1, R2 заход 3).
+	if got := []rune(field(strings.Repeat("\x1b", 1000))); len(got) > maxLine+1 {
+		t.Fatalf("an escaped field of %d characters", len(got))
+	}
 }
 
 // Причина агента с разметкой Slack не зовёт весь канал и не рисует ссылку с

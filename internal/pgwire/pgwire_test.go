@@ -113,6 +113,15 @@ func TestReplicationCommandQuotesForItsGrammar(t *testing.T) {
 	}
 }
 
+// По тяжести решают (FATAL на COMMIT — исход неизвестен), а S переводится по
+// lc_messages сервера: берётся V, тяжесть без перевода (R1 заход 3).
+func TestParseErrorTakesTheUntranslatedSeverity(t *testing.T) {
+	e := parseError([]byte("SВАЖНО\x00VFATAL\x00C57P01\x00Mзавершение\x00\x00"))
+	if e.Severity != "FATAL" || e.Code != "57P01" {
+		t.Fatalf("%+v", e)
+	}
+}
+
 func TestParseError(t *testing.T) {
 	e := parseError([]byte("SERROR\x00C42501\x00Mpermission denied\x00Hask\x00\x00"))
 	if e.Code != "42501" || e.Message != "permission denied" || e.Hint != "ask" || !strings.Contains(e.Error(), "42501") {

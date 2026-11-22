@@ -447,7 +447,11 @@ func (t *Tap) refused(m pgoutput.Message) error {
 	t.lastRefused = m.LSN
 	var detail string
 	kind := alert.KindRefused
-	switch i := c.Info; i.Cause {
+	// Отметку об отказе может положить и SQL агента (P-255): строковые поля —
+	// одной строкой, иначе он дописывал в тревогу свои строки (R1 заход 3).
+	i := c.Info
+	i.XID, i.Window, i.Timeout, i.Tool = alert.Field(i.XID), alert.Field(i.Window), alert.Field(i.Timeout), alert.Field(i.Tool)
+	switch i.Cause {
 	case "escaped":
 		// Не отказ: сервер ничего не остановил, агент вышел из его транзакции
 		// сам. Сказать «ничего не изменилось» нельзя.
@@ -478,7 +482,7 @@ func (t *Tap) refused(m pgoutput.Message) error {
 	case "timeout":
 		detail = fmt.Sprintf("the MCP server cancelled an action that ran longer than %s: it was rolled back, nothing changed", i.Timeout)
 	default:
-		detail = fmt.Sprintf("the MCP server stopped an action (%s): nothing changed", i.Cause)
+		detail = fmt.Sprintf("the MCP server stopped an action (%s): nothing changed", alert.Field(i.Cause))
 	}
 	ev := alert.Event{Time: t.now().UTC().Format(time.RFC3339Nano), Actions: []json.RawMessage{m.Content}}
 	ev.Add(kind, detail)

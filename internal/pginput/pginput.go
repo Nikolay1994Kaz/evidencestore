@@ -252,11 +252,13 @@ func SetupSQL(c *Config) (string, error) {
 	p("END $evidence$;")
 	p("")
 	p("-- Отметки в журнале: кто менял (ставит триггер), какое это действие (ставит MCP-сервер)")
-	p("-- и что транзакция — откат (ставит esundo или MCP-сервер).")
+	p("-- и что транзакция — откат (ставит esundo или MCP-сервер). Функции идут правами владельца, путь")
+	p("-- поиска — pg_catalog и pg_temp последним: не названный pg_temp ищется первым для типов, и домен")
+	p("-- агента pg_temp.text с проверкой на его функцию срабатывал бы в приведении ::text (R2, заход 3).")
 	p("CREATE SCHEMA IF NOT EXISTS evidence;")
 	p("REVOKE ALL ON SCHEMA evidence FROM PUBLIC;")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_who() RETURNS trigger")
-	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $evidence$")
+	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
 	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object(", lit(pgtap.PrefixWho))
 	p("    'role', session_user, 'app', current_setting('application_name', true),")
@@ -265,13 +267,13 @@ func SetupSQL(c *Config) (string, error) {
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_who() FROM PUBLIC;")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_action(info json) RETURNS void")
-	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $evidence$")
+	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
 	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixAction))
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_action(json) FROM PUBLIC;")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_undo(info json) RETURNS void")
-	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $evidence$")
+	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
 	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixUndo))
 	p("END $evidence$;")
@@ -279,7 +281,7 @@ func SetupSQL(c *Config) (string, error) {
 	p("-- Отказ: MCP-сервер остановил действие пределом строк и откатывает его. Сообщение не")
 	p("-- транзакционное (false): откат транзакции его из журнала не убирает, и сборщик о нём узнаёт.")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_refused(info json) RETURNS void")
-	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $evidence$")
+	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
 	p("  PERFORM pg_logical_emit_message(false, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixRefused))
 	p("END $evidence$;")
@@ -353,13 +355,31 @@ func SetupSQL(c *Config) (string, error) {
 	p("      FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER') CROSS JOIN %s", named)
 	p("      JOIN pg_class c ON c.oid = part.relid JOIN pg_namespace n ON n.oid = c.relnamespace")
 	p("      WHERE r.rolname IN (%s) AND c.relowner = g.oid", strings.Join(lits, ", "))
-	p("    UNION ALL SELECT format('%%I is a superuser or may replicate', r.rolname) || CASE WHEN g.oid <> r.oid THEN format(' (as %%I)', g.rolname) ELSE '' END")
+	p("    UNION ALL SELECT format('%%I is a superuser, may replicate or create roles', r.rolname) || CASE WHEN g.oid <> r.oid THEN format(' (as %%I)', g.rolname) ELSE '' END")
 	p("      FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER')")
-	p("      WHERE r.rolname IN (%s) AND (g.rolsuper OR g.rolreplication)) AS rights;", strings.Join(lits, ", "))
+	p("      WHERE r.rolname IN (%s) AND (g.rolsuper OR g.rolreplication OR g.rolcreaterole)", strings.Join(lits, ", "))
+	p("    UNION ALL SELECT format('%%I is a member of %%I', r.rolname, g.rolname)")
+	p("      FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER')")
+	p("      WHERE r.rolname IN (%s) AND g.rolname IN ('pg_execute_server_program', 'pg_write_server_files')) AS rights;", strings.Join(lits, ", "))
 	p("  IF bad IS NOT NULL THEN")
 	p("    RAISE EXCEPTION 'evidencestore: %%', bad USING HINT =")
 	p("      'With these rights the agent removes rows past the log (TRUNCATE), switches off the trigger that names it (TRIGGER, ownership) '")
-	p("      'or drops the slot of the collector (superuser, REPLICATION). Revoke them from the role and from the roles it is a member of.';")
+	p("      'or drops the slot of the collector (superuser, REPLICATION), or becomes one (server programs and files, CREATEROLE). '")
+	p("      'Revoke them from the role and from the roles it is a member of.';")
+	p("  END IF;")
+	p("END $evidence$;")
+	p("-- С PostgreSQL 15 право на параметр выдают отдельно: SET session_replication_role = replica")
+	p("-- выключает триггеры, и отметки «кто» нет (R1, R2, заход 3).")
+	p("DO $evidence$ DECLARE bad text; BEGIN")
+	p("  IF current_setting('server_version_num')::int < 150000 THEN RETURN; END IF;")
+	p("  EXECUTE format($q$SELECT string_agg(DISTINCT format('%%%%I can %%%%s parameter %%%%s', r.rolname, pr.p, a.parname), ', ')")
+	p("    FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER') CROSS JOIN pg_parameter_acl a")
+	p("    LEFT JOIN pg_settings s ON s.name = a.parname CROSS JOIN (VALUES ('SET'), ('ALTER SYSTEM')) AS pr(p)")
+	p("    WHERE r.rolname IN (%%s) AND NOT g.rolsuper AND has_parameter_privilege(g.oid, a.parname, pr.p)")
+	p("      AND (pr.p = 'ALTER SYSTEM' OR coalesce(s.context, 'superuser') <> 'user')$q$, %s) INTO bad;", lit(strings.Join(lits, ", ")))
+	p("  IF bad IS NOT NULL THEN")
+	p("    RAISE EXCEPTION 'evidencestore: %%', bad USING HINT =")
+	p("      'With such a parameter the agent switches off the trigger that names it (session_replication_role) or the server settings. Revoke it.';")
 	p("  END IF;")
 	p("END $evidence$;")
 	p("")
@@ -556,11 +576,14 @@ func (s *Source) connect(ctx context.Context) (err error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
-	// Путь каталожного соединения — только pg_catalog: format_type называет
-	// тогда любой тип не из pg_catalog со схемой, и откат читает образы с
-	// путём pgundo.Path, где схем агента нет (R2 заход 2).
+	// Путь обоих соединений — только pg_catalog (и pg_temp последним):
+	// format_type называет тогда любой тип не из pg_catalog со схемой, а поток
+	// так же пишет значения regclass, regtype и подобных — откат читает их с
+	// путём своего сеанса, и имя без схемы там нашлось бы не то (R2 заход 2,
+	// R1 заход 3).
+	pinned := map[string]string{"search_path": "pg_catalog, pg_temp"}
 	catDSN := s.dsn
-	catDSN.Params = map[string]string{"search_path": "pg_catalog"}
+	catDSN.Params = pinned
 	cat, err := pgwire.Dial(ctx, catDSN)
 	if err != nil {
 		return err
@@ -587,6 +610,7 @@ func (s *Source) connect(ctx context.Context) (err error) {
 	}
 	rdsn := s.dsn
 	rdsn.Replication = true
+	rdsn.Params = pinned
 	repl, err := pgwire.Dial(ctx, rdsn)
 	if err != nil {
 		return err

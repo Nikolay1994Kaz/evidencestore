@@ -72,6 +72,9 @@ func TestLiveMCP(t *testing.T) {
 		admin.Query("ALTER ROLE pgm_agent INHERIT")
 		admin.Query("REVOKE CREATE ON SCHEMA public FROM pgm_maker")
 		admin.Query("DROP ROLE IF EXISTS pgm_maker")
+		admin.Query("REVOKE SET ON PARAMETER session_replication_role FROM pgm_agent")
+		admin.Query("REVOKE pg_execute_server_program FROM pgm_agent")
+		admin.Query("ALTER ROLE pgm_agent NOCREATEROLE")
 		admin.Query("ALTER ROLE pgm_agent RESET search_path")
 		admin.Query("ALTER ROLE pgm_agent RESET standard_conforming_strings")
 		admin.Query("REVOKE CREATE ON SCHEMA public FROM pgm_agent")
@@ -389,6 +392,43 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		t.Fatalf("the setup script took an agent role that owns a table: %v", err)
 	}
 	exec("ROLLBACK; ALTER TABLE pgm.docs OWNER TO " + pgwire.Ident(owner))
+	// И права, с которыми агент выключает триггеры или становится
+	// суперпользователем: SET на session_replication_role (PostgreSQL 15+),
+	// программы сервера, CREATEROLE (R1, R2 заход 3).
+	for _, c := range [][3]string{
+		{"GRANT SET ON PARAMETER session_replication_role TO pgm_agent", "pgm_agent can SET parameter session_replication_role", "REVOKE SET ON PARAMETER session_replication_role FROM pgm_agent"},
+		{"GRANT pg_execute_server_program TO pgm_agent", "pgm_agent is a member of pg_execute_server_program", "REVOKE pg_execute_server_program FROM pgm_agent"},
+		{"ALTER ROLE pgm_agent CREATEROLE", "pgm_agent is a superuser, may replicate or create roles", "ALTER ROLE pgm_agent NOCREATEROLE"},
+	} {
+		if c[0][:9] == "GRANT SET" && one("SELECT current_setting('server_version_num')::int >= 150000") != "t" {
+			continue
+		}
+		exec(c[0])
+		if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), c[1]) {
+			t.Fatalf("the setup script took an agent role after %s: %v", c[0], err)
+		}
+		exec("ROLLBACK; " + c[2])
+	}
+
+	// Отметки идут правами владельца: временный домен агента pg_temp.text с
+	// проверкой на его функцию — не названный в пути pg_temp ищется первым для
+	// типов — срабатывал в приведении ::text внутри отметки, и функция агента
+	// шла правами того, кто выполнил -setup-sql (R2, заход 3).
+	temp, err := pgwire.Dial(ctx, dcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer temp.Close()
+	if _, err := temp.Query(`CREATE FUNCTION pg_temp.pwn(v pg_catalog.text) RETURNS boolean LANGUAGE plpgsql AS $f$BEGIN
+  IF current_user <> session_user THEN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END IF; RETURN true; END$f$;
+CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.pwn(VALUE))`); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{"SELECT evidence.mark_refused('{}')", "SELECT evidence.mark_action('{}')", "UPDATE pgm.docs SET body = body WHERE id = 1"} {
+		if _, err := temp.Query(sql); err != nil {
+			t.Fatalf("%s under a temporary domain of the agent: %v", sql, err)
+		}
+	}
 	// И таблицу без первичного ключа — тоже: строки отката не найти (P-253).
 	nopk := cfg
 	nopk.Tables = []string{"pgm.docs", "pgm.audit"}

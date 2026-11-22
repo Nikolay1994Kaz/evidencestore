@@ -462,6 +462,12 @@ func parseError(msg []byte) *PgError {
 		val := string(msg[1:end])
 		switch msg[0] {
 		case 'S':
+			if e.Severity == "" {
+				e.Severity = val
+			}
+		case 'V':
+			// Тяжесть без перевода (PostgreSQL 9.6+): S переводится по
+			// lc_messages сервера, а по тяжести решают (FATAL на COMMIT).
 			e.Severity = val
 		case 'C':
 			e.Code = val

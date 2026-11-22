@@ -3,6 +3,7 @@ package pginput
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -68,7 +69,7 @@ func TestLiveUndoUnderOddSessionDefaults(t *testing.T) {
 	tidy := func() {
 		admin.Query("ROLLBACK")
 		admin.Query("ALTER DATABASE " + db + " RESET array_nulls")
-		admin.Query("ALTER ROLE pgs_tap RESET IntervalStyle")
+		admin.Query("ALTER ROLE pgs_tap RESET ALL")
 		admin.Query("ALTER ROLE pgs_agent RESET ALL")
 		admin.Query("DROP OPERATOR IF EXISTS public.= (varchar, varchar)")
 		admin.Query("DROP FUNCTION IF EXISTS public.pgs_eq(varchar, varchar)")
@@ -76,14 +77,19 @@ func TestLiveUndoUnderOddSessionDefaults(t *testing.T) {
 		admin.Query("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'pgs_slot'")
 		admin.Query("DROP PUBLICATION IF EXISTS pgs_pub")
 		admin.Query("DROP SCHEMA IF EXISTS pgs CASCADE")
+		admin.Query("DROP TABLE IF EXISTS public.pgs_tick_audit")
 	}
 	exec(admin, "SET client_min_messages = warning")
 	tidy()
 	defer tidy()
-	exec(admin, `CREATE SCHEMA pgs; CREATE TABLE pgs.vals (id int PRIMARY KEY, tags text[], span interval);
-INSERT INTO pgs.vals VALUES (1, '{NULL,a}', '-1 days -02:00:00'), (2, '{NULL,b}', '-2 days -03:00:00'), (3, '{c}', '3 days');
+	exec(admin, `CREATE SCHEMA pgs; CREATE TABLE pgs.vals (id int PRIMARY KEY, tags text[], span interval, rel regclass);
+INSERT INTO pgs.vals VALUES (1, '{NULL,a}', '-1 days -02:00:00', 'pg_class'), (2, '{NULL,b}', '-2 days -03:00:00', 'pg_class'), (3, '{c}', '3 days', 'pg_class');
 -- Ключ varchar: у pg_catalog нет =(varchar, varchar), сравнение идёт через text.
 CREATE TABLE pgs.tick (id varchar PRIMARY KEY, note text); INSERT INTO pgs.tick VALUES ('k1', 'human');
+-- Аудит владельца, как его обычно пишут: таблица в public, имя без схемы.
+CREATE TABLE public.pgs_tick_audit (id varchar, at timestamptz DEFAULT now());
+CREATE FUNCTION pgs.tick_audit() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $f$ BEGIN INSERT INTO pgs_tick_audit (id) VALUES (NEW.id); RETURN NEW; END $f$;
+CREATE TRIGGER audit AFTER UPDATE ON pgs.tick FOR EACH ROW EXECUTE FUNCTION pgs.tick_audit();
 -- Триггер владельца: вставка в vals пишет 50 строк журнала таблицы.
 CREATE TABLE pgs.fanout (n int);
 CREATE FUNCTION pgs.fan() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $f$ BEGIN INSERT INTO pgs.fanout SELECT g FROM generate_series(1, 50) g; RETURN NEW; END $f$;
@@ -98,7 +104,10 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	}
 	exec(admin, script)
 	// Сборщик пишет интервалы стилем sql_standard (умолчание его роли).
+	// regclass поток пишет с путём своего сеанса: таблицу из public — без
+	// схемы, и откат с другим путём читал бы его не так (R1 заход 3).
 	exec(admin, "ALTER ROLE pgs_tap SET IntervalStyle = sql_standard")
+	exec(admin, "UPDATE pgs.vals SET rel = 'pgs.tick'; UPDATE pgs.vals SET rel = 'public.pgs_tick_audit' WHERE id = 2")
 	sink := &memSink{}
 	src, err := New(cfg, slog.New(slog.NewTextHandler(logTo{t}, nil)))
 	if err != nil {
@@ -122,12 +131,13 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 		return sink.bodies[e.FirstSeq-1 : e.LastSeq], nil
 	}
 	row := func(id string) string {
-		return one(admin, "SELECT tags::text || ' ' || ((tags)[1] IS NULL)::text || ' ' || span::text FROM pgs.vals WHERE id = "+id)
+		return one(admin, "SELECT tags::text || ' ' || ((tags)[1] IS NULL)::text || ' ' || span::text || ' ' || rel::oid::text FROM pgs.vals WHERE id = "+id)
 	}
 
 	// 1. Человек, esundo: база с array_nulls = off, сеанс — новый, правами владельца.
 	agent := dial("pgs_agent", "")
-	res, err := agent.Query("BEGIN; UPDATE pgs.vals SET tags = '{c}', span = '1 day' WHERE id = 1; SELECT pg_current_xact_id()::xid::text; COMMIT")
+	tick := one(admin, "SELECT 'pgs.tick'::regclass::oid::text")
+	res, err := agent.Query("BEGIN; UPDATE pgs.vals SET tags = '{c}', span = '1 day', rel = 'pg_class' WHERE id = 1; SELECT pg_current_xact_id()::xid::text; COMMIT")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,8 +160,8 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := row("1"); got != "{NULL,a} true -1 days -02:00:00" || done.Differ != nil {
-		t.Fatalf("the undo by a person: row %q (want {NULL,a} true -1 days -02:00:00), differs %v", got, done.Differ)
+	if got := row("1"); got != "{NULL,a} true -1 days -02:00:00 "+tick || done.Differ != nil {
+		t.Fatalf("the undo by a person: row %q (want {NULL,a} true -1 days -02:00:00 %s), differs %v", got, tick, done.Differ)
 	}
 
 	// 2. Агент, undo_apply: своей сессией мимо сервера ставит своей роли
@@ -187,7 +197,7 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 		}
 		return m.Result.Content[0].Text, m.Result.IsError
 	}
-	text, isErr := tool("execute", `{"sql":"UPDATE pgs.vals SET tags = '{d}', span = '2 days' WHERE id = 2","reason":"test"}`)
+	text, isErr := tool("execute", `{"sql":"UPDATE pgs.vals SET tags = '{d}', span = '2 days', rel = 'pg_class' WHERE id = 2","reason":"test"}`)
 	if isErr {
 		t.Fatal(text)
 	}
@@ -195,7 +205,7 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 		ID string `json:"action_id"`
 	}
 	json.Unmarshal([]byte(text), &action)
-	exec(agent, "ALTER ROLE pgs_agent SET array_nulls = off")
+	exec(agent, "ALTER ROLE pgs_agent SET array_nulls = off; ALTER ROLE pgs_agent SET search_path = pgs")
 	exec(agent, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'pgs_agent' AND application_name = 'esmcp/pgs-bot'")
 	for wait := time.Now().Add(5 * time.Second); one(admin, "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'esmcp/pgs-bot'") != "0"; time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(wait) {
@@ -206,10 +216,11 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	if isErr || strings.Contains(text, "differs_from_before") {
 		t.Fatalf("undo_apply: %v %s", isErr, text)
 	}
-	if got := row("2"); got != "{NULL,b} true -2 days -03:00:00" {
-		t.Fatalf("the undo by the agent: row %q (want {NULL,b} true -2 days -03:00:00)", got)
+	audit := one(admin, "SELECT 'public.pgs_tick_audit'::regclass::oid::text")
+	if got := row("2"); got != "{NULL,b} true -2 days -03:00:00 "+audit {
+		t.Fatalf("the undo by the agent: row %q (want {NULL,b} true -2 days -03:00:00 %s)", got, audit)
 	}
-	exec(admin, "ALTER ROLE pgs_agent RESET array_nulls")
+	exec(admin, "ALTER ROLE pgs_agent RESET array_nulls; ALTER ROLE pgs_agent RESET search_path")
 
 	// 3. Откат — под таймаутами сервера: агент снимает своей роли lock_timeout
 	// и statement_timeout и держит замок строки своей сессией. Раньше откат
@@ -264,6 +275,17 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	exec(admin, "GRANT CREATE ON SCHEMA public TO pgs_agent")
 	exec(agent, `CREATE FUNCTION public.pgs_eq(varchar, varchar) RETURNS bool LANGUAGE plpgsql AS $f$BEGIN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END$f$;
 CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = public.pgs_eq)`)
+	// Агент может CREATE в public, а public — в пути сеанса: сверка отказана
+	// и ничего его не позвала.
+	human = dial("postgres", "esundo")
+	if _, err = p.Check(human); !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema public") {
+		t.Fatalf("the check by a person with a schema of the agent on the path: %v", err)
+	}
+	// Свой запрос — тоже после того, как оператора не стало: он перехватил бы
+	// и его. Без права CREATE откат идёт с путём сеанса: аудит владельца с
+	// именем таблицы без схемы работает (при пути только из pg_catalog он
+	// падал — R2 заход 3).
+	exec(admin, "DROP OPERATOR public.= (varchar, varchar); DROP FUNCTION public.pgs_eq(varchar, varchar); REVOKE CREATE ON SCHEMA public FROM pgs_agent")
 	human = dial("postgres", "esundo")
 	if statuses, err = p.Check(human); err != nil {
 		t.Fatalf("the check by a person: %v", err)
@@ -271,11 +293,8 @@ CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = publ
 	if done, err = p.Apply(human, map[string]any{"by": "test"}); err != nil {
 		t.Fatalf("the undo by a person: %v", err)
 	}
-	// Свой запрос — тоже после того, как оператора не стало: он перехватил бы
-	// и его.
-	exec(admin, "DROP OPERATOR public.= (varchar, varchar); DROP FUNCTION public.pgs_eq(varchar, varchar); REVOKE CREATE ON SCHEMA public FROM pgs_agent")
-	if got := one(admin, "SELECT note FROM pgs.tick WHERE id = 'k1'"); got != "human" {
-		t.Fatalf("pgs.tick after the undo: %q", got)
+	if got := one(admin, "SELECT note || ' ' || (SELECT count(*) FROM public.pgs_tick_audit) FROM pgs.tick WHERE id = 'k1'"); got != "human 2" {
+		t.Fatalf("pgs.tick after the undo, and its audit: %q", got)
 	}
 
 	// 5. Строки отката — по статистике его транзакции: вернуть удалённую

@@ -24,7 +24,9 @@
 //
 // Коды выхода: 0 — готово, 1 — ошибка вызова или базы, 2 — откат построить
 // нельзя (TRUNCATE, таблица без REPLICA IDENTITY FULL, транзакция не вся),
-// 3 — строка изменилась после сверки, ничего не применено.
+// 3 — строка изменилась после сверки, ничего не применено, 4 — связь
+// оборвалась на COMMIT отката: он мог зафиксироваться, сначала посмотреть
+// транзакцию.
 package main
 
 import (
@@ -103,6 +105,8 @@ func fail(err error) {
 		os.Exit(2)
 	case errors.Is(err, pgundo.ErrChanged):
 		os.Exit(3)
+	case errors.Is(err, pgundo.ErrCommitUnknown):
+		os.Exit(4) // откат мог зафиксироваться: сначала посмотреть транзакцию
 	}
 	os.Exit(1)
 }
@@ -289,11 +293,16 @@ func describe(w io.Writer, p *pgundo.Plan, records int) {
 		// Всё в отметке — от агента: причина, имена, номер действия (P-251).
 		// Причина — в кавычках и не длиннее 300 знаков: пробелами агент
 		// переносил свой текст на отдельные строки терминала (T заход 2).
-		reason := []rune(m.Info.Reason)
-		if len(reason) > 300 {
-			reason = append(reason[:300], '…')
+		// Номер, агент и инструмент — тоже не длиннее (T заход 3): отметку
+		// кладёт и SQL агента (P-255).
+		cut := func(s string, n int) string {
+			if r := []rune(s); len(r) > n {
+				return string(r[:n]) + "…"
+			}
+			return s
 		}
-		fmt.Fprintf(w, "  action %s: agent %s, tool %s, reason: %q\n", pgundo.Shown(m.Info.ActionID), pgundo.Shown(m.Info.Agent), pgundo.Shown(m.Info.Tool), string(reason))
+		fmt.Fprintf(w, "  action %s: agent %s, tool %s, reason: %q\n", cut(pgundo.Shown(m.Info.ActionID), 60), cut(pgundo.Shown(m.Info.Agent), 60),
+			cut(pgundo.Shown(m.Info.Tool), 20), cut(m.Info.Reason, 300))
 	}
 	if p.Who != nil && len(p.Actions) == 0 {
 		fmt.Fprintln(w, "  no action marker: the transaction did not come through the MCP server")

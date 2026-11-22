@@ -246,17 +246,24 @@ func short(s string) string {
 // \uXXXX. Отметки пишет и SQL агента (P-255), а application_name он ставит
 // сам: иначе он дописывал в тревогу свои строки («changed: 1 row», «approved by
 // the on-call DBA») или длиной выталкивал настоящие (T заход 2).
+//
+// Сначала экранирование, потом предел: иначе каждый управляющий символ
+// становился шестью знаками, и поле росло вшестеро сверх предела (R1, R2
+// заход 3). Field — то же для pgtap: поля отметки об отказе.
 func field(s string) string {
 	var b strings.Builder
-	for _, c := range []rune(short(s)) {
+	for _, c := range s {
 		if unicode.IsControl(c) || unicode.Is(unicode.Bidi_Control, c) || unicode.In(c, unicode.Zl, unicode.Zp) {
 			fmt.Fprintf(&b, "\\u%04x", c)
 			continue
 		}
 		b.WriteRune(c)
 	}
-	return b.String()
+	return short(b.String())
 }
+
+// Field — значение из отметки одной строкой и не длиннее строки тревоги.
+func Field(s string) string { return field(s) }
 
 // Text — тревога словами, для человека: что случилось, кто и какое действие,
 // сколько строк и чем посмотреть откат.

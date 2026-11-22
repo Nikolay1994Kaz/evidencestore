@@ -43,6 +43,11 @@ import (
 // ErrRefused — по этим записям откат построить нельзя.
 var ErrRefused = errors.New("pgundo: undo refused")
 
+// ErrCommitUnknown — связь оборвалась на COMMIT отката: он мог
+// зафиксироваться. Applied, возвращённый с этой ошибкой, — то, что откат успел
+// сделать в своей транзакции.
+var ErrCommitUnknown = errors.New("pgundo: the connection broke during COMMIT of the undo: it may be committed; check the transaction before repeating it")
+
 func refuse(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrRefused, fmt.Sprintf(format, args...))
 }
@@ -581,26 +586,68 @@ func (g group) keyChanged() string {
 	return "ROW(" + strings.Join(o, ", ") + ") IS DISTINCT FROM ROW(" + strings.Join(n, ", ") + ")"
 }
 
-// Path — путь поиска сверки и отката: только pg_catalog (и pg_temp последним
-// — своих временных объектов у сеанса нет). Любая другая схема в пути, куда
-// агент может CREATE, — и его функция или оператор с точным совпадением типов
-// выигрывает у системных при любом их порядке: `=(varchar, varchar)` в public
-// перехватывал сверку ключа, а esundo запускает человек правами владельца
-// (R2 заход 2, тот же класс, что CVE-2018-1058). Типы колонок сборщик пишет
-// со схемой (его путь — pg_catalog), так что путь роли откату не нужен.
+// Path — путь поиска своих проверочных запросов сеанса: только pg_catalog и
+// pg_temp последним (не названный pg_temp ищется первым для типов).
 const Path = "pg_catalog, pg_temp"
 
-// session ставит сеансу путь поиска Path (на весь сеанс: следующий запрос
-// человека в esundo — тоже наш, MCP-сервер начинает вызов с DISCARD ALL).
-func session(db DB) error {
-	_, err := db.Query("SELECT pg_catalog.set_config('search_path', '" + Path + "', false)")
+// session готовит сеанс сверки и отката. Функция или оператор с точным
+// совпадением типов выигрывает у системных при любом порядке пути (класс
+// CVE-2018-1058): `=(varchar, varchar)` агента в public перехватывал сверку
+// ключа, а esundo запускает человек правами владельца (R2 заход 2). Но и путь
+// только из pg_catalog нельзя: триггеры таблиц владельца в откате идут с путём
+// сеанса, и аудит с именем таблицы без схемы падал (R2 заход 3). Поэтому путь
+// — pg_catalog, путь сеанса, pg_temp последним, — и откат отказывает, если
+// роль, чью транзакцию он возвращает (или роль, которой она может стать),
+// может CREATE в какой-либо схеме этого пути. Типы колонок сборщик пишет со
+// схемой. Путь ставится на весь сеанс: следующий запрос человека в esundo —
+// тоже наш, MCP-сервер начинает вызов с DISCARD ALL.
+func (p *Plan) session(db DB) error {
+	res, err := db.Query("SELECT pg_catalog.array_to_string(pg_catalog.current_schemas(false), ',')")
+	if err != nil {
+		return err
+	}
+	var schemas []string
+	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil && *res[0].Rows[0][0] != "" {
+		schemas = strings.Split(*res[0].Rows[0][0], ",")
+	}
+	if _, err := db.Query("SELECT pg_catalog.set_config('search_path', '" + Path + "', false)"); err != nil {
+		return err
+	}
+	var who struct{ Role string }
+	json.Unmarshal(p.Who, &who)
+	path := []string{"pg_catalog"}
+	for _, n := range schemas {
+		if n != "pg_catalog" {
+			path = append(path, pgwire.Ident(n))
+		}
+	}
+	if who.Role == "" || len(path) == 1 {
+		return nil // путь — только Path
+	}
+	lits := make([]string, 0, len(schemas))
+	for _, n := range schemas {
+		lits = append(lits, pgwire.Literal(n))
+	}
+	res, err = db.Query("SELECT string_agg(DISTINCT format('%I can CREATE in schema %I', r.rolname, n.nspname) || " +
+		"CASE WHEN g.oid <> r.oid THEN format(' (as %I)', g.rolname) ELSE '' END, ', ') " +
+		"FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER') JOIN pg_namespace n ON n.nspname IN (" + strings.Join(lits, ", ") + ") " +
+		"WHERE r.rolname = " + pgwire.Literal(who.Role) + " AND n.nspname <> 'pg_catalog' AND has_schema_privilege(g.oid, n.oid, 'CREATE')")
+	if err != nil {
+		return err
+	}
+	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
+		return refuse("%s, and that schema is on the search_path of this session: a function or operator of the role would run in the check "+
+			"and the undo with the rights of this session. Take the schema off the search_path (SET search_path) or revoke the right", *res[0].Rows[0][0])
+	}
+	path = append(path, "pg_temp")
+	_, err = db.Query("SELECT pg_catalog.set_config('search_path', " + pgwire.Literal(strings.Join(path, ", ")) + ", false)")
 	return err
 }
 
 // Check спрашивает базу про каждый шаг и запоминает годные в p.OK.
 // Ответы — по порядку шагов. База не меняется.
 func (p *Plan) Check(db DB) ([]Status, error) {
-	if err := session(db); err != nil {
+	if err := p.session(db); err != nil {
 		return nil, err
 	}
 	if err := p.catalog(db); err != nil {
@@ -713,7 +760,7 @@ func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := session(db); err != nil {
+	if err := p.session(db); err != nil {
 		return nil, err
 	}
 	out, err := p.apply(db, string(mark), p.groups(only), OrderJournal)
@@ -826,7 +873,9 @@ func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Appli
 		if err != nil {
 			return nil, err
 		}
-		out.Rows = after - before
+		// Как у execute — большее из статистики и шагов: при track_counts =
+		// off статистика молчит (R1, R2 заход 3).
+		out.Rows = max(after-before, out.Steps)
 		if err := p.limit(out.Rows); err != nil {
 			return nil, err
 		}
@@ -835,6 +884,13 @@ func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Appli
 		return nil, err
 	}
 	if _, err := db.Query("COMMIT"); err != nil {
+		var pg *pgwire.PgError
+		if !errors.As(err, &pg) || pg.Severity == "FATAL" || pg.Severity == "PANIC" {
+			// Связь оборвалась на COMMIT (или база закрыла сеанс): зафиксировал
+			// ли он, отсюда не узнать — при синхронной реплике сеанс, прерванный
+			// в её ожидании, у себя уже зафиксирован (R1, R2 заход 3).
+			return out, fmt.Errorf("%w (transaction %s): %v", ErrCommitUnknown, out.XID, err)
+		}
 		return nil, err
 	}
 	return out, nil
