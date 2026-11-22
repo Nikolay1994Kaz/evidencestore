@@ -465,11 +465,10 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	rc := Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "undo_apply",
 		Reason: reason, Undoes: actionID, Client: s.client, Outcome: "failed"}
 	// Откат — тоже действие: его отметка несёт и номер действия, и что он возвращает.
-	undoXID, err := plan.Apply(s.db, map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": reason,
+	applied, err := plan.Apply(s.db, map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": reason,
 		"undoes_action": actionID, "undoes_xid": target.XID, "steps_applied": ok, "conflicts_left": bad})
-	rc.XID = undoXID
 	if err == nil {
-		rc.Outcome = "committed"
+		rc.XID, rc.Outcome = applied.XID, "committed"
 	} else {
 		rc.Error = err.Error()
 	}
@@ -483,7 +482,12 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out["undo_action_id"], out["undo_xid"], out["applied"] = rc.ActionID, undoXID, ok
+	out["undo_action_id"], out["undo_xid"], out["applied"] = rc.ActionID, applied.XID, applied.Steps
+	if len(applied.Differ) > 0 {
+		// Строки вернулись, но триггеры таблиц переписали часть значений: агент
+		// должен знать, что «как было» получилось не во всём.
+		out["differs_from_before"] = applied.Differ
+	}
 	delete(out, "to_apply")
 	text, _ := json.Marshal(out)
 	return string(text), nil

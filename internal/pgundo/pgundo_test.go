@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -214,8 +216,10 @@ func TestCheckAndApply(t *testing.T) {
 	tag := map[string]string{"INSERT": "INSERT 0 1", "DELETE": "DELETE 1", "UPDATE": "UPDATE 1"}
 	db := &fakeDB{answer: func(sql string) ([]pgwire.Result, error) {
 		switch {
-		case strings.Contains(sql, "to_regclass"):
-			return rows([]string{"t", "t"}), nil
+		case strings.Contains(sql, "pg_attribute"):
+			return rows([]string{"id", ""}, []string{"v", ""}), nil
+		case strings.HasPrefix(sql, "SELECT count(*) FILTER"): // сверка после отката: все строки на месте и равны до-образам
+			return rows([]string{"0", "0", "0"}), nil
 		case strings.HasPrefix(sql, "SELECT w.step") && strings.Contains(sql, "'exists'"):
 			return rows([]string{"2", "ok", "<null>"}), nil
 		case strings.HasPrefix(sql, "SELECT w.step") && strings.Contains(sql, "'key-taken'"):
@@ -251,14 +255,16 @@ func TestCheckAndApply(t *testing.T) {
 	}
 
 	db.log = nil
-	xid, err := p.Apply(db, m{"by": "nikolay"})
-	if err != nil || xid != "900" {
-		t.Fatal(xid, err)
+	done, err := p.Apply(db, m{"by": "nikolay"})
+	if err != nil || done.XID != "900" || done.Steps != 2 || done.Order != OrderJournal || done.Differ != nil {
+		t.Fatal(done, err)
 	}
-	// Транзакция, отметка первой, шаг 2 (вернуть удалённую), шаг 4 (вернуть значения), фиксация. Шаги 1 и 3 не тронуты.
-	if len(db.log) != 6 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], `SELECT evidence.mark_undo('{"by":"nikolay"}'`) ||
+	// Транзакция, отметка первой, шаг 2 (вернуть удалённую), шаг 4 (вернуть значения), сверка обеих
+	// команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
+	if len(db.log) != 8 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], `SELECT evidence.mark_undo('{"by":"nikolay"}'`) ||
 		!strings.HasPrefix(db.log[3], `INSERT INTO "public"."t"`) || !strings.HasPrefix(db.log[4], `UPDATE "public"."t" t SET "id" = w.o0, "v" = w.o1`) ||
-		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id" IS NOT DISTINCT FROM w.n0 AND t."v" IS NOT DISTINCT FROM w.n1`) || db.log[5] != "COMMIT" {
+		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id" IS NOT DISTINCT FROM w.n0 AND t."v" IS NOT DISTINCT FROM w.n1`) ||
+		!strings.Contains(db.log[5], `LEFT JOIN "public"."t" t ON t."id" = w.o0`) || !strings.Contains(db.log[6], `NOT (t."v" IS NOT DISTINCT FROM w.o1)`) || db.log[7] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
 
@@ -272,8 +278,12 @@ func TestCheckAndApply(t *testing.T) {
 
 func TestCheckRefusesAChangedTable(t *testing.T) {
 	p := build(t, rel(1, "t"), ch("U", 1, v("1", "a"), v("1", "b")))
-	for want, answer := range map[string][]string{"no longer exists": {"f", "<null>"}, "other columns": {"t", "f"}} {
-		db := &fakeDB{answer: func(string) ([]pgwire.Result, error) { return rows(answer), nil }}
+	for want, answer := range map[string][][]string{
+		"no longer exists": {},
+		"other columns now than in the journal (v is gone)": {{"id", ""}, {"w", ""}},
+		"other columns now than in the journal (w is new)":  {{"id", ""}, {"v", ""}, {"w", ""}},
+	} {
+		db := &fakeDB{answer: func(string) ([]pgwire.Result, error) { return rows(answer...), nil }}
 		if _, err := p.Check(db); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: %v", want, err)
 		}
@@ -313,5 +323,201 @@ func TestConflictsAreDescribed(t *testing.T) {
 	}
 	if s := p.Summary(); s.Steps != 2 || s.Restore != 1 || s.Reinsert != 1 {
 		t.Errorf("%+v", s)
+	}
+}
+
+// Что о таблице знает только каталог: колонку, которую база считает сама, откат
+// не пишет; колонку типа без оператора равенства сравнивает текстом.
+func TestCheckTakesGeneratedAndUncomparableColumnsFromTheCatalog(t *testing.T) {
+	wide := func(r m) {
+		r["columns"], r["types"] = []string{"id", "v", "double", "place"}, []string{"integer", "text", "integer", "point"}
+	}
+	p := build(t, rel(1, "t", wide), ch("U", 1, v("1", "a", "2", "(0,0)"), v("1", "b", "4", "(1,1)")), ch("D", 1, v("3", "c", "6", "(3,3)"), nil))
+	db := &fakeDB{answer: func(sql string) ([]pgwire.Result, error) {
+		switch {
+		case strings.Contains(sql, "pg_attribute"):
+			// В таблице есть ещё колонка, которой в журнале нет: генерируемая, до 18-й версии база их не шлёт.
+			return rows([]string{"id", ""}, []string{"v", ""}, []string{"double", "s"}, []string{"place", ""}, []string{"shadow", "s"}), nil
+		case sql == "SELECT NULL::point IS NOT DISTINCT FROM NULL::point":
+			return nil, &pgwire.PgError{Severity: "ERROR", Code: "42883", Message: "operator does not exist: point = point"}
+		case strings.HasPrefix(sql, "SELECT w.step") && strings.Contains(sql, "'exists'"):
+			return rows([]string{"1", "ok", "<null>"}), nil
+		case strings.HasPrefix(sql, "SELECT w.step"):
+			return rows([]string{"2", "ok", "<null>"}), nil
+		case strings.Contains(sql, "pg_current_xact_id"):
+			return rows([]string{"900"}), nil
+		case strings.HasPrefix(sql, "SELECT count(*) FILTER"):
+			return rows([]string{"0", "0", "0", "0", "0"}), nil
+		}
+		return []pgwire.Result{{Tag: map[string]string{"INSERT": "INSERT 0 1", "UPDATE": "UPDATE 1"}[strings.Fields(sql)[0]]}}, nil
+	}}
+	if _, err := p.Check(db); err != nil {
+		t.Fatal(err)
+	}
+	tab := p.Tables["public.t"]
+	if fmt.Sprint(tab.Generated) != "[double]" || fmt.Sprint(tab.AsText) != "[place]" {
+		t.Fatalf("generated %v, as text %v", tab.Generated, tab.AsText)
+	}
+	// План переживает запись в файл: apply читает его оттуда.
+	data, _ := json.Marshal(p)
+	p = &Plan{}
+	if err := json.Unmarshal(data, p); err != nil {
+		t.Fatal(err)
+	}
+	db.log = nil
+	if _, err := p.Apply(db, m{}); err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Join(db.log, "\n")
+	for _, want := range []string{
+		`INSERT INTO "public"."t" ("id", "v", "place")` + "\n  SELECT w.o0, w.o1, w.o3",
+		`UPDATE "public"."t" t SET "id" = w.o0, "v" = w.o1, "place" = w.o3` + "\n",
+		`t."double" IS NOT DISTINCT FROM w.n2 AND t."place"::text IS NOT DISTINCT FROM w.n3::text`,
+		`NOT (t."place"::text IS NOT DISTINCT FROM w.o3::text)`,
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("the undo lacks %q:\n%s", want, all)
+		}
+	}
+	if strings.Contains(all, `"double" = `) || strings.Contains(all, `"shadow"`) {
+		t.Errorf("the undo writes a generated column:\n%s", all)
+	}
+}
+
+// Каскад внешнего ключа: в журнале родитель удалён раньше детей, и порядок,
+// обратный журналу, возвращает детей первыми — база отказывает. Вторая попытка
+// идёт по внешним ключам: родитель, потом дети; правки — под замком и со сверкой
+// заранее.
+func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
+	p := build(t,
+		rel(2, "parent"), ch("D", 2, v("9", "p"), nil), // оператор агента
+		rel(1, "child"), ch("D", 1, v("1", "c"), nil), ch("D", 1, v("2", "c"), nil), // каскад
+		rel(3, "other"), ch("U", 3, v("5", "a"), v("6", "a")), ch("I", 3, nil, v("7", "new")))
+	p.OK = []int{1, 2, 3, 4, 5}
+	violation := &pgwire.PgError{Severity: "ERROR", Code: "23503", Message: `insert or update on table "child" violates foreign key constraint`}
+	attempt, locked := 0, "1"
+	db := &fakeDB{}
+	db.answer = func(sql string) ([]pgwire.Result, error) {
+		switch {
+		case sql == "BEGIN":
+			attempt++
+		case strings.Contains(sql, "pg_current_xact_id"):
+			return rows([]string{fmt.Sprint(900 + attempt)}), nil
+		case strings.HasPrefix(sql, `INSERT INTO "public"."child"`) && attempt == 1:
+			return nil, violation
+		case strings.Contains(sql, "pg_constraint"):
+			return rows([]string{"public.child", "public.parent"}), nil
+		case strings.Contains(sql, "FOR UPDATE OF t"):
+			return rows([]string{locked}), nil
+		case strings.HasPrefix(sql, "SELECT count(*) FILTER"):
+			return rows([]string{"0", "0", "0"}), nil
+		case strings.HasPrefix(sql, "SELECT count(*) FROM"): // убранные строки: их нет
+			return rows([]string{"0"}), nil
+		case strings.HasPrefix(sql, `INSERT INTO "public"."child"`):
+			return []pgwire.Result{{Tag: "INSERT 0 2"}}, nil
+		case strings.HasPrefix(sql, "UPDATE") && attempt == 2 && !strings.Contains(sql, "NOT EXISTS"):
+			return []pgwire.Result{{Tag: "UPDATE 0"}}, nil // под новым ключом строки уже нет: её вернул каскад
+		}
+		return []pgwire.Result{{Tag: map[string]string{"INSERT": "INSERT 0 1", "UPDATE": "UPDATE 1", "DELETE": "DELETE 1"}[strings.Fields(sql)[0]]}}, nil
+	}
+	done, err := p.Apply(db, m{})
+	if err != nil || done.Order != OrderKeys || done.XID != "902" || done.Steps != 5 {
+		t.Fatal(done, err)
+	}
+	// Что шло после отмены первой попытки: какая команда над какой таблицей.
+	table := regexp.MustCompile(`"public"\."(\w+)"`)
+	var second []string
+	for _, q := range db.log[slices.Index(db.log, "ROLLBACK")+1:] {
+		what := map[string]string{"INSERT": "insert", "UPDATE": "update", "DELETE": "delete"}[strings.Fields(q)[0]]
+		switch {
+		case strings.Contains(q, "pg_constraint"):
+			second = append(second, "keys")
+			continue
+		case strings.Contains(q, "FOR UPDATE OF t"):
+			what = "lock"
+		case strings.Contains(q, "NOT EXISTS"):
+			what = "update-moved"
+			// Строка под прежним ключом, ещё не равная до-образу, а под новым ключом её уже нет.
+			if !strings.Contains(q, `WHERE ROW(w.o0) IS DISTINCT FROM ROW(w.n0) AND t."id" = w.o0 AND NOT (t."id" IS NOT DISTINCT FROM w.o0 AND t."v" IS NOT DISTINCT FROM w.o1)`+
+				` AND NOT EXISTS (SELECT 1 FROM "public"."other" x WHERE x."id" = w.n0)`) {
+				t.Fatalf("the statement for rows a cascade moved back:\n%s", q)
+			}
+		case strings.HasPrefix(q, "SELECT count(*)"):
+			what = "after"
+		case what == "":
+			continue
+		}
+		second = append(second, what+" "+table.FindStringSubmatch(q)[1])
+	}
+	// Замок и сверка заранее — у правки и уборки; родитель раньше детей; правка — двумя командами
+	// (первая — по прежнему ключу); уборка вставленной — последней; в конце сверка с до-образами.
+	want := "keys, lock other, lock other, insert parent, insert child, update-moved other, update other, delete other, after parent, after child, after other, after other"
+	if got := strings.Join(second, ", "); got != want {
+		t.Fatalf("the second attempt:\n got %s\nwant %s", got, want)
+	}
+	// Сверка в этом порядке — в замке, а не в условии команды: команда берёт строку по ключу.
+	for _, q := range db.log[slices.Index(db.log, "ROLLBACK")+1:] {
+		if (strings.HasPrefix(q, "UPDATE") && !strings.Contains(q, "NOT EXISTS") && !strings.HasSuffix(q, `WHERE t."id" = w.n0`)) ||
+			(strings.HasPrefix(q, "DELETE") && !strings.HasSuffix(q, `WHERE t."id" = w.n0`)) {
+			t.Fatalf("a statement of the second attempt carries a guard:\n%s", q)
+		}
+	}
+
+	// Строка шага изменилась после сверки: под замок встало меньше строк — откат отменён.
+	attempt, locked, db.log = 0, "0", nil
+	if _, err := p.Apply(db, m{}); !errors.Is(err, ErrChanged) || db.log[len(db.log)-1] != "ROLLBACK" || !strings.Contains(err.Error(), "in the order of the journal") {
+		t.Fatalf("%v %q", err, db.log[len(db.log)-1])
+	}
+	// Отказ не по ограничению второй попытки не даёт.
+	db.answer = func(sql string) ([]pgwire.Result, error) {
+		if strings.HasPrefix(sql, "INSERT") {
+			return nil, &pgwire.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied"}
+		}
+		return rows([]string{"900"}), nil
+	}
+	db.log = nil
+	if _, err := p.Apply(db, m{}); err == nil || strings.Count(strings.Join(db.log, " "), "BEGIN") != 1 {
+		t.Fatalf("%v %q", err, db.log)
+	}
+}
+
+// Сверка после отката: строки на месте нет — откат отменён; значения переписал
+// триггер — откат применён, а колонки названы.
+func TestApplyChecksTheRowsAfterTheUndo(t *testing.T) {
+	p := build(t, rel(1, "t"), ch("U", 1, v("1", "a"), v("1", "b")), ch("U", 1, v("2", "a"), v("2", "b")), ch("I", 1, nil, v("4", "d")))
+	p.OK = []int{1, 2, 3}
+	after, left := []string{"0", "0", "2"}, "0"
+	db := &fakeDB{answer: func(sql string) ([]pgwire.Result, error) {
+		switch {
+		case strings.HasPrefix(sql, "SELECT count(*) FILTER"):
+			return rows(after), nil
+		case strings.HasPrefix(sql, "SELECT count(*) FROM"):
+			return rows([]string{left}), nil
+		case strings.Contains(sql, "pg_current_xact_id"):
+			return rows([]string{"900"}), nil
+		}
+		return []pgwire.Result{{Tag: map[string]string{"UPDATE": "UPDATE 2", "DELETE": "DELETE 1"}[strings.Fields(sql)[0]]}}, nil
+	}}
+	done, err := p.Apply(db, m{})
+	if err != nil || len(done.Differ) != 1 || done.Differ[0] != (Difference{Table: "public.t", Column: "v", Rows: 2}) || db.log[len(db.log)-1] != "COMMIT" {
+		t.Fatalf("%+v %v", done, err)
+	}
+	for name, spoil := range map[string]func(){
+		"put back are not there":  func() { after = []string{"1", "0", "0"} },
+		"removed are still there": func() { after, left = []string{"0", "0", "0"}, "1" },
+	} {
+		spoil()
+		db.log = nil
+		if _, err := p.Apply(db, m{}); err == nil || !strings.Contains(err.Error(), name) || db.log[len(db.log)-1] != "ROLLBACK" {
+			t.Errorf("%s: %v, then %s", name, err, db.log[len(db.log)-1])
+		}
+	}
+}
+
+func TestRanks(t *testing.T) {
+	// c → b → a; d ссылается на a и на c; e и f — друг на друга (круг); g — ни на кого.
+	r := ranks([][2]string{{"b", "a"}, {"c", "b"}, {"d", "a"}, {"d", "c"}, {"e", "f"}, {"f", "e"}})
+	if r["a"] != 0 || r["b"] != 1 || r["c"] != 2 || r["d"] != 3 || r["g"] != 0 || r["e"]+r["f"] != 1 {
+		t.Fatalf("%v", r)
 	}
 }

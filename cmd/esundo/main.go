@@ -278,8 +278,20 @@ func apply(args []string) {
 	}
 	db := dial(*dsn)
 	defer db.Close()
-	xid, err := p.Apply(db, map[string]any{"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "by": *by, "reason": *reason,
+	done, err := p.Apply(db, map[string]any{"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "by": *by, "reason": *reason,
 		"steps_applied": len(p.OK), "steps_total": len(p.Steps)})
 	fail(err)
-	fmt.Printf("undo applied: %d steps in transaction %s\n", len(p.OK), xid)
+	fmt.Printf("undo applied: %d steps in transaction %s\n", done.Steps, done.XID)
+	if done.Order == pgundo.OrderKeys {
+		fmt.Println("  the steps went in the order of the foreign keys: in the order of the journal the database refused them (a cascade made a part of the changes)")
+	}
+	if len(done.Differ) == 0 {
+		fmt.Println("  checked after the undo: every row is as it was before the transaction")
+		return
+	}
+	fmt.Println("  checked after the undo: the rows are back, but not all values are as they were before the transaction.")
+	fmt.Println("  Triggers of these tables rewrote what the undo put back (the undo does not switch triggers off):")
+	for _, d := range done.Differ {
+		fmt.Printf("    %s.%s: %d rows\n", d.Table, d.Column, d.Rows)
+	}
 }

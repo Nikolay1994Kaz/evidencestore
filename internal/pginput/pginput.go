@@ -178,10 +178,43 @@ func SetupSQL(c *Config) (string, error) {
 	var b strings.Builder
 	p := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	lit, id := pgwire.Literal, pgwire.Ident
+	var schemas, tables, regclasses []string
+	for _, t := range c.Tables {
+		s, n, err := splitTable(t)
+		if err != nil {
+			return "", err
+		}
+		if !slices.Contains(schemas, s) {
+			schemas = append(schemas, s)
+		}
+		tables = append(tables, id(s)+"."+id(n))
+		regclasses = append(regclasses, lit(id(s)+"."+id(n))+"::regclass")
+	}
+	// named — названные таблицы и все их секции: (relid, level). Сама таблица —
+	// отдельной строкой: pg_partition_tree обычную таблицу не отдаёт вовсе.
+	array := "unnest(ARRAY[" + strings.Join(regclasses, ", ") + "]) AS t(oid)"
+	named := "(SELECT t.oid AS relid, 0 AS level FROM " + array + " UNION\n" +
+		"      SELECT tree.relid, tree.level FROM " + array + " CROSS JOIN LATERAL pg_partition_tree(t.oid) AS tree) AS part"
 	p("-- evidencestore: настройка базы под запись до-образов (escollect -setup-sql).")
 	p("-- Выполняет владелец таблиц или суперпользователь. Нужен wal_level = logical")
 	p("-- (меняется с перезапуском базы) и предел журнала для слота: max_slot_wal_keep_size.")
 	p("BEGIN;")
+	p("")
+	p("-- Чего по записи не вернуть, под запись не берём. Проверка — до любых изменений:")
+	p("-- скрипт — одна транзакция, и отказ здесь не оставляет в базе ничего.")
+	p("-- Виртуальная генерируемая колонка (PostgreSQL 18+): таблице с ней под REPLICA IDENTITY FULL")
+	p("-- база отказывает в UPDATE и DELETE — любой роли, не только агенту.")
+	p("DO $evidence$ DECLARE bad text; BEGIN")
+	p("  SELECT string_agg(format('%%I.%%I.%%I', n.nspname, c.relname, a.attname), ', ' ORDER BY n.nspname, c.relname, a.attnum) INTO bad")
+	p("    FROM %s", named)
+	p("    JOIN pg_class c ON c.oid = part.relid JOIN pg_namespace n ON n.oid = c.relnamespace")
+	p("    JOIN pg_attribute a ON a.attrelid = part.relid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = 'v';")
+	p("  IF bad IS NOT NULL THEN")
+	p("    RAISE EXCEPTION 'evidencestore: a virtual generated column: %%', bad USING HINT =")
+	p("      'With REPLICA IDENTITY FULL PostgreSQL refuses UPDATE and DELETE of a table that has a virtual generated column. '")
+	p("      'Take the table out of \"tables\" in the collector config, or make the column STORED.';")
+	p("  END IF;")
+	p("END $evidence$;")
 	p("")
 	p("-- Отметки в журнале: кто менял (ставит триггер), какое это действие (ставит MCP-сервер)")
 	p("-- и что транзакция — откат (ставит esundo или MCP-сервер).")
@@ -229,18 +262,9 @@ func SetupSQL(c *Config) (string, error) {
 	p("")
 	p("-- Роли агентов: только строки названных таблиц. Ни TRUNCATE, ни владения —")
 	p("-- значит, ни TRUNCATE, ни DROP: то, что по записи не вернуть, агенту недоступно.")
-	var schemas, tables []string
-	for _, t := range c.Tables {
-		s, n, err := splitTable(t)
-		if err != nil {
-			return "", err
-		}
-		if !slices.Contains(schemas, s) {
-			schemas = append(schemas, s)
-		}
-		tables = append(tables, id(s)+"."+id(n))
-	}
+	var roles []string
 	for _, r := range c.Roles {
+		roles = append(roles, id(r))
 		p("DO $evidence$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s LOGIN; END IF; END $evidence$;", lit(r), id(r))
 		for _, s := range schemas {
 			p("GRANT USAGE ON SCHEMA %s TO %s;", id(s), id(r))
@@ -258,9 +282,34 @@ func SetupSQL(c *Config) (string, error) {
 		p("  FOR EACH STATEMENT EXECUTE FUNCTION evidence.mark_who();")
 	}
 	p("")
-	p("-- Публикация: в поток репликации идут только эти таблицы.")
+	p("-- Секции секционированных таблиц. Изменения идут в журнал под именем секции, и старую")
+	p("-- строку пишет она: каждой секции — то же, что самой таблице, и те же права агентам.")
+	p("-- Секцию, созданную позже, этот скрипт не знает: после неё его выполняют снова")
+	p("-- (сборщик при подключении называет секции, которым не хватает настройки).")
+	p("DO $evidence$ DECLARE leaf regclass; BEGIN")
+	p("  FOR leaf IN SELECT part.relid FROM %s", named)
+	p("      JOIN pg_class c ON c.oid = part.relid WHERE part.level > 0 AND c.relkind = 'r' LOOP")
+	p("    EXECUTE format('ALTER TABLE %%s REPLICA IDENTITY FULL', leaf);")
+	p("    EXECUTE format('DROP TRIGGER IF EXISTS evidence_who ON %%s', leaf);")
+	p("    EXECUTE format('CREATE TRIGGER evidence_who BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON %%s '")
+	p("      'FOR EACH STATEMENT EXECUTE FUNCTION evidence.mark_who()', leaf);")
+	// Имена ролей попадают в строку формата: знак процента в имени удваивается.
+	p("    EXECUTE format(%s, leaf);", lit("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO "+strings.ReplaceAll(strings.Join(roles, ", "), "%", "%%")))
+	p("  END LOOP;")
+	p("END $evidence$;")
+	p("")
+	p("-- Публикация: в поток репликации идут только эти таблицы. С PostgreSQL 18 в неё входят и")
+	p("-- хранимые генерируемые колонки: иначе таблице с такой колонкой под REPLICA IDENTITY FULL")
+	p("-- база отказывает в UPDATE и DELETE.")
+	publication := "CREATE PUBLICATION " + id(c.Publication) + " FOR TABLE " + strings.Join(tables, ", ")
 	p("DROP PUBLICATION IF EXISTS %s;", id(c.Publication))
-	p("CREATE PUBLICATION %s FOR TABLE %s;", id(c.Publication), strings.Join(tables, ", "))
+	p("DO $evidence$ BEGIN")
+	p("  IF current_setting('server_version_num')::int >= 180000 THEN")
+	p("    EXECUTE %s;", lit(publication+" WITH (publish_generated_columns = stored)"))
+	p("  ELSE")
+	p("    EXECUTE %s;", lit(publication))
+	p("  END IF;")
+	p("END $evidence$;")
 	p("")
 	p("-- Роль сборщика: читает поток репликации, к таблицам доступа не имеет.")
 	p("DO $evidence$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s LOGIN REPLICATION; END IF; END $evidence$;", lit(tapRole), id(tapRole))
@@ -318,6 +367,8 @@ type Source struct {
 	downSince time.Time
 	downErr   error
 	downSaid  bool
+	// identitySaid — о каких таблицах без REPLICA IDENTITY FULL тревога уже поднята.
+	identitySaid string
 
 	partSize int // размер части pgtap; 0 — его умолчание (меняют тесты)
 }
@@ -430,6 +481,7 @@ func (s *Source) connect(ctx context.Context) (err error) {
 	} else if !ok {
 		return fmt.Errorf("publication %s does not exist: run the script printed by escollect -setup-sql", s.cfg.Publication)
 	}
+	s.watchIdentity(cat)
 	start, err := s.ensureSlot(cat)
 	if err != nil {
 		return err
@@ -466,6 +518,44 @@ func (s *Source) connect(ctx context.Context) (err error) {
 	s.backoff, s.retryAt = 0, time.Time{}
 	s.log.Info("reading the database log", "slot", s.cfg.Slot, "publication", s.cfg.Publication, "from", start.String(), "roles", strings.Join(s.cfg.Roles, ","))
 	return nil
+}
+
+// watchIdentity называет таблицы и секции из настроек, у которых нет REPLICA
+// IDENTITY FULL: старых строк их изменений в журнале базы не будет. Обычный
+// случай — секция, созданная после настройки базы. Сказать об этом надо при
+// подключении, а не после первого действия агента над такой секцией.
+func (s *Source) watchIdentity(cat *pgwire.Conn) {
+	// По каталогу, а не по именам: у роли сборщика нет прав на схемы таблиц, и
+	// разбор имени ('schema.table'::regclass) ей отказал бы.
+	var names []string
+	for _, t := range s.cfg.Tables {
+		if schema, table, err := splitTable(t); err == nil {
+			names = append(names, "("+pgwire.Literal(schema)+", "+pgwire.Literal(table)+")")
+		}
+	}
+	// Сама таблица — отдельной строкой: pg_partition_tree обычную таблицу не отдаёт вовсе.
+	row, _, err := cat.QueryRow("SELECT string_agg(part.relid::text, ', ' ORDER BY part.relid::text) " +
+		"FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace " +
+		"CROSS JOIN LATERAL (SELECT t.oid::regclass AS relid UNION SELECT tree.relid FROM pg_partition_tree(t.oid) AS tree) AS part " +
+		"JOIN pg_class c ON c.oid = part.relid WHERE (n.nspname, t.relname) IN (" + strings.Join(names, ", ") + ") AND c.relkind = 'r' AND c.relreplident <> 'f'")
+	if err != nil {
+		s.log.Warn("the replica identity of the watched tables could not be checked", "err", err)
+		return
+	}
+	bad := ""
+	if row != nil && row[0] != nil {
+		bad = *row[0]
+	}
+	if bad == s.identitySaid {
+		return
+	}
+	if s.identitySaid = bad; bad == "" {
+		return
+	}
+	detail := "no REPLICA IDENTITY FULL on " + bad + ": old rows of their changes are not in the database log, such changes cannot be undone. " +
+		"Run the script of escollect -setup-sql again (a partition made after the setup needs it)"
+	s.log.Error("alert", "kind", alert.KindIdentity, "detail", detail)
+	s.raise(alert.KindIdentity, detail)
 }
 
 // ensureSlot находит слот и отдаёт позицию, которую он подтвердил. Нет слота

@@ -11,6 +11,14 @@
 //	Apply  — годные шаги одной транзакцией. Каждая команда несёт ту же сверку в
 //	         своём условии и обязана тронуть ровно столько строк, сколько в ней
 //	         шагов: строка, изменённая между Check и Apply, отменяет откат целиком.
+//	         В конце той же транзакции строки сверяются с до-образами: что после
+//	         отката не равно им (значения переписал триггер таблицы), названо.
+//
+// Триггеры и внешние ключи при откате работают как обычно: откат — обычная
+// транзакция владельца, целостность проверяет база. Порядок шагов — обратный
+// журналу. Где база на нём отказывает по ограничению (часть изменений сделал
+// каскад внешнего ключа: в журнале они идут после родителя), Apply пробует
+// второй порядок — по внешним ключам из каталога.
 //
 // Значения колонок идут текстом, как их отдал PostgreSQL, и возвращаются
 // литералом с приведением к типу колонки. Отказ построить план — ErrRefused:
@@ -22,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -45,6 +54,13 @@ type Table struct {
 	Columns []string `json:"columns"`
 	Types   []string `json:"types"`
 	PK      []string `json:"pk"`
+	// Что знает только каталог базы; дописывает Check.
+	// Generated — колонки журнала, которые база считает сама (GENERATED …
+	// STORED, с PostgreSQL 18 они идут в журнал): откат их не пишет.
+	Generated []string `json:"generated,omitempty"`
+	// AsText — колонки типа без оператора равенства (point, json, xml): с
+	// образом они сравниваются текстом.
+	AsText []string `json:"as_text,omitempty"`
 }
 
 func (t *Table) rel() string { return pgwire.Ident(t.Schema) + "." + pgwire.Ident(t.Name) }
@@ -365,9 +381,13 @@ func (g group) sides() string {
 	return "n"
 }
 
-// values — шаги списком VALUES: step, новый образ (n0..), старый образ (o0..).
-// Тип — в первой строке: остальные PostgreSQL приводит к нему сам.
-func (g group) values() string {
+// values — шаги списком VALUES: step, новый образ (n0..), старый образ (o0..) —
+// те, что нужны команде шага. Тип — в первой строке: остальные PostgreSQL
+// приводит к нему сам.
+func (g group) values() string { return g.valuesOf(g.sides()) }
+
+// valuesOf — то же с названными образами: "n", "o" или "no".
+func (g group) valuesOf(sides string) string {
 	var b strings.Builder
 	b.WriteString("(VALUES\n  ")
 	for i, s := range g.steps {
@@ -375,7 +395,7 @@ func (g group) values() string {
 			b.WriteString(",\n  ")
 		}
 		b.WriteString("(" + strconv.Itoa(s.N))
-		for _, side := range g.sides() {
+		for _, side := range sides {
 			img := s.New
 			if side == 'o' {
 				img = s.Old
@@ -395,7 +415,7 @@ func (g group) values() string {
 		b.WriteString(")")
 	}
 	b.WriteString("\n) AS w(step")
-	for _, side := range g.sides() {
+	for _, side := range sides {
 		for c := range g.t.Columns {
 			fmt.Fprintf(&b, ", %c%d", side, c)
 		}
@@ -414,10 +434,21 @@ func (g group) join(alias string, side byte) string {
 
 func (g group) same(side byte) string {
 	var parts []string
-	for i, c := range g.t.Columns {
-		parts = append(parts, fmt.Sprintf("t.%s IS NOT DISTINCT FROM w.%c%d", pgwire.Ident(c), side, i))
+	for i := range g.t.Columns {
+		parts = append(parts, g.t.equal(i, side))
 	}
 	return strings.Join(parts, " AND ")
+}
+
+// equal — колонка i строки t равна образу side. У типа без оператора
+// равенства сравнивается текст: образ в VALUES приведён к типу колонки, так что
+// обе стороны пишет одна функция вывода в одном сеансе.
+func (t *Table) equal(i int, side byte) string {
+	col, img := "t."+pgwire.Ident(t.Columns[i]), fmt.Sprintf("w.%c%d", side, i)
+	if slices.Contains(t.AsText, t.Columns[i]) {
+		col, img = col+"::text", img+"::text"
+	}
+	return col + " IS NOT DISTINCT FROM " + img
 }
 
 func (g group) missing() string { return "t." + pgwire.Ident(g.t.PK[0]) + " IS NULL" }
@@ -448,31 +479,87 @@ type DB interface {
 	Query(sql string) ([]pgwire.Result, error)
 }
 
+// catalog сверяет таблицы плана с каталогом базы и дописывает в план то, что
+// знает только каталог: какие колонки база считает сама и какие сравнивать
+// текстом.
+func (p *Plan) catalog(db DB) error {
+	noEquality := map[string]bool{} // тип → оператора равенства у него нет
+	for _, name := range p.tableNames() {
+		t := p.Tables[name]
+		res, err := db.Query("SELECT a.attname::text, a.attgenerated::text FROM pg_attribute a WHERE a.attrelid = to_regclass(" + pgwire.Literal(t.rel()) +
+			") AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum")
+		if err != nil {
+			return err
+		}
+		if len(res) != 1 {
+			return fmt.Errorf("pgundo: check of %s: unexpected answer", name)
+		}
+		if len(res[0].Rows) == 0 {
+			return refuse("%s no longer exists: an undo by row images does not fit", name)
+		}
+		// Колонки журнала должны быть в таблице все. В таблице сверх журнала —
+		// только генерируемые: их база в журнал может не слать, а считает сама.
+		generated, extra := map[string]bool{}, map[string]bool{}
+		for _, r := range res[0].Rows {
+			if len(r) != 2 {
+				return fmt.Errorf("pgundo: check of %s: unexpected row", name)
+			}
+			generated[deref(r[0])] = deref(r[1]) != ""
+			extra[deref(r[0])] = true
+		}
+		t.Generated, t.AsText = nil, nil
+		for _, c := range t.Columns {
+			if !extra[c] {
+				return refuse("%s has other columns now than in the journal (%s is gone): an undo by row images does not fit", name, c)
+			}
+			delete(extra, c)
+			if generated[c] {
+				t.Generated = append(t.Generated, c)
+			}
+		}
+		for _, c := range slices.Sorted(maps.Keys(extra)) {
+			if !generated[c] {
+				return refuse("%s has other columns now than in the journal (%s is new): an undo by row images does not fit", name, c)
+			}
+		}
+		for i, typ := range t.Types {
+			no, known := noEquality[typ]
+			if !known {
+				// Спрашиваем саму базу: оператор она ищет здесь так же, как в сверке.
+				_, err := db.Query("SELECT NULL::" + typ + " IS NOT DISTINCT FROM NULL::" + typ)
+				var pg *pgwire.PgError
+				switch {
+				case errors.As(err, &pg) && pg.Code == "42883": // undefined_function: оператора нет
+					no = true
+				case err != nil:
+					return err
+				}
+				noEquality[typ] = no
+			}
+			if no {
+				t.AsText = append(t.AsText, t.Columns[i])
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Plan) tableNames() []string { return slices.Sorted(maps.Keys(p.Tables)) }
+
+// keyChanged — транзакция сменила строке первичный ключ.
+func (g group) keyChanged() string {
+	var o, n []string
+	for _, i := range g.t.pkIndex() {
+		o, n = append(o, fmt.Sprintf("w.o%d", i)), append(n, fmt.Sprintf("w.n%d", i))
+	}
+	return "ROW(" + strings.Join(o, ", ") + ") IS DISTINCT FROM ROW(" + strings.Join(n, ", ") + ")"
+}
+
 // Check спрашивает базу про каждый шаг и запоминает годные в p.OK.
 // Ответы — по порядку шагов. База не меняется.
 func (p *Plan) Check(db DB) ([]Status, error) {
-	for name, t := range p.Tables {
-		cols := slices.Clone(t.Columns)
-		sort.Strings(cols)
-		var lits []string
-		for _, c := range cols {
-			lits = append(lits, pgwire.Literal(c))
-		}
-		reg := "to_regclass(" + pgwire.Literal(t.rel()) + ")"
-		res, err := db.Query("SELECT " + reg + " IS NOT NULL, (SELECT array_agg(attname::text ORDER BY attname::text) FROM pg_attribute WHERE attrelid = " + reg +
-			" AND attnum > 0 AND NOT attisdropped) = ARRAY[" + strings.Join(lits, ", ") + "]::text[]")
-		if err != nil {
-			return nil, err
-		}
-		if len(res) != 1 || len(res[0].Rows) != 1 {
-			return nil, fmt.Errorf("pgundo: check of %s: unexpected answer", name)
-		}
-		switch r := res[0].Rows[0]; {
-		case deref(r[0]) != "t":
-			return nil, refuse("%s no longer exists: an undo by row images does not fit", name)
-		case deref(r[1]) != "t":
-			return nil, refuse("%s has other columns now than in the journal: an undo by row images does not fit", name)
-		}
+	if err := p.catalog(db); err != nil {
+		return nil, err
 	}
 	byStep := map[int]Status{}
 	for _, g := range p.groups(nil) {
@@ -480,11 +567,7 @@ func (p *Plan) Check(db DB) ([]Status, error) {
 		side := byte('n')
 		switch g.op {
 		case OpUpdate:
-			var o, n []string
-			for _, i := range g.t.pkIndex() {
-				o, n = append(o, fmt.Sprintf("w.o%d", i)), append(n, fmt.Sprintf("w.n%d", i))
-			}
-			taken := "(ROW(" + strings.Join(o, ", ") + ") IS DISTINCT FROM ROW(" + strings.Join(n, ", ") + ") AND EXISTS (SELECT 1 FROM " + g.t.rel() + " x WHERE " + g.join("x", 'o') + "))"
+			taken := "(" + g.keyChanged() + " AND EXISTS (SELECT 1 FROM " + g.t.rel() + " x WHERE " + g.join("x", 'o') + "))"
 			state = "CASE WHEN " + g.missing() + " THEN 'gone' WHEN " + taken + " THEN 'key-taken' WHEN " + g.same('n') + " THEN 'ok' WHEN " + g.same('o') + " THEN 'done' ELSE 'changed' END"
 			differs = "NOT (" + g.missing() + ") AND NOT (" + g.same('n') + ") AND NOT (" + g.same('o') + ")"
 		case OpInsert:
@@ -533,13 +616,41 @@ func (p *Plan) Check(db DB) ([]Status, error) {
 // ErrChanged — строка изменилась после Check: откат не применён вовсе.
 var ErrChanged = errors.New("pgundo: a row changed after the check; nothing is applied")
 
-// Apply применяет шаги p.OK одной транзакцией и отдаёт её номер. marker —
-// кто и почему откатывает; он уходит в журнал базы отметкой evidence.mark_undo
-// и делает сам откат записью хранилища. Команда, тронувшая не столько строк,
-// сколько в ней шагов, отменяет всё: ErrChanged.
-func (p *Plan) Apply(db DB, marker any) (xid string, err error) {
+// Порядок шагов в Apply.
+const (
+	OrderJournal = "journal" // обратный журналу
+	OrderKeys    = "keys"    // по внешним ключам из каталога
+)
+
+// Applied — что сделал Apply.
+type Applied struct {
+	XID   string `json:"xid"`   // транзакция отката
+	Steps int    `json:"steps"` // применено шагов
+	Order string `json:"order"` // OrderJournal или OrderKeys
+	// Differ — где строки после отката не равны до-образам: то, что откат
+	// вернул, переписали триггеры таблицы. Пусто — строки равны до-образам.
+	Differ []Difference `json:"differ,omitempty"`
+}
+
+// Difference — колонка, в которой строки после отката не равны до-образам.
+type Difference struct {
+	Table  string `json:"table"`
+	Column string `json:"column"`
+	Rows   int    `json:"rows"`
+}
+
+// Apply применяет шаги p.OK одной транзакцией. marker — кто и почему
+// откатывает; он уходит в журнал базы отметкой evidence.mark_undo и делает сам
+// откат записью хранилища. Строка, изменённая после Check, отменяет всё:
+// ErrChanged.
+//
+// Сначала — порядок, обратный журналу: он верен всегда, когда каждое изменение
+// транзакции делал её собственный оператор. Отказ базы по ограничению
+// целостности (SQLSTATE класса 23) значит, что часть изменений сделал каскад
+// внешнего ключа: тогда вторая попытка, по внешним ключам из каталога.
+func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 	if len(p.OK) == 0 {
-		return "", errors.New("pgundo: no step to apply: run the check first")
+		return nil, errors.New("pgundo: no step to apply: run the check first")
 	}
 	only := map[int]bool{}
 	for _, n := range p.OK {
@@ -547,10 +658,27 @@ func (p *Plan) Apply(db DB, marker any) (xid string, err error) {
 	}
 	mark, err := json.Marshal(marker)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+	out, err := p.apply(db, string(mark), p.groups(only), OrderJournal)
+	var pg *pgwire.PgError
+	if !errors.As(err, &pg) || !strings.HasPrefix(pg.Code, "23") {
+		return out, err
+	}
+	first := err
+	ordered, err := p.byKeys(db, only)
+	if err != nil {
+		return nil, fmt.Errorf("%w (and the order by foreign keys could not be built: %v)", first, err)
+	}
+	if out, err = p.apply(db, string(mark), ordered, OrderKeys); err != nil {
+		return nil, fmt.Errorf("%w (in the order of the journal: %v)", err, first)
+	}
+	return out, nil
+}
+
+func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Applied, err error) {
 	if _, err := db.Query("BEGIN"); err != nil {
-		return "", err
+		return nil, err
 	}
 	defer func() {
 		if err != nil {
@@ -558,49 +686,287 @@ func (p *Plan) Apply(db DB, marker any) (xid string, err error) {
 		}
 	}()
 	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
-	if _, err := db.Query("SELECT evidence.mark_undo(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
-		return "", fmt.Errorf("the undo marker could not be set (is the database prepared with escollect -setup-sql?): %w", err)
+	if _, err := db.Query("SELECT evidence.mark_undo(" + pgwire.Literal(mark) + "::json)"); err != nil {
+		return nil, fmt.Errorf("the undo marker could not be set (is the database prepared with escollect -setup-sql?): %w", err)
 	}
+	out := &Applied{Order: order}
 	res, err := db.Query("SELECT pg_current_xact_id()::text")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 {
-		xid = deref(res[0].Rows[0][0])
+		out.XID = deref(res[0].Rows[0][0])
 	}
-	for _, g := range p.groups(only) {
-		var cols, olds, sets []string
-		for i, c := range g.t.Columns {
-			cols = append(cols, pgwire.Ident(c))
-			olds = append(olds, fmt.Sprintf("w.o%d", i))
-			sets = append(sets, fmt.Sprintf("%s = w.o%d", pgwire.Ident(c), i))
+	if order == OrderKeys {
+		// В этом порядке строку шага может изменить не её команда, а каскад от
+		// команды родителя: сверка в условии команды и счёт тронутых строк уже
+		// ничего не доказывают. Поэтому сверка — заранее и с замком: строки,
+		// которые откат правит и убирает, сейчас такие, какими их оставила
+		// транзакция, и до конца отката их не изменит никто, кроме него.
+		for _, g := range groups {
+			if g.op == OpInsert {
+				continue
+			}
+			n, err := count(db, "SELECT count(*) FROM (SELECT 1 FROM "+g.t.rel()+" t\n  JOIN "+g.valuesOf("n")+"\n  ON "+g.join("t", 'n')+" AND "+g.same('n')+" FOR UPDATE OF t) locked")
+			if err != nil {
+				return nil, err
+			}
+			if n != len(g.steps) {
+				return nil, g.changed(n)
+			}
 		}
-		var stmt string
-		switch g.op {
-		case OpInsert:
-			stmt = "INSERT INTO " + g.t.rel() + " (" + strings.Join(cols, ", ") + ")\n  SELECT " + strings.Join(olds, ", ") + "\n  FROM " + g.values()
-		case OpDelete:
-			stmt = "DELETE FROM " + g.t.rel() + " t\n  USING " + g.values() + "\n  WHERE " + g.join("t", 'n') + " AND " + g.same('n')
-		default:
-			stmt = "UPDATE " + g.t.rel() + " t SET " + strings.Join(sets, ", ") + "\n  FROM " + g.values() + "\n  WHERE " + g.join("t", 'n') + " AND " + g.same('n')
+	}
+	for _, g := range groups {
+		touched := 0
+		for _, stmt := range g.statements(order) {
+			res, err := db.Query(stmt)
+			if err != nil {
+				return nil, err
+			}
+			if len(res) != 1 || affected(res[0].Tag) < 0 {
+				return nil, fmt.Errorf("pgundo: %s.%s: unexpected answer to an undo statement", g.t.Schema, g.t.Name)
+			}
+			touched += affected(res[0].Tag)
 		}
-		res, err := db.Query(stmt)
-		if err != nil {
-			return "", err
+		if order == OrderJournal && touched != len(g.steps) {
+			return nil, g.changed(touched)
 		}
-		touched := -1
-		if len(res) == 1 {
-			touched = affected(res[0].Tag)
-		}
-		if touched != len(g.steps) {
-			return "", fmt.Errorf("%w: %s.%s: steps %d–%d expected %d rows, the statement touched %d", ErrChanged,
-				g.t.Schema, g.t.Name, g.steps[0].N, g.steps[len(g.steps)-1].N, len(g.steps), touched)
-		}
+		out.Steps += len(g.steps)
+	}
+	if out.Differ, err = verify(db, groups); err != nil {
+		return nil, err
 	}
 	if _, err := db.Query("COMMIT"); err != nil {
-		return "", err
+		return nil, err
 	}
-	return xid, nil
+	return out, nil
+}
+
+func (g group) changed(found int) error {
+	return fmt.Errorf("%w: %s.%s: steps %d–%d expected %d rows as the transaction left them, found %d", ErrChanged,
+		g.t.Schema, g.t.Name, g.steps[0].N, g.steps[len(g.steps)-1].N, len(g.steps), found)
+}
+
+// statements — команды шагов группы. Генерируемые колонки откат не пишет: их
+// считает база.
+//
+// В порядке журнала команда несёт сверку в своём условии: трогает строку,
+// только если та такая, какой её оставила транзакция. В порядке внешних
+// ключей сверка уже сделана, и строки под замком (см. apply): команда берёт
+// строку по ключу, какой бы та ни стала после каскада от команды родителя.
+func (g group) statements(order string) []string {
+	var cols, olds, sets []string
+	for i, c := range g.t.Columns {
+		if slices.Contains(g.t.Generated, c) {
+			continue
+		}
+		cols = append(cols, pgwire.Ident(c))
+		olds = append(olds, fmt.Sprintf("w.o%d", i))
+		sets = append(sets, fmt.Sprintf("%s = w.o%d", pgwire.Ident(c), i))
+	}
+	guard := ""
+	if order == OrderJournal {
+		guard = " AND " + g.same('n')
+	}
+	switch g.op {
+	case OpInsert:
+		return []string{"INSERT INTO " + g.t.rel() + " (" + strings.Join(cols, ", ") + ")\n  SELECT " + strings.Join(olds, ", ") + "\n  FROM " + g.values()}
+	case OpDelete:
+		return []string{"DELETE FROM " + g.t.rel() + " t\n  USING " + g.values() + "\n  WHERE " + g.join("t", 'n') + guard}
+	}
+	update := "UPDATE " + g.t.rel() + " t SET " + strings.Join(sets, ", ") + "\n  FROM " + g.values() + "\n  WHERE "
+	byNewKey := update + g.join("t", 'n') + guard
+	pk := g.t.pkIndex()
+	moved := slices.ContainsFunc(g.steps, func(s Step) bool {
+		return slices.ContainsFunc(pk, func(i int) bool { return !same(s.Old[i:i+1], s.New[i:i+1]) })
+	})
+	if order != OrderKeys || !moved {
+		return []string{byNewKey}
+	}
+	// Строку, которой транзакция сменила ключ, каскад мог уже вернуть под
+	// прежний: родитель откатился раньше, и под новым ключом её нет. Такие
+	// строки — первой командой, по прежнему ключу; остальные — второй, по новому.
+	return []string{
+		update + g.keyChanged() + " AND " + g.join("t", 'o') + " AND NOT (" + g.same('o') + ")" +
+			" AND NOT EXISTS (SELECT 1 FROM " + g.t.rel() + " x WHERE " + g.join("x", 'n') + ")",
+		byNewKey,
+	}
+}
+
+// verify сверяет строки с до-образами в конце транзакции отката. Строки нет
+// там, куда её вернули, или она осталась там, откуда её убрали, — ошибка:
+// откат отменяется. Строка на месте, а значения не те — их переписал триггер
+// таблицы: такие колонки отдаются списком.
+func verify(db DB, groups []group) ([]Difference, error) {
+	type column struct{ table, name string }
+	differ := map[column]int{}
+	for _, g := range groups {
+		table := g.t.Schema + "." + g.t.Name
+		if g.op == OpDelete {
+			n, err := count(db, "SELECT count(*) FROM "+g.valuesOf("n")+"\nJOIN "+g.t.rel()+" t ON "+g.join("t", 'n'))
+			if err != nil {
+				return nil, err
+			}
+			if n != 0 {
+				return nil, fmt.Errorf("pgundo: %s: %d rows the undo removed are still there (steps %d–%d): a trigger or a rule of the table stood in the way; nothing is applied",
+					table, n, g.steps[0].N, g.steps[len(g.steps)-1].N)
+			}
+			continue
+		}
+		q := "SELECT count(*) FILTER (WHERE " + g.missing() + ")"
+		for i := range g.t.Columns {
+			q += ", count(*) FILTER (WHERE NOT (" + g.missing() + ") AND NOT (" + g.t.equal(i, 'o') + "))"
+		}
+		res, err := db.Query(q + "\nFROM " + g.valuesOf("o") + "\nLEFT JOIN " + g.t.rel() + " t ON " + g.join("t", 'o'))
+		if err != nil {
+			return nil, err
+		}
+		if len(res) != 1 || len(res[0].Rows) != 1 || len(res[0].Rows[0]) != 1+len(g.t.Columns) {
+			return nil, fmt.Errorf("pgundo: %s: unexpected answer to the check after the undo", table)
+		}
+		for i, v := range res[0].Rows[0] {
+			n, err := strconv.Atoi(deref(v))
+			switch {
+			case err != nil:
+				return nil, fmt.Errorf("pgundo: %s: unexpected answer to the check after the undo", table)
+			case i == 0 && n != 0:
+				return nil, fmt.Errorf("pgundo: %s: %d rows the undo put back are not there (steps %d–%d): a trigger or a rule of the table stood in the way; nothing is applied",
+					table, n, g.steps[0].N, g.steps[len(g.steps)-1].N)
+			case i > 0 && n != 0:
+				differ[column{table, g.t.Columns[i-1]}] += n
+			}
+		}
+	}
+	var out []Difference
+	for c, n := range differ {
+		out = append(out, Difference{Table: c.table, Column: c.name, Rows: n})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Table < out[j].Table || out[i].Table == out[j].Table && out[i].Column < out[j].Column
+	})
+	return out, nil
+}
+
+func count(db DB, sql string) (int, error) {
+	res, err := db.Query(sql)
+	if err != nil {
+		return 0, err
+	}
+	if len(res) != 1 || len(res[0].Rows) != 1 || len(res[0].Rows[0]) != 1 {
+		return 0, errors.New("pgundo: unexpected answer to a count")
+	}
+	return strconv.Atoi(deref(res[0].Rows[0][0]))
+}
+
+// byKeys раскладывает годные шаги по внешним ключам. Возврат удалённых строк —
+// от родителей к детям; правки — так же (родитель, вернув себе ключ, каскадом
+// вернёт его детям); уборка вставленных — последней и от детей к родителям.
+// Шаги одной таблицы и одного вида — одна команда: ссылки внутри таблицы база
+// проверяет в конце команды.
+func (p *Plan) byKeys(db DB, only map[int]bool) ([]group, error) {
+	edges, err := p.foreignKeys(db)
+	if err != nil {
+		return nil, err
+	}
+	rank := ranks(edges)
+	type slot struct{ op, table string }
+	bySlot := map[slot]*group{}
+	var order []slot
+	for _, s := range p.Steps {
+		if !only[s.N] {
+			continue
+		}
+		k := slot{s.Op, s.Table}
+		if bySlot[k] == nil {
+			bySlot[k] = &group{t: p.Tables[s.Table], op: s.Op}
+			order = append(order, k)
+		}
+		bySlot[k].steps = append(bySlot[k].steps, s)
+	}
+	phase := map[string]int{OpInsert: 0, OpUpdate: 1, OpDelete: 2}
+	sort.SliceStable(order, func(i, j int) bool {
+		a, b := order[i], order[j]
+		switch {
+		case a.op != b.op:
+			return phase[a.op] < phase[b.op]
+		case a.op == OpDelete:
+			return rank[a.table] > rank[b.table]
+		}
+		return rank[a.table] < rank[b.table]
+	})
+	out := make([]group, len(order))
+	for i, k := range order {
+		out[i] = *bySlot[k]
+	}
+	return out, nil
+}
+
+// foreignKeys — внешние ключи между таблицами плана: пары «кто ссылается, на
+// кого». Секция отвечает за свою таблицу: в журнале стоит имя секции, а ключ
+// объявлен у таблицы.
+func (p *Plan) foreignKeys(db DB) ([][2]string, error) {
+	var vals []string
+	for _, name := range p.tableNames() {
+		vals = append(vals, "("+pgwire.Literal(name)+", to_regclass("+pgwire.Literal(p.Tables[name].rel())+"))")
+	}
+	root := func(col string) string {
+		return "coalesce(pg_partition_root(" + col + "::regclass), " + col + "::regclass)"
+	}
+	res, err := db.Query("WITH t(name, oid) AS (VALUES " + strings.Join(vals, ", ") + "),\n" +
+		"r AS (SELECT name, " + root("oid") + " AS root FROM t WHERE oid IS NOT NULL)\n" +
+		"SELECT DISTINCT child.name, parent.name FROM pg_constraint c\n" +
+		"JOIN r child ON child.root = " + root("c.conrelid") + "\n" +
+		"JOIN r parent ON parent.root = " + root("c.confrelid") + "\n" +
+		"WHERE c.contype = 'f' AND child.root <> parent.root ORDER BY 1, 2")
+	if err != nil {
+		return nil, err
+	}
+	if len(res) != 1 {
+		return nil, errors.New("pgundo: unexpected answer about foreign keys")
+	}
+	var out [][2]string
+	for _, r := range res[0].Rows {
+		if len(r) != 2 {
+			return nil, errors.New("pgundo: unexpected row about foreign keys")
+		}
+		out = append(out, [2]string{deref(r[0]), deref(r[1])})
+	}
+	return out, nil
+}
+
+// ranks — глубина таблицы по внешним ключам: 0 — ни на кого не ссылается, у
+// остальных — на единицу больше самого глубокого родителя. Круг ссылок глубины
+// не даёт: ребро, которое его замыкает, не считается.
+func ranks(edges [][2]string) map[string]int {
+	parents := map[string][]string{}
+	for _, e := range edges {
+		parents[e[0]] = append(parents[e[0]], e[1])
+	}
+	rank := map[string]int{}
+	const visiting, done = 1, 2
+	state := map[string]int{}
+	var visit func(string) int
+	visit = func(t string) int {
+		switch state[t] {
+		case done:
+			return rank[t]
+		case visiting:
+			return -1
+		}
+		state[t] = visiting
+		depth := 0
+		for _, parent := range parents[t] {
+			if r := visit(parent); r >= depth {
+				depth = r + 1
+			}
+		}
+		state[t], rank[t] = done, depth
+		return depth
+	}
+	for _, child := range slices.Sorted(maps.Keys(parents)) {
+		visit(child)
+	}
+	return rank
 }
 
 // affected — число строк из метки команды: "UPDATE 3", "INSERT 0 3", "DELETE 3".

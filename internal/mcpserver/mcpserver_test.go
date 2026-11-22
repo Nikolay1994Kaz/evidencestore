@@ -286,8 +286,11 @@ func TestUndoPreviewAndApply(t *testing.T) {
 	// База: строка 7 всё ещё такая, какой её оставило действие; строку 6 потом поправил человек.
 	db.answers = func(sql string) ([]pgwire.Result, bool) {
 		switch {
-		case strings.Contains(sql, "to_regclass"):
-			return []pgwire.Result{{Rows: [][]*string{{text("t"), text("t")}}}}, true
+		case strings.Contains(sql, "pg_attribute"):
+			return []pgwire.Result{{Rows: [][]*string{{text("id"), text("")}, {text("note"), text("")}}}}, true
+		case strings.HasPrefix(sql, "SELECT count(*) FILTER"):
+			// Сверка после отката: строка на месте, но note в ней переписал триггер таблицы.
+			return []pgwire.Result{{Rows: [][]*string{{text("0"), text("0"), text("1")}}}}, true
 		case strings.HasPrefix(sql, "SELECT w.step"):
 			return []pgwire.Result{{Rows: [][]*string{{text("1"), text("ok"), nil}, {text("2"), text("changed"), text(`{"id":6,"note":"human"}`)}}}}, true
 		case strings.HasPrefix(sql, `UPDATE "public"."accounts" t SET`):
@@ -309,7 +312,8 @@ func TestUndoPreviewAndApply(t *testing.T) {
 	before := len(db.log)
 	s.newID = func() string { return "u-1" }
 	out, isErr = callText(t, s, "undo_apply", `{"action_id":"a-1","reason":"wrong rows"}`)
-	if isErr || !strings.Contains(out, `"undo_action_id":"u-1"`) || !strings.Contains(out, `"applied":1`) {
+	if isErr || !strings.Contains(out, `"undo_action_id":"u-1"`) || !strings.Contains(out, `"applied":1`) ||
+		!strings.Contains(out, `"differs_from_before":[{"table":"public.accounts","column":"note","rows":1}]`) {
 		t.Fatalf("%v %s", isErr, out)
 	}
 	// Откат — отметка с номером своего действия и того, что он возвращает; одна команда на годный шаг.

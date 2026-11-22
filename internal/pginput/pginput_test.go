@@ -61,7 +61,7 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 // имена берутся в кавычки.
 func TestSetupSQL(t *testing.T) {
 	c := good()
-	c.Roles = []string{`agent "x"`}
+	c.Roles = []string{`agent "x"`, "50% off"}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +78,18 @@ func TestSetupSQL(t *testing.T) {
 		`REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC`,
 		`PERFORM pg_logical_emit_message(false, 'evidence/refused',`,
 		`evidence.mark_refused(json) TO "agent ""x""";`,
-		`CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders";`,
+		// Публикация: с PostgreSQL 18 — вместе с хранимыми генерируемыми колонками.
+		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders" WITH (publish_generated_columns = stored)';`,
+		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders"';`,
 		`CREATE ROLE "evidence_tap" LOGIN REPLICATION;`,
+		// Виртуальная генерируемая колонка — отказ до любых изменений.
+		`AND a.attgenerated = 'v';`,
+		`RAISE EXCEPTION 'evidencestore: a virtual generated column: %', bad USING HINT =`,
+		// Секции: названные таблицы и всё их дерево; секции — то же, что таблице, и права агентам.
+		`(SELECT t.oid AS relid, 0 AS level FROM unnest(ARRAY['"public"."accounts"'::regclass, '"sales"."orders"'::regclass]) AS t(oid) UNION`,
+		`CROSS JOIN LATERAL pg_partition_tree(t.oid) AS tree) AS part`,
+		`EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', leaf);`,
+		`EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO "agent ""x""", "50%% off"', leaf);`,
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("the script lacks %s", want)
@@ -90,5 +100,9 @@ func TestSetupSQL(t *testing.T) {
 	}
 	if !strings.HasPrefix(strings.TrimSpace(sql[strings.Index(sql, "BEGIN;"):]), "BEGIN;") || !strings.HasSuffix(strings.TrimSpace(sql), "COMMIT;") {
 		t.Error("the script is not one transaction")
+	}
+	// Проверка — раньше первого изменения базы.
+	if guard, first := strings.Index(sql, "RAISE EXCEPTION"), strings.Index(sql, "CREATE SCHEMA"); guard < 0 || guard > first {
+		t.Error("the refusal comes after the script has begun to change the database")
 	}
 }
