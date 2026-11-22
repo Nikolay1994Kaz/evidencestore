@@ -63,6 +63,9 @@ func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 	}
 	v := "751"
 	switch {
+	case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_xact_user_tables"):
+		zero := "0" // счёт строк до SQL агента
+		return []pgwire.Result{{Columns: []string{"xid", "rows"}, Rows: [][]*string{{&v, &zero}}, Tag: "SELECT 1"}}, nil
 	case strings.Contains(sql, "pg_current_xact_id"):
 		return []pgwire.Result{{Columns: []string{"xid"}, Rows: [][]*string{{&v}}, Tag: "SELECT 1"}}, nil
 	case strings.HasPrefix(sql, "SELECT id"):
@@ -367,11 +370,23 @@ func TestUndoPreviewAndApply(t *testing.T) {
 }
 
 // limited — сервер с пределом строк на действие; stat — что база отвечает на
-// вопрос, сколько строк изменила транзакция.
+// вопрос, сколько строк изменила транзакция (после SQL агента; до него — 0).
 func limited(t *testing.T, limit int, stat string) (*Server, *fakeDB, string) {
 	t.Helper()
+	return limitedFrom(t, limit, "0", stat)
+}
+
+// limitedFrom — то же, но до SQL агента статистика сеанса уже показывает
+// before строк: изменения прошлых транзакций, не сброшенные базой.
+func limitedFrom(t *testing.T, limit int, before, stat string) (*Server, *fakeDB, string) {
+	t.Helper()
+	xid := "751"
 	db := &fakeDB{answers: func(sql string) ([]pgwire.Result, bool) {
-		if strings.Contains(sql, "pg_stat_xact_user_tables") && stat != "" {
+		switch {
+		case stat == "":
+		case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_xact_user_tables"):
+			return []pgwire.Result{{Columns: []string{"xid", "rows"}, Rows: [][]*string{{&xid, &before}}, Tag: "SELECT 1"}}, true
+		case strings.Contains(sql, "pg_stat_xact_user_tables"):
 			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
 		}
 		return nil, false
@@ -470,5 +485,29 @@ func TestRowLimitDoesNotFailOpen(t *testing.T) {
 	data, _ := os.ReadFile(path)
 	if !strings.Contains(string(data), `"outcome":"failed"`) {
 		t.Fatalf("%s", data)
+	}
+}
+
+// Статистика сеанса держит изменения прошлых транзакций, пока база их не
+// сбросит: правка одной строки вслед за правкой сорока — это одна строка, а не
+// сорок одна. До исправления P-240 действие отказывалось чужими строками.
+func TestRowCountIsTheActionsOwn(t *testing.T) {
+	s, db, path := limitedFrom(t, 5, "40", "41")
+	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`)
+	if isErr || !strings.Contains(text, `"outcome":"committed"`) {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	// Счёт «до» — в одном запросе с номером транзакции, лишнего обмена нет.
+	if !strings.Contains(db.log[2], "pg_current_xact_id") || !strings.Contains(db.log[2], "pg_stat_xact_user_tables") {
+		t.Fatalf("%q", db.log)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"rows":3`) { // 41 − 40 = 1, но ответ на оператор — UPDATE 3: берётся большее
+		t.Fatalf("%s", data)
+	}
+	// И наоборот: своих строк больше предела — отказ, как раньше.
+	s, _, _ = limitedFrom(t, 5, "40", "50")
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`); !isErr || !strings.Contains(text, "would change 10 rows") {
+		t.Fatalf("%v %s", isErr, text)
 	}
 }

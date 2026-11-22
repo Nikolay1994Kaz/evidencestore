@@ -289,7 +289,7 @@ func TestWindowRowsStopsAnAgentThatSplitsItsChange(t *testing.T) {
 	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
 	stat := "400"
 	db := &fakeDB{answers: func(sql string) ([]pgwire.Result, bool) {
-		if strings.Contains(sql, "pg_stat_xact_user_tables") {
+		if strings.Contains(sql, "pg_stat_xact_user_tables") && !strings.Contains(sql, "pg_current_xact_id") {
 			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
 		}
 		return nil, false

@@ -87,7 +87,7 @@ func TestSQLThatEndsTheTransactionIsNotReportedAsRolledBack(t *testing.T) {
 			db.tags, db.err, db.after = []string{"UPDATE 1"}, nil, pgwire.TxOpen
 			one := "1"
 			db.answers = func(sql string) ([]pgwire.Result, bool) {
-				if strings.Contains(sql, "pg_stat_xact_user_tables") {
+				if strings.Contains(sql, "pg_stat_xact_user_tables") && !strings.Contains(sql, "pg_current_xact_id") {
 					return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&one}}, Tag: "SELECT 1"}}, true
 				}
 				return nil, false

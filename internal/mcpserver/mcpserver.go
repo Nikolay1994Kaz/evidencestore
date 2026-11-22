@@ -675,12 +675,28 @@ func (s *Server) transaction(rc *Receipt) error {
 	if _, err := s.run("SELECT evidence.mark_action(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
 		return fail(fmt.Errorf("the action marker could not be set (is the database prepared with escollect -setup-sql?): %w", err))
 	}
-	res, err := s.run("SELECT pg_current_xact_id()::text")
+	// Номер транзакции, а при пределах строк — и счёт строк до SQL агента
+	// (changed): тем же запросом, без лишнего обмена с базой.
+	counting := s.cfg.RowLimit > 0 || s.cfg.WindowRows > 0
+	ask := "SELECT pg_current_xact_id()::text"
+	if counting {
+		ask += ", " + xactRows
+	}
+	res, err := s.run(ask)
 	if err != nil {
+		if counting {
+			return fail(fmt.Errorf("the transaction id and its row count could not be read, so the rows the action changes could not be counted and the row limits cannot be checked: %w", err))
+		}
 		return fail(err)
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
 		rc.XID = *res[0].Rows[0][0]
+	}
+	before := 0
+	if counting {
+		if before, err = countIn(res, 1); err != nil {
+			return fail(fmt.Errorf("the rows the action changes could not be counted, so the row limits cannot be checked: %w", err))
+		}
 	}
 	res, err = s.timed(rc.SQL)
 	for _, r := range res {
@@ -709,7 +725,7 @@ func (s *Server) transaction(rc *Receipt) error {
 		// Предохранитель: до фиксации известно, сколько строк действие изменило.
 		// Не сосчитать — не фиксировать: предел, который молча не работает, хуже
 		// его отсутствия.
-		rows, err := s.changed(rc.Tags)
+		rows, err := s.changed(before, rc.Tags)
 		if err != nil {
 			return fail(fmt.Errorf("the rows the action changed could not be counted, so the row limits cannot be checked: %w", err))
 		}
@@ -836,23 +852,41 @@ func (s *Server) escapedQuery(sql string) error {
 	return fmt.Errorf("the read %s %w", rc.ActionID, err)
 }
 
+// xactRows — сколько строк, по статистике базы, изменили транзакции этого
+// сеанса, ещё не сброшенные в общую статистику (pg_stat_xact_user_tables).
+const xactRows = "(SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0) FROM pg_stat_xact_user_tables)::bigint"
+
+// countIn — число из колонки col единственной строки ответа.
+func countIn(res []pgwire.Result, col int) (int, error) {
+	if len(res) != 1 || len(res[0].Rows) != 1 || len(res[0].Rows[0]) <= col || res[0].Rows[0][col] == nil {
+		return 0, errors.New("the server did not answer the question about the transaction's statistics")
+	}
+	return strconv.Atoi(*res[0].Rows[0][col])
+}
+
 // changed — сколько строк изменила текущая транзакция. Счёт ведёт сама база
 // (статистика транзакции): в него входят и строки, изменённые внутри WITH,
 // триггерами и каскадом, чего по ответам на операторы не видно. Ответы
 // операторов — второе мнение на случай, если статистика в базе выключена
 // (track_counts = off): берётся большее.
-func (s *Server) changed(tags []string) (int, error) {
-	res, err := s.run("SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint FROM pg_stat_xact_user_tables")
+//
+// Счёт — разность: before взят в начале транзакции, до SQL агента.
+// pg_stat_xact_user_tables показывает не одну текущую транзакцию, а всё, что
+// сеанс ещё не сбросил в общую статистику: база сбрасывает её не чаще раза в
+// секунду, иначе — примерно через 10 с простоя. Действие вслед за другим
+// получало строки соседа к своим: правка одной строки — «would change 101
+// rows» (P-240). Внутри транзакции база статистику не сбрасывает, поэтому
+// разность — ровно строки этой транзакции.
+func (s *Server) changed(before int, tags []string) (int, error) {
+	res, err := s.run("SELECT " + xactRows)
 	if err != nil {
 		return 0, err
 	}
-	if len(res) != 1 || len(res[0].Rows) != 1 || res[0].Rows[0][0] == nil {
-		return 0, errors.New("the server did not answer the question about the transaction's statistics")
-	}
-	rows, err := strconv.Atoi(*res[0].Rows[0][0])
+	after, err := countIn(res, 0)
 	if err != nil {
 		return 0, err
 	}
+	rows := max(after-before, 0)
 	byTags := 0
 	for _, tag := range tags {
 		f := strings.Fields(tag)
