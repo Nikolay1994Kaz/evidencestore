@@ -508,14 +508,20 @@ func TestApplyChecksTheRowsAfterTheUndo(t *testing.T) {
 	if err != nil || len(done.Differ) != 1 || done.Differ[0] != (Difference{Table: "public.t", Column: "v", Rows: 2}) || db.log[len(db.log)-1] != "COMMIT" {
 		t.Fatalf("%+v %v", done, err)
 	}
-	for name, spoil := range map[string]func(){
-		"put back are not there":  func() { after = []string{"1", "0", "0"} },
-		"removed are still there": func() { after, left = []string{"0", "0", "0"}, "1" },
+	// Каждый случай задаёт оба ответа базы сам: порядок случаев не важен, и
+	// поломка одного не протекает в другой.
+	for _, tc := range []struct {
+		name  string
+		after []string
+		left  string
+	}{
+		{"put back are not there", []string{"1", "0", "0"}, "0"},
+		{"removed are still there", []string{"0", "0", "0"}, "1"},
 	} {
-		spoil()
+		after, left = tc.after, tc.left
 		db.log = nil
-		if _, err := p.Apply(db, m{}); err == nil || !strings.Contains(err.Error(), name) || db.log[len(db.log)-1] != "ROLLBACK" {
-			t.Errorf("%s: %v, then %s", name, err, db.log[len(db.log)-1])
+		if _, err := p.Apply(db, m{}); err == nil || !strings.Contains(err.Error(), tc.name) || db.log[len(db.log)-1] != "ROLLBACK" {
+			t.Errorf("%s: %v, then %s", tc.name, err, db.log[len(db.log)-1])
 		}
 	}
 }
