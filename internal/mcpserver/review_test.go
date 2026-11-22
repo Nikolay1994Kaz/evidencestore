@@ -124,13 +124,39 @@ func TestLostCommitIsUnknownNotRolledBack(t *testing.T) {
 	if !isErr || !strings.Contains(text, "may have been committed (transaction 751)") || strings.Contains(text, "rolled back") {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	if rc := receipts(t, path); len(rc) != 1 || rc[0].Outcome != "unknown" {
+	if rc := receipts(t, path); len(rc) != 1 || rc[0].Outcome != "unknown" || rc[0].Cause != CauseUnknown {
 		t.Fatalf("receipt %+v", rc)
 	}
+	// Людям — тревога: отметка с причиной unknown, номером и строками, уже с
+	// нового соединения (P-258).
+	if last := db.log[len(db.log)-1]; !strings.Contains(last, "evidence.mark_refused(") || !strings.Contains(last, `"cause":"unknown"`) || !strings.Contains(last, `"xid":"751"`) {
+		t.Fatalf("no alert about the lost COMMIT: %q", last)
+	}
+	// Такое действие могло зафиксироваться: откат его берёт, если хранилище
+	// знает транзакцию с его отметкой (в journalLine — отметка a-1).
+	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
+	db.answers = undoAnswers
+	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`); isErr || !strings.Contains(out, `"to_apply":2`) {
+		t.Fatalf("the undo of an action whose COMMIT was lost: %v %s", isErr, out)
+	}
+	db.answers = nil
 	// Ошибка базы на COMMIT (отложенное ограничение) — честный откат, как раньше.
 	db.fail = map[string]error{"COMMIT": &pgwire.PgError{Severity: "ERROR", Code: "23503", Message: "violates foreign key constraint"}}
 	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`); !isErr || !strings.Contains(text, "failed and was rolled back") {
 		t.Fatalf("%v %s", isErr, text)
+	}
+	// База закрыла сеанс на COMMIT (FATAL: так отвечает сеанс, прерванный в
+	// ожидании синхронной реплики, — у себя он уже зафиксирован): тоже
+	// unknown. И строки таких действий идут в окно: раньше агент обрывал
+	// сеанс сервера своей ролью и обходил окно сколько угодно раз (P-258).
+	s, db, path = limited(t, 0, "3")
+	s.cfg.WindowRows, s.cfg.Window = 3, time.Hour
+	db.fail = map[string]error{"COMMIT": &pgwire.PgError{Severity: "FATAL", Code: "57P01", Message: "terminating connection due to administrator command"}}
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`); !isErr || !strings.Contains(text, "may have been committed") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'y' WHERE id = 1"}`); !isErr || !strings.Contains(text, "the agent would have changed 6 rows in the last 1h0m0s") {
+		t.Fatalf("the window after a lost COMMIT: %v %s", isErr, text)
 	}
 }
 
@@ -186,4 +212,99 @@ func appendLine(t *testing.T, path string, line []byte) {
 	}
 	defer f.Close()
 	f.Write(append(line, '\n'))
+}
+
+// Квитанция после обрывка (запись прервалась без перевода строки) — с новой
+// строки: её видят и идущий сеанс, и новый. Раньше она приклеивалась к
+// обрывку, и её строки в окно не шли ни у кого (R1 заход 2: регрессия от
+// P-244 — идущий сеанс до неё считал).
+func TestTornReceiptDoesNotHideTheNext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s, _, _ := limited(t, 0, "40")
+	s.cfg.WindowRows, s.cfg.Window = 50, 10*time.Minute
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	s.cfg.Receipts, s.cfg.ReceiptsPath = f, path
+	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 0 {
+		t.Fatal(rows, err)
+	}
+	torn, _ := json.Marshal(Receipt{ActionID: "a-torn", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute", Outcome: "committed", Rows: 5})
+	f.Write(torn[:len(torn)/2])
+	if _, _, _, err := s.usage(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if out, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`); isErr {
+		t.Fatal(out)
+	}
+	fresh := serverOn(t, &fakeDB{}, path, func(c *Config) { c.WindowRows, c.Window = 50, 10*time.Minute })
+	_, running, _, err1 := s.usage(time.Now())
+	_, again, _, err2 := fresh.usage(time.Now())
+	if err1 != nil || err2 != nil || running != 40 || again != 40 {
+		t.Fatalf("after a torn line: the running session counts %d rows, a new one %d (want 40): %v %v", running, again, err1, err2)
+	}
+}
+
+// Время квитанции — после замка: действия, прождавшие в очереди за долгим
+// (откат висит на замке строки, часы уходят на 65 с), считаются по тому,
+// когда пошли, а не когда пришли. Раньше время ставилось до ожидания, они
+// были записаны в прошлое, и при пределе 2 в минуту проходили все 6 (R2,
+// T заход 2).
+func TestQueuedActionsAreCountedWhenTheyRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	var mu sync.Mutex
+	base, off := time.Now(), time.Duration(0)
+	now := func() time.Time { mu.Lock(); defer mu.Unlock(); return base.Add(off) }
+	advance := func(d time.Duration) { mu.Lock(); off += d; mu.Unlock() }
+	mod := func(c *Config) { c.ActionsPerMinute = 2; c.StatementTimeout = time.Minute }
+	first := serverOn(t, &fakeDB{}, path, mod)
+	first.now = now
+	if out, isErr := callText(t, first, "execute", `{"sql":"UPDATE accounts SET note = 'b'"}`); isErr { // a-1
+		t.Fatal(out)
+	}
+	advance(2 * time.Minute)
+	started := make(chan struct{})
+	stalled := func(sql string) ([]pgwire.Result, bool) {
+		if strings.HasPrefix(sql, `UPDATE "public"."accounts" t SET`) {
+			close(started)
+			time.Sleep(300 * time.Millisecond)
+			advance(65 * time.Second)
+		}
+		return undoAnswers(sql)
+	}
+	holder := serverOn(t, &fakeDB{answers: stalled}, path, mod)
+	holder.now = now
+	holder.newID = func() string { return "u-1" }
+	holder.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if out, isErr := callText(t, holder, "undo_apply", `{"action_id":"a-1"}`); isErr {
+			t.Errorf("undo: %s", out)
+		}
+	}()
+	<-started
+	var pm sync.Mutex
+	passed := 0
+	for i := 0; i < 6; i++ {
+		s := serverOn(t, &fakeDB{}, path, mod)
+		s.now = now
+		s.newID = func() string { return fmt.Sprintf("q-%d", i) }
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.execute([]string{"UPDATE accounts SET note = 'q' WHERE id = 1"}, "queued"); err == nil {
+				pm.Lock()
+				passed++
+				pm.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if passed > 2 {
+		t.Fatalf("%d of 6 actions queued behind a long undo passed the limit of 2 a minute", passed)
+	}
 }

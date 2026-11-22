@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +45,9 @@ type Config struct {
 	SSLMode     string
 	SSLRootCert string
 	Timeout     time.Duration // на подключение и вход; 0 — 15 с
+	// Params — ещё параметры входа (имя → значение): они сильнее умолчаний
+	// базы и роли, и DISCARD ALL возвращает к ним, а не к умолчаниям.
+	Params map[string]string
 }
 
 // ParseDSN разбирает строку вида "host=/var/run/postgresql port=5432 user=u
@@ -258,9 +262,27 @@ func (c *Conn) startup(cfg Config) error {
 	add("user", cfg.User)
 	add("database", cfg.Database)
 	add("client_encoding", "UTF8")
-	// Времена и числа в тексте — в одном виде, от настроек роли не зависят.
+	// Текст значений пишется и читается одинаково в любом сеансе, от умолчаний
+	// базы и роли не зависит (параметры входа сильнее их, и DISCARD ALL
+	// возвращает к ним): даты, числа, интервалы, массивы. Образы строк сборщик
+	// получает текстом в своём сеансе, а откат читает их в своём: при
+	// IntervalStyle = sql_standard у одного '-1 2:00:00' — это «−1 день −2 часа»,
+	// у другого — «−1 день +2 часа»; при array_nulls = off '{NULL,a}' читается
+	// со строкой "NULL" вместо NULL, и сверка после отката, сравнивая две
+	// одинаково прочитанные стороны, этого не видит. Умолчания роли агент ставит
+	// себе сам, базы — старые приложения (P-257).
 	add("DateStyle", "ISO, YMD")
 	add("extra_float_digits", "3")
+	add("IntervalStyle", "postgres")
+	add("array_nulls", "on")
+	keys := make([]string, 0, len(cfg.Params))
+	for k := range cfg.Params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		add(k, cfg.Params[k])
+	}
 	if cfg.AppName != "" {
 		add("application_name", cfg.AppName)
 	}
@@ -747,16 +769,9 @@ func Time(micros int64) time.Time { return pgEpoch.Add(time.Duration(micros) * t
 // options — параметры плагина парами "имя", "значение". Соединение должно быть
 // открыто с Replication.
 func (c *Conn) StartReplication(slot string, from LSN, options ...string) error {
-	if len(options)%2 != 0 {
-		return errors.New("pgwire: plugin options come in pairs")
-	}
-	var opts []string
-	for i := 0; i < len(options); i += 2 {
-		opts = append(opts, Ident(options[i])+" "+Literal(options[i+1]))
-	}
-	sql := "START_REPLICATION SLOT " + Ident(slot) + " LOGICAL " + from.String()
-	if len(opts) > 0 {
-		sql += " (" + strings.Join(opts, ", ") + ")"
+	sql, err := replicationCommand(slot, from, options)
+	if err != nil {
+		return err
 	}
 	if _, err := c.Query(sql); err != nil {
 		return err
@@ -765,6 +780,25 @@ func (c *Conn) StartReplication(slot string, from LSN, options ...string) error 
 		return errors.New("pgwire: the server did not start a replication stream")
 	}
 	return nil
+}
+
+// replicationCommand — текст START_REPLICATION. Значения параметров — в
+// кавычках грамматики команд репликации: там только удвоенная кавычка, ни
+// E'…', ни черты как особого знака нет. Literal с его E'…' (P-256) здесь —
+// ошибка разбора: публикация с чертой в имени не читалась (R1 заход 2).
+func replicationCommand(slot string, from LSN, options []string) (string, error) {
+	if len(options)%2 != 0 {
+		return "", errors.New("pgwire: plugin options come in pairs")
+	}
+	var opts []string
+	for i := 0; i < len(options); i += 2 {
+		opts = append(opts, Ident(options[i])+" '"+strings.ReplaceAll(options[i+1], "'", "''")+"'")
+	}
+	sql := "START_REPLICATION SLOT " + Ident(slot) + " LOGICAL " + from.String()
+	if len(opts) > 0 {
+		sql += " (" + strings.Join(opts, ", ") + ")"
+	}
+	return sql, nil
 }
 
 // ReplMessage — сообщение потока: либо данные журнала, либо «я жив» от сервера.

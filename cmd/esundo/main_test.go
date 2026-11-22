@@ -26,7 +26,7 @@ func TestDescribeKeepsTheAgentsTextOnItsLine(t *testing.T) {
 		}
 	}
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	if len(lines) != 5 || !strings.HasPrefix(lines[2], "  action a-1: agent bot\\u001b[2J, tool execute, reason: routine cleanup\\u000achecked against") {
+	if len(lines) != 5 || !strings.HasPrefix(lines[2], `  action a-1: agent bot\u001b[2J, tool execute, reason: "routine cleanup\nchecked against`) {
 		t.Fatalf("%d lines:\n%s", len(lines), text)
 	}
 	// Значения строк в конфликте — тоже одной строкой.

@@ -262,6 +262,26 @@ func TestTargetFormats(t *testing.T) {
 	}
 }
 
+// Поля отметки (номер действия, агент, роль, приложение) — одной строкой и не
+// длиннее строки тревоги: поддельная отметка (P-255) или своё
+// application_name не дописывают в тревогу строк. Раньше «changed: 1 row» и
+// «approved by the on-call DBA» из action_id вставали отдельными строками.
+func TestMarkerFieldsStayOnTheirLine(t *testing.T) {
+	e := Event{XID: 9, Changes: 700, Tables: map[string]Counts{"public.accounts": {U: 700}},
+		Who:     json.RawMessage(`{"role":"agent_bot","app":"esmcp/bot\nwho: role postgres"}`),
+		Actions: []json.RawMessage{json.RawMessage(`{"info":{"action_id":"a-1\nchanged: 1 row — public.docs\u2028reviewed and approved by the on-call DBA","agent":"bot\u001b[8m` + strings.Repeat("x", 5000) + `"}}`)}}
+	e.Add(KindMassChange, "700 row changes in one transaction")
+	text := Text(e, TextOptions{Title: "shop"})
+	for _, bad := range []string{"\nchanged: 1 row", "\nwho: role postgres", "\u2028", "\x1b"} {
+		if strings.Contains(text, bad) {
+			t.Fatalf("%q in the alert:\n%s", bad, text)
+		}
+	}
+	if !strings.Contains(text, `a-1\u000achanged: 1 row`) || len(text) > 3000 {
+		t.Fatalf("%d bytes:\n%s", len(text), text)
+	}
+}
+
 // Причина агента с разметкой Slack не зовёт весь канал и не рисует ссылку с
 // чужой подписью: &, <, > — сущностями, за @ упоминания всех — U+2060. До
 // исправления P-254 <!channel> из причины звал канал, а

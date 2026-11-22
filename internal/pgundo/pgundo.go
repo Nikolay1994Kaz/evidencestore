@@ -108,7 +108,22 @@ type Plan struct {
 	Steps   []Step                  `json:"steps"` // в порядке применения
 	// OK — номера шагов, которые Check счёл годными: их применит Apply.
 	OK []int `json:"apply,omitempty"`
+
+	limit func(rows int) error
 }
+
+// XactRows — сколько строк, по статистике базы, изменили транзакции сеанса,
+// ещё не сброшенные в общую статистику (вид pg_stat_xact_user_tables, взятый
+// прямо из функций; таблицы — всё, что создано после initdb).
+const XactRows = "(SELECT coalesce(sum(pg_stat_get_xact_tuples_inserted(oid) + pg_stat_get_xact_tuples_updated(oid) + pg_stat_get_xact_tuples_deleted(oid)), 0) " +
+	"FROM pg_catalog.pg_class WHERE oid >= 16384 AND relkind IN ('r', 'm', 'p'))::bigint"
+
+// LimitRows — проверка перед фиксацией отката: f получает, сколько строк он
+// изменил по статистике транзакции — с тем, что изменили триггеры и каскады
+// (отложенные срабатывают раньше счёта). Ошибка f — откат не зафиксирован.
+// Так MCP-сервер держит откат под теми же пределами, что действие: по шагам
+// плана триггер на вставку, менявший 500 строк, шёл как одна (T заход 2).
+func (p *Plan) LimitRows(f func(rows int) error) { p.limit = f }
 
 type row struct {
 	table    string
@@ -566,9 +581,28 @@ func (g group) keyChanged() string {
 	return "ROW(" + strings.Join(o, ", ") + ") IS DISTINCT FROM ROW(" + strings.Join(n, ", ") + ")"
 }
 
+// Path — путь поиска сверки и отката: только pg_catalog (и pg_temp последним
+// — своих временных объектов у сеанса нет). Любая другая схема в пути, куда
+// агент может CREATE, — и его функция или оператор с точным совпадением типов
+// выигрывает у системных при любом их порядке: `=(varchar, varchar)` в public
+// перехватывал сверку ключа, а esundo запускает человек правами владельца
+// (R2 заход 2, тот же класс, что CVE-2018-1058). Типы колонок сборщик пишет
+// со схемой (его путь — pg_catalog), так что путь роли откату не нужен.
+const Path = "pg_catalog, pg_temp"
+
+// session ставит сеансу путь поиска Path (на весь сеанс: следующий запрос
+// человека в esundo — тоже наш, MCP-сервер начинает вызов с DISCARD ALL).
+func session(db DB) error {
+	_, err := db.Query("SELECT pg_catalog.set_config('search_path', '" + Path + "', false)")
+	return err
+}
+
 // Check спрашивает базу про каждый шаг и запоминает годные в p.OK.
 // Ответы — по порядку шагов. База не меняется.
 func (p *Plan) Check(db DB) ([]Status, error) {
+	if err := session(db); err != nil {
+		return nil, err
+	}
 	if err := p.catalog(db); err != nil {
 		return nil, err
 	}
@@ -642,6 +676,9 @@ const (
 type Applied struct {
 	XID   string `json:"xid"`   // транзакция отката
 	Steps int    `json:"steps"` // применено шагов
+	// Rows — сколько строк изменила транзакция отката по статистике базы, с
+	// триггерами и каскадами; считается, когда задан LimitRows.
+	Rows  int    `json:"rows,omitempty"`
 	Order string `json:"order"` // OrderJournal или OrderKeys
 	// Differ — где строки после отката не равны до-образам: то, что откат
 	// вернул, переписали триггеры таблицы. Пусто — строки равны до-образам.
@@ -674,6 +711,9 @@ func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 	}
 	mark, err := json.Marshal(marker)
 	if err != nil {
+		return nil, err
+	}
+	if err := session(db); err != nil {
 		return nil, err
 	}
 	out, err := p.apply(db, string(mark), p.groups(only), OrderJournal)
@@ -717,6 +757,14 @@ func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Appli
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 {
 		out.XID = deref(res[0].Rows[0][0])
+	}
+	// Счёт до шагов: статистика сеанса держит и не сброшенные прошлые
+	// транзакции, строки отката — разность.
+	var before int
+	if p.limit != nil {
+		if before, err = count(db, "SELECT "+XactRows); err != nil {
+			return nil, err
+		}
 	}
 	if order == OrderKeys {
 		// В этом порядке строку шага может изменить не её команда, а каскад от
@@ -769,6 +817,19 @@ func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Appli
 			return nil, g.changed(touched)
 		}
 		out.Steps += len(g.steps)
+	}
+	if p.limit != nil {
+		if _, err := db.Query("SET CONSTRAINTS ALL IMMEDIATE"); err != nil {
+			return nil, err
+		}
+		after, err := count(db, "SELECT "+XactRows)
+		if err != nil {
+			return nil, err
+		}
+		out.Rows = after - before
+		if err := p.limit(out.Rows); err != nil {
+			return nil, err
+		}
 	}
 	if out.Differ, err = verify(db, groups); err != nil {
 		return nil, err

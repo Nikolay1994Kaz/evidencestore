@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -62,8 +64,14 @@ func TestLiveMCP(t *testing.T) {
 	// счёт: роли в первый прогон ещё нет.
 	tidy := func() {
 		admin.Query("ROLLBACK")
+		admin.Query("DROP SCHEMA IF EXISTS pgm CASCADE")
+		admin.Query("DROP OWNED BY pgm_group, pgm_maker")
 		admin.Query("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'pgm_peek'")
-		admin.Query("DROP FUNCTION IF EXISTS public.pg_stat_get_xact_tuples_inserted(oid), public.pg_stat_get_xact_tuples_updated(oid), public.pg_stat_get_xact_tuples_deleted(oid), public.pg_current_xact_id()")
+		admin.Query("DROP FUNCTION IF EXISTS public.pg_stat_get_xact_tuples_inserted(oid), public.pg_stat_get_xact_tuples_updated(oid), public.pg_stat_get_xact_tuples_deleted(oid), public.pg_current_xact_id(), public.left(name, integer)")
+		admin.Query("ALTER ROLE pgm_agent RESET ALL")
+		admin.Query("ALTER ROLE pgm_agent INHERIT")
+		admin.Query("REVOKE CREATE ON SCHEMA public FROM pgm_maker")
+		admin.Query("DROP ROLE IF EXISTS pgm_maker")
 		admin.Query("ALTER ROLE pgm_agent RESET search_path")
 		admin.Query("ALTER ROLE pgm_agent RESET standard_conforming_strings")
 		admin.Query("REVOKE CREATE ON SCHEMA public FROM pgm_agent")
@@ -97,7 +105,11 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		t.Fatal(err)
 	}
 	s := mcpserver.New(mcpserver.Config{Agent: "live-bot", RowLimit: 1, Version: "test",
-		Dial: func() (mcpserver.DB, error) { return pgwire.Dial(ctx, dcfg) }}, nil)
+		Dial: func(params map[string]string) (mcpserver.DB, error) {
+			c := dcfg
+			c.Params = params
+			return pgwire.Dial(ctx, c)
+		}}, nil)
 	tool := func(name, args string) (string, bool) {
 		t.Helper()
 		var m struct {
@@ -231,7 +243,11 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	// вне транзакции идёт со своими настройками сеанса.
 	exec("ALTER ROLE pgm_agent SET standard_conforming_strings = off")
 	rated := mcpserver.New(mcpserver.Config{Agent: "live-bot", ActionsPerMinute: 1, Version: "test",
-		Dial: func() (mcpserver.DB, error) { return pgwire.Dial(ctx, dcfg) }}, nil)
+		Dial: func(params map[string]string) (mcpserver.DB, error) {
+			c := dcfg
+			c.Params = params
+			return pgwire.Dial(ctx, c)
+		}}, nil)
 	call := func(s *mcpserver.Server, args string) string {
 		var m struct {
 			Result struct {
@@ -241,25 +257,65 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		json.Unmarshal(s.Handle([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute","arguments":`+args+`}}`)), &m)
 		return m.Result.Content[0].Text
 	}
+	// Последняя команда действия ставит простою в транзакции 1 мс: по сети
+	// между запросами сервера больше, и база рвала сеанс раньше, чем ложилась
+	// отметка об отказе, — тревоги не было (T заход 2). Здесь сеть — задержка
+	// перед каждым запросом; сервер возвращает и таймауты (ownTimeouts).
+	idle := mcpserver.New(mcpserver.Config{Agent: "live-bot-idle", RowLimit: 1, Version: "test",
+		Dial: func(params map[string]string) (mcpserver.DB, error) {
+			c := dcfg
+			c.Params = params
+			conn, err := pgwire.Dial(ctx, c)
+			if err != nil {
+				return nil, err
+			}
+			return laggy{conn}, nil
+		}}, nil)
+	if text := call(idle, `{"statements":["DELETE FROM pgm.docs","SELECT set_config('idle_in_transaction_session_timeout', '1', true)"],"reason":"idle"}`); !strings.Contains(text, "would change 5 rows") {
+		t.Fatal(text)
+	}
 	if text := call(rated, `{"statements":["UPDATE pgm.docs SET body = 'r' WHERE id = 1","SELECT set_config('client_encoding', 'EUC_JP', false)"]}`); !strings.Contains(text, `"committed"`) {
 		t.Fatal(text)
 	}
 	if text := call(rated, `{"sql":"UPDATE pgm.docs SET body = 'r' WHERE id = 2","reason":"ещё раз: \"dormant\" docs"}`); !strings.Contains(text, "was refused: 1 actions in the last minute") {
 		t.Fatal(text)
 	}
-	// Отказ по частоте — вне транзакции, и сообщение не транзакционное: в
-	// слот оно попадает, когда журнал сброшен на диск (walwriter, доли секунды).
+	exec("ALTER ROLE pgm_agent RESET standard_conforming_strings")
+	// Умолчания роли, с которыми отметка вне транзакции не ложилась вовсе:
+	// statement_timeout = 1 мс (и jit, чтобы не успеть) и роль — группа без
+	// права на отметки. Тревоги не было ни о частоте, ни о таймауте; теперь
+	// параметры входа сервера сильнее умолчаний роли (R2, T заход 2).
+	exec("ALTER ROLE pgm_agent SET statement_timeout = 1; ALTER ROLE pgm_agent SET jit_above_cost = 0; ALTER ROLE pgm_agent SET role = 'pgm_group'")
+	dial := func(params map[string]string) (mcpserver.DB, error) {
+		c := dcfg
+		c.Params = params
+		return pgwire.Dial(ctx, c)
+	}
+	rated = mcpserver.New(mcpserver.Config{Agent: "live-bot-2", ActionsPerMinute: 1, Version: "test", Dial: dial}, nil)
+	if text := call(rated, `{"sql":"UPDATE pgm.docs SET body = 'r' WHERE id = 3"}`); !strings.Contains(text, `"committed"`) {
+		t.Fatal(text)
+	}
+	if text := call(rated, `{"sql":"UPDATE pgm.docs SET body = 'r' WHERE id = 4"}`); !strings.Contains(text, "was refused: 1 actions in the last minute") {
+		t.Fatal(text)
+	}
+	slow := mcpserver.New(mcpserver.Config{Agent: "live-bot-3", StatementTimeout: 200 * time.Millisecond, Version: "test", Dial: dial}, nil)
+	if text := call(slow, `{"sql":"SELECT pg_sleep(2)"}`); !strings.Contains(text, "longer than 200ms") {
+		t.Fatal(text)
+	}
+	exec("ALTER ROLE pgm_agent RESET statement_timeout; ALTER ROLE pgm_agent RESET jit_above_cost; ALTER ROLE pgm_agent RESET role")
+	// Отказ вне транзакции — сообщение не транзакционное: в слот оно
+	// попадает, когда журнал сброшен на диск (walwriter, доли секунды).
+	want := `"cause":"row-limit" "cause":"row-limit" "cause":"row-limit" "cause":"row-limit" "cause":"rate" "cause":"rate" "cause":"timeout"`
 	var marks string
 	for wait := time.Now().Add(5 * time.Second); time.Now().Before(wait); time.Sleep(50 * time.Millisecond) {
 		marks = one(`SELECT string_agg(substring(data from '"cause":"[a-z-]+"'), ' ' ORDER BY lsn) FROM pg_logical_slot_peek_changes('pgm_peek', NULL, NULL) WHERE data LIKE '%evidence/refused%'`)
-		if strings.Count(marks, "cause") == 4 {
+		if marks == want {
 			break
 		}
 	}
-	if marks != `"cause":"row-limit" "cause":"row-limit" "cause":"row-limit" "cause":"rate"` {
+	if marks != want {
 		t.Fatalf("refusal markers in the database log: %q", marks)
 	}
-	exec("ALTER ROLE pgm_agent RESET standard_conforming_strings")
 
 	// Подмена системных функций: у агента схема, где можно CREATE, в ней —
 	// функции счёта строк и номера транзакции, и его search_path ставит её
@@ -280,8 +336,18 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	if _, err := agent.Query("CREATE FUNCTION public.pg_current_xact_id() RETURNS xid8 LANGUAGE sql AS $$SELECT '7'::xid8$$; ALTER ROLE pgm_agent SET search_path = public, pg_catalog"); err != nil {
 		t.Fatal(err)
 	}
+	// И функция для скрипта настройки, который выполнит владелец: точное
+	// совпадение типов выигрывает у pg_catalog.left(text, integer) при любом
+	// порядке пути (R2 заход 2).
+	if _, err := agent.Query("CREATE FUNCTION public.left(name, integer) RETURNS text LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END$$"); err != nil {
+		t.Fatal(err)
+	}
 	s = mcpserver.New(mcpserver.Config{Agent: "live-bot", RowLimit: 1, Version: "test",
-		Dial: func() (mcpserver.DB, error) { return pgwire.Dial(ctx, dcfg) }}, nil)
+		Dial: func(params map[string]string) (mcpserver.DB, error) {
+			c := dcfg
+			c.Params = params
+			return pgwire.Dial(ctx, c)
+		}}, nil)
 	before = docs()
 	if text, isErr := tool("execute", `{"statements":["SELECT set_config('search_path', 'public, pg_catalog', true)","WITH d AS (DELETE FROM pgm.docs RETURNING 1) SELECT count(*) FROM d"]}`); !isErr ||
 		!strings.Contains(text, "would change 5 rows") || docs() != before {
@@ -297,6 +363,32 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		t.Fatalf("the setup script took an agent role that can CREATE: %v", err)
 	}
 	exec("ROLLBACK; REVOKE CREATE ON SCHEMA public FROM pgm_agent")
+	// Право — через роль, которой агент может стать, но не наследует
+	// (NOINHERIT; с PostgreSQL 16 — и WITH INHERIT FALSE): has_schema_privilege
+	// его не видит, а SET ROLE агенту доступен (R2 заход 2).
+	// NOINHERIT — до GRANT: с PostgreSQL 16 атрибут роли задаёт наследование
+	// только членствам, выданным после него.
+	exec("CREATE ROLE pgm_maker NOLOGIN; GRANT CREATE ON SCHEMA public TO pgm_maker; ALTER ROLE pgm_agent NOINHERIT; GRANT pgm_maker TO pgm_agent")
+	if one("SELECT has_schema_privilege('pgm_agent', 'public', 'CREATE')::text") != "false" {
+		t.Fatal("the right is inherited: the case is not the one under test")
+	}
+	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent can CREATE in schema public (as pgm_maker)") {
+		t.Fatalf("the setup script took an agent role that can become a role that can CREATE: %v", err)
+	}
+	exec("ROLLBACK; ALTER ROLE pgm_agent INHERIT; REVOKE CREATE ON SCHEMA public FROM pgm_maker; DROP ROLE pgm_maker")
+	// Права, с которыми записи не вернуть или их не будет: TRUNCATE, TRIGGER,
+	// владение таблицей — и через группу (T заход 2).
+	exec("GRANT TRUNCATE, TRIGGER ON pgm.docs TO pgm_agent")
+	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent can trigger pgm.docs") || !strings.Contains(err.Error(), "pgm_agent can truncate pgm.docs") {
+		t.Fatalf("the setup script took an agent role with TRUNCATE and TRIGGER: %v", err)
+	}
+	exec("ROLLBACK; REVOKE TRUNCATE, TRIGGER ON pgm.docs FROM pgm_agent")
+	owner := one("SELECT current_user")
+	exec("ALTER TABLE pgm.docs OWNER TO pgm_group")
+	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent owns pgm.docs (as pgm_group)") {
+		t.Fatalf("the setup script took an agent role that owns a table: %v", err)
+	}
+	exec("ROLLBACK; ALTER TABLE pgm.docs OWNER TO " + pgwire.Ident(owner))
 	// И таблицу без первичного ключа — тоже: строки отката не найти (P-253).
 	nopk := cfg
 	nopk.Tables = []string{"pgm.docs", "pgm.audit"}
@@ -306,4 +398,156 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		t.Fatalf("the setup script took a table without a primary key: %v", err)
 	}
 	exec("ROLLBACK")
+}
+
+// TestLiveMCPLostCommit — COMMIT действия ждёт синхронную реплику, а роль
+// агента своей сессией обрывает сеанс сервера (pg_terminate_backend своей
+// роли): база у себя уже зафиксировала. Агенту — «может быть зафиксировано»,
+// строки идут в окно, людям — отметка unknown. Раньше строки таких действий в
+// окно не шли, и окно обходилось сколько угодно раз, а тревоги не было (P-258,
+// R1 заход 2). Тест на время ставит synchronous_standby_names на весь кластер:
+// фиксации чужих сеансов в это время ждут.
+func TestLiveMCPLostCommit(t *testing.T) {
+	base := os.Getenv("PGINPUT_TEST_DSN")
+	if base == "" {
+		t.Skip("PGINPUT_TEST_DSN is not set")
+	}
+	ctx := context.Background()
+	dial := func(dsn string) *pgwire.Conn {
+		t.Helper()
+		cfg, err := pgwire.ParseDSN(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := pgwire.Dial(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	admin := dial(base + " user=postgres")
+	exec := func(c *pgwire.Conn, sql string) {
+		t.Helper()
+		if _, err := c.Query(sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	one := func(sql string) string {
+		t.Helper()
+		row, ok, err := admin.QueryRow(sql)
+		if err != nil || !ok || row[0] == nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		return *row[0]
+	}
+	tidy := func() {
+		admin.Query("ROLLBACK")
+		admin.Query("ALTER SYSTEM RESET synchronous_standby_names")
+		admin.Query("SELECT pg_reload_conf()")
+		admin.Query("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'pgl_peek'")
+		admin.Query("DROP PUBLICATION IF EXISTS pgl_pub")
+		admin.Query("DROP SCHEMA IF EXISTS pgl CASCADE")
+	}
+	exec(admin, "SET client_min_messages = warning")
+	tidy()
+	defer tidy()
+	exec(admin, "CREATE SCHEMA pgl; CREATE TABLE pgl.docs (id int PRIMARY KEY, body text); INSERT INTO pgl.docs SELECT g, 'v' FROM generate_series(1, 5) g")
+	cfg := Config{DSN: base + " user=pgl_tap", Slot: "pgl_slot", Publication: "pgl_pub", Dir: t.TempDir(), Roles: []string{"pgl_agent"}, Tables: []string{"pgl.docs"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	script, err := SetupSQL(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(admin, script)
+	exec(admin, "SELECT pg_create_logical_replication_slot('pgl_peek', 'test_decoding')")
+
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	dcfg, err := pgwire.ParseDSN(base + " user=pgl_agent application_name=esmcp/pgl-bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Окно — одна строка в час.
+	s := mcpserver.New(mcpserver.Config{Agent: "pgl-bot", WindowRows: 1, Window: time.Hour, Version: "test", Receipts: f, ReceiptsPath: path,
+		Dial: func(params map[string]string) (mcpserver.DB, error) {
+			c := dcfg
+			c.Params = params
+			return pgwire.Dial(ctx, c)
+		}}, nil)
+	tool := func(args string) (string, bool) {
+		var m struct {
+			Result struct {
+				Content []struct{ Text string } `json:"content"`
+				IsError bool                    `json:"isError"`
+			} `json:"result"`
+		}
+		out := s.Handle([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute","arguments":` + args + `}}`))
+		if json.Unmarshal(out, &m) != nil || len(m.Result.Content) != 1 {
+			return string(out), true
+		}
+		return m.Result.Content[0].Text, m.Result.IsError
+	}
+
+	// Синхронная реплика, которой нет (стоит или отстаёт): COMMIT ждёт её.
+	exec(admin, "ALTER SYSTEM SET synchronous_standby_names = 'pgl_missing_standby'")
+	exec(admin, "SELECT pg_reload_conf()")
+	for wait := time.Now().Add(5 * time.Second); one("SHOW synchronous_standby_names") != "pgl_missing_standby"; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(wait) {
+			t.Fatal("the setting did not take")
+		}
+	}
+	killer := dial(base + " user=pgl_agent") // своя сессия агента мимо MCP
+	var told []string
+	for i := 1; i <= 3; i++ {
+		done := make(chan string, 1)
+		go func() {
+			text, _ := tool(`{"sql":"UPDATE pgl.docs SET body = 'agent' WHERE id = ` + strconv.Itoa(i) + `","reason":"again"}`)
+			done <- text
+		}()
+		var text string
+	wait:
+		for {
+			select {
+			case text = <-done:
+				break wait
+			case <-time.After(20 * time.Millisecond):
+				killer.Query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'pgl_agent' AND application_name = 'esmcp/pgl-bot' AND wait_event = 'SyncRep'")
+			}
+		}
+		told = append(told, text)
+	}
+	exec(admin, "ALTER SYSTEM RESET synchronous_standby_names")
+	exec(admin, "SELECT pg_reload_conf()")
+	if !strings.Contains(told[0], "may have been committed") || !strings.Contains(told[0], "the operators are alerted") ||
+		!strings.Contains(told[1], "would have changed 2 rows in the last 1h0m0s") || !strings.Contains(told[2], "would have changed 2 rows") {
+		t.Fatalf("the agent was told:\n%s", strings.Join(told, "\n"))
+	}
+	if got := one("SELECT string_agg(id || '=' || body, ',' ORDER BY id) FROM pgl.docs"); got != "1=agent,2=v,3=v,4=v,5=v" {
+		t.Fatalf("the table: %s", got)
+	}
+	var marks string
+	for wait := time.Now().Add(5 * time.Second); time.Now().Before(wait); time.Sleep(50 * time.Millisecond) {
+		marks = one(`SELECT coalesce(string_agg(substring(data from '"cause":"[a-z-]+"'), ' ' ORDER BY lsn), '') FROM pg_logical_slot_peek_changes('pgl_peek', NULL, NULL) WHERE data LIKE '%evidence/refused%'`)
+		if strings.Count(marks, "cause") == 3 {
+			break
+		}
+	}
+	if marks != `"cause":"unknown" "cause":"window-rows" "cause":"window-rows"` {
+		t.Fatalf("markers in the database log: %q", marks)
+	}
+}
+
+// laggy — соединение, как по сети: каждый запрос уходит с задержкой.
+type laggy struct{ *pgwire.Conn }
+
+func (c laggy) Query(sql string) ([]pgwire.Result, error) {
+	time.Sleep(10 * time.Millisecond)
+	return c.Conn.Query(sql)
 }

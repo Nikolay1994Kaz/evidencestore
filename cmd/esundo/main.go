@@ -287,7 +287,13 @@ func describe(w io.Writer, p *pgundo.Plan, records int) {
 		}
 		json.Unmarshal(a, &m)
 		// Всё в отметке — от агента: причина, имена, номер действия (P-251).
-		fmt.Fprintf(w, "  action %s: agent %s, tool %s, reason: %s\n", pgundo.Shown(m.Info.ActionID), pgundo.Shown(m.Info.Agent), pgundo.Shown(m.Info.Tool), pgundo.Shown(m.Info.Reason))
+		// Причина — в кавычках и не длиннее 300 знаков: пробелами агент
+		// переносил свой текст на отдельные строки терминала (T заход 2).
+		reason := []rune(m.Info.Reason)
+		if len(reason) > 300 {
+			reason = append(reason[:300], '…')
+		}
+		fmt.Fprintf(w, "  action %s: agent %s, tool %s, reason: %q\n", pgundo.Shown(m.Info.ActionID), pgundo.Shown(m.Info.Agent), pgundo.Shown(m.Info.Tool), string(reason))
 	}
 	if p.Who != nil && len(p.Actions) == 0 {
 		fmt.Fprintln(w, "  no action marker: the transaction did not come through the MCP server")

@@ -143,7 +143,11 @@ func main() {
 		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, ActionsPerMinute: cfg.ActionsPerMinute,
 		WindowRows: cfg.WindowRows, Window: cfg.Window.D(), StatementTimeout: cfg.StatementTimeout.D(), LockTimeout: cfg.LockTimeout.D(),
 		Receipts: receipts, ReceiptsPath: cfg.Receipts, Version: version.String("esmcp"),
-		Dial: func() (mcpserver.DB, error) { return pgwire.Dial(context.Background(), dsn) },
+		Dial: func(params map[string]string) (mcpserver.DB, error) {
+			c := dsn
+			c.Params = params
+			return pgwire.Dial(context.Background(), c)
+		},
 	}
 	if cfg.Undo != nil {
 		mc.Fetch = cfg.Undo.Fetch

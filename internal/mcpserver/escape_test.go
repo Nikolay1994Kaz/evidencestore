@@ -77,7 +77,7 @@ func TestSQLThatEndsTheTransactionIsNotReportedAsRolledBack(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "receipts.jsonl")
 			dials := 0
 			s := serverOn(t, &db, path, func(c *Config) { c.RowLimit = 1 })
-			s.cfg.Dial = func() (DB, error) { dials++; return &db, nil }
+			s.cfg.Dial = func(map[string]string) (DB, error) { dials++; return &db, nil }
 			text, isErr := callText(t, s, "execute", `{"sql":"UPDATE docs SET body = 'x'","reason":"tidy"}`)
 			if !isErr || !strings.Contains(text, "action a-1 left the server's transaction") || !strings.Contains(text, "may be committed") ||
 				strings.Contains(text, "nothing changed") || strings.Contains(text, "rolled back") {

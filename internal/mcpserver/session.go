@@ -28,12 +28,21 @@ import (
 // последним: функции и операторы — системные, типы и таблицы pg_temp
 // системных не заслонят. Текст — в UTF-8, роль — та, которой сервер вошёл
 // (роль агента может состоять в группе без права на отметки). Строковые
-// литералы своих настроек не требуют: pgwire.Literal (P-256).
+// литералы своих настроек не требуют: pgwire.Literal (P-256). Таймауты —
+// те, с которыми сервер вошёл (sessionParams), а transaction_timeout
+// (PostgreSQL 17+) — выключен: SQL агента ставил последней командой
+// idle_in_transaction_session_timeout = 5 мс, и база рвала сеанс раньше, чем
+// ложилась отметка об отказе, — тревоги не было (T заход 2). Запрос — через
+// pg_settings: параметра, которого у версии нет, в нём нет и строки.
 var own = []string{
 	"SET LOCAL search_path = pg_catalog, pg_temp",
 	"SET LOCAL client_encoding = 'UTF8'",
 	"SET LOCAL ROLE NONE",
+	ownTimeouts,
 }
+
+const ownTimeouts = "SELECT pg_catalog.set_config(s.name, CASE s.name WHEN 'transaction_timeout' THEN '0' ELSE s.reset_val END, true) " +
+	"FROM pg_catalog.pg_settings s WHERE s.name IN ('statement_timeout', 'lock_timeout', 'idle_in_transaction_session_timeout', 'transaction_timeout')"
 
 // agentHead — перед командами агента: его search_path (по умолчанию роли).
 // Остальные настройки own командам агента не мешают: текст и так в UTF-8.

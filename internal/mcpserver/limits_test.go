@@ -101,7 +101,7 @@ func serverOn(t *testing.T, db DB, path string, mod func(*Config)) *Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { f.Close() })
-	cfg := Config{Agent: "support-bot", Receipts: f, ReceiptsPath: path, Version: "test", Dial: func() (DB, error) { return db, nil }}
+	cfg := Config{Agent: "support-bot", Receipts: f, ReceiptsPath: path, Version: "test", Dial: func(map[string]string) (DB, error) { return db, nil }}
 	if mod != nil {
 		mod(&cfg)
 	}

@@ -589,6 +589,7 @@ func TestRefusedActionRaisesAnAlert(t *testing.T) {
 		{`"cause":"something-new"`, "stopped an action (something-new)"},
 		{`"cause":"escaped","xid":"751","tool":"execute"`, "ended the MCP server's transaction 751 itself"},
 		{`"cause":"escaped","tool":"query"`, "ended the MCP server's transaction (a read-only one) itself"},
+		{`"cause":"unknown","xid":"752","rows":3`, "broke during COMMIT of an action (transaction 752, 3 rows): it may be committed"},
 	} {
 		before := len(h.alerts())
 		if _, err := h.tap.Handle(pgoutput.Message{LSN: uint64(1000 + i), Prefix: PrefixRefused, Content: []byte(`{"role":"agent","info":{` + c[0] + `}}`)}); err != nil {
@@ -600,8 +601,9 @@ func TestRefusedActionRaisesAnAlert(t *testing.T) {
 		}
 		// Выход из транзакции — не отказ: свой вид тревоги, и «ничего не
 		// изменилось» в нём нет.
-		escaped := strings.Contains(c[0], "escaped")
-		if sig := ev[len(ev)-1].Signals[0]; (sig.Kind == alert.KindEscaped) != escaped || (escaped && strings.Contains(sig.Detail, "nothing changed")) {
+		escaped, unknown := strings.Contains(c[0], "escaped"), strings.Contains(c[0], `"unknown"`)
+		if sig := ev[len(ev)-1].Signals[0]; (sig.Kind == alert.KindEscaped) != escaped || (sig.Kind == alert.KindUnknown) != unknown ||
+			((escaped || unknown) && strings.Contains(sig.Detail, "nothing changed")) {
 			t.Fatalf("cause %s: %+v", c[0], sig)
 		}
 	}

@@ -262,6 +262,11 @@ func TestCheckAndApply(t *testing.T) {
 	// Транзакция, отметка первой, шаг 2 (вернуть удалённую — со своим прежним номером, даже если колонка
 	// GENERATED ALWAYS AS IDENTITY), шаг 4 (вернуть значения: пишется только колонка, которую транзакция
 	// меняла), сверка обеих команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
+	// Перед всем — путь поиска сверки и отката (Path).
+	if len(db.log) != 9 || db.log[0] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" {
+		t.Fatalf("%q", db.log)
+	}
+	db.log = db.log[1:]
 	if len(db.log) != 8 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], `SELECT evidence.mark_undo('{"by":"nikolay"}'`) ||
 		!strings.HasPrefix(db.log[3], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[4], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
 		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id"::text IS NOT DISTINCT FROM w.n0::text AND t."v"::text IS NOT DISTINCT FROM w.n1::text`) ||

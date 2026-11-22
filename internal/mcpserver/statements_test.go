@@ -102,7 +102,7 @@ func TestEveryCallStartsWithACleanSession(t *testing.T) {
 	db := &fakeDB{fail: map[string]error{"DISCARD ALL": &pgwire.PgError{Severity: "ERROR", Code: "25001", Message: "DISCARD ALL cannot run inside a transaction block"}}}
 	dials := 0
 	s := serverOn(t, db, filepath.Join(t.TempDir(), "receipts.jsonl"), nil)
-	s.cfg.Dial = func() (DB, error) { dials++; return db, nil }
+	s.cfg.Dial = func(map[string]string) (DB, error) { dials++; return db, nil }
 	if text, isErr := callText(t, s, "query", `{"sql":"SELECT id FROM accounts"}`); isErr {
 		t.Fatal(text)
 	}
@@ -111,7 +111,7 @@ func TestEveryCallStartsWithACleanSession(t *testing.T) {
 	}
 	db.fail = nil
 	db.log = nil
-	s.cfg.Dial = func() (DB, error) { return nil, errors.New("must not dial") }
+	s.cfg.Dial = func(map[string]string) (DB, error) { return nil, errors.New("must not dial") }
 	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`); isErr || db.log[0] != "DISCARD ALL" {
 		t.Fatalf("%v %s %q", isErr, text, db.log)
 	}

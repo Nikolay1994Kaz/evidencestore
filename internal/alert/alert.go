@@ -34,25 +34,27 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
 // Поводы тревог.
 const (
-	KindMassChange = "mass-change" // изменений в транзакции не меньше порога
-	KindCanary     = "canary"      // тронута строка-ловушка
-	KindNoAction   = "no-action"   // транзакция агента без отметки действия: в обход MCP
-	KindTruncate   = "truncate"    // TRUNCATE: строк в записи нет
-	KindIdentity   = "identity"    // таблица без REPLICA IDENTITY FULL
-	KindLateMarker = "late-marker" // отметка пришла после пропущенных изменений
-	KindRefused    = "refused"     // MCP-сервер остановил действие пределом строк
-	KindEscaped    = "escaped"     // SQL агента сам закрыл транзакцию MCP-сервера
-	KindDBDown     = "db-down"     // нет связи с базой дольше порога
-	KindDBUp       = "db-up"       // связь с базой вернулась
-	KindGap        = "gap"         // записи потеряны: слот удалён или его журнал стёрт
-	KindSlotLag    = "slot-lag"    // база копит журнал для слота: до предела — половина или меньше
-	KindSlotOK     = "slot-ok"     // журнал для слота снова в норме
-	KindDropped    = "dropped"     // тревога слишком длинная для доставки: вместо неё — эта, с местом в файле
+	KindMassChange = "mass-change"    // изменений в транзакции не меньше порога
+	KindCanary     = "canary"         // тронута строка-ловушка
+	KindNoAction   = "no-action"      // транзакция агента без отметки действия: в обход MCP
+	KindTruncate   = "truncate"       // TRUNCATE: строк в записи нет
+	KindIdentity   = "identity"       // таблица без REPLICA IDENTITY FULL
+	KindLateMarker = "late-marker"    // отметка пришла после пропущенных изменений
+	KindRefused    = "refused"        // MCP-сервер остановил действие пределом строк
+	KindEscaped    = "escaped"        // SQL агента сам закрыл транзакцию MCP-сервера
+	KindUnknown    = "commit-unknown" // связь MCP-сервера с базой оборвалась на COMMIT: действие могло зафиксироваться
+	KindDBDown     = "db-down"        // нет связи с базой дольше порога
+	KindDBUp       = "db-up"          // связь с базой вернулась
+	KindGap        = "gap"            // записи потеряны: слот удалён или его журнал стёрт
+	KindSlotLag    = "slot-lag"       // база копит журнал для слота: до предела — половина или меньше
+	KindSlotOK     = "slot-ok"        // журнал для слота снова в норме
+	KindDropped    = "dropped"        // тревога слишком длинная для доставки: вместо неё — эта, с местом в файле
 )
 
 // Signal — один повод тревоги.
@@ -238,6 +240,24 @@ func short(s string) string {
 	return s
 }
 
+// field — значение из отметки (номер действия, имя агента, роль, имя
+// приложения) одной строкой и не длиннее строки тревоги: управляющие символы
+// (и перевод строки), разделители строк и символы направления текста — кодом
+// \uXXXX. Отметки пишет и SQL агента (P-255), а application_name он ставит
+// сам: иначе он дописывал в тревогу свои строки («changed: 1 row», «approved by
+// the on-call DBA») или длиной выталкивал настоящие (T заход 2).
+func field(s string) string {
+	var b strings.Builder
+	for _, c := range []rune(short(s)) {
+		if unicode.IsControl(c) || unicode.Is(unicode.Bidi_Control, c) || unicode.In(c, unicode.Zl, unicode.Zp) {
+			fmt.Fprintf(&b, "\\u%04x", c)
+			continue
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
+
 // Text — тревога словами, для человека: что случилось, кто и какое действие,
 // сколько строк и чем посмотреть откат.
 func Text(e Event, o TextOptions) string {
@@ -313,9 +333,9 @@ func describeWho(raw json.RawMessage) string {
 		return ""
 	}
 	if w.App != "" {
-		return short(fmt.Sprintf("role %s, application %s", w.Role, w.App))
+		return fmt.Sprintf("role %s, application %s", field(w.Role), field(w.App))
 	}
-	return short("role " + w.Role)
+	return "role " + field(w.Role)
 }
 
 func describeAction(raw json.RawMessage) string {
@@ -329,9 +349,9 @@ func describeAction(raw json.RawMessage) string {
 	if json.Unmarshal(raw, &a) != nil || a.Info.ActionID == "" {
 		return ""
 	}
-	s := a.Info.ActionID
+	s := field(a.Info.ActionID)
 	if a.Info.Agent != "" {
-		s += ", agent " + a.Info.Agent
+		s += ", agent " + field(a.Info.Agent)
 	}
 	if a.Info.Reason != "" {
 		s += fmt.Sprintf(" — reason given: %q", short(a.Info.Reason))

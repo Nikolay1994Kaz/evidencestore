@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,6 +25,9 @@ type fakeDB struct {
 	tx      byte // состояние транзакции, как его сказала бы база
 	// prepared — команды агента по именам PREPARE: EXECUTE отвечает за них.
 	prepared map[string]string
+	// changed — строк, которые изменили команды отката (по их тегам): это
+	// отвечает статистика транзакции (pgundo.XactRows) вне execute.
+	changed int
 }
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
@@ -96,8 +100,18 @@ func (d *fakeDB) TxStatus() byte {
 func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 	if d.answers != nil {
 		if res, ok := d.answers(sql); ok {
+			if len(res) == 1 && (strings.HasPrefix(sql, `UPDATE "`) || strings.HasPrefix(sql, `INSERT INTO "`) || strings.HasPrefix(sql, `DELETE FROM "`)) {
+				if f := strings.Fields(res[0].Tag); len(f) > 0 {
+					n, _ := strconv.Atoi(f[len(f)-1])
+					d.changed += n
+				}
+			}
 			return res, nil
 		}
+	}
+	if sql == "SELECT "+xactRows {
+		v := strconv.Itoa(d.changed)
+		return []pgwire.Result{{Columns: []string{"int8"}, Rows: [][]*string{{&v}}, Tag: "SELECT 1"}}, nil
 	}
 	for sub, err := range d.fail {
 		if strings.Contains(sql, sub) {
@@ -133,7 +147,7 @@ func newServer(t *testing.T, db *fakeDB) (*Server, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { f.Close() })
-	s := New(Config{Agent: "support-bot", Receipts: f, Version: "test", MaxRows: 1, Dial: func() (DB, error) { return db, nil }}, nil)
+	s := New(Config{Agent: "support-bot", Receipts: f, Version: "test", MaxRows: 1, Dial: func(map[string]string) (DB, error) { return db, nil }}, nil)
 	s.newID = func() string { return "a-1" }
 	return s, path
 }
@@ -233,12 +247,12 @@ func TestExecuteMarksTheActionAndKeepsAReceipt(t *testing.T) {
 	// действия первой, номер транзакции; пачка — путь агента, команда агента
 	// подготовкой и исполнением, отложенное — сразу, свои настройки снова;
 	// фиксация.
-	if len(db.log) != 13 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
+	if len(db.log) != 14 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
 		!strings.HasPrefix(db.log[3], "SELECT evidence.mark_action('{") ||
 		!strings.Contains(db.log[3], `"action_id":"a-1"`) || !strings.Contains(db.log[3], `"agent":"support-bot"`) ||
 		db.log[5] != "SET LOCAL search_path TO DEFAULT" ||
 		db.log[6] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[7] != "EXECUTE es_agent_0" ||
-		db.log[8] != "SET CONSTRAINTS ALL IMMEDIATE" || db.log[9] != "SET LOCAL search_path = pg_catalog, pg_temp" || db.log[12] != "COMMIT" {
+		db.log[8] != "SET CONSTRAINTS ALL IMMEDIATE" || db.log[9] != "SET LOCAL search_path = pg_catalog, pg_temp" || db.log[12] != ownTimeouts || db.log[13] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
 	data, _ := os.ReadFile(path)
@@ -294,7 +308,7 @@ func TestQueryIsReadOnlyAndBounded(t *testing.T) {
 func TestBrokenConnectionIsReopened(t *testing.T) {
 	db := &fakeDB{fail: map[string]error{"BEGIN": errors.New("broken pipe")}}
 	dials := 0
-	s := New(Config{Agent: "a", Dial: func() (DB, error) { dials++; return db, nil }}, nil)
+	s := New(Config{Agent: "a", Dial: func(map[string]string) (DB, error) { dials++; return db, nil }}, nil)
 	s.execute([]string{"UPDATE t SET a = 1"}, "")
 	db.fail = nil
 	if _, err := s.execute([]string{"UPDATE t SET a = 1"}, ""); err != nil || dials != 2 {
@@ -422,7 +436,7 @@ func TestUndoPreviewAndApply(t *testing.T) {
 		if q == "DISCARD ALL" && path0 < 0 {
 			path0 = i
 		}
-		if strings.Contains(q, "set_config('search_path', pg_catalog.concat_ws(', ', 'pg_catalog', ") && catalog < 0 {
+		if q == "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" && catalog < 0 {
 			catalog = i
 		}
 	}
@@ -482,7 +496,7 @@ func TestRowLimitRefusesBeforeCommit(t *testing.T) {
 	}
 	// Порядок: изменения, счёт строк, отметка об отказе, откат. Фиксации нет.
 	n := len(db.log)
-	if db.log[n-4] != "SET LOCAL ROLE NONE" || !strings.Contains(db.log[n-3], "pg_stat_get_xact_tuples") ||
+	if db.log[n-4] != ownTimeouts || !strings.Contains(db.log[n-3], "pg_stat_get_xact_tuples") ||
 		!strings.Contains(db.log[n-2], "SELECT evidence.mark_refused('{") || db.log[n-1] != "ROLLBACK" || slices.Contains(db.log, "COMMIT") {
 		t.Fatalf("%q", db.log)
 	}

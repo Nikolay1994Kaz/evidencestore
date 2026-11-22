@@ -461,6 +461,12 @@ func (t *Tap) refused(m pgoutput.Message) error {
 		}
 		detail = fmt.Sprintf("the agent's SQL ended %s itself (COMMIT, ROLLBACK or the like in its text): what it changed may be committed "+
 			"without the row limits being checked — in that transaction, and in transactions of the role after it, which come as no-action", where)
+	case "unknown":
+		// Не отказ: COMMIT ушёл, ответа нет — действие могло зафиксироваться
+		// (P-258).
+		kind = alert.KindUnknown
+		detail = fmt.Sprintf("the connection of the MCP server to the database broke during COMMIT of an action (transaction %s, %d rows): "+
+			"it may be committed. The agent was told not to repeat it: check the transaction", i.XID, i.Rows)
 	case "", "row-limit":
 		detail = fmt.Sprintf("the MCP server stopped an action that would change %d rows (the limit for one action is %d): it was rolled back, nothing changed", i.Rows, i.Limit)
 	case "window-rows":

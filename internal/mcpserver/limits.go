@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -38,6 +39,7 @@ const (
 	CauseRate       = "rate"        // слишком много действий за минуту
 	CauseTimeout    = "timeout"     // запрос шёл дольше предела и отменён
 	CauseEscaped    = "escaped"     // SQL агента закрыл транзакцию сервера (COMMIT, ROLLBACK в тексте)
+	CauseUnknown    = "unknown"     // связь с базой оборвалась на COMMIT: действие могло зафиксироваться
 )
 
 // canceler — соединение, запрос по которому можно прервать с другого потока
@@ -52,12 +54,34 @@ func (s *Server) connect() error {
 	if s.db != nil {
 		return nil
 	}
-	db, err := s.cfg.Dial()
+	db, err := s.cfg.Dial(s.sessionParams())
 	if err != nil {
 		return fmt.Errorf("the database is unreachable: %w", err)
 	}
 	s.db = db
 	return nil
+}
+
+// sessionParams — параметры входа соединения сервера. Умолчания своей роли
+// агент ставит себе сам (ALTER ROLE … SET в своей сессии мимо сервера), и
+// DISCARD ALL возвращает сеанс к ним; параметры входа сильнее их, и
+// DISCARD ALL возвращает к параметрам. Вне транзакции действия — отказ по
+// частоте, по таймауту, отказы отката, обрыв на COMMIT — сервер шёл с
+// умолчаниями агента: statement_timeout = 1 мс (и jit_above_cost = 0, чтобы
+// не успеть) или role = группа без права на отметки — и тревоги не было ни
+// одной. Откат же шёл без таймаутов вовсе (агент снимает их у своей роли) и
+// висел на замке строки под замком агента (R2 заход 2). Роль — та, которой
+// сервер вошёл; таймауты — те же, что ставит guards.
+func (s *Server) sessionParams() map[string]string {
+	ms := func(d time.Duration) string { return strconv.FormatInt(d.Milliseconds(), 10) }
+	p := map[string]string{"role": "none", "statement_timeout": "0", "lock_timeout": "0", "idle_in_transaction_session_timeout": "300000"}
+	if s.cfg.StatementTimeout > 0 {
+		p["statement_timeout"] = ms(s.cfg.StatementTimeout + dbBackstop)
+	}
+	if s.cfg.LockTimeout > 0 {
+		p["lock_timeout"] = ms(s.cfg.LockTimeout)
+	}
+	return p
 }
 
 // drop закрывает соединение: открытая в нём транзакция на сервере откатится.
@@ -240,13 +264,16 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 // count — идёт ли квитанция в счёт. Считаются действия этого агента — execute
 // и откаты undo_apply (откат меняет те же строки обратно, P-249), — кроме
 // отказанных за частоту: те в базу не ходили, и считать их — значит держать
-// агента под отказом, пока он пробует. Строки — только у зафиксированных.
+// агента под отказом, пока он пробует. Строки — у зафиксированных и у тех,
+// чей COMMIT оборвался (unknown): они могли зафиксироваться, и раньше так
+// обходилось окно — агент своей ролью обрывал сеанс сервера, пока COMMIT ждёт
+// синхронную реплику, а база уже зафиксировала у себя (P-258).
 func (l *ledger) count(rc Receipt, at time.Time) (spent, bool) {
 	if rc.Agent != l.agent || (rc.Tool != "execute" && rc.Tool != "undo_apply") || rc.Cause == CauseRate {
 		return spent{}, false
 	}
 	it := spent{at: at}
-	if rc.Outcome == "committed" {
+	if rc.Outcome == "committed" || rc.Outcome == "unknown" {
 		it.rows = rc.Rows
 	}
 	return it, true

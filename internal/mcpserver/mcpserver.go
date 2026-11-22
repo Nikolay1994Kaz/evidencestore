@@ -100,9 +100,10 @@ type Config struct {
 	ActionsPerMinute int
 	WindowRows       int
 	Window           time.Duration
-	// Dial открывает соединение ролью агента. Зовётся при первом запросе и
-	// заново после обрыва.
-	Dial func() (DB, error)
+	// Dial открывает соединение ролью агента с параметрами входа params
+	// (pgwire.Config.Params) — их задаёт сервер (sessionParams), и Dial обязан
+	// их передать. Зовётся при первом запросе и заново после обрыва.
+	Dial func(params map[string]string) (DB, error)
 	// Receipts — журнал квитанций (строки JSON, fsync на строку). ReceiptsPath —
 	// он же для чтения: по нему действие находится и после перезапуска сервера.
 	Receipts     *os.File
@@ -136,7 +137,8 @@ type Receipt struct {
 	Tags    []string `json:"tags,omitempty"`
 	Rows    int      `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
 	// Cause — почему действие остановлено сервером: row-limit, window-rows,
-	// rate (отказы), timeout (запрос отменён по времени) или escaped.
+	// rate (отказы), timeout (запрос отменён по времени), escaped или unknown
+	// (обрыв на COMMIT).
 	Cause string `json:"cause,omitempty"`
 	// Alerted — об этом отказе за частоту людям ушла тревога (об остальных в
 	// ту же минуту — нет).
@@ -428,6 +430,13 @@ func (s *Server) call(name string, args json.RawMessage) (string, error) {
 			return "", fmt.Errorf("arguments: %w", err)
 		}
 	}
+	// Причина — в отметке, квитанции и тексте тревоги людям: в мегабайты она
+	// там не нужна, а длиной агент добивался своего — тревога «слишком
+	// длинная» (dropped) вместо настоящей, отметка не успевала лечь (T, заходы
+	// 1 и 2).
+	if len(a.Reason) > maxReason {
+		return "", fmt.Errorf("the reason is %d bytes, and at most %d are taken: say it in a sentence", len(a.Reason), maxReason)
+	}
 	switch name {
 	case "query":
 		if len(a.Statements) > 0 {
@@ -503,16 +512,14 @@ func marks(p *pgundo.Plan, actionID string) bool {
 	return false
 }
 
-// undoSession — search_path для сверки и отката (сеанс — после fresh, прочее
-// DISCARD ALL уже вернул). pg_catalog — первым: системные функции, операторы и
-// типы ничем не заслонить; за ним путь роли (типы колонок в журнале — как их
-// назвал format_type у сборщика, свои типы базы без схемы); pg_temp —
-// последним. Сам запрос — с полными именами: путь роли агент выбирает сам.
-func (s *Server) undoSession() error {
-	_, err := s.run("SELECT pg_catalog.set_config('search_path', pg_catalog.concat_ws(', ', 'pg_catalog', " +
-		"NULLIF(pg_catalog.current_setting('search_path'), ''), 'pg_temp'), false)")
-	return err
+// undoLimit — откат перешёл предел строк по статистике своей транзакции.
+type undoLimit struct {
+	cause string
+	info  map[string]any
+	why   error
 }
+
+func (e *undoLimit) Error() string { return e.why.Error() }
 
 // undo показывает или применяет откат действия. До-образы — только из
 // хранилища (Fetch): локальной копии журнала сервер не верит.
@@ -526,7 +533,10 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	switch {
 	case target == nil:
 		return "", fmt.Errorf("action %s is not in this server's receipts", actionID)
-	case target.Outcome != "committed":
+	case target.Outcome != "committed" && target.Outcome != "unknown":
+		// unknown — COMMIT оборвался, и действие могло зафиксироваться: если
+		// хранилище знает транзакцию с его отметкой (marks ниже), откат есть
+		// (T заход 2).
 		return "", fmt.Errorf("action %s did not commit (%s): there is nothing to undo", actionID, target.Outcome)
 	case target.Tool == "undo_apply":
 		// Откат отката повторил бы то изменение, которое откат вернул (P-249).
@@ -571,11 +581,9 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 		return "", fmt.Errorf("transaction %d in the evidence store carries no marker of action %s: the transaction id was taken again "+
 			"(the database was restored from a backup, or the counter wrapped). This action is not undone here: ask a person", xid, actionID)
 	}
-	// Сверка и откат — с чистого сеанса и со своими настройками (undoSession).
+	// Сверка и откат — с чистого сеанса; путь поиска ставит pgundo (Path),
+	// таймауты — параметры входа (sessionParams).
 	if err := s.fresh(); err != nil {
-		return "", err
-	}
-	if err := s.undoSession(); err != nil {
 		return "", err
 	}
 	statuses, err := plan.Check(s.db)
@@ -596,9 +604,11 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	if ok == 0 {
 		return "", fmt.Errorf("nothing to apply for action %s: %d steps are already as before, %d are conflicts", actionID, done, bad)
 	}
-	// Пределы строк — по шагам отката: столько строк он изменит.
+	// Пределы строк — заранее по шагам отката (меньше он не изменит), и перед
+	// фиксацией — по статистике его транзакции, с триггерами и каскадами
+	// (LimitRows).
 	refuse := func(cause string, info map[string]any, why error) (string, error) {
-		rc.Outcome, rc.Cause, rc.Rows, rc.Error = "refused", cause, ok, why.Error()
+		rc.Outcome, rc.Cause, rc.Rows, rc.Error = "refused", cause, info["rows"].(int), why.Error()
 		s.markRefused(&rc, info)
 		if werr := s.keep(rc); werr != nil {
 			s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
@@ -620,11 +630,33 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 					ok, before+ok, s.cfg.Window, s.cfg.WindowRows))
 		}
 	}
+	plan.LimitRows(func(rows int) error {
+		if s.cfg.RowLimit > 0 && rows > s.cfg.RowLimit {
+			return &undoLimit{CauseRowLimit, map[string]any{"rows": rows, "limit": s.cfg.RowLimit},
+				fmt.Errorf("it changed %d rows (with what triggers and cascades changed), and one action may change at most %d: ask a person to undo it", rows, s.cfg.RowLimit)}
+		}
+		if s.cfg.WindowRows > 0 {
+			_, before, _, err := s.usage(s.now())
+			if err != nil {
+				return err
+			}
+			if before+rows > s.cfg.WindowRows {
+				return &undoLimit{CauseWindowRows, map[string]any{"rows": rows, "window_rows": before, "limit": s.cfg.WindowRows, "window": s.cfg.Window.String()},
+					fmt.Errorf("with its %d rows the agent would have changed %d rows in the last %s, and the limit is %d: ask a person to undo it",
+						rows, before+rows, s.cfg.Window, s.cfg.WindowRows)}
+			}
+		}
+		return nil
+	})
 	// Откат — тоже действие: его отметка несёт и номер действия, и что он возвращает.
 	applied, err := plan.Apply(s.db, map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": reason,
 		"undoes_action": actionID, "undoes_xid": target.XID, "steps_applied": ok, "conflicts_left": bad})
+	var lim *undoLimit
+	if errors.As(err, &lim) {
+		return refuse(lim.cause, lim.info, lim.why)
+	}
 	if err == nil {
-		rc.XID, rc.Outcome, rc.Rows = applied.XID, "committed", applied.Steps
+		rc.XID, rc.Outcome, rc.Rows = applied.XID, "committed", applied.Rows
 	} else {
 		rc.Error = err.Error()
 	}
@@ -696,6 +728,9 @@ func (s *Server) fresh() error {
 
 // maxStatements — сколько команд может быть в одном действии.
 const maxStatements = 100
+
+// maxReason — предел длины причины действия или отката, в байтах.
+const maxReason = 2000
 
 // statements — команды вызова: одна в sql или несколько в list, ни одной
 // пустой. Режет на команды не сервер: разбор оставлен базе (prepared).
@@ -776,7 +811,7 @@ func (s *Server) query(sql string) (string, error) {
 }
 
 func (s *Server) execute(stmts []string, reason string) (string, error) {
-	rc := Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "execute",
+	rc := Receipt{ActionID: s.newID(), Agent: s.cfg.Agent, Tool: "execute",
 		SQL: strings.Join(stmts, ";\n"), Reason: reason, Client: s.client, Outcome: "failed"}
 	if len(stmts) > 1 {
 		rc.Statements = stmts
@@ -786,6 +821,11 @@ func (s *Server) execute(stmts []string, reason string) (string, error) {
 		return "", fmt.Errorf("action %s did not run: %w", rc.ActionID, err)
 	}
 	defer unlock()
+	// Время — после замка: частота считается по нему. Раньше оно ставилось до
+	// ожидания, а ждать можно дольше минуты (до statement_timeout + 15 с), и
+	// действия, прождавшие в очереди за долгим, были записаны в прошлое — счёт
+	// их не видел, и проходили все подряд (R2 заход 2).
+	rc.Time = s.now().UTC().Format(time.RFC3339Nano)
 	err = s.throttle(&rc)
 	if err == nil {
 		err = s.transaction(&rc, stmts)
@@ -956,13 +996,18 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	}
 	if _, err := s.run("COMMIT"); err != nil {
 		var pg *pgwire.PgError
-		if !errors.As(err, &pg) {
-			// Связь оборвалась на COMMIT: зафиксировала ли база, отсюда не
-			// узнать. «Откатилось» сказать нельзя — агент повторил бы
-			// действие (P-250).
-			rc.Outcome = "unknown"
+		if !errors.As(err, &pg) || pg.Severity == "FATAL" || pg.Severity == "PANIC" {
+			// Связь оборвалась на COMMIT (или база закрыла сеанс — FATAL):
+			// зафиксировала ли она, отсюда не узнать. При синхронной реплике
+			// сеанс, прерванный в её ожидании, уже зафиксирован у себя.
+			// «Откатилось» сказать нельзя — агент повторил бы действие
+			// (P-250); строки идут в счёт окна, а людям — тревога: «спроси
+			// человека» без человека не работало (P-258).
+			s.drop()
+			rc.Outcome, rc.Cause = "unknown", CauseUnknown
+			s.markRefused(rc, map[string]any{"xid": rc.XID, "rows": rc.Rows})
 			return fmt.Errorf("lost the connection to the database during COMMIT: the action may have been committed (transaction %s). "+
-				"Do not repeat it: ask a person to check the transaction", rc.XID)
+				"Do not repeat it: the operators are alerted to check the transaction", rc.XID)
 		}
 		return fail(err)
 	}
@@ -1067,8 +1112,8 @@ func (s *Server) escapedQuery(sql string) error {
 // агента). Таблицы те же: всё, что создано после initdb (oid от
 // FirstNormalObjectId, 16384), — обычные, секционированные и материализованные;
 // системные и TOAST вид отбрасывает так же.
-const xactRows = "(SELECT coalesce(sum(pg_stat_get_xact_tuples_inserted(oid) + pg_stat_get_xact_tuples_updated(oid) + pg_stat_get_xact_tuples_deleted(oid)), 0) " +
-	"FROM pg_catalog.pg_class WHERE oid >= 16384 AND relkind IN ('r', 'm', 'p'))::bigint"
+// Тот же запрос считает строки отката (pgundo.XactRows).
+const xactRows = pgundo.XactRows
 
 // countIn — число из колонки col единственной строки ответа.
 func countIn(res []pgwire.Result, col int) (int, error) {
@@ -1128,8 +1173,34 @@ func (s *Server) keep(rc Receipt) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.cfg.Receipts.Write(append(line, '\n')); err != nil {
+	line = append(line, '\n')
+	// Прошлая запись оборвалась на полуслове (сбой процесса, нет места):
+	// своя квитанция — с новой строки, иначе она приклеится к обрывку, и её
+	// не разберёт ни счёт пределов, ни actions (R1 заход 2).
+	if s.cfg.ReceiptsPath != "" && !endsLine(s.cfg.ReceiptsPath) {
+		line = append([]byte{'\n'}, line...)
+	}
+	if _, err := s.cfg.Receipts.Write(line); err != nil {
 		return err
 	}
 	return s.cfg.Receipts.Sync()
+}
+
+// endsLine — файл пуст или кончается переводом строки. Не прочесть — да:
+// лишний перевод строки безвреден, а не дописать его — тоже не хуже, чем было.
+func endsLine(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return true
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], fi.Size()-1); err != nil {
+		return true
+	}
+	return b[0] == '\n'
 }

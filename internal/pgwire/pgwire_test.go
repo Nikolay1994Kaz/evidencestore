@@ -101,6 +101,18 @@ func TestLiteralAndIdent(t *testing.T) {
 	}
 }
 
+// В команде репликации значения — в её кавычках, без E'…': черта там не
+// особый знак. Как её читает база — TestLive (публикация с чертой в имени).
+func TestReplicationCommandQuotesForItsGrammar(t *testing.T) {
+	got, err := replicationCommand("s", 0, []string{"proto_version", "1", "publication_names", `pub\it's`})
+	if err != nil || got != `START_REPLICATION SLOT "s" LOGICAL 0/0 ("proto_version" '1', "publication_names" 'pub\it''s')` {
+		t.Fatal(got, err)
+	}
+	if _, err := replicationCommand("s", 0, []string{"odd"}); err == nil {
+		t.Fatal("an odd number of options")
+	}
+}
+
 func TestParseError(t *testing.T) {
 	e := parseError([]byte("SERROR\x00C42501\x00Mpermission denied\x00Hask\x00\x00"))
 	if e.Code != "42501" || e.Message != "permission denied" || e.Hint != "ask" || !strings.Contains(e.Error(), "42501") {

@@ -155,7 +155,7 @@ func TestLive(t *testing.T) {
 
 	slot := "pgwire_live_test"
 	c.Query("SELECT pg_drop_replication_slot(" + Literal(slot) + ")")
-	if _, err := c.Query("CREATE TABLE IF NOT EXISTS pgwire_live (id int PRIMARY KEY, v text); DROP PUBLICATION IF EXISTS pgwire_live_pub; CREATE PUBLICATION pgwire_live_pub FOR TABLE pgwire_live"); err != nil {
+	if _, err := c.Query("CREATE TABLE IF NOT EXISTS pgwire_live (id int PRIMARY KEY, v text); DROP PUBLICATION IF EXISTS pgwire_live_pub, \"pgwire\\live_pub\"; CREATE PUBLICATION \"pgwire\\live_pub\" FOR TABLE pgwire_live"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Query("SELECT pg_create_logical_replication_slot(" + Literal(slot) + ", 'pgoutput')"); err != nil {
@@ -168,7 +168,8 @@ func TestLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.StartReplication(slot, 0, "proto_version", "1", "publication_names", "pgwire_live_pub", "messages", "true"); err != nil {
+	// Черта в имени публикации: в команде репликации E'…' нет (R1 заход 2).
+	if err := r.StartReplication(slot, 0, "proto_version", "1", "publication_names", `pgwire\live_pub`, "messages", "true"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Query("SELECT 1"); err == nil {
