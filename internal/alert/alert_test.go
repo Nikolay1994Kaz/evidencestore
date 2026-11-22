@@ -208,7 +208,7 @@ func TestTextOfATransactionAlert(t *testing.T) {
 	}
 	big.Actions = []json.RawMessage{json.RawMessage(`{"info":{"action_id":"a1","reason":"` + strings.Repeat("because ", 500) + `"}}`)}
 	text := Text(big, TextOptions{UndoHint: "esundo check -xid {xid}"})
-	for _, want := range []string{"and 290 more signals", "store records: 3–4\nundo preview: esundo check -xid 749"} {
+	for _, want := range []string{"and 294 more signals", "store records: 3–4\nundo preview: esundo check -xid 749"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("the long alert lacks %q", want)
 		}
@@ -383,7 +383,14 @@ func TestBacklogBecomesADigest(t *testing.T) {
 		}
 		r.raise(uint32(100+i), kind, fmt.Sprint("alert ", i))
 	}
-	waitFor(t, "a refused attempt", func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(h.tried) > 0 })
+	// Чинить получателя — когда доставка уже видела всю очередь: запрос,
+	// который был в пути, пока писалась последняя тревога, собран по очереди
+	// покороче, и сводка в нём была бы на тревогу меньше. Второй отказ после
+	// конца записи — уже точно по полной очереди.
+	h.mu.Lock()
+	base := len(h.tried)
+	h.mu.Unlock()
+	waitFor(t, "two refused attempts with the whole queue", func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(h.tried) >= base+2 })
 	h.setFail(0)
 	waitFor(t, "the digest and the latest ten", func() bool { return len(h.calls()) == 11 })
 	time.Sleep(60 * time.Millisecond)
@@ -391,12 +398,14 @@ func TestBacklogBecomesADigest(t *testing.T) {
 	if len(got) != 11 {
 		t.Fatalf("%d messages", len(got))
 	}
-	for _, want := range []string{"15 alerts were waiting for this channel", "mass-change ×3, no-action ×12", "transactions: 101, 102,", "115"} {
+	for _, want := range []string{"15 alerts were waiting for this channel", "mass-change ×3, no-action ×12", "transactions: 101, 102,"} {
 		if !strings.Contains(got[0], want) {
 			t.Fatalf("the digest lacks %q:\n%s", want, got[0])
 		}
 	}
-	if strings.Contains(got[0], "116") || !strings.Contains(got[1], "transaction 116") || !strings.Contains(got[10], "transaction 125") {
+	// (Номер ищется в строке транзакций: в сводке есть и время, а в нём — любые цифры.)
+	if strings.Contains(got[0], ", 116") || !strings.HasSuffix(strings.Split(got[0], "\n")[2], ", 115") ||
+		!strings.Contains(got[1], "transaction 116") || !strings.Contains(got[10], "transaction 125") {
 		t.Fatalf("after the digest: %q … %q", got[1], got[10])
 	}
 }

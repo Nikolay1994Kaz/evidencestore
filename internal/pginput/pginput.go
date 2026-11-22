@@ -28,6 +28,15 @@
 // потеряны. Все они ложатся в alerts.jsonl, а оттуда, если в настройках есть
 // "notify", уходят человеку (internal/alert): в Telegram, в Slack-совместимый
 // веб-хук или на свой адрес.
+//
+// ОТСТАВАНИЕ СЛОТА. Слот теряется не вдруг: сначала база копит для него
+// журнал. Вход раз в slotEvery спрашивает у базы, сколько журнала она держит
+// для слота и сколько ей позволено (max_slot_wal_keep_size), и поднимает
+// тревогу slot-lag на половине предела и снова на 80 %, а slot-ok — когда
+// журнал отпущен. Причина бывает и при исправном сборщике: долгая открытая
+// транзакция в базе не даёт слоту отпустить журнал. Те же числа — в
+// показателях сборщика (Metrics). Упавший сборщик о себе не скажет: о нём
+// говорит хранилище (источник замолчал).
 package pginput
 
 import (
@@ -46,6 +55,7 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/input"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgtap"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
@@ -81,6 +91,11 @@ type Config struct {
 	// DownAfter — связи с базой нет дольше этого — тревога db-down (и db-up,
 	// когда связь вернётся). По умолчанию 1m.
 	DownAfter config.Duration `json:"down_after"`
+	// SlotAlertMB — тревога slot-lag, когда база держит для слота столько
+	// мегабайт журнала, — в дополнение к долям предела базы (50 % и 80 % от
+	// max_slot_wal_keep_size), которые проверяются всегда. Нужна, когда предел
+	// в базе не задан или велик. 0 — только доли предела.
+	SlotAlertMB int `json:"slot_alert_mb"`
 	// Notify — кому нести тревоги. Нет раздела — тревоги только в alerts.jsonl
 	// и в журнале сборщика.
 	Notify *Notify `json:"notify"`
@@ -141,6 +156,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DownAfter.D() < time.Second {
 		errs = append(errs, fmt.Errorf("postgres.down_after %v: a second at least", c.DownAfter.D()))
+	}
+	if c.SlotAlertMB < 0 {
+		errs = append(errs, fmt.Errorf("postgres.slot_alert_mb %d: must not be negative", c.SlotAlertMB))
 	}
 	if n := c.Notify; n != nil {
 		if n.UndoHint == "" {
@@ -272,6 +290,12 @@ func SetupSQL(c *Config) (string, error) {
 		p("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s;", strings.Join(tables, ", "), id(r))
 		p("GRANT USAGE ON SCHEMA evidence TO %s;", id(r))
 		p("GRANT EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json), evidence.mark_refused(json) TO %s;", id(r))
+		// Таймауты роли — значения по умолчанию для любых её сессий, в том
+		// числе в обход MCP-сервера. Сессия может сменить их командой SET:
+		// жёсткий предел — таймер MCP-сервера (esmcp, statement_timeout).
+		p("ALTER ROLE %s SET statement_timeout = '60s';", id(r))
+		p("ALTER ROLE %s SET lock_timeout = '10s';", id(r))
+		p("ALTER ROLE %s SET idle_in_transaction_session_timeout = '5min';", id(r))
 	}
 	p("")
 	p("-- Таблицы: старая строка в журнал целиком, отметка «кто» перед каждым оператором.")
@@ -369,6 +393,11 @@ type Source struct {
 	downSaid  bool
 	// identitySaid — о каких таблицах без REPLICA IDENTITY FULL тревога уже поднята.
 	identitySaid string
+	// slot — что база сказала о слоте в последний раз; slotLevel — о каком
+	// уровне отставания уже поднята тревога (0 — в норме, 1 — половина
+	// предела, 2 — 80 %).
+	slot      SlotState
+	slotLevel int
 
 	partSize int // размер части pgtap; 0 — его умолчание (меняют тесты)
 }
@@ -747,6 +776,159 @@ func (s *Source) fail(err error) error {
 	return nil
 }
 
+// slotEvery — как часто спрашивать базу о слоте. Переменная — чтобы тест не
+// ждал.
+var slotEvery = 10 * time.Second
+
+// SlotState — что база говорит о слоте репликации.
+type SlotState struct {
+	At       time.Time // когда спрашивали; ноль — ещё не спрашивали
+	Status   string    // wal_status: reserved, extended, unreserved, lost
+	Retained int64     // столько байт журнала база держит для слота
+	Lag      int64     // на столько байт подтверждённая позиция отстаёт от конца журнала
+	Limit    int64     // max_slot_wal_keep_size в байтах; -1 — без предела
+	Safe     int64     // сколько байт журнала можно написать, пока слот не под угрозой; -1 — база не говорит
+}
+
+// watchSlot раз в slotEvery спрашивает базу о слоте и поднимает тревогу, когда
+// журнал для него дорос до половины предела, и снова — до 80 %.
+func (s *Source) watchSlot() error {
+	if time.Since(s.slot.At) < slotEvery {
+		return nil
+	}
+	row, ok, err := s.cat.QueryRow("SELECT s.wal_status, pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint, " +
+		"pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn)::bigint, coalesce(s.safe_wal_size, -1), " +
+		"(SELECT setting::bigint FROM pg_settings WHERE name = 'max_slot_wal_keep_size') " +
+		"FROM pg_replication_slots s WHERE s.slot_name = " + pgwire.Literal(s.cfg.Slot))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("replication slot %s is gone from the server", s.cfg.Slot)
+	}
+	num := func(v *string) int64 {
+		if v == nil {
+			return 0
+		}
+		var n int64
+		fmt.Sscan(*v, &n)
+		return n
+	}
+	st := SlotState{At: time.Now(), Retained: num(row[1]), Lag: num(row[2]), Safe: num(row[3]), Limit: num(row[4])}
+	if row[0] != nil {
+		st.Status = *row[0]
+	}
+	if st.Limit > 0 {
+		st.Limit <<= 20 // настройка — в мегабайтах
+	}
+	s.slot = st
+
+	level, calm := grade(st, s.cfg.SlotAlertMB)
+	switch {
+	case level > s.slotLevel:
+		s.slotLevel = level
+		detail := fmt.Sprintf("the server holds %s of its log for slot %s", human(st.Retained), s.cfg.Slot)
+		switch {
+		case st.Limit > 0 && st.Retained >= st.Limit:
+			detail += fmt.Sprintf(", more than the %s allowed (max_slot_wal_keep_size): at its next checkpoint it drops the slot and changes are lost", human(st.Limit))
+		case st.Limit > 0:
+			detail += fmt.Sprintf(", %d%% of the %s allowed (max_slot_wal_keep_size); at 100%% it drops the slot and changes are lost", st.Retained*100/st.Limit, human(st.Limit))
+		default:
+			detail += " and has no limit for it (max_slot_wal_keep_size): it grows until the disk is full"
+		}
+		if own := int64(s.cfg.SlotAlertMB) << 20; own > 0 && st.Retained >= own {
+			detail += fmt.Sprintf(" [alert threshold %d MB]", s.cfg.SlotAlertMB)
+		}
+		detail += fmt.Sprintf(". The collector is %s behind. Usual causes: a long open transaction on the server, or the collector cannot keep up", human(st.Lag))
+		s.log.Error("alert", "kind", alert.KindSlotLag, "detail", detail)
+		s.raise(alert.KindSlotLag, detail)
+	case s.slotLevel > 0 && level == 0 && calm:
+		s.slotLevel = 0
+		s.raise(alert.KindSlotOK, fmt.Sprintf("the server's log held for slot %s is back to %s", s.cfg.Slot, human(st.Retained)))
+	}
+	return nil
+}
+
+// grade — уровень отставания слота: 0 — в норме, 1 — журнал для слота дорос до
+// половины предела базы или до своего порога (ownMB мегабайт), 2 — до 80 %
+// предела. calm — можно сказать «снова в норме»: с запасом ниже порогов (40 %
+// предела и 80 % своего порога), чтобы тревоги не мигали у самой границы.
+func grade(st SlotState, ownMB int) (level int, calm bool) {
+	calm = true
+	if st.Limit > 0 {
+		switch pct := st.Retained * 100 / st.Limit; {
+		case pct >= 80:
+			level = 2
+		case pct >= 50:
+			level = 1
+		}
+		calm = st.Retained*100/st.Limit < 40
+	}
+	if own := int64(ownMB) << 20; own > 0 {
+		if st.Retained >= own {
+			level = max(level, 1)
+		}
+		calm = calm && st.Retained < own*8/10
+	}
+	return level, calm
+}
+
+// human — число байт словами.
+func human(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.0f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.0f kB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d bytes", n)
+}
+
+// Slot — что база сказала о слоте в последний раз.
+func (s *Source) Slot() SlotState { return s.slot }
+
+// Metrics — показатели входа для страницы /metrics сборщика. Зовётся из цикла
+// сборщика, как и остальные методы.
+func (s *Source) Metrics() []metrics.Family {
+	fams := []metrics.Family{
+		metrics.One("escollect_postgres_connected", "1 while the replication stream from the database is open", metrics.Gauge, metrics.Bool(s.repl != nil)),
+	}
+	if s.tap != nil {
+		st := s.tap.Stats()
+		fams = append(fams,
+			metrics.One("escollect_postgres_transactions_captured_total", "transactions of the watched roles put into the spool since the collector started", metrics.Counter, float64(st.Captured)),
+			metrics.One("escollect_postgres_transactions_skipped_total", "transactions of other roles passed by since the collector started", metrics.Counter, float64(st.Skipped)),
+			metrics.One("escollect_postgres_row_changes_total", "row changes put into the spool since the collector started", metrics.Counter, float64(st.Changes)),
+			metrics.One("escollect_postgres_alerts_total", "alert signals raised since the collector started", metrics.Counter, float64(st.Alerts)))
+	}
+	if !s.slot.At.IsZero() {
+		fams = append(fams,
+			metrics.One("escollect_postgres_slot_checked_timestamp_seconds", "when the collector last asked the server about its replication slot", metrics.Gauge, float64(s.slot.At.Unix())),
+			metrics.One("escollect_postgres_slot_retained_bytes", "the server's log held for the replication slot; at max_slot_wal_keep_size the server drops the slot", metrics.Gauge, float64(s.slot.Retained)),
+			metrics.One("escollect_postgres_slot_lag_bytes", "how far the position confirmed by the collector is behind the end of the server's log", metrics.Gauge, float64(s.slot.Lag)),
+			metrics.One("escollect_postgres_slot_lost", "1 when the server reports the slot as lost", metrics.Gauge, metrics.Bool(s.slot.Status == "lost")))
+		if s.slot.Limit > 0 {
+			fams = append(fams, metrics.One("escollect_postgres_slot_limit_bytes", "max_slot_wal_keep_size of the server", metrics.Gauge, float64(s.slot.Limit)))
+		}
+		if s.slot.Safe >= 0 {
+			fams = append(fams, metrics.One("escollect_postgres_slot_safe_bytes", "how much log the server can still write before the slot is in danger (safe_wal_size)", metrics.Gauge, float64(s.slot.Safe)))
+		}
+	}
+	if s.notifier != nil {
+		waiting := metrics.Family{Name: "escollect_alerts_waiting", Help: "alerts not yet delivered to a notify target", Type: metrics.Gauge}
+		failing := metrics.Family{Name: "escollect_alerts_target_failing", Help: "1 while a notify target refuses or cannot be reached", Type: metrics.Gauge}
+		for _, t := range s.notifier.Stats() {
+			label := [][2]string{{"target", t.Name}}
+			waiting.Samples = append(waiting.Samples, metrics.Sample{Labels: label, Value: float64(t.Waiting)})
+			failing.Samples = append(failing.Samples, metrics.Sample{Labels: label, Value: metrics.Bool(t.Failing)})
+		}
+		fams = append(fams, waiting, failing)
+	}
+	return fams
+}
+
 // raise пишет служебную тревогу входа в alerts.jsonl; оттуда её несёт
 // получателям notifier.
 func (s *Source) raise(kind, detail string) {
@@ -805,6 +987,9 @@ func (s *Source) Read() (int, error) {
 	// сервер замолчал надолго (step ждал status_every); между транзакциями —
 	// ещё и по времени: накопленное надо слать, а хранилищу — слышать пульс.
 	if err := s.pump(func(idle, inTx bool) bool { return idle || !inTx && time.Since(start) >= passBudget }); err != nil {
+		return s.emitted, s.fail(err)
+	}
+	if err := s.watchSlot(); err != nil {
 		return s.emitted, s.fail(err)
 	}
 	return s.emitted, nil

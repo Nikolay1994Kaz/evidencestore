@@ -17,12 +17,15 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/collector"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pginput"
@@ -116,6 +119,21 @@ func main() {
 		}
 		closeAll()
 		return
+	}
+	// Страница показателей — одна на процесс.
+	listen := cfgs[0].MetricsListen
+	for _, cfg := range cfgs {
+		if cfg.MetricsListen != listen {
+			failClosing(errors.New("metrics_listen differs between sources: one process serves one page, set it once at the top of the config"))
+		}
+	}
+	if listen != "" {
+		ln, err := net.Listen("tcp", listen)
+		failClosing(err)
+		srv := &http.Server{Handler: collector.MetricsHandler(cs...), ReadHeaderTimeout: 10 * time.Second}
+		go srv.Serve(ln)
+		defer srv.Close()
+		log.Info("metrics", "listen", ln.Addr().String())
 	}
 	if !many {
 		failClosing(cs[0].Run(ctx))

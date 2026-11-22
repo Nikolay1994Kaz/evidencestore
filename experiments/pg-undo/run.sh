@@ -12,6 +12,8 @@
 #   Тревоги сборщик несёт людям сам: Telegram, Slack-совместимый веб-хук, свой адрес в JSON
 #   (здесь все три — местный приёмник hook_server.py). В тревоге — готовая команда отката.
 #   У MCP-сервера — предел строк на действие: больше — откат до фиксации и тревога.
+#   Там же — таймер на запрос агента (отмена на сервере базы), предел действий в минуту и
+#   строк за окно (счёт по файлу квитанций). У сборщика — страница /metrics.
 #   Откат делают двое: оператор командой esundo и сам агент инструментом MCP undo_apply.
 #
 # Что происходит: агент делает хорошее действие и плохое (обнуляет треть счетов,
@@ -40,6 +42,7 @@ BIN=${ES_BIN:-$WORK/bin}
 PORT=${PORT:-18443}
 PGPORT=${PGPORT:-55432}
 HOOKPORT=${HOOKPORT:-$((PORT + 1))}
+METRICSPORT=${METRICSPORT:-$((PORT + 2))}
 ROWS=${ROWS:-2000}
 WINDOW=${WINDOW:-0}
 SRC=pg-agent
@@ -158,6 +161,7 @@ cat >"$WORK/collector.json" <<EOF
   "ca": "pki/ca.crt",
   "store_key": "$STORE_KEY",
   "flush_every": "200ms",
+  "metrics_listen": "127.0.0.1:$METRICSPORT",
   "sources": [
     {"cert": "pki/$SRC.crt", "key": "pki/$SRC.key", "spool_dir": "spool-$SRC",
      "postgres": {
@@ -234,6 +238,20 @@ cat >"$WORK/mcp.json" <<EOF
 }
 EOF
 "$BIN/evidencestore" tsa-root -config "$CFG" -out "$WORK/tsa-root.crt" >/dev/null 2>&1
+# Второй агент — со строгими пределами: секунда на запрос, четыре действия в
+# минуту, 50 строк за десять минут. Квитанции — в тот же файл.
+cat >"$WORK/mcp-strict.json" <<EOF
+{
+  "dsn": "host=$WORK/sock port=$PGPORT user=agent_bot dbname=shop",
+  "agent": "batch-bot",
+  "receipts": "mcp/receipts.jsonl",
+  "statement_timeout": "1s",
+  "actions_per_minute": 4,
+  "window_rows": 50,
+  "window": "10m"
+}
+EOF
+mcp_strict() { python3 -I "$HERE/mcp_call.py" "$BIN/esmcp" "$WORK/mcp-strict.json" "$1" "$2" 2>>"$WORK/mcp.log"; }
 # Настройки оператора для esundo: база и то, как достать записи из хранилища.
 OPDSN="host=$WORK/sock port=$PGPORT user=postgres dbname=shop"
 cat >"$WORK/undo.json" <<EOF
@@ -546,6 +564,57 @@ sed 's/^/    /' <<<"$REFUSED"
 grep -q 'reason given: "normalize everything"' <<<"$REFUSED" || die "в тревоге об отказе нет причины действия"
 [ "$(wc -l <"$INDEX")" = "$INDEX_BEFORE" ] || die "отказанное действие попало в хранилище как транзакция"
 echo "в базе ничего не изменилось, записей в хранилище нет; люди узнали из тревоги, квитанция — с исходом refused"
+
+# ---------------------------------------------------------------- таймер и частота
+
+step "таймер: запрос агента идёт дольше секунды (и сам снимает себе таймаут базы)"
+T=$(now)
+if R=$(mcp_strict execute "$(sql_arg "heavy report" <<<"set statement_timeout = 0; set lock_timeout = 0; select pg_sleep(30)")"); then die "зависший запрос прошёл: $R"; fi
+cut -c1-200 <<<"$R"
+grep -q "ran longer than 1s and was cancelled" <<<"$R" || die "ждали отмену по таймеру"
+TOOK=$(since "$T")
+python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 10 else 1)' "$TOOK" || die "отмена заняла $TOOK с"
+[ "$("${OWNER[@]}" -Atc "select count(*) from pg_stat_activity where query like '%pg_sleep(30)%' and state = 'active' and pid <> pg_backend_pid()")" = 0 ] ||
+  die "запрос агента всё ещё идёт на сервере базы"
+echo "отменён через $TOOK с; на сервере базы запрос не идёт: SET в запросе агента таймер MCP-сервера не снимает"
+hooked /alerts "ran longer than 1s" | sed -n '2p' | sed 's/^/    /'
+
+step "строки за окно: агент дробит большое изменение на части (предел — 50 строк за 10 минут)"
+for part in 1 2; do
+  R=$(mcp_strict execute "$(sql_arg "part $part of a big change" <<<"update accounts set note = 'part $part' where id between $((part * 100)) and $((part * 100 + 19))")") || die "часть $part не прошла: $R"
+done
+echo "две части по 20 строк прошли"
+if R=$(mcp_strict execute "$(sql_arg "part 3 of a big change" <<<"update accounts set note = 'part 3' where id between 300 and 319")"); then die "третья часть прошла: $R"; fi
+cut -c1-230 <<<"$R"
+grep -q "would have changed 60 rows in the last 10m0s, and the limit is 50" <<<"$R" || die "ждали отказ по строкам за окно"
+[ "$("${OWNER[@]}" -Atc "select count(*) from accounts where note = 'part 3'")" = 0 ] || die "третья часть изменила строки"
+hooked /alerts "would have changed 60 rows in 10m0s" | sed -n '2p' | sed 's/^/    /'
+
+step "частота: пятое действие за минуту (предел — четыре), потом ещё одно"
+if R=$(mcp_strict execute "$(sql_arg "again" <<<"update accounts set note = 'again' where id = 400")"); then die "пятое действие за минуту прошло: $R"; fi
+cut -c1-230 <<<"$R"
+grep -q "4 actions in the last minute, and the limit is 4" <<<"$R" || die "ждали отказ по частоте"
+if R=$(mcp_strict execute "$(sql_arg "and again" <<<"update accounts set note = 'again' where id = 400")"); then die "шестое действие за минуту прошло: $R"; fi
+[ "$("${OWNER[@]}" -Atc "select count(*) from accounts where note = 'again'")" = 0 ] || die "отказанное действие изменило строки"
+[ "$(grep -c '"agent":"batch-bot".*"cause":"rate"' "$WORK/mcp/receipts.jsonl")" = 2 ] || die "в квитанциях должны быть оба отказа по частоте"
+hooked /alerts "refuses the agent's actions" | sed -n '2p' | sed 's/^/    /'
+sleep 1
+[ "$(grep -c "refuses the agent's actions" "$ALERTS")" = 1 ] || die "тревога о частоте должна быть одна, а не на каждый отказ"
+echo "оба отказа — в квитанциях, тревога людям — одна; счёт шёл по файлу квитанций: каждое действие — новый сеанс сервера"
+
+# ---------------------------------------------------------------- показатели
+
+step "страница показателей сборщика (/metrics): оба источника, слот, очередь тревог"
+python3 -I - "http://127.0.0.1:$METRICSPORT/metrics" >"$WORK/metrics.txt" <<'PY'
+import sys, urllib.request
+sys.stdout.write(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())
+PY
+grep -E '^escollect_(spool_pending_records|acked_seq|postgres_connected|postgres_slot_retained_bytes|postgres_slot_limit_bytes|postgres_slot_lag_bytes|alerts_waiting)' "$WORK/metrics.txt" | sed 's/^/    /'
+for want in "escollect_up{source=\"$SRC\"} 1" 'escollect_up{source="agent-mcp"} 1' "escollect_postgres_connected{source=\"$SRC\"} 1" \
+  "escollect_postgres_slot_retained_bytes{source=\"$SRC\"} " "escollect_postgres_slot_limit_bytes{source=\"$SRC\"} 2.147483648e+09" \
+  "escollect_alerts_waiting{source=\"$SRC\",target=\"telegram\"} 0" "escollect_spool_pending_records{source=\"$SRC\"} 0"; do
+  grep -qF "$want" "$WORK/metrics.txt" || die "на странице показателей нет: $want"
+done
 
 # ---------------------------------------------------------------- живучесть
 

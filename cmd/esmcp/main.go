@@ -18,7 +18,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/mcpserver"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
@@ -40,6 +42,19 @@ type Config struct {
 	// действие execute. Больше — действие откатывается до фиксации, агент
 	// получает отказ, сборщик поднимает тревогу refused. 0 — без предела.
 	ActionRowLimit int `json:"action_row_limit"`
+	// ActionsPerMinute — сколько действий execute агент может сделать за
+	// минуту; WindowRows — сколько строк изменить за Window (по умолчанию
+	// 10m). Счёт — по журналу квитанций, общий для всех сеансов агента. 0 —
+	// без предела.
+	ActionsPerMinute int             `json:"actions_per_minute"`
+	WindowRows       int             `json:"window_rows"`
+	Window           config.Duration `json:"window"`
+	// StatementTimeout — сколько может идти SQL агента: дольше — запрос
+	// отменяется на сервере базы, действие откатывается. По умолчанию 1m.
+	// LockTimeout — сколько оператор агента ждёт чужую блокировку; по
+	// умолчанию 10s. "0s" — без предела.
+	StatementTimeout *config.Duration `json:"statement_timeout"`
+	LockTimeout      *config.Duration `json:"lock_timeout"`
 	// Undo — откуда брать до-образы для инструментов отката (тот же раздел,
 	// что у esundo -config). Нет секции — инструментов undo_preview и
 	// undo_apply у агента нет.
@@ -72,8 +87,26 @@ func loadConfig(path string) (*Config, error) {
 	if c.MaxRows < 0 {
 		errs = append(errs, errors.New("max_rows is negative"))
 	}
-	if c.ActionRowLimit < 0 {
-		errs = append(errs, errors.New("action_row_limit is negative"))
+	if c.ActionRowLimit < 0 || c.ActionsPerMinute < 0 || c.WindowRows < 0 {
+		errs = append(errs, errors.New("action_row_limit, actions_per_minute and window_rows must not be negative"))
+	}
+	if c.Window == 0 {
+		c.Window = config.Duration(10 * time.Minute)
+	}
+	if c.Window.D() < time.Minute || c.Window.D() > 24*time.Hour {
+		errs = append(errs, fmt.Errorf("window %v: from 1m to 24h", c.Window.D()))
+	}
+	for name, d := range map[string]**config.Duration{"statement_timeout": &c.StatementTimeout, "lock_timeout": &c.LockTimeout} {
+		if *d == nil {
+			def := config.Duration(time.Minute)
+			if name == "lock_timeout" {
+				def = config.Duration(10 * time.Second)
+			}
+			*d = &def
+		}
+		if (*d).D() < 0 {
+			errs = append(errs, fmt.Errorf("%s is negative", name))
+		}
 	}
 	if c.Undo != nil {
 		if err := c.Undo.Validate(filepath.Dir(path)); err != nil {
@@ -107,7 +140,9 @@ func main() {
 	defer receipts.Close()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	mc := mcpserver.Config{
-		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, Receipts: receipts, ReceiptsPath: cfg.Receipts, Version: version.String("esmcp"),
+		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, ActionsPerMinute: cfg.ActionsPerMinute,
+		WindowRows: cfg.WindowRows, Window: cfg.Window.D(), StatementTimeout: cfg.StatementTimeout.D(), LockTimeout: cfg.LockTimeout.D(),
+		Receipts: receipts, ReceiptsPath: cfg.Receipts, Version: version.String("esmcp"),
 		Dial: func() (mcpserver.DB, error) { return pgwire.Dial(context.Background(), dsn) },
 	}
 	if cfg.Undo != nil {

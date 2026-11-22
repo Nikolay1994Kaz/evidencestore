@@ -179,6 +179,10 @@ type Conn struct {
 	r      *bufio.Reader
 	params map[string]string // ParameterStatus сервера
 	stream bool              // идёт поток репликации (CopyBoth)
+	// cfg и ключ отмены (BackendKeyData) — для Cancel: после входа не меняются,
+	// поэтому Cancel можно звать с другого потока.
+	cfg         Config
+	pid, secret uint32
 }
 
 // Dial подключается и проходит вход.
@@ -206,7 +210,7 @@ func Dial(ctx context.Context, cfg Config) (_ *Conn, err error) {
 		}
 		nc = secured
 	}
-	c := &Conn{nc: nc, r: bufio.NewReaderSize(nc, 64<<10), params: map[string]string{}}
+	c := &Conn{nc: nc, r: bufio.NewReaderSize(nc, 64<<10), params: map[string]string{}, cfg: cfg}
 	if err := c.startup(cfg); err != nil {
 		return nil, err
 	}
@@ -331,13 +335,57 @@ func (c *Conn) startup(cfg Config) error {
 			if k, v, ok := strings.Cut(strings.TrimRight(string(msg), "\x00"), "\x00"); ok {
 				c.params[k] = v
 			}
-		case 'K', 'N':
+		case 'K': // BackendKeyData: номер процесса сервера и ключ для запроса отмены
+			if len(msg) >= 8 {
+				c.pid, c.secret = binary.BigEndian.Uint32(msg), binary.BigEndian.Uint32(msg[4:])
+			}
+		case 'N':
 		case 'Z':
 			return nil
 		default:
 			return fmt.Errorf("pgwire: unexpected message %q during startup", typ)
 		}
 	}
+}
+
+// Cancel просит сервер прервать запрос, который сейчас идёт по этому
+// соединению (CancelRequest по отдельному соединению, как делает psql по
+// Ctrl-C). Единственный метод, который можно звать с другого потока, пока
+// Query ждёт ответа: Query тогда вернёт ошибку сервера 57014. Запрос уже
+// кончился — отмена ничего не делает. Ответа на неё сервер не даёт: nil —
+// просьба дошла, а не «запрос прерван».
+func (c *Conn) Cancel() error {
+	if c.pid == 0 {
+		return errors.New("pgwire: the server gave no key to cancel with")
+	}
+	const wait = 5 * time.Second
+	d := net.Dialer{Timeout: wait}
+	nc, err := d.Dial(c.cfg.Network, c.cfg.Address)
+	if err != nil {
+		return fmt.Errorf("pgwire: cancel: %w", err)
+	}
+	defer func() { nc.Close() }()
+	nc.SetDeadline(time.Now().Add(wait))
+	if c.cfg.SSLMode == "require" || c.cfg.SSLMode == "verify-full" {
+		// Ключ отмены — по тому же шифрованию, что и само соединение. Отдельная
+		// переменная: при ошибке startTLS возвращает nil, а отложенное закрытие
+		// выше должно закрыть исходное соединение (как в Dial, P-231).
+		secured, err := startTLS(nc, c.cfg)
+		if err != nil {
+			return fmt.Errorf("pgwire: cancel: %w", err)
+		}
+		nc = secured
+	}
+	req := binary.BigEndian.AppendUint32(nil, 16)
+	req = binary.BigEndian.AppendUint32(req, 80877102) // код CancelRequest
+	req = binary.BigEndian.AppendUint32(req, c.pid)
+	req = binary.BigEndian.AppendUint32(req, c.secret)
+	if _, err := nc.Write(req); err != nil {
+		return fmt.Errorf("pgwire: cancel: %w", err)
+	}
+	// Сервер молча закрывает соединение, когда просьба обработана.
+	io.Copy(io.Discard, nc)
+	return nil
 }
 
 // Param — значение параметра сервера из ParameterStatus (server_version и т. п.).

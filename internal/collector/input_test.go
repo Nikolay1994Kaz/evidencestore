@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +18,7 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/input"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pginput"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/store"
 )
@@ -94,6 +98,15 @@ func (f *fakeInput) Wait(ctx context.Context, d time.Duration) {
 }
 
 func (f *fakeInput) Close() error { f.closed = true; return nil }
+
+// Metrics — показатели входа: свой и с меткой, как у очереди тревог.
+func (f *fakeInput) Metrics() []metrics.Family {
+	return []metrics.Family{
+		metrics.One("escollect_fake_position", "where the fake input stands", metrics.Gauge, float64(f.pos)),
+		{Name: "escollect_alerts_waiting", Help: "alerts not yet delivered to a notify target", Type: metrics.Gauge,
+			Samples: []metrics.Sample{{Labels: [][2]string{{"target", "telegram"}}, Value: 2}}},
+	}
+}
 
 // inputRig — стенд, где сборщик читает не файл, а вход.
 func inputRig(t *testing.T) (*rig, *fakeSource) {
@@ -492,5 +505,85 @@ func TestLoadConfigsWithSeveralSources(t *testing.T) {
 		if _, err := LoadConfigs(write(body)); err == nil {
 			t.Errorf("%s: принято", name)
 		}
+	}
+}
+
+// Страница /metrics: показатели сборщика и его входа с меткой источника; у
+// процесса с несколькими источниками одноимённые показатели — один показатель
+// с разными метками. Страница отдаёт снимок последнего прохода цикла, а не
+// читает поля сборщика из чужого потока.
+func TestMetricsPage(t *testing.T) {
+	r, src := inputRig(t)
+	c, _ := r.again(t, src)
+	get := func(cs ...*Collector) string {
+		t.Helper()
+		srv := httptest.NewServer(MetricsHandler(cs...))
+		defer srv.Close()
+		resp, err := http.Get(srv.URL + "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain; version=0.0.4") {
+			t.Fatalf("%s %s", resp.Status, resp.Header.Get("Content-Type"))
+		}
+		return string(body)
+	}
+	if page := get(c); page != "" {
+		t.Fatalf("a page before the first pass of the loop:\n%s", page)
+	}
+	src.add("a")
+	src.add("b1", "b2")
+	if _, err := c.ReadOnce(); err != nil {
+		t.Fatal(err)
+	}
+	c.publish()
+	page := get(c)
+	for _, want := range []string{
+		"# TYPE escollect_spool_pending_records gauge\n",
+		`escollect_up{source="abs-core"} 1` + "\n",
+		`escollect_spool_pending_records{source="abs-core"} 3` + "\n",
+		`escollect_issued_seq{source="abs-core"} 3` + "\n",
+		`escollect_acked_seq{source="abs-core"} 0` + "\n",
+		`escollect_fake_position{source="abs-core"} 2` + "\n",
+		`escollect_alerts_waiting{source="abs-core",target="telegram"} 2` + "\n",
+		`escollect_loop_timestamp_seconds{source="abs-core"} `,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("the page lacks %q:\n%s", want, page)
+		}
+	}
+	if strings.Contains(page, `escollect_store_last_contact_timestamp_seconds{source="abs-core"} 0`+"\n") {
+		t.Fatal("the store answered at bootstrap, but the page says it never did")
+	}
+	// Доставили — снимок прежний, пока цикл не сложит новый.
+	if err := c.SendOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(get(c), `escollect_spool_pending_records{source="abs-core"} 3`) {
+		t.Fatal("the page read the collector's fields past the snapshot")
+	}
+	c.publish()
+	if page := get(c); !strings.Contains(page, `escollect_spool_pending_records{source="abs-core"} 0`) || !strings.Contains(page, `escollect_acked_seq{source="abs-core"} 3`) {
+		t.Fatalf("after delivery:\n%s", page)
+	}
+	// Второй источник того же процесса.
+	r2, src2 := inputRig(t)
+	c2, _ := r2.again(t, src2)
+	c2.source = "pg-agent"
+	c2.publish()
+	page = get(c, c2)
+	if strings.Count(page, "# TYPE escollect_up gauge") != 1 || !strings.Contains(page, `escollect_up{source="abs-core"} 1`) || !strings.Contains(page, `escollect_up{source="pg-agent"} 1`) {
+		t.Fatalf("two sources on one page:\n%s", page)
+	}
+	// Снимок первого источника вторым не испорчен.
+	if page := get(c); strings.Contains(page, "pg-agent") {
+		t.Fatalf("the first collector's snapshot was changed by the merge:\n%s", page)
+	}
+	bad := *r.cfg
+	bad.MetricsListen = "9465"
+	if err := bad.validate(); err == nil {
+		t.Fatal("metrics_listen without a host:port form was accepted")
 	}
 }

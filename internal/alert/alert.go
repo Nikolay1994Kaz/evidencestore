@@ -49,6 +49,8 @@ const (
 	KindDBDown     = "db-down"     // нет связи с базой дольше порога
 	KindDBUp       = "db-up"       // связь с базой вернулась
 	KindGap        = "gap"         // записи потеряны: слот удалён или его журнал стёрт
+	KindSlotLag    = "slot-lag"    // база копит журнал для слота: до предела — половина или меньше
+	KindSlotOK     = "slot-ok"     // журнал для слота снова в норме
 )
 
 // Signal — один повод тревоги.
@@ -222,8 +224,8 @@ const maxText = 3500
 // сотом одинаковом поводе.
 const (
 	maxTables  = 8
-	maxSignals = 12
-	maxLine    = 300
+	maxSignals = 8
+	maxLine    = 400
 )
 
 // short режет строку до maxLine знаков.

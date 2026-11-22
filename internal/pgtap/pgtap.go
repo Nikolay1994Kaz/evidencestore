@@ -428,17 +428,36 @@ func (t *Tap) refused(m pgoutput.Message) error {
 	var c struct {
 		Role string `json:"role"`
 		Info struct {
-			Rows  int `json:"rows"`
-			Limit int `json:"limit"`
+			Cause      string `json:"cause"` // причины — как в internal/mcpserver (Cause…)
+			Rows       int    `json:"rows"`
+			Limit      int    `json:"limit"`
+			WindowRows int    `json:"window_rows"`
+			Window     string `json:"window"`
+			Actions    int    `json:"actions"`
+			Timeout    string `json:"timeout"`
 		} `json:"info"`
 	}
 	if json.Unmarshal(m.Content, &c) != nil || !t.roles[c.Role] {
 		return nil
 	}
 	t.lastRefused = m.LSN
+	var detail string
+	switch i := c.Info; i.Cause {
+	case "", "row-limit":
+		detail = fmt.Sprintf("the MCP server stopped an action that would change %d rows (the limit for one action is %d): it was rolled back, nothing changed", i.Rows, i.Limit)
+	case "window-rows":
+		detail = fmt.Sprintf("the MCP server stopped an action of %d rows: with it the agent would have changed %d rows in %s (the limit is %d): it was rolled back, nothing changed",
+			i.Rows, i.WindowRows+i.Rows, i.Window, i.Limit)
+	case "rate":
+		detail = fmt.Sprintf("the MCP server refuses the agent's actions: %d in the last minute (the limit is %d). This is reported once a minute at most; every refusal is in the receipts",
+			i.Actions, i.Limit)
+	case "timeout":
+		detail = fmt.Sprintf("the MCP server cancelled an action that ran longer than %s: it was rolled back, nothing changed", i.Timeout)
+	default:
+		detail = fmt.Sprintf("the MCP server stopped an action (%s): nothing changed", i.Cause)
+	}
 	ev := alert.Event{Time: t.now().UTC().Format(time.RFC3339Nano), Actions: []json.RawMessage{m.Content}}
-	ev.Add(alert.KindRefused, fmt.Sprintf("the MCP server stopped an action that would change %d rows (the limit for one action is %d): it was rolled back, nothing changed",
-		c.Info.Rows, c.Info.Limit))
+	ev.Add(alert.KindRefused, detail)
 	return t.raise(ev)
 }
 

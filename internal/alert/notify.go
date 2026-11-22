@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -240,6 +241,7 @@ const (
 
 // Notifier несёт тревоги из файла получателям: по потоку на каждого.
 type Notifier struct {
+	senders []*sender
 	wakes   []chan struct{}
 	closing chan struct{} // закрыт — дослать очередь и выйти
 	cancel  context.CancelFunc
@@ -276,6 +278,7 @@ func Start(o Options, log *slog.Logger) (*Notifier, error) {
 			cancel()
 			return nil, err
 		}
+		n.senders = append(n.senders, s)
 		n.wakes = append(n.wakes, s.wake)
 		n.wg.Add(1)
 		go func() {
@@ -284,6 +287,24 @@ func Start(o Options, log *slog.Logger) (*Notifier, error) {
 		}()
 	}
 	return n, nil
+}
+
+// TargetStats — очередь одного получателя: сколько тревог ждёт отправки и
+// отказывает ли он сейчас.
+type TargetStats struct {
+	Name    string
+	Waiting int
+	Failing bool
+}
+
+// Stats — состояние очередей получателей (для показателей сборщика). Можно
+// звать с любого потока.
+func (n *Notifier) Stats() []TargetStats {
+	out := make([]TargetStats, len(n.senders))
+	for i, s := range n.senders {
+		out[i] = TargetStats{Name: s.target.Name, Waiting: int(s.waiting.Load()), Failing: s.down.Load()}
+	}
+	return out
 }
 
 // Wake будит доставку: в файле новая тревога.
@@ -328,6 +349,10 @@ type sender struct {
 
 	failing  bool      // последний запрос не прошёл
 	loggedAt time.Time // когда последний раз сказали об отказе
+
+	// Для Stats: сколько тревог в очереди и отказывает ли получатель.
+	waiting atomic.Int64
+	down    atomic.Bool
 }
 
 // item — тревога в очереди и где кончается её строка.
@@ -468,6 +493,7 @@ func (s *sender) run(ctx context.Context) {
 			}
 			continue
 		}
+		s.waiting.Store(int64(len(items)))
 		if len(items) == 0 {
 			select {
 			case <-ctx.Done():
@@ -508,6 +534,8 @@ func (s *sender) run(ctx context.Context) {
 				s.log.Info("alerts are delivered again")
 				s.failing, s.loggedAt = false, time.Time{}
 			}
+			s.down.Store(false)
+			s.waiting.Add(-int64(len(m.events)))
 			retry = 0
 			s.offset = m.end
 			if err := s.save(); err != nil {
@@ -524,6 +552,7 @@ func (s *sender) run(ctx context.Context) {
 // complain говорит об отказе в журнал: первый раз сразу, потом — раз в
 // десять минут. fatal — дело в настройках, это ошибка, а не предупреждение.
 func (s *sender) complain(msg string, err error, fatal bool) {
+	s.down.Store(true)
 	if s.failing && time.Since(s.loggedAt) < 10*time.Minute {
 		return
 	}

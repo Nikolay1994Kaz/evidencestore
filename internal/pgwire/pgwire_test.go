@@ -165,3 +165,58 @@ func TestDialTLSFailureIsAnError(t *testing.T) {
 		})
 	}
 }
+
+// Отмена запроса идёт новым соединением; TLS на нём не удался — Cancel
+// возвращает ошибку и закрывает соединение, а не роняет процесс: таймер
+// MCP-сервера после неудачной отмены закрывает соединение с запросом сам.
+func TestCancelTLSFailureIsAnError(t *testing.T) {
+	for _, tc := range []struct{ name, reply, want string }{
+		{"the server has TLS off", "N", "refused TLS"},
+		{"the server drops the connection", "", "EOF"},
+		{"not a TLS server", "Sthis is not a TLS handshake", "pgwire: TLS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			closed := make(chan struct{}) // заглушка увидела конец соединения
+			go func() {
+				defer close(closed)
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				var req [8]byte
+				if _, err := io.ReadFull(c, req[:]); err != nil || tc.reply == "" {
+					return
+				}
+				c.Write([]byte(tc.reply))
+				io.Copy(io.Discard, c)
+			}()
+			cfg, err := ParseDSN(fmt.Sprintf("host=127.0.0.1 port=%d user=u dbname=d sslmode=require", ln.Addr().(*net.TCPAddr).Port))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &Conn{cfg: cfg, pid: 7, secret: 9}
+			err = c.Cancel()
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "cancel") {
+				t.Fatalf("error %q, expected a cancel error with %q", err, tc.want)
+			}
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the connection was left open")
+			}
+		})
+	}
+	// Сервер не дал ключа отмены — просить нечем.
+	if err := (&Conn{}).Cancel(); err == nil {
+		t.Fatal("cancelled without a key")
+	}
+}

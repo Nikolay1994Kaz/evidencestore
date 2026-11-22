@@ -68,6 +68,18 @@ type Config struct {
 	// отказ, а в журнале базы остаётся отметка, по которой сборщик поднимает
 	// тревогу. 0 — без предела.
 	RowLimit int
+	// StatementTimeout — сколько может идти SQL агента (query и execute):
+	// дольше — запрос отменяется на сервере базы, соединение закрывается,
+	// действие откатывается. LockTimeout — сколько оператор агента ждёт чужую
+	// блокировку (SET LOCAL lock_timeout в начале транзакции). 0 — не задано.
+	StatementTimeout time.Duration
+	LockTimeout      time.Duration
+	// ActionsPerMinute — сколько действий execute агент может сделать за
+	// минуту; WindowRows — сколько строк изменить за Window. Счёт — по файлу
+	// квитанций, общий для всех сеансов агента. 0 — без предела.
+	ActionsPerMinute int
+	WindowRows       int
+	Window           time.Duration
 	// Dial открывает соединение ролью агента. Зовётся при первом запросе и
 	// заново после обрыва.
 	Dial func() (DB, error)
@@ -83,19 +95,25 @@ type Config struct {
 
 // Receipt — квитанция одного действия.
 type Receipt struct {
-	ActionID string          `json:"action_id"`
-	Time     string          `json:"time"`
-	Agent    string          `json:"agent"`
-	Tool     string          `json:"tool"`
-	SQL      string          `json:"sql"`
-	Reason   string          `json:"reason,omitempty"`
-	XID      string          `json:"xid,omitempty"`
-	Outcome  string          `json:"outcome"` // committed, failed или refused (остановлено пределом строк)
-	Tags     []string        `json:"tags,omitempty"`
-	Rows     int             `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
-	Error    string          `json:"error,omitempty"`
-	Undoes   string          `json:"undoes,omitempty"` // у отката: какое действие он возвращает
-	Client   json.RawMessage `json:"client,omitempty"`
+	ActionID string   `json:"action_id"`
+	Time     string   `json:"time"`
+	Agent    string   `json:"agent"`
+	Tool     string   `json:"tool"`
+	SQL      string   `json:"sql"`
+	Reason   string   `json:"reason,omitempty"`
+	XID      string   `json:"xid,omitempty"`
+	Outcome  string   `json:"outcome"` // committed, failed или refused (остановлено пределом строк)
+	Tags     []string `json:"tags,omitempty"`
+	Rows     int      `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
+	// Cause — почему действие остановлено сервером: row-limit, window-rows,
+	// rate (отказы) или timeout (запрос отменён по времени).
+	Cause string `json:"cause,omitempty"`
+	// Alerted — об этом отказе за частоту людям ушла тревога (об остальных в
+	// ту же минуту — нет).
+	Alerted bool            `json:"alerted,omitempty"`
+	Error   string          `json:"error,omitempty"`
+	Undoes  string          `json:"undoes,omitempty"` // у отката: какое действие он возвращает
+	Client  json.RawMessage `json:"client,omitempty"`
 }
 
 // Server — один агент на одном потоке ввода-вывода.
@@ -107,6 +125,8 @@ type Server struct {
 	newID  func() string
 	client json.RawMessage // clientInfo последнего запроса или initialize
 	recent []Receipt
+	// ledger — расход агента по файлу квитанций (limits.go).
+	ledger *ledger
 }
 
 // New собирает сервер.
@@ -307,13 +327,26 @@ var tools = []map[string]any{
 // tools — список инструментов: откат есть, только если сервер умеет достать до-образы.
 func (s *Server) tools() []map[string]any {
 	list := slices.Clone(tools)
+	// Агент должен знать о пределах заранее, а не из отказа.
+	var limits string
 	if s.cfg.RowLimit > 0 {
-		// Агент должен знать о пределе заранее, а не из отказа.
+		limits += fmt.Sprintf(" One action may change at most %d rows: a larger one is rolled back, nothing changes, "+
+			"and the operators are alerted. Do not split such a change into smaller actions; ask a person.", s.cfg.RowLimit)
+	}
+	if s.cfg.WindowRows > 0 {
+		limits += fmt.Sprintf(" All actions together may change at most %d rows in %s.", s.cfg.WindowRows, s.cfg.Window)
+	}
+	if s.cfg.ActionsPerMinute > 0 {
+		limits += fmt.Sprintf(" At most %d actions a minute: do not retry a refused action in a loop.", s.cfg.ActionsPerMinute)
+	}
+	if s.cfg.StatementTimeout > 0 {
+		limits += fmt.Sprintf(" A statement that runs longer than %s is cancelled and the action is rolled back.", s.cfg.StatementTimeout)
+	}
+	if limits != "" {
 		for i, t := range list {
 			if t["name"] == "execute" {
 				t = maps.Clone(t)
-				t["description"] = t["description"].(string) + fmt.Sprintf(" One action may change at most %d rows: a larger one is rolled back, nothing changes, "+
-					"and the operators are alerted. Do not split such a change into smaller actions; ask a person.", s.cfg.RowLimit)
+				t["description"] = t["description"].(string) + limits
 				list[i] = t
 			}
 		}
@@ -496,20 +529,13 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 // run исполняет запрос; соединение, сломавшееся не по вине запроса, бросает,
 // чтобы следующий вызов открыл новое.
 func (s *Server) run(sql string) ([]pgwire.Result, error) {
-	if s.db == nil {
-		db, err := s.cfg.Dial()
-		if err != nil {
-			return nil, fmt.Errorf("the database is unreachable: %w", err)
-		}
-		s.db = db
+	if err := s.connect(); err != nil {
+		return nil, err
 	}
 	res, err := s.db.Query(sql)
 	var pg *pgwire.PgError
 	if err != nil && !errors.As(err, &pg) {
-		if c, ok := s.db.(io.Closer); ok {
-			c.Close()
-		}
-		s.db = nil
+		s.drop()
 	}
 	return res, err
 }
@@ -518,8 +544,16 @@ func (s *Server) query(sql string) (string, error) {
 	if _, err := s.run("BEGIN TRANSACTION READ ONLY"); err != nil {
 		return "", err
 	}
-	res, err := s.run(sql)
-	s.run("ROLLBACK")
+	if guards := s.guards(); guards != "" {
+		if _, err := s.run(guards); err != nil {
+			s.run("ROLLBACK")
+			return "", err
+		}
+	}
+	res, err := s.timed(sql)
+	if s.db != nil { // по таймауту соединение уже закрыто
+		s.run("ROLLBACK")
+	}
 	if err != nil {
 		return "", err
 	}
@@ -553,7 +587,10 @@ func (s *Server) query(sql string) (string, error) {
 func (s *Server) execute(sql, reason string) (string, error) {
 	rc := Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "execute",
 		SQL: sql, Reason: reason, Client: s.client, Outcome: "failed"}
-	err := s.transaction(&rc)
+	err := s.throttle(&rc)
+	if err == nil {
+		err = s.transaction(&rc)
+	}
 	if err != nil {
 		rc.Error = err.Error()
 	}
@@ -561,6 +598,9 @@ func (s *Server) execute(sql, reason string) (string, error) {
 		// Действие без квитанции — дыра в учёте: о ней должен узнать и агент, и оператор.
 		s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
 		return "", fmt.Errorf("action %s is %s, but its receipt could not be written: %v", rc.ActionID, rc.Outcome, werr)
+	}
+	if err != nil && rc.Cause == CauseRate {
+		return "", fmt.Errorf("action %s was refused: %w", rc.ActionID, err)
 	}
 	if err != nil && rc.Outcome == "refused" {
 		return "", fmt.Errorf("action %s was refused and rolled back, nothing changed: %w", rc.ActionID, err)
@@ -572,13 +612,48 @@ func (s *Server) execute(sql, reason string) (string, error) {
 	return string(out), nil
 }
 
+// throttle — предел действий в минуту: отказ раньше, чем действие пойдёт в
+// базу.
+func (s *Server) throttle(rc *Receipt) error {
+	if s.cfg.ActionsPerMinute <= 0 {
+		return nil
+	}
+	now := s.now()
+	actions, _, alerted, err := s.usage(now)
+	if err != nil {
+		// Не сосчитать — не пускать: предел, который молча не работает, хуже
+		// его отсутствия.
+		return fmt.Errorf("the receipts journal could not be read, so the limit of %d actions a minute cannot be checked: %w", s.cfg.ActionsPerMinute, err)
+	}
+	if actions < s.cfg.ActionsPerMinute {
+		return nil
+	}
+	rc.Outcome, rc.Cause = "refused", CauseRate
+	// Тревога людям — на первый отказ и потом не чаще раза в минуту: агент в
+	// цикле не должен завалить их сообщениями. В квитанциях — каждый отказ, и
+	// по ним же видно, когда тревога уже была: сеансов у агента много.
+	if now.Sub(alerted) >= time.Minute {
+		rc.Alerted = true
+		s.markRefused(rc, map[string]any{"actions": actions, "limit": s.cfg.ActionsPerMinute})
+	}
+	return fmt.Errorf("%d actions in the last minute, and the limit is %d. Wait before the next one and do not retry in a loop; if this pace is needed, ask a person to raise the limit",
+		actions, s.cfg.ActionsPerMinute)
+}
+
 func (s *Server) transaction(rc *Receipt) error {
 	if _, err := s.run("BEGIN"); err != nil {
 		return err
 	}
 	fail := func(err error) error {
-		s.run("ROLLBACK")
+		if s.db != nil { // по таймауту соединение уже закрыто, транзакция откатилась с ним
+			s.run("ROLLBACK")
+		}
 		return err
+	}
+	if guards := s.guards(); guards != "" {
+		if _, err := s.run(guards); err != nil {
+			return fail(err)
+		}
 	}
 	mark, _ := json.Marshal(map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": rc.Reason, "client": rc.Client})
 	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
@@ -592,33 +667,53 @@ func (s *Server) transaction(rc *Receipt) error {
 	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
 		rc.XID = *res[0].Rows[0][0]
 	}
-	res, err = s.run(rc.SQL)
+	res, err = s.timed(rc.SQL)
 	for _, r := range res {
 		rc.Tags = append(rc.Tags, r.Tag)
+	}
+	if errors.Is(err, errTimeout) {
+		// Соединение закрыто, транзакция откатилась вместе с ним. Отметка для
+		// тревоги — по новому соединению.
+		rc.Cause = CauseTimeout
+		s.markRefused(rc, map[string]any{"timeout": s.cfg.StatementTimeout.String()})
+		return err
 	}
 	if err != nil {
 		return fail(err)
 	}
-	if s.cfg.RowLimit > 0 {
+	if s.cfg.RowLimit > 0 || s.cfg.WindowRows > 0 {
 		// Предохранитель: до фиксации известно, сколько строк действие изменило.
 		// Не сосчитать — не фиксировать: предел, который молча не работает, хуже
 		// его отсутствия.
 		rows, err := s.changed(rc.Tags)
 		if err != nil {
-			return fail(fmt.Errorf("the rows the action changed could not be counted, so the limit of %d rows cannot be checked: %w", s.cfg.RowLimit, err))
+			return fail(fmt.Errorf("the rows the action changed could not be counted, so the row limits cannot be checked: %w", err))
 		}
-		if rc.Rows = rows; rows > s.cfg.RowLimit {
-			// Отметка об отказе — не транзакционное сообщение журнала базы:
-			// откат её не стирает, и сборщик поднимет тревогу для людей.
-			mark, _ := json.Marshal(map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "reason": rc.Reason, "rows": rows, "limit": s.cfg.RowLimit})
-			if _, err := s.run("SELECT evidence.mark_refused(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
-				s.log.Error("the refusal is not marked in the database log, so no alert is raised for it (is the database prepared with the current escollect -setup-sql?)",
-					"action", rc.ActionID, "err", err)
-			}
+		rc.Rows = rows
+		// refuse: отметка об отказе — не транзакционное сообщение журнала базы,
+		// откат её не стирает, и сборщик поднимет тревогу для людей.
+		refuse := func(cause string, info map[string]any, why error) error {
+			rc.Cause = cause
+			s.markRefused(rc, info)
 			s.run("ROLLBACK")
 			rc.Outcome = "refused"
-			return fmt.Errorf("it would change %d rows, and one action may change at most %d. Do not split it into smaller actions: ask a person to do it or to raise the limit",
-				rows, s.cfg.RowLimit)
+			return why
+		}
+		if s.cfg.RowLimit > 0 && rows > s.cfg.RowLimit {
+			return refuse(CauseRowLimit, map[string]any{"rows": rows, "limit": s.cfg.RowLimit},
+				fmt.Errorf("it would change %d rows, and one action may change at most %d. Do not split it into smaller actions: ask a person to do it or to raise the limit",
+					rows, s.cfg.RowLimit))
+		}
+		if s.cfg.WindowRows > 0 {
+			_, before, _, err := s.usage(s.now())
+			if err != nil {
+				return fail(fmt.Errorf("the receipts journal could not be read, so the limit of %d rows in %s cannot be checked: %w", s.cfg.WindowRows, s.cfg.Window, err))
+			}
+			if before+rows > s.cfg.WindowRows {
+				return refuse(CauseWindowRows, map[string]any{"rows": rows, "window_rows": before, "limit": s.cfg.WindowRows, "window": s.cfg.Window.String()},
+					fmt.Errorf("with its %d rows the agent would have changed %d rows in the last %s, and the limit is %d. Do not go on in smaller actions: ask a person to do it or to raise the limit",
+						rows, before+rows, s.cfg.Window, s.cfg.WindowRows))
+			}
 		}
 	}
 	if _, err := s.run("COMMIT"); err != nil {

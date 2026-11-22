@@ -581,6 +581,22 @@ func TestRefusedActionRaisesAnAlert(t *testing.T) {
 	if text := alert.Text(ev[0], alert.TextOptions{Title: "database shop"}); !strings.Contains(text, "action: a-7, agent support-bot") {
 		t.Fatalf("text:\n%s", text)
 	}
+	// Другие причины отказа — другие слова в тревоге.
+	for i, c := range [][2]string{
+		{`"cause":"window-rows","rows":400,"window_rows":800,"limit":1000,"window":"10m0s"`, "would have changed 1200 rows in 10m0s (the limit is 1000)"},
+		{`"cause":"rate","actions":30,"limit":30`, "30 in the last minute (the limit is 30)"},
+		{`"cause":"timeout","timeout":"1m0s"`, "cancelled an action that ran longer than 1m0s"},
+		{`"cause":"something-new"`, "stopped an action (something-new)"},
+	} {
+		before := len(h.alerts())
+		if _, err := h.tap.Handle(pgoutput.Message{LSN: uint64(1000 + i), Prefix: PrefixRefused, Content: []byte(`{"role":"agent","info":{` + c[0] + `}}`)}); err != nil {
+			t.Fatal(err)
+		}
+		ev := h.alerts()
+		if len(ev) != before+1 || !strings.Contains(ev[len(ev)-1].Signals[0].Detail, c[1]) {
+			t.Fatalf("cause %s: %+v", c[0], ev[len(ev)-1])
+		}
+	}
 }
 
 func TestUndoTransactionIsJournaled(t *testing.T) {

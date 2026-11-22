@@ -37,6 +37,7 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 		"status_every 2m":      func(c *Config) { c.StatusEvery = config.Duration(2 * time.Minute) },
 		"alert_rows -1":        func(c *Config) { c.AlertRows = -1 },
 		"down_after 10ms":      func(c *Config) { c.DownAfter = config.Duration(10 * time.Millisecond) },
+		"slot_alert_mb -1":     func(c *Config) { c.SlotAlertMB = -1 },
 		"notify to nobody":     func(c *Config) { c.Notify = &Notify{} },
 		"notify to a bad target": func(c *Config) {
 			c.Notify = &Notify{To: []alert.Target{{Type: alert.TypeSlack, URL: "http://example.com/hook"}}}
@@ -78,6 +79,9 @@ func TestSetupSQL(t *testing.T) {
 		`REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC`,
 		`PERFORM pg_logical_emit_message(false, 'evidence/refused',`,
 		`evidence.mark_refused(json) TO "agent ""x""";`,
+		`ALTER ROLE "agent ""x""" SET statement_timeout = '60s';`,
+		`ALTER ROLE "agent ""x""" SET lock_timeout = '10s';`,
+		`ALTER ROLE "agent ""x""" SET idle_in_transaction_session_timeout = '5min';`,
 		// Публикация: с PostgreSQL 18 — вместе с хранимыми генерируемыми колонками.
 		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders" WITH (publish_generated_columns = stored)';`,
 		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders"';`,
@@ -104,5 +108,39 @@ func TestSetupSQL(t *testing.T) {
 	// Проверка — раньше первого изменения базы.
 	if guard, first := strings.Index(sql, "RAISE EXCEPTION"), strings.Index(sql, "CREATE SCHEMA"); guard < 0 || guard > first {
 		t.Error("the refusal comes after the script has begun to change the database")
+	}
+}
+
+// Уровни отставания слота: половина предела базы, 80 % предела, свой порог в
+// мегабайтах; назад в норму — с запасом, чтобы тревоги не мигали у границы.
+func TestSlotGrade(t *testing.T) {
+	const mb = 1 << 20
+	for _, tc := range []struct {
+		name            string
+		retained, limit int64
+		own             int
+		level           int
+		calm            bool
+	}{
+		{"далеко от предела", 100 * mb, 2048 * mb, 0, 0, true},
+		{"половина предела", 1024 * mb, 2048 * mb, 0, 1, false},
+		{"80 % предела", 1700 * mb, 2048 * mb, 0, 2, false},
+		{"чуть ниже половины: не тревога, но и не «в норме»", 900 * mb, 2048 * mb, 0, 0, false},
+		{"предела в базе нет, порога нет", 500000 * mb, -1, 0, 0, true},
+		{"предела в базе нет, свой порог", 600 * mb, -1, 512, 1, false},
+		{"свой порог ниже половины предела", 600 * mb, 2048 * mb, 512, 1, false},
+		{"чуть ниже своего порога", 450 * mb, 2048 * mb, 512, 0, false},
+		{"заметно ниже своего порога", 300 * mb, 2048 * mb, 512, 0, true},
+		{"свой порог выше, чем 80 % предела", 1700 * mb, 2048 * mb, 4096, 2, false},
+	} {
+		level, calm := grade(SlotState{Retained: tc.retained, Limit: tc.limit}, tc.own)
+		if level != tc.level || calm != tc.calm {
+			t.Errorf("%s: level %d, calm %v; want %d, %v", tc.name, level, calm, tc.level, tc.calm)
+		}
+	}
+	for n, want := range map[int64]string{512: "512 bytes", 2048: "2 kB", 5 * mb: "5 MB", 1536 * mb: "1.5 GB"} {
+		if got := human(n); got != want {
+			t.Errorf("human(%d) = %q, want %q", n, got, want)
+		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgtap"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -168,12 +170,15 @@ func TestLive(t *testing.T) {
 	}
 
 	cfg := Config{DSN: base + " user=pgin_tap", Slot: "pgin_slot", Publication: "pgin_pub", Dir: t.TempDir(),
-		Roles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}, RequireAction: true,
+		Roles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}, RequireAction: true, SlotAlertMB: 4,
 		Notify: &Notify{To: []alert.Target{{Type: alert.TypeSlack, URL: hook.URL}}}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	cfg.DownAfter = config.Duration(200 * time.Millisecond) // в жизни — не меньше секунды
+	savedEvery := slotEvery
+	slotEvery = 50 * time.Millisecond // в жизни — 10 с
+	defer func() { slotEvery = savedEvery }()
 	setup, err := SetupSQL(&cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -355,6 +360,8 @@ func TestLive(t *testing.T) {
 		t.Fatalf("after the log was lost: transaction %d, old note %q", xid, old)
 	}
 	s.Close()
+	exec(admin, "ALTER SYSTEM RESET max_slot_wal_keep_size") // дальше — с пределом кластера
+	exec(admin, "SELECT pg_reload_conf()")
 
 	// 6. Связь оборвалась посреди большой транзакции: её первые части уже в
 	// буфере. База присылает транзакцию заново, она ложится целиком под новыми
@@ -414,6 +421,61 @@ func TestLive(t *testing.T) {
 		t.Fatal("the torn copy alone was read as a whole transaction")
 	}
 	sink.bodies = sink.bodies[:before] // для итога ниже
+
+	// 7. Слот отстаёт при исправном сборщике: долгая открытая транзакция в базе
+	// не даёт слоту отпустить журнал, и он копится. Тревога slot-lag — раньше,
+	// чем база упрётся в предел; транзакция закрылась — slot-ok. Те же числа —
+	// в показателях входа.
+	partSize = 0
+	s = open()
+	readAll(s, 0)
+	hookMu.Lock()
+	hooked = nil // прежние сообщения — не об этом шаге
+	hookMu.Unlock()
+	holder := dial(super)
+	exec(holder, "BEGIN; INSERT INTO public.pgin_churn VALUES ('a transaction somebody forgot to close')")
+	exec(admin, "INSERT INTO public.pgin_churn SELECT repeat(md5(g::text), 30) FROM generate_series(1, 9000) g") // около 10 МБ журнала
+	if text := message(s, "• slot-lag:"); !strings.Contains(text, "of its log for slot pgin_slot") || !strings.Contains(text, "[alert threshold 4 MB]") ||
+		!strings.Contains(text, "% of the 2.0 GB allowed") ||
+		!strings.Contains(text, "a long open transaction on the server") {
+		t.Fatalf("slot-lag alert:\n%s", text)
+	}
+	if st := s.Slot(); st.Retained < 4<<20 || st.Status == "" || st.Status == "lost" {
+		t.Fatalf("slot state %+v", st)
+	}
+	var page strings.Builder
+	metrics.Write(&page, s.Metrics())
+	for _, want := range []string{"escollect_postgres_connected 1\n", "escollect_postgres_slot_retained_bytes ", "escollect_postgres_slot_lag_bytes ",
+		"escollect_postgres_slot_lost 0\n", "escollect_postgres_slot_checked_timestamp_seconds ", `escollect_alerts_waiting{target="slack"} `,
+		`escollect_alerts_target_failing{target="slack"} 0`, "escollect_postgres_transactions_captured_total "} {
+		if !strings.Contains(page.String(), want) {
+			t.Fatalf("the metrics lack %q:\n%s", want, page.String())
+		}
+	}
+	exec(holder, "COMMIT")
+	// Слот отпускает журнал, когда база запишет в него список открытых
+	// транзакций (это делает и CHECKPOINT), а сборщик подтвердит позицию.
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		exec(admin, "CHECKPOINT")
+		if _, err := s.Read(); err != nil {
+			t.Fatal(err)
+		}
+		hookMu.Lock()
+		ok := slices.ContainsFunc(hooked, func(text string) bool { return strings.Contains(text, "• slot-ok:") })
+		hookMu.Unlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no slot-ok after the long transaction ended; the slot: %+v", s.Slot())
+		}
+		s.Wait(ctx, 100*time.Millisecond)
+	}
+	if st := s.Slot(); st.Retained >= 4<<20 {
+		t.Fatalf("slot state after it was released: %+v", st)
+	}
+	s.Close()
 
 	// Итог в буфере: 1, 2, 3, пропуск, 5, пропуск, 7.
 	var shape []string

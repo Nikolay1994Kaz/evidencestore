@@ -74,6 +74,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -81,6 +82,7 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evlog"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/input"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pginput"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 
@@ -118,6 +120,10 @@ type Config struct {
 	// журнал голов (checkpoints.jsonl) и в checkpoint.json. 0 — 10 мин, не
 	// меньше секунды.
 	CheckpointEvery config.Duration `json:"checkpoint_every"`
+	// MetricsListen — адрес страницы /metrics в формате Prometheus, например
+	// "127.0.0.1:9465". Пусто — страницы нет. Процесс с несколькими источниками
+	// (sources) отдаёт одну страницу на всех: адрес задают наверху.
+	MetricsListen string `json:"metrics_listen"`
 
 	// in — готовый вход вместо file, glob и postgres (только тесты).
 	in input.Input
@@ -289,6 +295,11 @@ func (c *Config) validate() error {
 			errs = append(errs, err)
 		}
 	}
+	if c.MetricsListen != "" {
+		if _, _, err := net.SplitHostPort(c.MetricsListen); err != nil {
+			errs = append(errs, fmt.Errorf("metrics_listen: %w", err))
+		}
+	}
 	if c.FromStart && c.File == "" && c.Glob == "" {
 		errs = append(errs, errors.New("from_start is about files: it does not apply to this input"))
 	}
@@ -319,6 +330,8 @@ type Collector struct {
 	// которое легло в буфер с последней записью (input.go).
 	input  input.Input
 	cursor uint64
+	// snap — показатели на конец последнего прохода цикла (metrics.go).
+	snap atomic.Pointer[[]metrics.Family]
 
 	log      *slog.Logger
 	http     *http.Client
@@ -951,6 +964,7 @@ func (c *Collector) Run(ctx context.Context) error {
 				backoff = 0
 			}
 		}
+		c.publish()
 		if c.input != nil {
 			// Вход ждёт сам: появились данные — проход сразу, а не через паузу.
 			c.input.Wait(ctx, c.cfg.FlushEvery.D())

@@ -53,6 +53,32 @@ func TestLive(t *testing.T) {
 		t.Log("the server did not ask for a password (trust): the wrong-password check is skipped")
 	}
 
+	// Отмена с другого потока: долгий запрос обрывается ошибкой 57014, а
+	// соединение остаётся годным.
+	started := time.Now()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		if err := c.Cancel(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := c.Query("SELECT pg_sleep(30)"); !errors.As(err, &pg) || pg.Code != "57014" {
+		t.Fatalf("a cancelled query: %v", err)
+	}
+	if took := time.Since(started); took > 10*time.Second {
+		t.Fatalf("the cancel took %v", took)
+	}
+	if row, ok, err := c.QueryRow("SELECT 'alive'"); err != nil || !ok || *row[0] != "alive" {
+		t.Fatal(row, ok, err)
+	}
+	// Отмена, когда запроса нет, ничего не ломает.
+	if err := c.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Query("SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+
 	slot := "pgwire_live_test"
 	c.Query("SELECT pg_drop_replication_slot(" + Literal(slot) + ")")
 	if _, err := c.Query("CREATE TABLE IF NOT EXISTS pgwire_live (id int PRIMARY KEY, v text); DROP PUBLICATION IF EXISTS pgwire_live_pub; CREATE PUBLICATION pgwire_live_pub FOR TABLE pgwire_live"); err != nil {
