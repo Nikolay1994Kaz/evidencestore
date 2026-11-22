@@ -87,6 +87,14 @@ func TestLiveMCP(t *testing.T) {
 		admin.Query("REVOKE evidence_owner FROM pgm_agent")
 		admin.Query("REVOKE pgm_tap FROM pgm_ai")
 		admin.Query("DROP ROLE IF EXISTS pgm_other")
+		admin.Query("DROP ROLE IF EXISTS pgm_dba")
+		admin.Query("DROP SCHEMA IF EXISTS pgm_own")
+		admin.Query("REVOKE pg_signal_backend, pg_read_server_files FROM pgm_ai, pgm_agent")
+		admin.Query("ALTER DEFAULT PRIVILEGES IN SCHEMA pgm REVOKE UPDATE ON TABLES FROM pgm_ai")
+		// Права из случаев отказа скрипта: прогон, оборванный посреди случая, их оставил бы.
+		admin.Query("REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text) FROM pgm_ai")
+		admin.Query("REVOKE SELECT ON pg_authid FROM pgm_ai")
+		admin.Query("REVOKE EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) FROM pgm_agent")
 		admin.Query("REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) FROM pgm_agent")
 	}
 	tidy()
@@ -177,20 +185,39 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	// отметок не может и сервер: SQL агента идёт в его сеансе. А права,
 	// выданные раньше (до п. 39 агент и сервер ходили одной ролью), скрипт отзывает.
 	// c[3] — что тогда отвечает esmcp (CheckRole); пусто — роль сервера своя.
+	// Ролям агента и сервера — ни членств, ни владения: через них приходят
+	// права, которых скрипт не знает (заход 1 после п. 39: R1, R2, T).
 	for _, c := range [][4]string{
-		{"GRANT pgm_agent TO pgm_ai", "pgm_ai can become pgm_agent", "REVOKE pgm_agent FROM pgm_ai", "pgm_ai can become pgm_agent"},
-		{"CREATE ROLE pgm_other LOGIN; GRANT pgm_agent TO pgm_other", "pgm_other can become pgm_agent, the role of the MCP server", "DROP ROLE pgm_other", "pgm_other"},
-		{"GRANT pgm_tap TO pgm_ai", "pgm_ai can become pgm_tap", "REVOKE pgm_tap FROM pgm_ai", ""},
-		{"GRANT pg_signal_backend TO pgm_ai", "pgm_ai can become pg_signal_backend", "REVOKE pg_signal_backend FROM pgm_ai", ""},
-		{"CREATE ROLE pgm_writer NOLOGIN; GRANT UPDATE ON pgm.docs TO pgm_writer; GRANT pgm_writer TO pgm_ai", "pgm_ai can update pgm.docs (as pgm_writer)", "REVOKE UPDATE ON pgm.docs FROM pgm_writer; DROP ROLE pgm_writer", ""},
-		{"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text)", "REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) FROM pgm_agent", ""},
-		{"GRANT evidence_owner TO pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text) (as evidence_owner)", "REVOKE evidence_owner FROM pgm_agent", ""},
+		{"GRANT pgm_agent TO pgm_ai", "pgm_ai is a member of pgm_agent", "REVOKE pgm_agent FROM pgm_ai", "pgm_ai can become pgm_agent"},
+		{"CREATE ROLE pgm_other LOGIN; GRANT pgm_agent TO pgm_other", "pgm_other can become pgm_agent", "DROP ROLE pgm_other", "pgm_other can become pgm_agent"},
+		{"CREATE ROLE pgm_other LOGIN; GRANT evidence_owner TO pgm_other", "pgm_other can become evidence_owner", "DROP ROLE pgm_other", ""},
+		{"GRANT pgm_tap TO pgm_ai", "pgm_ai is a superuser, may replicate or create roles (as pgm_tap)", "REVOKE pgm_tap FROM pgm_ai", ""},
+		{"GRANT pg_signal_backend TO pgm_ai", "pgm_ai is a member of pg_signal_backend", "REVOKE pg_signal_backend FROM pgm_ai", ""},
+		{"GRANT pg_read_server_files TO pgm_ai", "pgm_ai is a member of pg_read_server_files", "REVOKE pg_read_server_files FROM pgm_ai", ""},
+		{"CREATE ROLE pgm_writer NOLOGIN; GRANT UPDATE ON pgm.docs TO pgm_writer; GRANT pgm_writer TO pgm_ai", "pgm_ai is a member of pgm_writer", "REVOKE UPDATE ON pgm.docs FROM pgm_writer; DROP ROLE pgm_writer", ""},
+		// Запись без членства: право на колонку у PUBLIC, вид над таблицей.
+		{"GRANT UPDATE (body) ON pgm.docs TO PUBLIC", "pgm_ai can update pgm.docs", "REVOKE UPDATE (body) ON pgm.docs FROM PUBLIC", ""},
+		{"CREATE VIEW pgm.docs_v AS SELECT * FROM pgm.docs; CREATE VIEW pgm.docs_vv AS SELECT * FROM pgm.docs_v; GRANT DELETE ON pgm.docs_vv TO pgm_ai", "pgm_ai can delete pgm.docs_vv", "DROP VIEW pgm.docs_vv, pgm.docs_v", ""},
+		// Владение: схемой — DROP SCHEMA … CASCADE мимо журнала (R1-5).
+		{"CREATE SCHEMA pgm_own AUTHORIZATION pgm_ai; REVOKE CREATE ON SCHEMA pgm_own FROM pgm_ai", "pgm_ai owns schema pgm_own", "DROP SCHEMA pgm_own", ""},
+		// Умолчания прав: секция, созданная позже, — без триггера «кто» (R2-3).
+		{"ALTER DEFAULT PRIVILEGES IN SCHEMA pgm GRANT UPDATE ON TABLES TO pgm_ai", "pgm_ai gets UPDATE on new tables (default privileges of postgres in schema pgm)", "ALTER DEFAULT PRIVILEGES IN SCHEMA pgm REVOKE UPDATE ON TABLES FROM pgm_ai", ""},
+		// То, что initdb оставил суперпользователям: файлы сервера (R1-2).
+		{"GRANT EXECUTE ON FUNCTION pg_read_binary_file(text) TO pgm_ai", "pgm_ai can call pg_read_binary_file(text)", "REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text) FROM pgm_ai", ""},
+		{"GRANT SELECT ON pg_authid TO pgm_ai", "pgm_ai can read pg_authid", "REVOKE SELECT ON pg_authid FROM pgm_ai", ""},
+		// Роль сервера: SQL агента идёт ею (R2-6, T-1, T-3, T-5).
+		{"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text)", "REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) FROM pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text)"},
+		{"GRANT EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) TO pgm_agent", "pgm_agent can call pg_terminate_backend(integer,bigint)", "REVOKE EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) FROM pgm_agent", "pgm_agent can call pg_terminate_backend(integer,bigint)"},
+		{"GRANT pg_signal_backend TO pgm_agent", "pgm_agent is a member of pg_signal_backend", "REVOKE pg_signal_backend FROM pgm_agent", "pgm_agent is a member of pg_signal_backend"},
+		{"GRANT evidence_owner TO pgm_agent", "pgm_agent is a member of evidence_owner", "REVOKE evidence_owner FROM pgm_agent", "pgm_agent is a member of evidence_owner"},
+		{"CREATE ROLE pgm_dba SUPERUSER; GRANT pgm_dba TO pgm_agent", "pgm_agent is a superuser, may replicate or create roles (as pgm_dba)", "DROP ROLE pgm_dba", "pgm_agent is a member of pgm_dba"},
 	} {
 		exec(c[0])
 		if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), c[1]) {
 			t.Fatalf("the setup script took the roles after %s: %v", c[0], err)
 		}
 		exec("ROLLBACK")
+		s.Close() // новое соединение — новая проверка роли
 		err := s.CheckRole()
 		if c[3] == "" && err != nil || c[3] != "" && (!errors.Is(err, mcpserver.ErrSharedRole) || !strings.Contains(err.Error(), c[3])) {
 			t.Fatalf("esmcp after %s: %v", c[0], err)
@@ -201,8 +228,18 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	// того, кто запускал скрипт, pg_logical_emit_message открыта PUBLIC (так в
 	// PostgreSQL по умолчанию). Скрипт переводит её на новую.
 	exec("GRANT UPDATE ON pgm.docs TO pgm_ai; GRANT USAGE ON SCHEMA evidence TO pgm_ai; GRANT EXECUTE ON FUNCTION evidence.mark_action(json) TO pgm_ai; " +
-		"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO PUBLIC; ALTER FUNCTION evidence.mark_action(json) OWNER TO postgres")
+		"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO PUBLIC; ALTER FUNCTION evidence.mark_action(json) OWNER TO postgres; " +
+		// Схема отметок — агента, роль evidence_owner — со входом и паролем: так
+		// агент удалял функции отметок, а с паролем писал в журнал сам (R1-6, R1-7).
+		"ALTER SCHEMA evidence OWNER TO pgm_ai; ALTER ROLE evidence_owner LOGIN PASSWORD 'pw'; " +
+		"GRANT EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint), pg_cancel_backend(integer) TO PUBLIC")
 	exec(script)
+	if got := one("SELECT pg_get_userbyid(nspowner) || ' ' || (SELECT rolcanlogin || ' ' || (rolpassword IS NULL) FROM pg_authid WHERE rolname = 'evidence_owner') FROM pg_namespace WHERE nspname = 'evidence'"); got != "evidence_owner false true" {
+		t.Fatalf("the schema of the marks and its owner after the setup script: %s", got)
+	}
+	if got := one("SELECT has_function_privilege('pgm_agent', 'pg_terminate_backend(integer, bigint)', 'EXECUTE')::text || has_function_privilege('pgm_agent', 'pg_cancel_backend(integer)', 'EXECUTE')::text"); got != "falsefalse" {
+		t.Fatalf("the server may end or cancel sessions: %s", got)
+	}
 	for _, sql := range []string{"UPDATE pgm.docs SET body = 'direct' WHERE id = 1", "SELECT evidence.mark_action('{}')", "SELECT pg_logical_emit_message(false, 'evidence/refused', '{}')"} {
 		if _, err := ai.Query(sql); err == nil {
 			t.Fatalf("the setup script left the agent a right of the old setup: %s", sql)
@@ -235,6 +272,11 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		return one("SELECT string_agg(id || '=' || body, ',' ORDER BY id) FROM pgm.docs")
 	}
 	before := docs()
+	// Сеансов роли сервера не обрывает и сама роль сервера: SQL агента идёт
+	// ею, и так он гасил отметки вне транзакции (R1-3, R2-6, T-1).
+	if text, isErr := tool("query", `{"sql":"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'pgm_agent'"}`); !isErr || !strings.Contains(text, "permission denied for function pg_terminate_backend") {
+		t.Fatalf("the SQL of the agent ends the sessions of the server: %v %s", isErr, text)
+	}
 
 	// Выйти из транзакции сервера нельзя: команды, которые её закрыли бы, база
 	// отвергает при подготовке, и не исполняется ни одна команда действия.
@@ -331,14 +373,13 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	// standard_conforming_strings = off ломал JSON с кавычкой в причине,
 	// client_encoding — причину не в ASCII, а отказ по частоте шёл по сеансу
 	// прошлого вызова; квитанция при этом писала «тревога ушла» (P-243).
-	// Роль агента в группе без права на отметки: SQL агента входит в неё
-	// (set_config('role', …)), и отметка своей ролью легла бы с отказом.
-	exec("CREATE ROLE pgm_group NOLOGIN; GRANT pgm_group TO pgm_agent")
+	// Роль сервера в группе без права на отметки (SQL агента входил в неё —
+	// set_config('role', …) — и отметка ложилась с отказом) теперь не берут
+	// ни -setup-sql, ни esmcp: членств у роли сервера нет (п. 39).
 	exec("SELECT pg_create_logical_replication_slot('pgm_peek', 'test_decoding')")
 	for _, args := range []string{
 		`{"statements":["DELETE FROM pgm.docs","SELECT set_config('standard_conforming_strings', 'off', true)"],"reason":"close \"dormant\" docs"}`,
 		`{"statements":["DELETE FROM pgm.docs","SELECT set_config('client_encoding', 'EUC_JP', true)"],"reason":"очистка документов"}`,
-		`{"statements":["DELETE FROM pgm.docs","SELECT set_config('role', 'pgm_group', true)"],"reason":"another role"}`,
 	} {
 		if text, isErr := tool("execute", args); !isErr || !strings.Contains(text, "would change 5 rows") {
 			t.Fatalf("%s: %v %s", args, isErr, text)
@@ -388,10 +429,10 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	}
 	exec("ALTER ROLE pgm_agent RESET standard_conforming_strings")
 	// Умолчания роли, с которыми отметка вне транзакции не ложилась вовсе:
-	// statement_timeout = 1 мс (и jit, чтобы не успеть) и роль — группа без
-	// права на отметки. Тревоги не было ни о частоте, ни о таймауте; теперь
-	// параметры входа сервера сильнее умолчаний роли (R2, T заход 2).
-	exec("ALTER ROLE pgm_agent SET statement_timeout = 1; ALTER ROLE pgm_agent SET jit_above_cost = 0; ALTER ROLE pgm_agent SET role = 'pgm_group'")
+	// statement_timeout = 1 мс (и jit, чтобы не успеть). Тревоги не было ни о
+	// частоте, ни о таймауте; теперь параметры входа сервера сильнее умолчаний
+	// роли (R2, T заход 2).
+	exec("ALTER ROLE pgm_agent SET statement_timeout = 1; ALTER ROLE pgm_agent SET jit_above_cost = 0")
 	dial := func(params map[string]string) (mcpserver.DB, error) {
 		c := dcfg
 		c.Params = params
@@ -408,10 +449,10 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	if text := call(slow, `{"sql":"SELECT pg_sleep(2)"}`); !strings.Contains(text, "longer than 200ms") {
 		t.Fatal(text)
 	}
-	exec("ALTER ROLE pgm_agent RESET statement_timeout; ALTER ROLE pgm_agent RESET jit_above_cost; ALTER ROLE pgm_agent RESET role")
+	exec("ALTER ROLE pgm_agent RESET statement_timeout; ALTER ROLE pgm_agent RESET jit_above_cost")
 	// Отказ вне транзакции — сообщение не транзакционное: в слот оно
 	// попадает, когда журнал сброшен на диск (walwriter, доли секунды).
-	want := `"cause":"row-limit" "cause":"row-limit" "cause":"row-limit" "cause":"row-limit" "cause":"rate" "cause":"rate" "cause":"timeout"`
+	want := `"cause":"row-limit" "cause":"row-limit" "cause":"row-limit" "cause":"rate" "cause":"rate" "cause":"timeout"`
 	var marks string
 	for wait := time.Now().Add(5 * time.Second); time.Now().Before(wait); time.Sleep(50 * time.Millisecond) {
 		marks = one(`SELECT string_agg(substring(data from '"cause":"[a-z-]+"'), ' ' ORDER BY lsn) FROM pg_logical_slot_peek_changes('pgm_peek', NULL, NULL) WHERE data LIKE '%evidence/refused%'`)
@@ -464,7 +505,13 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	if isErr || out.XID != one("SELECT xmin FROM pgm.docs WHERE id = 1") {
 		t.Fatalf("the transaction id: %v %s", isErr, text)
 	}
-	// А -setup-sql такую роль теперь не берёт: своих объектов агенту нельзя.
+	// А -setup-sql такую роль теперь не берёт: ни своих объектов (роль
+	// сервера ничем не владеет), ни права их заводить.
+	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), `pgm_agent owns function public."left"(name,integer)`) {
+		t.Fatalf("the setup script took a role of the server that owns functions: %v", err)
+	}
+	exec("ROLLBACK; DROP FUNCTION public.pg_stat_get_xact_tuples_inserted(oid), public.pg_stat_get_xact_tuples_updated(oid), public.pg_stat_get_xact_tuples_deleted(oid), " +
+		"public.pg_current_xact_id(), public.left(name, integer); ALTER ROLE pgm_agent RESET search_path")
 	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent can CREATE in schema public") {
 		t.Fatalf("the setup script took an agent role that can CREATE: %v", err)
 	}
@@ -478,7 +525,7 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	if one("SELECT has_schema_privilege('pgm_agent', 'public', 'CREATE')::text") != "false" {
 		t.Fatal("the right is inherited: the case is not the one under test")
 	}
-	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent can CREATE in schema public (as pgm_maker)") {
+	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent is a member of pgm_maker") {
 		t.Fatalf("the setup script took an agent role that can become a role that can CREATE: %v", err)
 	}
 	exec("ROLLBACK; ALTER ROLE pgm_agent INHERIT; REVOKE CREATE ON SCHEMA public FROM pgm_maker; DROP ROLE pgm_maker")
@@ -490,11 +537,14 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	}
 	exec("ROLLBACK; REVOKE TRUNCATE, TRIGGER ON pgm.docs FROM pgm_agent")
 	owner := one("SELECT current_user")
-	exec("ALTER TABLE pgm.docs OWNER TO pgm_group")
-	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent owns pgm.docs (as pgm_group)") {
+	exec("ALTER TABLE pgm.docs OWNER TO pgm_agent")
+	if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), "pgm_agent owns table pgm.docs") {
 		t.Fatalf("the setup script took an agent role that owns a table: %v", err)
 	}
+	// Владение переходит вместе с правами прежнего владельца: права роли
+	// сервера ушли с ним, и скрипт выдаёт их снова.
 	exec("ROLLBACK; ALTER TABLE pgm.docs OWNER TO " + pgwire.Ident(owner))
+	exec(script)
 	// И права, с которыми агент выключает триггеры или становится
 	// суперпользователем: SET на session_replication_role (PostgreSQL 15+),
 	// программы сервера, CREATEROLE (R1, R2 заход 3).

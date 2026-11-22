@@ -208,7 +208,8 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	}
 	json.Unmarshal([]byte(text), &action)
 	exec(agent, "ALTER ROLE pgs_agent SET array_nulls = off; ALTER ROLE pgs_agent SET search_path = pgs")
-	exec(agent, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'pgs_agent' AND application_name = 'esmcp/pgs-bot'")
+	// Обрывает администратор: роль сервера сеансов не обрывает и своих (R2-6).
+	exec(admin, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'pgs_agent' AND application_name = 'esmcp/pgs-bot'")
 	for wait := time.Now().Add(5 * time.Second); one(admin, "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'esmcp/pgs-bot'") != "0"; time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(wait) {
 			t.Fatal("the session of the server is still there")
@@ -289,6 +290,15 @@ CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = publ
 	// именем таблицы без схемы работает (при пути только из pg_catalog он
 	// падал — R2 заход 3).
 	exec(admin, "DROP OPERATOR public.= (varchar, varchar); DROP FUNCTION public.pgs_eq(varchar, varchar); REVOKE CREATE ON SCHEMA public FROM pgs_agent")
+	// Член роли-владельца схемы может в ней всё, что владелец: такого не
+	// пропускает и сверка (R2-1; раньше член владельца считался доверенным).
+	exec(admin, "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgs_owner') THEN CREATE ROLE pgs_owner NOLOGIN; END IF; END$$; ALTER SCHEMA public OWNER TO pgs_owner; GRANT pgs_owner TO pgs_agent")
+	human = dial("postgres", "esundo")
+	_, err = p.Check(human)
+	exec(admin, "ALTER SCHEMA public OWNER TO pg_database_owner; DROP ROLE pgs_owner")
+	if !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema public (as pgs_owner)") {
+		t.Fatalf("the check by a person with a schema the agent can become the owner of: %v", err)
+	}
 	human = dial("postgres", "esundo")
 	if statuses, err = p.Check(human); err != nil {
 		t.Fatalf("the check by a person: %v", err)

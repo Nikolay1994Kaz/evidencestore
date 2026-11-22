@@ -58,45 +58,91 @@ func (s *Server) connect() error {
 	if err != nil {
 		return fmt.Errorf("the database is unreachable: %w", err)
 	}
+	// Роль проверяется на каждом новом соединении, а не только при запуске:
+	// база могла быть недоступна на старте (её занял или рвал агент — R1-4,
+	// R2-5, T-2), а права выдают и после (DECISIONS, п. 39).
+	if err := checkRole(db); err != nil {
+		if c, ok := db.(io.Closer); ok {
+			c.Close()
+		}
+		var pg *pgwire.PgError
+		if errors.Is(err, ErrSharedRole) || errors.As(err, &pg) {
+			return err
+		}
+		return fmt.Errorf("the database is unreachable: %w", err)
+	}
 	s.db = db
 	return nil
 }
 
-// ErrSharedRole — роль сервера не только его: суперпользователь, или ею может
-// стать другая роль со входом.
+// Close закрывает соединение с базой. Следующий вызов откроет новое — и
+// снова проверит роль.
+func (s *Server) Close() { s.drop() }
+
+// ErrSharedRole — роль сервера не только его: суперпользователь, состоит в
+// другой роли, ею может стать другая роль со входом, или ей дано то, чем SQL
+// агента достал бы до чужих сеансов, журнала базы и файлов сервера.
 var ErrSharedRole = errors.New("the role of the MCP server is not its own")
 
-// CheckRole проверяет, что роль, которой сервер вошёл, — только его: не
-// суперпользователь, и ни одна другая роль со входом (кроме
-// суперпользователей) не может ею стать. Иначе её умолчания, сеансы и
-// отметки — в руках той роли, и граница между агентом и сервером — опять
-// перечень настроек, а не права базы (DECISIONS, п. 39). -setup-sql
-// проверяет то же, но права выдают и после него: esmcp зовёт CheckRole при
-// запуске.
-func (s *Server) CheckRole() error {
-	if err := s.connect(); err != nil {
-		return err
-	}
-	res, err := s.run("BEGIN; SET LOCAL search_path = pg_catalog, pg_temp; " +
-		"SELECT current_user::text, r.rolsuper::text, (SELECT string_agg(x.rolname::text, ', ' ORDER BY x.rolname) FROM pg_roles x " +
-		"WHERE x.oid <> r.oid AND x.rolcanlogin AND NOT x.rolsuper AND pg_has_role(x.oid, r.oid, 'MEMBER')) " +
+// RoleCheck — запрос проверки роли (checkRole); метка в начале — чтобы
+// поддельная база в тестах узнала его.
+const RoleCheck = "/* evidencestore: the role of the MCP server */ "
+
+// CheckRole подключается и проверяет роль сервера (checkRole). esmcp зовёт
+// её при запуске, чтобы не начинать работу с чужой ролью; та же проверка
+// идёт на каждом новом соединении.
+func (s *Server) CheckRole() error { return s.connect() }
+
+// checkRole проверяет, что роль, которой сервер вошёл, — только его. SQL
+// агента идёт этой ролью, поэтому:
+//   - не суперпользователь и ни в чём не состоит: всё, что ей можно, выдал
+//     ей самой escollect -setup-sql (через членство — set_config('role', …) —
+//     SQL агента взял бы права группы, суперпользователя тоже — T-3);
+//   - никакая другая роль со входом, кроме суперпользователей, не может ею
+//     стать: иначе её умолчания, сеансы и отметки — в руках той роли;
+//   - не зовёт pg_logical_emit_message, pg_terminate_backend,
+//     pg_cancel_backend и того, что initdb оставил суперпользователям
+//     (pg_read_file…): иначе SQL агента ставил бы свои отметки, обрывал сеансы
+//     сервера, которые ставят отметки вне транзакции (R1-3, R2-6, T-1), и
+//     читал бы файлы сервера.
+//
+// -setup-sql проверяет то же, но права выдают и после него (DECISIONS, п. 39).
+func checkRole(db DB) error {
+	res, err := db.Query("BEGIN; SET LOCAL search_path = pg_catalog, pg_temp; " + RoleCheck +
+		"SELECT current_user::text, r.rolsuper::text, " +
+		"(SELECT string_agg(g.rolname::text, ', ' ORDER BY g.rolname) FROM pg_roles g WHERE g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'MEMBER')), " +
+		"(SELECT string_agg(x.rolname::text, ', ' ORDER BY x.rolname) FROM pg_roles x " +
+		"WHERE x.oid <> r.oid AND x.rolcanlogin AND NOT x.rolsuper AND pg_has_role(x.oid, r.oid, 'MEMBER')), " +
+		"(SELECT string_agg(f.oid::regprocedure::text, ', ' ORDER BY f.oid::regprocedure::text) FROM pg_proc f " +
+		"WHERE f.pronamespace = 'pg_catalog'::regnamespace AND has_function_privilege(r.oid, f.oid, 'EXECUTE') " +
+		"AND (f.proname IN ('pg_logical_emit_message', 'pg_terminate_backend', 'pg_cancel_backend') " +
+		"OR EXISTS (SELECT FROM pg_init_privs i WHERE i.classoid = 'pg_proc'::regclass AND i.objoid = f.oid AND i.objsubid = 0 " +
+		"AND NOT EXISTS (SELECT FROM aclexplode(i.initprivs) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')))) " +
 		"FROM pg_roles r WHERE r.rolname = current_user; COMMIT")
 	if err != nil {
+		if tx := db.TxStatus(); tx != pgwire.TxIdle {
+			db.Query("ROLLBACK")
+		}
 		return err
 	}
 	for _, r := range res {
-		if len(r.Rows) != 1 || len(r.Rows[0]) != 3 {
+		if len(r.Rows) != 1 || len(r.Rows[0]) != 5 {
 			continue
 		}
 		row := r.Rows[0]
 		switch {
 		case row[1] != nil && *row[1] == "true":
-			return fmt.Errorf("%w: %s is a superuser", ErrSharedRole, *row[0])
+			return fmt.Errorf("%w: %s is a superuser. Give the MCP server a role of its own (mcp_roles in the collector config; escollect -setup-sql creates it)", ErrSharedRole, *row[0])
 		case row[2] != nil:
-			return fmt.Errorf("%w: %s can become %s. Revoke the membership: the agent must not have the server's role", ErrSharedRole, *row[2], *row[0])
+			return fmt.Errorf("%w: %s is a member of %s, and the SQL of the agent takes the rights of a role it is a member of. Revoke the membership", ErrSharedRole, *row[0], *row[2])
+		case row[3] != nil:
+			return fmt.Errorf("%w: %s can become %s. Revoke the membership: whoever can become the role of the server sets its defaults, ends its sessions and puts marks in the log", ErrSharedRole, *row[3], *row[0])
+		case row[4] != nil:
+			return fmt.Errorf("%w: %s can call %s. Revoke EXECUTE (from PUBLIC too; escollect -setup-sql does it): the SQL of the agent runs as this role", ErrSharedRole, *row[0], *row[4])
 		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%w: the check of the role gave no answer", ErrSharedRole)
 }
 
 // sessionParams — параметры входа соединения сервера. Умолчания своей роли
@@ -370,11 +416,22 @@ func (s *Server) markRefused(rc *Receipt, info map[string]any) bool {
 	info["action_id"], info["agent"], info["reason"], info["cause"] = rc.ActionID, rc.Agent, rc.Reason, rc.Cause
 	mark, _ := json.Marshal(info)
 	if _, err := s.run("SELECT evidence.mark_refused(" + pgwire.Literal(string(mark)) + "::pg_catalog.json)"); err != nil {
-		s.log.Error("the refusal is not marked in the database log, so no alert is raised for it (is the database prepared with the current escollect -setup-sql?)",
+		s.log.Error("the refusal is not marked in the database log, so no alert is raised for it"+setupHint(err),
 			"action", rc.ActionID, "cause", rc.Cause, "err", err)
 		return false
 	}
 	return true
+}
+
+// setupHint — подсказка про escollect -setup-sql, когда дело и правда в ней:
+// функции отметки нет, схемы нет или нет права. Оборванное соединение или
+// чужая роль — не о настройке, и подсказка вела бы не туда (R2-10, T-7).
+func setupHint(err error) string {
+	var pg *pgwire.PgError
+	if errors.As(err, &pg) && (pg.Code == "42883" || pg.Code == "3F000" || pg.Code == "42501") {
+		return " (is the database prepared with the current escollect -setup-sql?)"
+	}
+	return ""
 }
 
 // actionLock — замок на действие агента для всех его сеансов: flock на файле

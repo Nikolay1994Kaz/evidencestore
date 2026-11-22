@@ -30,9 +30,22 @@ type fakeDB struct {
 	// статистика молчит (track_counts = off): всегда 0.
 	changed int
 	noStats bool
+	// roleCheck — свой ответ на проверку роли (checkRole); nil — «роль своя».
+	roleCheck func() ([]pgwire.Result, error)
 }
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
+	// Проверка роли на каждом новом соединении (checkRole): поддельная база
+	// отвечает «роль своя» и в журнал запросов её не пишет — тесты смотрят
+	// на запросы действий. Саму проверку — TestCheckRole и TestLiveMCP.
+	if strings.Contains(sql, RoleCheck) {
+		if d.roleCheck != nil {
+			return d.roleCheck()
+		}
+		me, no := "esmcp_bot", "false"
+		return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "SET"}, {Columns: []string{"current_user", "rolsuper", "member_of", "members", "calls"},
+			Rows: [][]*string{{&me, &no, nil, nil, nil}}, Tag: "SELECT 1"}, {Tag: "COMMIT"}}, nil
+	}
 	d.log = append(d.log, sql)
 	res, err := d.answer(sql)
 	d.track(sql, err)
@@ -598,5 +611,66 @@ func TestRowCountIsTheActionsOwn(t *testing.T) {
 	s, _, _ = limitedFrom(t, 5, "40", "50")
 	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`); !isErr || !strings.Contains(text, "would change 10 rows") {
 		t.Fatalf("%v %s", isErr, text)
+	}
+}
+
+// Роль сервера проверяется на каждом новом соединении (R1-4, R2-5, T-2, T-3):
+// чужая роль — ни одного запроса действия, агенту — причина; база вернулась
+// после недоступности — проверка идёт тогда.
+func TestCheckRoleOnEveryConnection(t *testing.T) {
+	str := func(v string) *string { return &v }
+	row := func(super string, member, members, calls *string) func() ([]pgwire.Result, error) {
+		return func() ([]pgwire.Result, error) {
+			return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "SET"}, {Columns: []string{"a", "b", "c", "d", "e"},
+				Rows: [][]*string{{str("esmcp_bot"), str(super), member, members, calls}}, Tag: "SELECT 1"}, {Tag: "COMMIT"}}, nil
+		}
+	}
+	for name, c := range map[string]struct {
+		answer func() ([]pgwire.Result, error)
+		want   string
+	}{
+		"superuser":     {row("true", nil, nil, nil), "esmcp_bot is a superuser"},
+		"member of dba": {row("false", str("dba"), nil, nil), "esmcp_bot is a member of dba"},
+		"agent inside":  {row("false", nil, str("agent_bot"), nil), "agent_bot can become esmcp_bot"},
+		"may terminate": {row("false", nil, nil, str("pg_terminate_backend(integer,bigint)")), "esmcp_bot can call pg_terminate_backend(integer,bigint)"},
+		"no answer":     {func() ([]pgwire.Result, error) { return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "COMMIT"}}, nil }, "the check of the role gave no answer"},
+	} {
+		db := &fakeDB{roleCheck: c.answer}
+		s, _ := newServer(t, db)
+		if err := s.CheckRole(); !errors.Is(err, ErrSharedRole) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: CheckRole: %v", name, err)
+		}
+		text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 6","reason":"r"}`)
+		if !isErr || !strings.Contains(text, c.want) || len(db.log) != 0 {
+			t.Errorf("%s: execute: %v %s; queries %q", name, isErr, text, db.log)
+		}
+	}
+	// База недоступна при запуске: проверка — при первом соединении.
+	db, up := &fakeDB{roleCheck: row("false", nil, str("agent_bot"), nil)}, false
+	s := New(Config{Agent: "a", Dial: func(map[string]string) (DB, error) {
+		if !up {
+			return nil, errors.New("connection refused")
+		}
+		return db, nil
+	}}, nil)
+	if err := s.CheckRole(); err == nil || errors.Is(err, ErrSharedRole) {
+		t.Fatalf("unreachable: %v", err)
+	}
+	up = true
+	if text, isErr := callText(t, s, "query", `{"sql":"SELECT 1"}`); !isErr || !strings.Contains(text, "agent_bot can become esmcp_bot") || len(db.log) != 0 {
+		t.Fatalf("after the database is back: %v %s; queries %q", isErr, text, db.log)
+	}
+}
+
+// Подсказка про -setup-sql — только когда дело в настройке базы, а не в
+// оборванном соединении (R2-10, T-7).
+func TestSetupHintOnlyForSetupErrors(t *testing.T) {
+	for code, want := range map[string]bool{"42883": true, "3F000": true, "42501": true, "57P01": false, "40001": false} {
+		if got := setupHint(&pgwire.PgError{Code: code}) != ""; got != want {
+			t.Errorf("%s: hint %v", code, got)
+		}
+	}
+	if setupHint(errors.New("connection reset by peer")) != "" {
+		t.Error("a broken connection is told to run the setup script")
 	}
 }

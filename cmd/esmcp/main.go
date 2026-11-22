@@ -160,10 +160,12 @@ func main() {
 	// Роль сервера — только его (DECISIONS, п. 39): иначе не начинать. База
 	// недоступна — проверка при следующем запуске, а соединяться сервер будет
 	// по первому вызову, как всегда.
+	// Роль проверяется и на каждом новом соединении: база, недоступная
+	// сейчас, не пропускает проверку (R1-4, R2-5, T-2).
 	if err := srv.CheckRole(); errors.Is(err, mcpserver.ErrSharedRole) {
 		fail(err)
 	} else if err != nil {
-		log.Warn("the role of the server is not checked: the database is unreachable", "err", err)
+		log.Warn("the database is unreachable: the role of the server is checked when a connection is made", "err", err)
 	}
 	fail(srv.Serve(os.Stdin, os.Stdout))
 }

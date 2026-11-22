@@ -46,6 +46,9 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 		"notify to a bad target": func(c *Config) {
 			c.Notify = &Notify{To: []alert.Target{{Type: alert.TypeSlack, URL: "http://example.com/hook"}}}
 		},
+		// PostgreSQL режет имя до 63 байт, а сборщик сравнивал бы целиком (R2-8).
+		"a role of 64 bytes": func(c *Config) { c.MCPRoles = []string{strings.Repeat("s", 64)} },
+		"an empty role":      func(c *Config) { c.UndoRoles = []string{""} },
 		"undo hint without {xid}": func(c *Config) {
 			c.Notify = &Notify{UndoHint: "esundo check", To: []alert.Target{{Type: alert.TypeSlack, URL: "https://example.com/hook"}}}
 		},
@@ -58,6 +61,17 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 	}
 	if _, err := New(good(), nil); err == nil {
 		t.Error("a source without a directory for its index was created")
+	}
+	ok := good()
+	ok.MCPRoles = []string{strings.Repeat("s", 63)}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("a role of 63 bytes: %v", err)
+	}
+	// Роль отката — тоже наблюдаемая: её транзакция без отметки отката — тревога
+	// no-action (её функцию позвал кто-то другой, R2-1).
+	ok.UndoRoles = []string{"undo_op"}
+	if got := strings.Join(ok.watched(), ","); got != strings.Repeat("s", 63)+",agent_bot,undo_op" {
+		t.Errorf("watched: %s", got)
 	}
 }
 
@@ -99,9 +113,24 @@ func TestSetupSQL(t *testing.T) {
 		`CREATE ROLE "evidence_owner" NOLOGIN;`,
 		`ALTER FUNCTION evidence.mark_refused(json) OWNER TO "evidence_owner";`,
 		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', f, 'evidence_owner');`,
-		// Агент не становится ролью сервера; роль сервера — только его.
-		`format('%I can become %I', r.rolname, g.rolname)`,
-		`can become %I, the role of the MCP server'`,
+		// Роли агента и сервера — разрешённым перечнем: ни членств, ни владения;
+		// ролью сервера и владельцем отметок не может стать никто другой.
+		`SELECT format('%I is a member of %I', r.rolname, g.rolname) AS x`,
+		`WHERE r.rolname IN ('agent_bot', 'agent "x"', '50% off') AND g.oid <> r.oid`,
+		`SELECT format('%I owns %s', r.rolname, pg_describe_object(s.classid, s.objid, s.objsubid)) AS x`,
+		`SELECT format('%I can become %I', x.rolname, m.rolname) AS x`,
+		`WHERE m.rolname IN ('agent "x"', '50% off', 'evidence_owner')`,
+		`ALTER ROLE "evidence_owner" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD NULL;`,
+		`ALTER SCHEMA evidence OWNER TO "evidence_owner";`,
+		// Обрывать сеансы — только суперпользователям и pg_signal_backend; что initdb
+		// оставил суперпользователям, остаётся им.
+		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pg_signal_backend', f);`,
+		`f.proname IN ('pg_logical_emit_message', 'pg_terminate_backend', 'pg_cancel_backend')`,
+		`AND NOT EXISTS (SELECT FROM aclexplode(i.initprivs) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'))`,
+		// Запись агента — и в колонку, и через вид; умолчания прав.
+		`has_any_column_privilege(r.oid, c.oid, pr.p)`,
+		`WITH RECURSIVE over(oid) AS`,
+		`CROSS JOIN pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a`,
 		// Публикация: с PostgreSQL 18 — вместе с хранимыми генерируемыми колонками.
 		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders" WITH (publish_generated_columns = stored)';`,
 		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders"';`,

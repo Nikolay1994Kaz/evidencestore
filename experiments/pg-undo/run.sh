@@ -271,6 +271,9 @@ cat >"$WORK/undo.json" <<EOF
   "verify": ["$BIN/esverify", "-store-key", "$STORE_KEY", "-tsa-trust", "$WORK/tsa-root.crt"]
 }
 EOF
+# Настройки с паролями ролей сервера и отката — только владельцу файла: агент (и пользователь ОС
+# postgres, чьими правами база читает файлы) их не прочтёт (DECISIONS, п. 39; R1-2, T-6).
+chmod 600 "$WORK/mcp.json" "$WORK/mcp-strict.json" "$WORK/undo.json"
 
 INDEX=$WORK/pg-index/index.jsonl
 ALERTS=$WORK/pg-index/alerts.jsonl
@@ -344,12 +347,13 @@ echo "чтение через MCP: $(mcp query '{"sql": "select id, balance from
 
 step "что агенту нельзя: в базу идут только SELECT, INSERT, UPDATE, DELETE, MERGE (решает грамматика базы), остальное — права роли"
 for q in "truncate accounts" "drop table orders" "alter table accounts disable trigger evidence_who" \
-  "select pg_logical_emit_message(true, 'evidence/who', '{\"role\":\"postgres\"}')"; do
+  "select pg_logical_emit_message(true, 'evidence/who', '{\"role\":\"postgres\"}')" \
+  "select pg_terminate_backend(pid) from pg_stat_activity where usename = 'esmcp_bot'"; do
   if out=$(mcp execute "$(sql_arg "" <<<"$q")"); then die "агенту удалось: $q"; fi
   echo "$q → $(grep -o 'postgres: [^(]*' <<<"$out" | head -1)"
 done
-[ "$(grep -c '"outcome":"failed"' "$WORK/mcp/receipts.jsonl")" = 4 ] || die "ждали четыре квитанции с исходом failed"
-echo "все четыре попытки остались в квитанциях с исходом failed; три первые база отвергла при разборе, подделку отметки — правами роли"
+[ "$(grep -c '"outcome":"failed"' "$WORK/mcp/receipts.jsonl")" = 5 ] || die "ждали пять квитанций с исходом failed"
+echo "все пять попыток остались в квитанциях с исходом failed; три первые база отвергла при разборе, подделку отметки и обрыв сеансов сервера — правами роли"
 
 step "агент сам закрывает транзакцию сервера: BEGIN … COMMIT, COMMIT в списке команд, чтение с COMMIT"
 DOCS=$("${OWNER[@]}" -Atc "select md5(string_agg(id || coalesce(body, ''), ',' order by id)) from docs")

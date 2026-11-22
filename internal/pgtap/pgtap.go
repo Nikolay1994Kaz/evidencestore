@@ -781,7 +781,7 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 		t.alert(tx, "mass-change", fmt.Sprintf("%d row changes in one transaction (the threshold is %d)", tx.changes, t.cfg.AlertRows))
 	}
 	if t.cfg.RequireAction && tx.who != nil && len(tx.actions) == 0 && tx.undo == nil {
-		t.alert(tx, "no-action", "a transaction of a watched role carries no action marker: it did not come through the MCP server")
+		t.alert(tx, "no-action", "a transaction of a watched role carries no action or undo marker: it did not come through the MCP server or esundo")
 	}
 	return t.flushAlerts(tx, &entry)
 }

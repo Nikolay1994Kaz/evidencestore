@@ -946,7 +946,7 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	mark, _ := json.Marshal(map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": rc.Reason, "client": rc.Client})
 	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
 	if _, err := s.run("SELECT evidence.mark_action(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
-		return fail(fmt.Errorf("the action marker could not be set (is the database prepared with escollect -setup-sql?): %w", err))
+		return fail(fmt.Errorf("the action marker could not be set%s: %w", setupHint(err), err))
 	}
 	// Номер транзакции, а при пределах строк — и счёт строк до SQL агента
 	// (changed): тем же запросом, без лишнего обмена с базой. Номер — 32

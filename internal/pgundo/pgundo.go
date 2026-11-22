@@ -629,19 +629,27 @@ func (p *Plan) session(db DB) error {
 	for _, n := range schemas {
 		lits = append(lits, pgwire.Literal(n))
 	}
-	// Кто, кроме владельца схемы (и тех, кто им может стать) и
-	// суперпользователей, может в ней CREATE. Право у PUBLIC — у всех: имён
-	// хватит пяти.
-	res, err = db.Query("SELECT string_agg(x, ', ') FROM (SELECT format('%I can CREATE in schema %I', g.rolname, n.nspname) AS x " +
-		"FROM pg_namespace n JOIN pg_roles g ON NOT g.rolsuper AND NOT pg_has_role(g.oid, n.nspowner, 'MEMBER') " +
-		"WHERE n.nspname IN (" + strings.Join(lits, ", ") + ") AND n.nspname <> 'pg_catalog' AND has_schema_privilege(g.oid, n.oid, 'CREATE') " +
-		"ORDER BY 1 LIMIT 5) AS w")
+	// Кто может CREATE в схеме пути — сам или через роль, которой может
+	// стать (SET ROLE). Не в счёт: суперпользователи; владелец схемы, а у
+	// схемы pg_database_owner — владелец базы (так доверенных называет сам
+	// PostgreSQL после CVE-2018-1058); те, кто и так может стать ролью этого
+	// сеанса, — им своя функция ничего не прибавит. Член роли-владельца — в
+	// счёт: агента, которого после настройки включили в группу-владельца,
+	// прежнее условие пропускало (R2-1). Право у PUBLIC — у всех: имён хватит пяти.
+	res, err = db.Query("SELECT string_agg(x, ', ') FROM (SELECT DISTINCT format('%I can CREATE in schema %I', g.rolname, n.nspname) || " +
+		"CASE WHEN h.oid <> g.oid THEN format(' (as %I)', h.rolname) ELSE '' END AS x " +
+		"FROM pg_namespace n CROSS JOIN pg_roles g JOIN pg_roles h ON pg_has_role(g.oid, h.oid, 'MEMBER') " +
+		"WHERE n.nspname IN (" + strings.Join(lits, ", ") + ") AND n.nspname <> 'pg_catalog' AND has_schema_privilege(h.oid, n.oid, 'CREATE') " +
+		"AND NOT g.rolsuper AND g.oid <> n.nspowner " +
+		"AND NOT (n.nspowner = 'pg_database_owner'::regrole AND g.oid = (SELECT datdba FROM pg_database WHERE datname = current_database())) " +
+		"AND NOT pg_has_role(g.oid, current_user, 'MEMBER') ORDER BY 1 LIMIT 5) AS w")
 	if err != nil {
 		return err
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
 		return refuse("%s, and that schema is on the search_path of this session: a function or operator created there would run in the check "+
-			"and the undo with the rights of this session. Take the schema off the search_path (SET search_path) or let only its owner create there", *res[0].Rows[0][0])
+			"and the undo with the rights of this session. Take the schema off the search_path of this role (ALTER ROLE … SET search_path) "+
+			"or let only its owner create there", *res[0].Rows[0][0])
 	}
 	path = append(path, "pg_temp")
 	_, err = db.Query("SELECT pg_catalog.set_config('search_path', " + pgwire.Literal(strings.Join(path, ", ")) + ", false)")

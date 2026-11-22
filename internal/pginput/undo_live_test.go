@@ -114,7 +114,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	version, _ := strconv.Atoi(one("SELECT current_setting('server_version_num')"))
 
 	cfg := Config{DSN: base + " user=pgu_tap", Slot: "pgu_slot", Publication: "pgu_pub", Dir: t.TempDir(),
-		MCPRoles: []string{"pgu_agent"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident", "pgu.tag"}}
+		MCPRoles: []string{"pgu_agent"}, Roles: []string{"pgu_ai"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident", "pgu.tag"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,15 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Старая установка (до п. 39): у роли агента — запись и на секциях. Скрипт
+	// переводит её, а не отказывает: права на секции снимаются до проверок (R2-4).
+	exec(admin, "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgu_ai') THEN CREATE ROLE pgu_ai LOGIN; END IF; END$$; "+
+		"GRANT USAGE ON SCHEMA pgu TO pgu_ai; GRANT INSERT, UPDATE, DELETE ON pgu.part, pgu.part_1, pgu.part_2 TO pgu_ai")
 	exec(admin, script)
+	if got := one("SELECT string_agg(c.relname || ':' || has_table_privilege('pgu_ai', c.oid, 'SELECT') || ':' || has_table_privilege('pgu_ai', c.oid, 'UPDATE'), ' ' ORDER BY c.relname) " +
+		"FROM pg_class c WHERE c.relname IN ('part', 'part_1', 'part_2') AND c.relnamespace = 'pgu'::regnamespace"); got != "part:true:false part_1:true:false part_2:true:false" {
+		t.Fatalf("the rights of the agent on the partitions after the old setup: %s", got)
+	}
 	// Секциям — то же, что таблице: старая строка целиком, отметка «кто», права агента.
 	if got := one("SELECT string_agg(c.relname || ':' || c.relreplident::text || ':' || (SELECT count(*) FROM pg_trigger g WHERE g.tgrelid = c.oid AND g.tgname = 'evidence_who') " +
 		"|| ':' || has_table_privilege('pgu_agent', c.oid, 'UPDATE'), ' ' ORDER BY c.relname) FROM pg_class c WHERE c.relname IN ('part_1', 'part_2')"); got != "part_1:f:1:true part_2:f:1:true" {
