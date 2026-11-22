@@ -467,7 +467,9 @@ type Result struct {
 
 // Query исполняет текст простым протоколом. В тексте может быть несколько
 // команд через ";": на каждую — свой Result. При ошибке сервера возвращаются
-// результаты команд до неё и *PgError; соединение остаётся рабочим.
+// результаты команд до неё и *PgError; соединение остаётся рабочим. Чужой
+// текст сюда не передают: COMMIT в нём закроет транзакцию того, кто её открыл
+// (P-239) — для чужого текста есть Pipeline.
 func (c *Conn) Query(sql string) ([]Result, error) {
 	if c.stream {
 		return nil, errors.New("pgwire: the connection is streaming replication")

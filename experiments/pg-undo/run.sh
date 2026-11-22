@@ -124,6 +124,8 @@ echo "accounts: $ROWS строк, orders: $((ROWS / 2 + 2))"
 # mcp ИНСТРУМЕНТ JSON: вызов инструмента так, как его делает агент (stdio, ревизия MCP 2026-07-28).
 mcp() { python3 -I "$HERE/mcp_call.py" "$BIN/esmcp" "$WORK/mcp.json" "$1" "$2" 2>>"$WORK/mcp.log"; }
 sql_arg() { python3 -I -c 'import json,sys; print(json.dumps({"sql": sys.stdin.read(), "reason": sys.argv[1]}))' "$1"; }
+# stmts_arg ПРИЧИНА: команды со стандартного ввода, по одной на строку («;» в конце строки — не часть команды) → {"statements": […]}.
+stmts_arg() { python3 -I -c 'import json,sys; print(json.dumps({"statements": [l.strip().rstrip(";").rstrip() for l in sys.stdin if l.strip()], "reason": sys.argv[1]}))' "$1"; }
 
 step "хранилище: источники $SRC (метка субъекта — xid) и agent-mcp (квитанции, метка — action_id)"
 "$BIN/evidencestore" dev-pki -out "$WORK/pki" -source "$SRC" -source agent-mcp >/dev/null
@@ -324,7 +326,7 @@ sleep 1.5
 # ---------------------------------------------------------------- агент
 
 step "действие агента через MCP (хорошее): перевод 100.50 со счёта 1 на счёт 2"
-R=$(sql_arg "client asked to move funds" <<'SQL' | { mcp execute "$(cat)" || die "действие не прошло"; }
+R=$(stmts_arg "client asked to move funds" <<'SQL' | { mcp execute "$(cat)" || die "действие не прошло"; }
 update accounts set balance = balance - 100.50 where id = 1;
 update accounts set balance = balance + 100.50 where id = 2;
 SQL
@@ -334,14 +336,27 @@ GOOD=$(field "$R" xid)
 wait_tx "$GOOD"
 echo "чтение через MCP: $(mcp query '{"sql": "select id, balance from accounts where id in (1, 2) order by id"}')"
 
-step "что агенту нельзя: права роли в базе, а не разбор текста запроса"
+step "что агенту нельзя: в базу идут только SELECT, INSERT, UPDATE, DELETE, MERGE (решает грамматика базы), остальное — права роли"
 for q in "truncate accounts" "drop table orders" "alter table accounts disable trigger evidence_who" \
   "select pg_logical_emit_message(true, 'evidence/who', '{\"role\":\"postgres\"}')"; do
   if out=$(mcp execute "$(sql_arg "" <<<"$q")"); then die "агенту удалось: $q"; fi
   echo "$q → $(grep -o 'postgres: [^(]*' <<<"$out" | head -1)"
 done
 [ "$(grep -c '"outcome":"failed"' "$WORK/mcp/receipts.jsonl")" = 4 ] || die "ждали четыре квитанции с исходом failed"
-echo "все четыре попытки остались в квитанциях с исходом failed"
+echo "все четыре попытки остались в квитанциях с исходом failed; три первые база отвергла при разборе, подделку отметки — правами роли"
+
+step "агент сам закрывает транзакцию сервера: BEGIN … COMMIT, COMMIT в списке команд, чтение с COMMIT"
+DOCS=$("${OWNER[@]}" -Atc "select md5(string_agg(id || coalesce(body, ''), ',' order by id)) from docs")
+for a in "$(sql_arg "" <<<"begin; delete from docs; commit;")" "$(printf '%s\n' "delete from docs" "commit" | stmts_arg "")" \
+  "$(sql_arg "" <<<"commit; update docs set body = 'x' where id = 2")" "$(printf '%s\n' "update docs set body = 'x' where id = 2" "end" | stmts_arg "")"; do
+  if out=$(mcp execute "$a"); then die "агенту удалось: $a"; fi
+  grep -q "was not taken, nothing ran" <<<"$out" || die "ждали отказ до исполнения: $out"
+  echo "$(tr -d '\n' <<<"$a" | cut -c1-90) → $(grep -o 'postgres: [^(]*' <<<"$out" | head -1)"
+done
+if out=$(mcp query "$(sql_arg "" <<<"commit; insert into docs values (99, 'q')")"); then die "чтение с COMMIT прошло: $out"; fi
+grep -q "takes one SELECT" <<<"$out" || die "ждали отказ чтению: $out"
+[ "$("${OWNER[@]}" -Atc "select md5(string_agg(id || coalesce(body, ''), ',' order by id)) from docs")" = "$DOCS" ] || die "таблица docs изменилась"
+echo "ни одна команда не исполнилась, docs не тронута: транзакцию ведёт сервер, команды агента идут в PREPARE"
 
 step "агент в обход MCP: прямое подключение своей ролью"
 BEFORE_ALERTS=$(wc -l <"$ALERTS" 2>/dev/null || echo 0)
@@ -359,7 +374,7 @@ hooked /bot123456:DEMO-TOKEN/sendMessage "agent transaction $BYPASS" | sed 's/^/
 step "действие агента через MCP (плохое): «закрыть неактивные счета»"
 E0=$(size "$WORK/data/evidence"); C0=$(size "$WORK/data/chain")
 T=$(now)
-R=$(sql_arg "close inactive accounts" <<SQL | { mcp execute "$(cat)" || die "действие не прошло"; }
+R=$(stmts_arg "close inactive accounts" <<SQL | { mcp execute "$(cat)" || die "действие не прошло"; }
 update accounts set balance = 0, note = 'closed by support-bot' where id % 3 = 0;
 delete from orders where not paid and account_id <> 5;
 insert into orders values ($((ROWS + 3)), 1, 'refund', true);
@@ -554,7 +569,7 @@ fi
 step "предохранитель: агент хочет изменить больше строк, чем разрешено одному действию ($ROWS)"
 NOTES=$("${OWNER[@]}" -Atc "select md5(string_agg(coalesce(note, '') || id, ',' order by id)) from accounts")
 INDEX_BEFORE=$(wc -l <"$INDEX")
-if R=$(mcp execute "$(sql_arg "normalize everything" <<<"update accounts set note = 'normalized'; update orders set item = upper(item)")"); then die "действие сверх предела прошло: $R"; fi
+if R=$(mcp execute "$(printf '%s\n' "update accounts set note = 'normalized'" "update orders set item = upper(item)" | stmts_arg "normalize everything")"); then die "действие сверх предела прошло: $R"; fi
 cut -c1-250 <<<"$R"
 grep -q "was refused and rolled back, nothing changed" <<<"$R" || die "ждали отказ"
 [ "$("${OWNER[@]}" -Atc "select md5(string_agg(coalesce(note, '') || id, ',' order by id)) from accounts")" = "$NOTES" ] || die "отказанное действие изменило строки"
@@ -569,14 +584,14 @@ echo "в базе ничего не изменилось, записей в хр
 
 step "таймер: запрос агента идёт дольше секунды (и сам снимает себе таймаут базы)"
 T=$(now)
-if R=$(mcp_strict execute "$(sql_arg "heavy report" <<<"set statement_timeout = 0; set lock_timeout = 0; select pg_sleep(30)")"); then die "зависший запрос прошёл: $R"; fi
+if R=$(mcp_strict execute "$(printf '%s\n' "select set_config('statement_timeout', '0', true)" "select set_config('lock_timeout', '0', true)" "select pg_sleep(30)" | stmts_arg "heavy report")"); then die "зависший запрос прошёл: $R"; fi
 cut -c1-200 <<<"$R"
 grep -q "ran longer than 1s and was cancelled" <<<"$R" || die "ждали отмену по таймеру"
 TOOK=$(since "$T")
 python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 10 else 1)' "$TOOK" || die "отмена заняла $TOOK с"
-[ "$("${OWNER[@]}" -Atc "select count(*) from pg_stat_activity where query like '%pg_sleep(30)%' and state = 'active' and pid <> pg_backend_pid()")" = 0 ] ||
+[ "$("${OWNER[@]}" -Atc "select count(*) from pg_stat_activity where application_name = 'esmcp/batch-bot' and state = 'active'")" = 0 ] ||
   die "запрос агента всё ещё идёт на сервере базы"
-echo "отменён через $TOOK с; на сервере базы запрос не идёт: SET в запросе агента таймер MCP-сервера не снимает"
+echo "отменён через $TOOK с; на сервере базы запрос не идёт: set_config в запросе агента таймер MCP-сервера не снимает"
 hooked /alerts "ran longer than 1s" | sed -n '2p' | sed 's/^/    /'
 
 step "строки за окно: агент дробит большое изменение на части (предел — 50 строк за 10 минут)"
