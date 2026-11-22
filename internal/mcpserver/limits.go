@@ -4,10 +4,10 @@ package mcpserver
 // может идти один запрос, сколько действий в минуту и сколько строк за окно.
 //
 // ПОЧЕМУ ТАЙМЕР ЗДЕСЬ, А НЕ ТОЛЬКО В БАЗЕ. statement_timeout и lock_timeout
-// роли — значения по умолчанию: сессия меняет их командой SET, а SQL агента
-// идёт в базу как есть. Таймер сервера агенту недоступен: время вышло —
-// запрос отменяется на сервере базы (CancelRequest), соединение закрывается,
-// транзакция откатывается.
+// роли — значения по умолчанию: сессия их меняет, и SQL агента тоже может —
+// SET ему не дают (PREPARE), но SELECT set_config(…) — обычный SELECT. Таймер
+// сервера агенту недоступен: время вышло — запрос отменяется на сервере базы
+// (CancelRequest), соединение закрывается, транзакция откатывается.
 //
 // ПОЧЕМУ СЧЁТ — ПО ФАЙЛУ КВИТАНЦИЙ. Сервер живёт один сеанс агента. Счёт в
 // памяти обнулялся бы с каждым новым сеансом, а файл квитанций у всех сеансов
@@ -64,14 +64,14 @@ func (s *Server) drop() {
 	s.db = nil
 }
 
-// timed выполняет SQL агента не дольше StatementTimeout. Время вышло —
+// timed выполняет SQL агента (run) не дольше StatementTimeout. Время вышло —
 // запрос отменяется на сервере базы, а соединение закрывается: просьба об
 // отмене не должна догнать следующий запрос, и транзакция должна откатиться,
 // что бы агент в ней ни выставил.
-func (s *Server) timed(sql string) ([]pgwire.Result, error) {
+func (s *Server) timed(run func() ([]pgwire.Result, error)) ([]pgwire.Result, error) {
 	limit := s.cfg.StatementTimeout
 	if limit <= 0 {
-		return s.run(sql)
+		return run()
 	}
 	if err := s.connect(); err != nil {
 		return nil, err
@@ -90,7 +90,7 @@ func (s *Server) timed(sql string) ([]pgwire.Result, error) {
 			cl.Close()
 		}
 	})
-	res, err := s.run(sql)
+	res, err := run()
 	if t.Stop() {
 		return res, err
 	}

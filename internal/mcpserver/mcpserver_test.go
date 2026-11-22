@@ -21,6 +21,8 @@ type fakeDB struct {
 	fail    map[string]error
 	answers func(sql string) ([]pgwire.Result, bool)
 	tx      byte // состояние транзакции, как его сказала бы база
+	// prepared — команды агента по именам PREPARE: EXECUTE отвечает за них.
+	prepared map[string]string
 }
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
@@ -43,6 +45,46 @@ func (d *fakeDB) track(sql string, err error) {
 	}
 }
 
+// Pipeline — пачка, как её исполнила бы база: PREPARE запоминает команду
+// (или отвергает её, если в тексте есть подстрока из fail), EXECUTE отвечает
+// за неё; первая ошибка останавливает пачку.
+func (d *fakeDB) Pipeline(sqls []string) ([]pgwire.Result, error) {
+	var out []pgwire.Result
+	for _, sql := range sqls {
+		d.log = append(d.log, sql)
+		res, err := d.step(sql)
+		if err != nil {
+			if d.tx == pgwire.TxOpen {
+				d.tx = pgwire.TxFailed
+			}
+			return out, err
+		}
+		out = append(out, res...)
+	}
+	return out, nil
+}
+
+func (d *fakeDB) step(sql string) ([]pgwire.Result, error) {
+	rest, isPrepare := strings.CutPrefix(sql, "PREPARE ")
+	if !isPrepare {
+		if name, ok := strings.CutPrefix(sql, "EXECUTE "); ok {
+			return d.answer(d.prepared[name])
+		}
+		return d.answer(sql)
+	}
+	for sub, err := range d.fail {
+		if strings.Contains(sql, sub) {
+			return nil, err
+		}
+	}
+	name, body, _ := strings.Cut(rest, " AS ")
+	if d.prepared == nil {
+		d.prepared = map[string]string{}
+	}
+	d.prepared[name] = body
+	return []pgwire.Result{{Tag: "PREPARE"}}, nil
+}
+
 func (d *fakeDB) TxStatus() byte {
 	if d.tx == 0 {
 		return pgwire.TxIdle
@@ -63,7 +105,7 @@ func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 	}
 	v := "751"
 	switch {
-	case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_xact_user_tables"):
+	case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_get_xact_tuples"):
 		zero := "0" // счёт строк до SQL агента
 		return []pgwire.Result{{Columns: []string{"xid", "rows"}, Rows: [][]*string{{&v, &zero}}, Tag: "SELECT 1"}}, nil
 	case strings.Contains(sql, "pg_current_xact_id"):
@@ -181,10 +223,11 @@ func TestExecuteMarksTheActionAndKeepsAReceipt(t *testing.T) {
 	if out["action_id"] != "a-1" || out["xid"] != "751" || out["outcome"] != "committed" || out["statements"].([]any)[0] != "UPDATE 3" {
 		t.Fatalf("%v", out)
 	}
-	// Порядок: транзакция, отметка действия первой, номер транзакции, запрос, фиксация.
-	if len(db.log) != 5 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], "SELECT evidence.mark_action('{") ||
-		!strings.Contains(db.log[1], `"action_id":"a-1"`) || !strings.Contains(db.log[1], `"agent":"support-bot"`) ||
-		!strings.HasPrefix(db.log[3], "UPDATE") || db.log[4] != "COMMIT" {
+	// Порядок: чистый сеанс, транзакция, отметка действия первой, номер
+	// транзакции, команда агента — подготовкой и исполнением, фиксация.
+	if len(db.log) != 7 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SELECT evidence.mark_action('{") ||
+		!strings.Contains(db.log[2], `"action_id":"a-1"`) || !strings.Contains(db.log[2], `"agent":"support-bot"`) ||
+		db.log[4] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[5] != "EXECUTE es_agent_0" || db.log[6] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
 	data, _ := os.ReadFile(path)
@@ -224,7 +267,8 @@ func TestQueryIsReadOnlyAndBounded(t *testing.T) {
 	if isErr || text != `{"columns":["id","note"],"rows":[["1",null]],"truncated":true}` {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	if db.log[0] != "BEGIN TRANSACTION READ ONLY" || db.log[2] != "ROLLBACK" {
+	if db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN TRANSACTION READ ONLY" || db.log[2] != "PREPARE es_agent_0 AS SELECT id, note FROM accounts" ||
+		db.log[3] != "EXECUTE es_agent_0" || db.log[4] != "ROLLBACK" {
 		t.Fatalf("%q", db.log)
 	}
 	if data, _ := os.ReadFile(path); len(data) != 0 {
@@ -239,9 +283,9 @@ func TestBrokenConnectionIsReopened(t *testing.T) {
 	db := &fakeDB{fail: map[string]error{"BEGIN": errors.New("broken pipe")}}
 	dials := 0
 	s := New(Config{Agent: "a", Dial: func() (DB, error) { dials++; return db, nil }}, nil)
-	s.execute("UPDATE t SET a = 1", "")
+	s.execute([]string{"UPDATE t SET a = 1"}, "")
 	db.fail = nil
-	if _, err := s.execute("UPDATE t SET a = 1", ""); err != nil || dials != 2 {
+	if _, err := s.execute([]string{"UPDATE t SET a = 1"}, ""); err != nil || dials != 2 {
 		t.Fatalf("%v, dials %d", err, dials)
 	}
 }
@@ -384,9 +428,9 @@ func limitedFrom(t *testing.T, limit int, before, stat string) (*Server, *fakeDB
 	db := &fakeDB{answers: func(sql string) ([]pgwire.Result, bool) {
 		switch {
 		case stat == "":
-		case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_xact_user_tables"):
+		case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_get_xact_tuples"):
 			return []pgwire.Result{{Columns: []string{"xid", "rows"}, Rows: [][]*string{{&xid, &before}}, Tag: "SELECT 1"}}, true
-		case strings.Contains(sql, "pg_stat_xact_user_tables"):
+		case strings.Contains(sql, "pg_stat_get_xact_tuples"):
 			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
 		}
 		return nil, false
@@ -412,13 +456,13 @@ func TestRowLimitRefusesBeforeCommit(t *testing.T) {
 	}
 	// Порядок: изменения, счёт строк, отметка об отказе, откат. Фиксации нет.
 	n := len(db.log)
-	if n != 7 || !strings.HasPrefix(db.log[3], "UPDATE") || !strings.Contains(db.log[4], "pg_stat_xact_user_tables") ||
-		!strings.HasPrefix(db.log[5], "SELECT evidence.mark_refused('{") || db.log[6] != "ROLLBACK" {
+	if n != 9 || db.log[5] != "EXECUTE es_agent_0" || !strings.Contains(db.log[6], "pg_stat_get_xact_tuples") ||
+		!strings.HasPrefix(db.log[7], "SELECT evidence.mark_refused('{") || db.log[8] != "ROLLBACK" {
 		t.Fatalf("%q", db.log)
 	}
 	for _, want := range []string{`"action_id":"a-1"`, `"agent":"support-bot"`, `"rows":700`, `"limit":500`, `"reason":"close inactive accounts"`} {
-		if !strings.Contains(db.log[5], want) {
-			t.Fatalf("the refusal marker lacks %s: %s", want, db.log[5])
+		if !strings.Contains(db.log[7], want) {
+			t.Fatalf("the refusal marker lacks %s: %s", want, db.log[7])
 		}
 	}
 	data, _ := os.ReadFile(path)
@@ -474,7 +518,7 @@ func TestRowLimitDoesNotFailOpen(t *testing.T) {
 	}
 
 	s, db, path := limited(t, 2, "")
-	db.fail = map[string]error{"pg_stat_xact_user_tables": &pgwire.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied for view pg_stat_xact_user_tables"}}
+	db.fail = map[string]error{"pg_stat_get_xact_tuples": &pgwire.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied for view pg_stat_xact_user_tables"}}
 	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`)
 	if !isErr || !strings.Contains(text, "could not be counted") || !strings.Contains(text, "rolled back") {
 		t.Fatalf("%v %s", isErr, text)
@@ -498,7 +542,7 @@ func TestRowCountIsTheActionsOwn(t *testing.T) {
 		t.Fatalf("%v %s", isErr, text)
 	}
 	// Счёт «до» — в одном запросе с номером транзакции, лишнего обмена нет.
-	if !strings.Contains(db.log[2], "pg_current_xact_id") || !strings.Contains(db.log[2], "pg_stat_xact_user_tables") {
+	if !strings.Contains(db.log[3], "pg_current_xact_id") || !strings.Contains(db.log[3], "pg_stat_get_xact_tuples") {
 		t.Fatalf("%q", db.log)
 	}
 	data, _ := os.ReadFile(path)

@@ -12,6 +12,18 @@
 // Запреты держит не этот сервер, а база: он подключается ролью агента, и что
 // этой роли не выдано, то агенту недоступно, каким бы ни был текст запроса.
 //
+// ТРАНЗАКЦИЮ ВЕДЁТ СЕРВЕР. Отметка, предел строк и квитанция держатся на том,
+// что до COMMIT сервера ничего не зафиксировано. Поэтому команда агента идёт
+// в базу обёрнутой в PREPARE и расширенным протоколом (pgwire.Pipeline):
+// разбор допускает ровно одну команду, а грамматика PREPARE — только SELECT,
+// INSERT, UPDATE, DELETE, MERGE и VALUES. COMMIT, ROLLBACK, BEGIN, SET, DO,
+// CALL и изменения схемы база отвергает ещё при разборе, ничего не исполнив;
+// список разрешённого проверяет сама база, а не разбор текста здесь. Раньше
+// текст шёл простым протоколом, и COMMIT в нём фиксировал транзакцию сервера
+// до проверки предела (P-239). Каждый вызов начинается с DISCARD ALL: что
+// SQL агента сменил на весь сеанс (set_config(…, false), рекомендательные
+// замки), до следующего вызова не доживает.
+//
 // ПРОТОКОЛ. JSON-RPC 2.0 по stdio, сообщение на строку. Сервер двух эпох
 // (спецификация MCP, «Versioning and Compatibility»): запрос с версией в _meta
 // обслуживается без состояния по ревизии 2026-07-28 (server/discover,
@@ -56,7 +68,12 @@ const instructions = "Access to a PostgreSQL database for an AI agent. Use `quer
 
 // DB — соединение с базой (у *pgwire.Conn такие методы есть).
 type DB interface {
+	// Query — простой протокол: для своих запросов сервера, не для текста
+	// агента (в нём можно склеить несколько команд).
 	Query(sql string) ([]pgwire.Result, error)
+	// Pipeline — расширенный протокол, ровно одна команда на текст: для
+	// команд агента (pgwire.Pipeline).
+	Pipeline(sqls []string) ([]pgwire.Result, error)
 	// TxStatus — состояние транзакции после последнего ответа базы
 	// (pgwire.TxIdle, TxOpen, TxFailed).
 	TxStatus() byte
@@ -102,9 +119,12 @@ type Receipt struct {
 	Time     string `json:"time"`
 	Agent    string `json:"agent"`
 	Tool     string `json:"tool"`
-	SQL      string `json:"sql"`
-	Reason   string `json:"reason,omitempty"`
-	XID      string `json:"xid,omitempty"`
+	// SQL — команды действия, через ";\n" для чтения; Statements — они же по
+	// одной, когда их больше одной.
+	SQL        string   `json:"sql"`
+	Statements []string `json:"statements,omitempty"`
+	Reason     string   `json:"reason,omitempty"`
+	XID        string   `json:"xid,omitempty"`
 	// Outcome — committed, failed, refused (остановлено пределом) или escaped
 	// (SQL агента сам закрыл транзакцию сервера: что он изменил после этого,
 	// могло зафиксироваться мимо пределов).
@@ -112,7 +132,7 @@ type Receipt struct {
 	Tags    []string `json:"tags,omitempty"`
 	Rows    int      `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
 	// Cause — почему действие остановлено сервером: row-limit, window-rows,
-	// rate (отказы) или timeout (запрос отменён по времени).
+	// rate (отказы), timeout (запрос отменён по времени) или escaped.
 	Cause string `json:"cause,omitempty"`
 	// Alerted — об этом отказе за частоту людям ушла тревога (об остальных в
 	// ту же минуту — нет).
@@ -304,20 +324,26 @@ func (e errUnknownTool) Error() string { return "unknown tool: " + string(e) }
 
 var tools = []map[string]any{
 	{
-		"name":        "query",
-		"title":       "Read from the database",
-		"description": "Run one read-only SQL statement (SELECT) and get the rows back as JSON. The transaction is read-only: a statement that writes fails.",
+		"name":  "query",
+		"title": "Read from the database",
+		"description": "Run one read-only SQL statement (SELECT) and get the rows back as JSON. The transaction is read-only: a statement that writes fails. " +
+			"One statement only: several in one string are refused.",
 		"inputSchema": map[string]any{"type": "object", "required": []string{"sql"}, "additionalProperties": false,
 			"properties": map[string]any{"sql": map[string]any{"type": "string", "description": "A SELECT statement."}}},
 	},
 	{
 		"name":  "execute",
 		"title": "Change rows in the database",
-		"description": "Run SQL that changes rows (INSERT, UPDATE, DELETE) as one transaction and one recorded action. " +
+		"description": "Run SQL that changes rows (INSERT, UPDATE, DELETE, MERGE) as one transaction and one recorded action. " +
+			"Give one statement in `sql`, or several in `statements`: they run in that order, in one transaction. " +
+			"Each statement is a single SELECT, INSERT, UPDATE, DELETE, MERGE or VALUES. The server runs the transaction itself, " +
+			"so BEGIN, COMMIT, ROLLBACK, SET, DO, CALL and schema changes are refused before anything runs. " +
 			"Returns the action id, the transaction id and what each statement did. The previous values of every changed row are kept, so the action can be undone by a human.",
-		"inputSchema": map[string]any{"type": "object", "required": []string{"sql"}, "additionalProperties": false,
+		"inputSchema": map[string]any{"type": "object", "additionalProperties": false,
 			"properties": map[string]any{
-				"sql":    map[string]any{"type": "string", "description": "One or more statements; they run in a single transaction."},
+				"sql": map[string]any{"type": "string", "description": "One statement. Use `statements` for several."},
+				"statements": map[string]any{"type": "array", "minItems": 1, "maxItems": maxStatements, "items": map[string]any{"type": "string"},
+					"description": "Several statements, one per item; they run in order, in a single transaction."},
 				"reason": map[string]any{"type": "string", "description": "Why this change is being made, in a sentence. Kept with the action."},
 			}},
 	},
@@ -387,10 +413,11 @@ var undoTools = []map[string]any{
 
 func (s *Server) call(name string, args json.RawMessage) (string, error) {
 	var a struct {
-		SQL      string `json:"sql"`
-		Reason   string `json:"reason"`
-		Limit    int    `json:"limit"`
-		ActionID string `json:"action_id"`
+		SQL        string   `json:"sql"`
+		Statements []string `json:"statements"`
+		Reason     string   `json:"reason"`
+		Limit      int      `json:"limit"`
+		ActionID   string   `json:"action_id"`
 	}
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -398,17 +425,21 @@ func (s *Server) call(name string, args json.RawMessage) (string, error) {
 		}
 	}
 	switch name {
-	case "query", "execute":
-		if strings.TrimSpace(a.SQL) == "" {
-			return "", errors.New("sql is empty")
+	case "query":
+		if len(a.Statements) > 0 {
+			return "", errors.New("`query` takes one statement in `sql`")
 		}
-		if strings.IndexByte(a.SQL, 0) >= 0 {
-			return "", errors.New("sql holds a zero byte")
+		stmts, err := statements(a.SQL, nil)
+		if err != nil {
+			return "", err
 		}
-		if name == "query" {
-			return s.query(a.SQL)
+		return s.query(stmts[0])
+	case "execute":
+		stmts, err := statements(a.SQL, a.Statements)
+		if err != nil {
+			return "", err
 		}
-		return s.execute(a.SQL, a.Reason)
+		return s.execute(stmts, a.Reason)
 	case "actions":
 		n := a.Limit
 		if n <= 0 || n > 50 {
@@ -478,10 +509,10 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if s.db == nil {
-		if _, err := s.run("SELECT 1"); err != nil {
-			return "", err
-		}
+	// Сверка и откат читают и пишут значения текстом: настройки сеанса,
+	// которые SQL агента мог сменить (DateStyle, search_path…), им не нужны.
+	if err := s.fresh(); err != nil {
+		return "", err
 	}
 	statuses, err := plan.Check(s.db)
 	if err != nil {
@@ -546,7 +577,128 @@ func (s *Server) run(sql string) ([]pgwire.Result, error) {
 	return res, err
 }
 
+// pipe исполняет пачку команд расширенным протоколом (pgwire.Pipeline);
+// соединение — как у run.
+func (s *Server) pipe(sqls []string) ([]pgwire.Result, error) {
+	if err := s.connect(); err != nil {
+		return nil, err
+	}
+	res, err := s.db.Pipeline(sqls)
+	var pg *pgwire.PgError
+	if err != nil && !errors.As(err, &pg) {
+		s.drop()
+	}
+	return res, err
+}
+
+// fresh начинает вызов с чистого сеанса. DISCARD ALL сбрасывает то, что SQL
+// агента мог оставить сеансу прошлым вызовом: настройки на весь сеанс
+// (SELECT set_config(…, false) — роль, search_path, DateStyle…),
+// рекомендательные замки, временные таблицы, подготовленные команды. Не
+// вышло (сеанс, например, внутри транзакции) — соединение бросается и
+// открывается новое: новый сеанс чист сам.
+func (s *Server) fresh() error {
+	if err := s.connect(); err != nil {
+		return err
+	}
+	if _, err := s.run("DISCARD ALL"); err == nil {
+		return nil
+	}
+	s.drop()
+	return s.connect()
+}
+
+// maxStatements — сколько команд может быть в одном действии.
+const maxStatements = 100
+
+// statements — команды вызова: одна в sql или несколько в list, ни одной
+// пустой. Режет на команды не сервер: разбор оставлен базе (prepared).
+func statements(sql string, list []string) ([]string, error) {
+	switch {
+	case sql != "" && len(list) > 0:
+		return nil, errors.New("give one statement in `sql` or several in `statements`, not both")
+	case len(list) > maxStatements:
+		return nil, fmt.Errorf("%d statements, and one action takes at most %d", len(list), maxStatements)
+	case len(list) == 0:
+		list = []string{sql}
+	}
+	for i, st := range list {
+		if strings.TrimSpace(st) == "" {
+			if len(list) == 1 {
+				return nil, errors.New("sql is empty")
+			}
+			return nil, fmt.Errorf("statement %d is empty", i+1)
+		}
+		if strings.IndexByte(st, 0) >= 0 {
+			return nil, fmt.Errorf("statement %d holds a zero byte", i+1)
+		}
+	}
+	return list, nil
+}
+
+// agentStmt — имя подготовленной команды агента под номером i.
+func agentStmt(i int) string { return fmt.Sprintf("es_agent_%d", i) }
+
+// prepared — пачка для команд агента: сначала PREPARE каждой, потом EXECUTE
+// каждой. Разбор пачки (Parse) допускает в тексте одну команду, грамматика
+// PREPARE — только SELECT, INSERT, UPDATE, DELETE, MERGE и VALUES: всё прочее
+// база отвергает при разборе, и раз все PREPARE идут первыми, не исполняется
+// ни одна команда агента. Склейка текста безопасна: «;» отвергнет Parse, а
+// после AS грамматика другого не примет.
+func prepared(stmts []string) []string {
+	batch := make([]string, 0, 2*len(stmts))
+	for i, st := range stmts {
+		batch = append(batch, "PREPARE "+agentStmt(i)+" AS "+st)
+	}
+	for i := range stmts {
+		batch = append(batch, "EXECUTE "+agentStmt(i))
+	}
+	return batch
+}
+
+// agentResults — ответы на команды агента из ответов пачки prepared: первые
+// n — подготовка.
+func agentResults(res []pgwire.Result, n int) []pgwire.Result {
+	if len(res) <= n {
+		return nil
+	}
+	return res[n:]
+}
+
+// refusedStmt объясняет ошибку пачки prepared: на какой команде агента и
+// почему. done — сколько команд пачки прошло; n — команд агента. Отказ при
+// подготовке с синтаксической ошибкой — почти всегда команда, которой нельзя
+// (COMMIT, SET…), или две в одном тексте: об этом и сказано.
+func refusedStmt(err error, done, n int, read bool) error {
+	var pg *pgwire.PgError
+	if !errors.As(err, &pg) {
+		return err
+	}
+	if done >= n {
+		if n == 1 {
+			return err
+		}
+		return fmt.Errorf("statement %d: %w", done-n+1, err)
+	}
+	which := "the statement"
+	if n > 1 {
+		which = fmt.Sprintf("statement %d", done+1)
+	}
+	if pg.Code != "42601" {
+		return fmt.Errorf("%s: %w", which, err)
+	}
+	if read {
+		return fmt.Errorf("%s was not taken: %w. `query` takes one SELECT (or VALUES) and nothing else; several statements in one string are refused, and changes go through `execute`", which, err)
+	}
+	return fmt.Errorf("%s was not taken, nothing ran: %w. Each statement must be a single SELECT, INSERT, UPDATE, DELETE, MERGE or VALUES: "+
+		"the server runs the transaction itself, so BEGIN, COMMIT, ROLLBACK, SET, DO, CALL and schema changes are not taken, "+
+		"and several statements go as separate items of `statements`", which, err)
+}
+
 func (s *Server) query(sql string) (string, error) {
+	if err := s.fresh(); err != nil {
+		return "", err
+	}
 	if _, err := s.run("BEGIN TRANSACTION READ ONLY"); err != nil {
 		return "", err
 	}
@@ -556,18 +708,19 @@ func (s *Server) query(sql string) (string, error) {
 			return "", err
 		}
 	}
-	res, err := s.timed(sql)
+	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(prepared([]string{sql})) })
+	res := agentResults(all, 1)
 	if s.db != nil && s.leftReadOnly(res) {
-		// Чтение закрыло свою транзакцию «только для чтения» (COMMIT; INSERT …):
-		// всё, что шло в тексте после этого, исполнялось с правами роли и могло
-		// зафиксироваться. Это уже не чтение, а действие мимо сервера.
+		// Чтение закрыло свою транзакцию «только для чтения»: всё, что шло
+		// после этого, исполнялось с правами роли и могло зафиксироваться. С
+		// PREPARE так не выйти; проверка — страховка.
 		return "", s.escapedQuery(sql)
 	}
 	if s.db != nil { // по таймауту соединение уже закрыто
 		s.run("ROLLBACK")
 	}
 	if err != nil {
-		return "", err
+		return "", refusedStmt(err, len(all), 1, true)
 	}
 	type set struct {
 		Columns   []string    `json:"columns"`
@@ -596,12 +749,15 @@ func (s *Server) query(sql string) (string, error) {
 	return string(text), nil
 }
 
-func (s *Server) execute(sql, reason string) (string, error) {
+func (s *Server) execute(stmts []string, reason string) (string, error) {
 	rc := Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "execute",
-		SQL: sql, Reason: reason, Client: s.client, Outcome: "failed"}
+		SQL: strings.Join(stmts, ";\n"), Reason: reason, Client: s.client, Outcome: "failed"}
+	if len(stmts) > 1 {
+		rc.Statements = stmts
+	}
 	err := s.throttle(&rc)
 	if err == nil {
-		err = s.transaction(&rc)
+		err = s.transaction(&rc, stmts)
 	}
 	if err != nil {
 		rc.Error = err.Error()
@@ -655,7 +811,10 @@ func (s *Server) throttle(rc *Receipt) error {
 		actions, s.cfg.ActionsPerMinute)
 }
 
-func (s *Server) transaction(rc *Receipt) error {
+func (s *Server) transaction(rc *Receipt, stmts []string) error {
+	if err := s.fresh(); err != nil {
+		return err
+	}
 	if _, err := s.run("BEGIN"); err != nil {
 		return err
 	}
@@ -698,8 +857,8 @@ func (s *Server) transaction(rc *Receipt) error {
 			return fail(fmt.Errorf("the rows the action changes could not be counted, so the row limits cannot be checked: %w", err))
 		}
 	}
-	res, err = s.timed(rc.SQL)
-	for _, r := range res {
+	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(prepared(stmts)) })
+	for _, r := range agentResults(all, len(stmts)) {
 		rc.Tags = append(rc.Tags, r.Tag)
 	}
 	if errors.Is(err, errTimeout) {
@@ -719,7 +878,7 @@ func (s *Server) transaction(rc *Receipt) error {
 		return s.escaped(rc)
 	}
 	if err != nil {
-		return fail(err)
+		return fail(refusedStmt(err, len(all), len(stmts), false))
 	}
 	if s.cfg.RowLimit > 0 || s.cfg.WindowRows > 0 {
 		// Предохранитель: до фиксации известно, сколько строк действие изменило.
@@ -853,8 +1012,15 @@ func (s *Server) escapedQuery(sql string) error {
 }
 
 // xactRows — сколько строк, по статистике базы, изменили транзакции этого
-// сеанса, ещё не сброшенные в общую статистику (pg_stat_xact_user_tables).
-const xactRows = "(SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0) FROM pg_stat_xact_user_tables)::bigint"
+// сеанса, ещё не сброшенные в общую статистику. Это сумма n_tup_ins, n_tup_upd
+// и n_tup_del вида pg_stat_xact_user_tables, взятая прямо из функций: вид
+// соединяет pg_class с индексами и namespace и на каждом вызове обходился
+// примерно в 0,5–0,7 мс, а счёт берётся дважды за действие (до и после SQL
+// агента). Таблицы те же: всё, что создано после initdb (oid от
+// FirstNormalObjectId, 16384), — обычные, секционированные и материализованные;
+// системные и TOAST вид отбрасывает так же.
+const xactRows = "(SELECT coalesce(sum(pg_stat_get_xact_tuples_inserted(oid) + pg_stat_get_xact_tuples_updated(oid) + pg_stat_get_xact_tuples_deleted(oid)), 0) " +
+	"FROM pg_catalog.pg_class WHERE oid >= 16384 AND relkind IN ('r', 'm', 'p'))::bigint"
 
 // countIn — число из колонки col единственной строки ответа.
 func countIn(res []pgwire.Result, col int) (int, error) {
@@ -871,7 +1037,7 @@ func countIn(res []pgwire.Result, col int) (int, error) {
 // (track_counts = off): берётся большее.
 //
 // Счёт — разность: before взят в начале транзакции, до SQL агента.
-// pg_stat_xact_user_tables показывает не одну текущую транзакцию, а всё, что
+// Статистика транзакции (pg_stat_xact_*) показывает не одну текущую, а всё, что
 // сеанс ещё не сбросил в общую статистику: база сбрасывает её не чаще раза в
 // секунду, иначе — примерно через 10 с простоя. Действие вслед за другим
 // получало строки соседа к своим: правка одной строки — «would change 101

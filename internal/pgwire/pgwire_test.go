@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -218,5 +219,86 @@ func TestCancelTLSFailureIsAnError(t *testing.T) {
 	// Сервер не дал ключа отмены — просить нечем.
 	if err := (&Conn{}).Cancel(); err == nil {
 		t.Fatal("cancelled without a key")
+	}
+}
+
+// msg — сообщение сервера: тип, длина, тело.
+func msg(typ byte, body ...byte) []byte {
+	return append([]byte{typ, 0, 0, 0, byte(len(body) + 4)}, body...)
+}
+
+// Пачка уходит одной записью: на каждую команду Parse, Bind, Describe,
+// Execute, в конце один Sync. Ответ разбирается по командам; после ошибки
+// сервер пропускает остальное, и состояние транзакции — из ReadyForQuery.
+func TestPipelineFramesAndAnswers(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	got := make(chan string, 1) // типы сообщений пачки, как их прочла заглушка
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		var n [4]byte
+		io.ReadFull(c, n[:]) // стартовое сообщение
+		io.CopyN(io.Discard, c, int64(n[0])<<24|int64(n[1])<<16|int64(n[2])<<8|int64(n[3])-4)
+		c.Write(append(msg('R', 0, 0, 0, 0), msg('Z', 'I')...)) // вход без пароля
+		var types []byte
+		for {
+			var head [5]byte
+			if _, err := io.ReadFull(c, head[:]); err != nil {
+				return
+			}
+			body := make([]byte, int(head[1])<<24|int(head[2])<<16|int(head[3])<<8|int(head[4])-4)
+			io.ReadFull(c, body)
+			types = append(types, head[0])
+			if head[0] == 'P' && !strings.Contains(string(body), "SELECT") {
+				types = append(types, '?') // Parse без текста команды
+			}
+			if head[0] == 'S' {
+				break
+			}
+		}
+		got <- string(types)
+		var answer []byte
+		answer = append(answer, msg('1')...)
+		answer = append(answer, msg('2')...)
+		answer = append(answer, msg('T', append([]byte{0, 1, 'a', 0}, make([]byte, 18)...)...)...)
+		answer = append(answer, msg('D', 0, 1, 0, 0, 0, 1, '7')...)
+		answer = append(answer, msg('C', []byte("SELECT 1\x00")...)...)
+		answer = append(answer, msg('E', []byte("SERROR\x00C42601\x00Mcannot insert multiple commands into a prepared statement\x00\x00")...)...)
+		answer = append(answer, msg('Z', 'E')...)
+		c.Write(answer)
+		io.Copy(io.Discard, c)
+	}()
+	cfg, err := ParseDSN(fmt.Sprintf("host=127.0.0.1 port=%d user=u dbname=d", ln.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Dial(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.TxStatus() != TxIdle {
+		t.Fatalf("after the start: %c", c.TxStatus())
+	}
+	res, err := c.Pipeline([]string{"SELECT 7 AS a", "SELECT 1; SELECT 2"})
+	if types := <-got; types != "PBDEPBDES" {
+		t.Fatalf("the pipeline went as %q", types)
+	}
+	var pg *PgError
+	if !errors.As(err, &pg) || pg.Code != "42601" || len(res) != 1 || res[0].Columns[0] != "a" || *res[0].Rows[0][0] != "7" || res[0].Tag != "SELECT 1" {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if c.TxStatus() != TxFailed {
+		t.Fatalf("after the error: %c", c.TxStatus())
+	}
+	if _, err := c.Pipeline([]string{"SELECT 1\x00"}); err == nil {
+		t.Fatal("a zero byte went through")
 	}
 }

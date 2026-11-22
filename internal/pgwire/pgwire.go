@@ -403,11 +403,15 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) send(typ byte, body []byte) error {
-	buf := make([]byte, 0, 5+len(body))
+	_, err := c.nc.Write(frame(make([]byte, 0, 5+len(body)), typ, body))
+	return err
+}
+
+// frame дописывает к buf сообщение клиента: тип, длина, тело.
+func frame(buf []byte, typ byte, body []byte) []byte {
 	buf = append(buf, typ)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(body)+4))
-	_, err := c.nc.Write(append(buf, body...))
-	return err
+	return append(buf, body...)
 }
 
 func (c *Conn) read() (byte, []byte, error) {
@@ -520,6 +524,94 @@ func (c *Conn) Query(sql string) ([]Result, error) {
 		case 'N', 'S', 'A':
 		default:
 			return out, fmt.Errorf("pgwire: unexpected message %q in a query answer", typ)
+		}
+	}
+}
+
+// Pipeline исполняет команды расширенным протоколом одной пачкой: на каждую —
+// Parse, Bind, Describe и Execute, в конце один Sync, и всё — одной записью в
+// соединение и одним ответом. На каждую исполненную команду — свой Result, как
+// у Query.
+//
+// В отличие от Query, текст каждой команды — ровно одна команда: две через ";"
+// сервер отвергает ещё при разборе (42601, «cannot insert multiple commands
+// into a prepared statement»), ничего не исполнив. Так в текст нельзя
+// вставить COMMIT, который закроет чужую транзакцию, вместе с тем, что пойдёт
+// после него.
+//
+// После первой ошибки сервер пропускает остальное до Sync: возвращаются
+// результаты команд до неё и *PgError. Внутри открытой транзакции Sync её не
+// фиксирует, а ошибка оставляет сломанной (TxFailed); вне транзакции пачка —
+// одна неявная транзакция, которую Sync фиксирует или откатывает целиком.
+// Параметров у команд нет: значения — в тексте (Literal).
+func (c *Conn) Pipeline(sqls []string) ([]Result, error) {
+	if c.stream {
+		return nil, errors.New("pgwire: the connection is streaming replication")
+	}
+	var buf []byte
+	for _, sql := range sqls {
+		if strings.IndexByte(sql, 0) >= 0 {
+			return nil, errors.New("pgwire: a query cannot hold a zero byte")
+		}
+		parse := append([]byte{0}, sql...) // безымянный оператор: имя "" и текст
+		parse = append(parse, 0, 0, 0)     // конец текста, 0 типов параметров
+		buf = frame(buf, 'P', parse)
+		buf = frame(buf, 'B', make([]byte, 8)) // портал "" ← оператор "", без параметров, ответ текстом
+		buf = frame(buf, 'D', []byte{'P', 0})  // описать портал: колонки ('T') или их нет ('n')
+		buf = frame(buf, 'E', make([]byte, 5)) // исполнить портал "", все строки
+	}
+	buf = frame(buf, 'S', nil)
+	if _, err := c.nc.Write(buf); err != nil {
+		return nil, err
+	}
+	var out []Result
+	var cur *Result
+	var failed error
+	for {
+		typ, msg, err := c.read()
+		if err != nil {
+			return out, err
+		}
+		switch typ {
+		case '1', '2', 'n': // ParseComplete, BindComplete, NoData
+		case 'T':
+			cols, err := parseRowDescription(msg)
+			if err != nil {
+				return out, err
+			}
+			cur = &Result{Columns: cols}
+		case 'D':
+			row, err := parseDataRow(msg)
+			if err != nil {
+				return out, err
+			}
+			if cur == nil {
+				cur = &Result{}
+			}
+			cur.Rows = append(cur.Rows, row)
+		case 'C':
+			if cur == nil {
+				cur = &Result{}
+			}
+			cur.Tag = strings.TrimRight(string(msg), "\x00")
+			out = append(out, *cur)
+			cur = nil
+		case 'I':
+			out = append(out, Result{})
+			cur = nil
+		case 'E':
+			if failed == nil {
+				failed = parseError(msg)
+			}
+			cur = nil
+		case 'Z':
+			c.ready(msg)
+			return out, failed
+		case 'N', 'S', 'A':
+		default:
+			// COPY и прочее, что требует от клиента ответа по ходу: соединение
+			// в таком состоянии дальше не годится.
+			return out, fmt.Errorf("pgwire: unexpected message %q in a pipeline answer", typ)
 		}
 	}
 }

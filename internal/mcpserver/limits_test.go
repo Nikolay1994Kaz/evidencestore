@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,11 @@ func (d *slowDB) Query(sql string) ([]pgwire.Result, error) {
 		return d.fakeDB.Query(sql)
 	}
 	d.log = append(d.log, sql)
+	return d.hang()
+}
+
+// hang ждёт отмены или закрытия соединения.
+func (d *slowDB) hang() ([]pgwire.Result, error) {
 	d.mu.Lock()
 	cancelled, closed := d.cancelled, d.close
 	d.mu.Unlock()
@@ -48,6 +54,15 @@ func (d *slowDB) Query(sql string) ([]pgwire.Result, error) {
 	case <-time.After(10 * time.Second):
 		return nil, errors.New("the test never stopped the slow query")
 	}
+}
+
+// Pipeline: пачка, где есть медленная команда, висит так же.
+func (d *slowDB) Pipeline(sqls []string) ([]pgwire.Result, error) {
+	if !slices.ContainsFunc(sqls, func(sql string) bool { return strings.Contains(sql, d.slow) }) {
+		return d.fakeDB.Pipeline(sqls)
+	}
+	d.log = append(d.log, sqls...)
+	return d.hang()
 }
 
 func (d *slowDB) Cancel() error {
@@ -121,7 +136,9 @@ func TestStatementTimeoutCancelsAndDropsTheConnection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
 	s := serverOn(t, db, path, func(c *Config) { c.StatementTimeout = 30 * time.Millisecond })
 	start := time.Now()
-	text, isErr := callText(t, s, "execute", `{"sql":"SET statement_timeout = 0; UPDATE accounts SET note = pg_sleep(3600)::text","reason":"slow"}`)
+	// SET агенту не дают, но set_config — обычный SELECT: таймаут базы он
+	// себе снимет. Таймер сервера ему недоступен.
+	text, isErr := callText(t, s, "execute", `{"statements":["SELECT set_config('statement_timeout', '0', true)","UPDATE accounts SET note = pg_sleep(3600)::text"],"reason":"slow"}`)
 	if !isErr || !strings.Contains(text, "action a-1 failed and was rolled back") || !strings.Contains(text, "ran longer than 30ms and was cancelled") {
 		t.Fatalf("%v %s", isErr, text)
 	}
@@ -131,10 +148,10 @@ func TestStatementTimeoutCancelsAndDropsTheConnection(t *testing.T) {
 	if cancels, closes := db.counts(); cancels != 1 || closes != 1 {
 		t.Fatalf("cancels %d, closes %d", cancels, closes)
 	}
-	// После зависшего запроса в закрытое соединение ничего не шло: ни ROLLBACK,
+	// После зависшей пачки в закрытое соединение ничего не шло: ни ROLLBACK,
 	// ни COMMIT. Отметка для тревоги — уже по новому соединению.
 	n := len(db.log)
-	if !strings.Contains(db.log[n-2], "pg_sleep") || !strings.HasPrefix(db.log[n-1], "SELECT evidence.mark_refused('{") ||
+	if !strings.Contains(db.log[n-4], "pg_sleep") || db.log[n-2] != "EXECUTE es_agent_1" || !strings.HasPrefix(db.log[n-1], "SELECT evidence.mark_refused('{") ||
 		!strings.Contains(db.log[n-1], `"cause":"timeout"`) || !strings.Contains(db.log[n-1], `"timeout":"30ms"`) {
 		t.Fatalf("%q", db.log)
 	}
@@ -178,8 +195,8 @@ func TestTimeoutsLeaveFastActionsAlone(t *testing.T) {
 	if isErr || !strings.Contains(text, `"outcome":"committed"`) {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	if db.log[0] != "BEGIN" || db.log[1] != "SET LOCAL statement_timeout = 65000; SET LOCAL lock_timeout = 5000" ||
-		!strings.Contains(db.log[2], "mark_action") || db.log[len(db.log)-1] != "COMMIT" {
+	if db.log[1] != "BEGIN" || db.log[2] != "SET LOCAL statement_timeout = 65000; SET LOCAL lock_timeout = 5000" ||
+		!strings.Contains(db.log[3], "mark_action") || db.log[len(db.log)-1] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
 	if cancels, closes := db.counts(); cancels != 0 || closes != 0 {
@@ -289,7 +306,7 @@ func TestWindowRowsStopsAnAgentThatSplitsItsChange(t *testing.T) {
 	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
 	stat := "400"
 	db := &fakeDB{answers: func(sql string) ([]pgwire.Result, bool) {
-		if strings.Contains(sql, "pg_stat_xact_user_tables") && !strings.Contains(sql, "pg_current_xact_id") {
+		if strings.Contains(sql, "pg_stat_get_xact_tuples") && !strings.Contains(sql, "pg_current_xact_id") {
 			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
 		}
 		return nil, false

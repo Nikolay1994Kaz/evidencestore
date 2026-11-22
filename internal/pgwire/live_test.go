@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,6 +79,55 @@ func TestLive(t *testing.T) {
 	if _, err := c.Query("SELECT 1"); err != nil {
 		t.Fatal(err)
 	}
+
+	// Пачка расширенным протоколом: в тексте одна команда. COMMIT, склеенный с
+	// изменением, сервер отвергает при разборе, и открытая транзакция не
+	// фиксируется; PREPARE не берёт COMMIT вовсе; EXECUTE отдаёт колонки и
+	// тег самой команды.
+	if _, err := c.Query("CREATE TEMP TABLE pgwire_pipe (id int)"); err != nil {
+		t.Fatal(err)
+	}
+	count := func() string {
+		row, _, err := c.QueryRow("SELECT count(*) FROM pgwire_pipe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return *row[0]
+	}
+	if c.TxStatus() != TxIdle {
+		t.Fatalf("outside a transaction: %c", c.TxStatus())
+	}
+	c.Query("BEGIN")
+	res, err = c.Pipeline([]string{"INSERT INTO pgwire_pipe VALUES (1)", "COMMIT; INSERT INTO pgwire_pipe VALUES (2)", "INSERT INTO pgwire_pipe VALUES (3)"})
+	if !errors.As(err, &pg) || pg.Code != "42601" || len(res) != 1 || res[0].Tag != "INSERT 0 1" || c.TxStatus() != TxFailed {
+		t.Fatalf("COMMIT glued to a change: %+v %v %c", res, err, c.TxStatus())
+	}
+	c.Query("ROLLBACK")
+	if n := count(); n != "0" {
+		t.Fatalf("%s rows after the refused pipeline", n)
+	}
+	c.Query("BEGIN")
+	res, err = c.Pipeline([]string{"PREPARE pw0 AS INSERT INTO pgwire_pipe VALUES (4)", "PREPARE pw1 AS COMMIT", "EXECUTE pw0", "EXECUTE pw1"})
+	if !errors.As(err, &pg) || pg.Code != "42601" || len(res) != 1 || res[0].Tag != "PREPARE" || c.TxStatus() != TxFailed {
+		t.Fatalf("PREPARE … AS COMMIT: %+v %v %c", res, err, c.TxStatus())
+	}
+	c.Query("ROLLBACK")
+	c.Query("DISCARD ALL")
+	c.Query("CREATE TEMP TABLE pgwire_pipe (id int)") // DISCARD ALL убрал и временную таблицу
+	c.Query("BEGIN")
+	res, err = c.Pipeline([]string{"PREPARE pw0 AS INSERT INTO pgwire_pipe VALUES (5), (6) RETURNING id", "PREPARE pw1 AS SELECT id, 'x' AS t FROM pgwire_pipe WHERE false",
+		"EXECUTE pw0", "EXECUTE pw1"})
+	if err != nil || len(res) != 4 || res[2].Tag != "INSERT 0 2" || len(res[2].Rows) != 2 || *res[2].Rows[1][0] != "6" ||
+		strings.Join(res[3].Columns, ",") != "id,t" || len(res[3].Rows) != 0 || c.TxStatus() != TxOpen {
+		t.Fatalf("PREPARE and EXECUTE: %+v %v %c", res, err, c.TxStatus())
+	}
+	c.Query("ROLLBACK")
+	// Вне транзакции пачка — одна неявная транзакция: ошибка откатывает её целиком.
+	res, err = c.Pipeline([]string{"INSERT INTO pgwire_pipe VALUES (7)", "SELECT 1/0"})
+	if !errors.As(err, &pg) || pg.Code != "22012" || len(res) != 1 || c.TxStatus() != TxIdle || count() != "0" {
+		t.Fatalf("an implicit transaction: %+v %v %c %s", res, err, c.TxStatus(), count())
+	}
+	c.Query("DISCARD ALL")
 
 	slot := "pgwire_live_test"
 	c.Query("SELECT pg_drop_replication_slot(" + Literal(slot) + ")")

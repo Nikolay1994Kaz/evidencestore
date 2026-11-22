@@ -8,27 +8,37 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
-// textDB — база, где текст агента (запрос со словом docs) отвечает заданными
-// тегами и оставляет транзакцию в заданном состоянии: так COMMIT в тексте
-// закрывает транзакцию сервера, не спрашивая его.
+// textDB — база, где команды агента (со словом docs) отвечают заданными
+// тегами и оставляют транзакцию в заданном состоянии: так вела себя база,
+// когда текст агента шёл простым протоколом и COMMIT в нём закрывал
+// транзакцию сервера (P-239). С PREPARE до этого не дойти; эти тесты держат
+// страховку, которая заметит выход, если он всё же найдётся.
 type textDB struct {
 	fakeDB
 	tags  []string
 	err   error
-	after byte   // состояние транзакции после текста агента
-	xid   string // номер открытой транзакции после текста агента
+	after byte   // состояние транзакции после команд агента
+	xid   string // номер открытой транзакции после команд агента
+}
+
+func (d *textDB) Pipeline(sqls []string) ([]pgwire.Result, error) {
+	if !strings.Contains(strings.Join(sqls, "\n"), "docs") {
+		return d.fakeDB.Pipeline(sqls)
+	}
+	d.log = append(d.log, sqls...)
+	var res []pgwire.Result
+	for range len(sqls) / 2 {
+		res = append(res, pgwire.Result{Tag: "PREPARE"})
+	}
+	for _, tag := range d.tags {
+		res = append(res, pgwire.Result{Tag: tag})
+	}
+	d.tx = d.after
+	return res, d.err
 }
 
 func (d *textDB) Query(sql string) ([]pgwire.Result, error) {
 	switch {
-	case strings.Contains(sql, "docs"):
-		d.log = append(d.log, sql)
-		var res []pgwire.Result
-		for _, tag := range d.tags {
-			res = append(res, pgwire.Result{Tag: tag})
-		}
-		d.tx = d.after
-		return res, d.err
 	case strings.Contains(sql, "pg_current_xact_id_if_assigned"):
 		d.log = append(d.log, sql)
 		return []pgwire.Result{{Columns: []string{"xid"}, Rows: [][]*string{{&d.xid}}, Tag: "SELECT 1"}}, nil
@@ -87,7 +97,7 @@ func TestSQLThatEndsTheTransactionIsNotReportedAsRolledBack(t *testing.T) {
 			db.tags, db.err, db.after = []string{"UPDATE 1"}, nil, pgwire.TxOpen
 			one := "1"
 			db.answers = func(sql string) ([]pgwire.Result, bool) {
-				if strings.Contains(sql, "pg_stat_xact_user_tables") && !strings.Contains(sql, "pg_current_xact_id") {
+				if strings.Contains(sql, "pg_stat_get_xact_tuples") && !strings.Contains(sql, "pg_current_xact_id") {
 					return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&one}}, Tag: "SELECT 1"}}, true
 				}
 				return nil, false
