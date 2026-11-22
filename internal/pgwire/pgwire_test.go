@@ -1,8 +1,13 @@
 package pgwire
 
 import (
+	"context"
+	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Вектор RFC 7677, раздел 3: пользователь user, пароль pencil.
@@ -105,5 +110,58 @@ func TestRows(t *testing.T) {
 	}
 	if _, err := parseDataRow([]byte{0, 1, 0, 0, 0, 9, 'x'}); err == nil {
 		t.Fatal("a truncated row passed")
+	}
+}
+
+// Вход по TLS не удался: Dial возвращает ошибку и закрывает соединение.
+// Сервер здесь — заглушка: читает SSLRequest и отвечает, как сказано в reply
+// ("" — рвёт соединение молча). До исправления P-231 каждый из путей ронял
+// процесс: отложенное закрытие шло по nil.
+func TestDialTLSFailureIsAnError(t *testing.T) {
+	for _, tc := range []struct{ name, reply, dsn, want string }{
+		{"the server has TLS off", "N", "sslmode=require", "refused TLS"},
+		{"the server drops the connection", "", "sslmode=require", "EOF"},
+		{"no root file", "S", "sslmode=verify-full sslrootcert=/nonexistent/root.crt", "sslrootcert"},
+		{"not a TLS server", "Sthis is not a TLS handshake", "sslmode=require", "pgwire: TLS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			closed := make(chan struct{}) // заглушка увидела конец соединения
+			go func() {
+				defer close(closed)
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				var req [8]byte
+				if _, err := io.ReadFull(c, req[:]); err != nil || tc.reply == "" {
+					return
+				}
+				c.Write([]byte(tc.reply))
+				io.Copy(io.Discard, c) // до тех пор, пока клиент не закроет соединение
+			}()
+			cfg, err := ParseDSN(fmt.Sprintf("host=127.0.0.1 port=%d user=u dbname=d %s", ln.Addr().(*net.TCPAddr).Port, tc.dsn))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := Dial(context.Background(), cfg)
+			if err == nil {
+				c.Close()
+				t.Fatal("connected")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q, expected one with %q", err, tc.want)
+			}
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the connection was left open")
+			}
+		})
 	}
 }

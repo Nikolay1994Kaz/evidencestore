@@ -198,9 +198,13 @@ func Dial(ctx context.Context, cfg Config) (_ *Conn, err error) {
 	}()
 	nc.SetDeadline(time.Now().Add(cfg.Timeout))
 	if cfg.SSLMode == "require" || cfg.SSLMode == "verify-full" {
-		if nc, err = startTLS(nc, cfg); err != nil {
+		// Отдельная переменная: при ошибке startTLS возвращает nil, а отложенное
+		// закрытие выше должно закрыть исходное соединение.
+		secured, err := startTLS(nc, cfg)
+		if err != nil {
 			return nil, err
 		}
+		nc = secured
 	}
 	c := &Conn{nc: nc, r: bufio.NewReaderSize(nc, 64<<10), params: map[string]string{}}
 	if err := c.startup(cfg); err != nil {
