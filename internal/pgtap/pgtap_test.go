@@ -587,6 +587,8 @@ func TestRefusedActionRaisesAnAlert(t *testing.T) {
 		{`"cause":"rate","actions":30,"limit":30`, "30 in the last minute (the limit is 30)"},
 		{`"cause":"timeout","timeout":"1m0s"`, "cancelled an action that ran longer than 1m0s"},
 		{`"cause":"something-new"`, "stopped an action (something-new)"},
+		{`"cause":"escaped","xid":"751","tool":"execute"`, "ended the MCP server's transaction 751 itself"},
+		{`"cause":"escaped","tool":"query"`, "ended the MCP server's transaction (a read-only one) itself"},
 	} {
 		before := len(h.alerts())
 		if _, err := h.tap.Handle(pgoutput.Message{LSN: uint64(1000 + i), Prefix: PrefixRefused, Content: []byte(`{"role":"agent","info":{` + c[0] + `}}`)}); err != nil {
@@ -595,6 +597,12 @@ func TestRefusedActionRaisesAnAlert(t *testing.T) {
 		ev := h.alerts()
 		if len(ev) != before+1 || !strings.Contains(ev[len(ev)-1].Signals[0].Detail, c[1]) {
 			t.Fatalf("cause %s: %+v", c[0], ev[len(ev)-1])
+		}
+		// Выход из транзакции — не отказ: свой вид тревоги, и «ничего не
+		// изменилось» в нём нет.
+		escaped := strings.Contains(c[0], "escaped")
+		if sig := ev[len(ev)-1].Signals[0]; (sig.Kind == alert.KindEscaped) != escaped || (escaped && strings.Contains(sig.Detail, "nothing changed")) {
+			t.Fatalf("cause %s: %+v", c[0], sig)
 		}
 	}
 }

@@ -421,6 +421,8 @@ func (t *Tap) mark(m pgoutput.Message) error {
 // refused — не транзакционное сообщение: MCP-сервер остановил действие агента
 // пределом строк и откатил его. В базе ничего не изменилось, записей в
 // хранилище нет — есть тревога: человек должен знать, что агент пытался.
+// Причина escaped — другое: сервер увидел, что SQL агента сам закрыл его
+// транзакцию, и что изменилось, могло зафиксироваться (тревога escaped).
 func (t *Tap) refused(m pgoutput.Message) error {
 	if m.Prefix != PrefixRefused || m.LSN <= t.lastRefused {
 		return nil
@@ -435,6 +437,8 @@ func (t *Tap) refused(m pgoutput.Message) error {
 			Window     string `json:"window"`
 			Actions    int    `json:"actions"`
 			Timeout    string `json:"timeout"`
+			XID        string `json:"xid"`
+			Tool       string `json:"tool"`
 		} `json:"info"`
 	}
 	if json.Unmarshal(m.Content, &c) != nil || !t.roles[c.Role] {
@@ -442,7 +446,21 @@ func (t *Tap) refused(m pgoutput.Message) error {
 	}
 	t.lastRefused = m.LSN
 	var detail string
+	kind := alert.KindRefused
 	switch i := c.Info; i.Cause {
+	case "escaped":
+		// Не отказ: сервер ничего не остановил, агент вышел из его транзакции
+		// сам. Сказать «ничего не изменилось» нельзя.
+		kind = alert.KindEscaped
+		where := "the MCP server's transaction"
+		if i.XID != "" {
+			where += " " + i.XID
+		}
+		if i.Tool == "query" {
+			where += " (a read-only one)"
+		}
+		detail = fmt.Sprintf("the agent's SQL ended %s itself (COMMIT, ROLLBACK or the like in its text): what it changed may be committed "+
+			"without the row limits being checked — in that transaction, and in transactions of the role after it, which come as no-action", where)
 	case "", "row-limit":
 		detail = fmt.Sprintf("the MCP server stopped an action that would change %d rows (the limit for one action is %d): it was rolled back, nothing changed", i.Rows, i.Limit)
 	case "window-rows":
@@ -457,7 +475,7 @@ func (t *Tap) refused(m pgoutput.Message) error {
 		detail = fmt.Sprintf("the MCP server stopped an action (%s): nothing changed", i.Cause)
 	}
 	ev := alert.Event{Time: t.now().UTC().Format(time.RFC3339Nano), Actions: []json.RawMessage{m.Content}}
-	ev.Add(alert.KindRefused, detail)
+	ev.Add(kind, detail)
 	return t.raise(ev)
 }
 

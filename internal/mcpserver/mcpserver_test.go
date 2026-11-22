@@ -20,10 +20,37 @@ type fakeDB struct {
 	log     []string
 	fail    map[string]error
 	answers func(sql string) ([]pgwire.Result, bool)
+	tx      byte // состояние транзакции, как его сказала бы база
 }
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
 	d.log = append(d.log, sql)
+	res, err := d.answer(sql)
+	d.track(sql, err)
+	return res, err
+}
+
+// track ведёт состояние транзакции: BEGIN открывает, COMMIT и ROLLBACK
+// закрывают, ошибка внутри ломает.
+func (d *fakeDB) track(sql string, err error) {
+	switch {
+	case strings.HasPrefix(sql, "BEGIN") && err == nil:
+		d.tx = pgwire.TxOpen
+	case sql == "COMMIT" || sql == "ROLLBACK":
+		d.tx = pgwire.TxIdle
+	case err != nil && d.tx == pgwire.TxOpen:
+		d.tx = pgwire.TxFailed
+	}
+}
+
+func (d *fakeDB) TxStatus() byte {
+	if d.tx == 0 {
+		return pgwire.TxIdle
+	}
+	return d.tx
+}
+
+func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 	if d.answers != nil {
 		if res, ok := d.answers(sql); ok {
 			return res, nil

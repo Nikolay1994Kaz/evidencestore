@@ -179,6 +179,7 @@ type Conn struct {
 	r      *bufio.Reader
 	params map[string]string // ParameterStatus сервера
 	stream bool              // идёт поток репликации (CopyBoth)
+	tx     byte              // состояние транзакции из последнего ReadyForQuery (TxStatus)
 	// cfg и ключ отмены (BackendKeyData) — для Cancel: после входа не меняются,
 	// поэтому Cancel можно звать с другого потока.
 	cfg         Config
@@ -341,6 +342,7 @@ func (c *Conn) startup(cfg Config) error {
 			}
 		case 'N':
 		case 'Z':
+			c.ready(msg)
 			return nil
 		default:
 			return fmt.Errorf("pgwire: unexpected message %q during startup", typ)
@@ -513,6 +515,7 @@ func (c *Conn) Query(sql string) ([]Result, error) {
 			c.stream = true
 			return out, nil
 		case 'Z':
+			c.ready(msg)
 			return out, failed
 		case 'N', 'S', 'A':
 		default:
@@ -520,6 +523,27 @@ func (c *Conn) Query(sql string) ([]Result, error) {
 		}
 	}
 }
+
+// Состояние транзакции в ReadyForQuery.
+const (
+	TxIdle   = 'I' // вне транзакции
+	TxOpen   = 'T' // внутри транзакции
+	TxFailed = 'E' // внутри транзакции, сломанной ошибкой: до ROLLBACK сервер ничего не исполнит
+)
+
+// ready запоминает состояние транзакции из ReadyForQuery.
+func (c *Conn) ready(msg []byte) {
+	if len(msg) > 0 {
+		c.tx = msg[0]
+	}
+}
+
+// TxStatus — состояние транзакции, о котором сервер сказал в последнем
+// ответе: TxIdle, TxOpen или TxFailed; 0 — сервер ещё не отвечал. По нему
+// видно, осталась ли открытой транзакция, в которой исполнялся чужой текст:
+// COMMIT или ROLLBACK внутри текста закрывают её, не спрашивая того, кто её
+// открыл.
+func (c *Conn) TxStatus() byte { return c.tx }
 
 // QueryRow — первая строка первого результата; ok = false — строк нет.
 func (c *Conn) QueryRow(sql string) (row []*string, ok bool, err error) {

@@ -33,6 +33,7 @@ const (
 	CauseWindowRows = "window-rows" // с ним агент превысил бы предел строк за окно
 	CauseRate       = "rate"        // слишком много действий за минуту
 	CauseTimeout    = "timeout"     // запрос шёл дольше предела и отменён
+	CauseEscaped    = "escaped"     // SQL агента закрыл транзакцию сервера (COMMIT, ROLLBACK в тексте)
 )
 
 // canceler — соединение, запрос по которому можно прервать с другого потока

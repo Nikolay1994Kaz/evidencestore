@@ -46,6 +46,7 @@ const (
 	KindIdentity   = "identity"    // таблица без REPLICA IDENTITY FULL
 	KindLateMarker = "late-marker" // отметка пришла после пропущенных изменений
 	KindRefused    = "refused"     // MCP-сервер остановил действие пределом строк
+	KindEscaped    = "escaped"     // SQL агента сам закрыл транзакцию MCP-сервера
 	KindDBDown     = "db-down"     // нет связи с базой дольше порога
 	KindDBUp       = "db-up"       // связь с базой вернулась
 	KindGap        = "gap"         // записи потеряны: слот удалён или его журнал стёрт

@@ -54,9 +54,12 @@ const instructions = "Access to a PostgreSQL database for an AI agent. Use `quer
 	"Every `execute` call is recorded as one action with the previous row values, so a human can undo it later; " +
 	"the database role decides what is allowed."
 
-// DB — соединение с базой (у *pgwire.Conn такой метод есть).
+// DB — соединение с базой (у *pgwire.Conn такие методы есть).
 type DB interface {
 	Query(sql string) ([]pgwire.Result, error)
+	// TxStatus — состояние транзакции после последнего ответа базы
+	// (pgwire.TxIdle, TxOpen, TxFailed).
+	TxStatus() byte
 }
 
 // Config — настройки сервера.
@@ -95,16 +98,19 @@ type Config struct {
 
 // Receipt — квитанция одного действия.
 type Receipt struct {
-	ActionID string   `json:"action_id"`
-	Time     string   `json:"time"`
-	Agent    string   `json:"agent"`
-	Tool     string   `json:"tool"`
-	SQL      string   `json:"sql"`
-	Reason   string   `json:"reason,omitempty"`
-	XID      string   `json:"xid,omitempty"`
-	Outcome  string   `json:"outcome"` // committed, failed или refused (остановлено пределом строк)
-	Tags     []string `json:"tags,omitempty"`
-	Rows     int      `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
+	ActionID string `json:"action_id"`
+	Time     string `json:"time"`
+	Agent    string `json:"agent"`
+	Tool     string `json:"tool"`
+	SQL      string `json:"sql"`
+	Reason   string `json:"reason,omitempty"`
+	XID      string `json:"xid,omitempty"`
+	// Outcome — committed, failed, refused (остановлено пределом) или escaped
+	// (SQL агента сам закрыл транзакцию сервера: что он изменил после этого,
+	// могло зафиксироваться мимо пределов).
+	Outcome string   `json:"outcome"`
+	Tags    []string `json:"tags,omitempty"`
+	Rows    int      `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
 	// Cause — почему действие остановлено сервером: row-limit, window-rows,
 	// rate (отказы) или timeout (запрос отменён по времени).
 	Cause string `json:"cause,omitempty"`
@@ -551,6 +557,12 @@ func (s *Server) query(sql string) (string, error) {
 		}
 	}
 	res, err := s.timed(sql)
+	if s.db != nil && s.leftReadOnly(res) {
+		// Чтение закрыло свою транзакцию «только для чтения» (COMMIT; INSERT …):
+		// всё, что шло в тексте после этого, исполнялось с правами роли и могло
+		// зафиксироваться. Это уже не чтение, а действие мимо сервера.
+		return "", s.escapedQuery(sql)
+	}
 	if s.db != nil { // по таймауту соединение уже закрыто
 		s.run("ROLLBACK")
 	}
@@ -601,6 +613,9 @@ func (s *Server) execute(sql, reason string) (string, error) {
 	}
 	if err != nil && rc.Cause == CauseRate {
 		return "", fmt.Errorf("action %s was refused: %w", rc.ActionID, err)
+	}
+	if err != nil && rc.Outcome == "escaped" {
+		return "", fmt.Errorf("action %s %w", rc.ActionID, err)
 	}
 	if err != nil && rc.Outcome == "refused" {
 		return "", fmt.Errorf("action %s was refused and rolled back, nothing changed: %w", rc.ActionID, err)
@@ -678,6 +693,15 @@ func (s *Server) transaction(rc *Receipt) error {
 		s.markRefused(rc, map[string]any{"timeout": s.cfg.StatementTimeout.String()})
 		return err
 	}
+	// Транзакция всё ещё та, что открыл сервер? COMMIT или ROLLBACK в тексте
+	// агента закрывают её, не спрашивая сервера, а всё, что идёт в тексте
+	// после них, база исполняет само по себе: без отметки действия, мимо
+	// пределов строк и с фиксацией раньше, чем сервер что-то проверит.
+	if left, lerr := s.left(rc.XID, rc.Tags); lerr != nil {
+		return fail(lerr)
+	} else if left {
+		return s.escaped(rc)
+	}
 	if err != nil {
 		return fail(err)
 	}
@@ -721,6 +745,95 @@ func (s *Server) transaction(rc *Receipt) error {
 	}
 	rc.Outcome = "committed"
 	return nil
+}
+
+// closing — теги ответа на команды, которые закрывают транзакцию: COMMIT и END
+// (тег COMMIT), ROLLBACK и ABORT (тег ROLLBACK), PREPARE TRANSACTION и
+// завершение подготовленной. ROLLBACK TO SAVEPOINT тоже даёт тег ROLLBACK, но
+// транзакцию не закрывает: это видно по её номеру (left).
+var closing = []string{"COMMIT", "ROLLBACK", "PREPARE TRANSACTION", "COMMIT PREPARED", "ROLLBACK PREPARED"}
+
+func closes(tags []string) bool {
+	return slices.ContainsFunc(tags, func(tag string) bool { return slices.Contains(closing, tag) })
+}
+
+// left — вышел ли SQL агента из транзакции действия xid. Транзакции нет —
+// вышел. Транзакция открыта, а среди ответов есть COMMIT или ROLLBACK —
+// вышел, если номер у открытой уже не тот (агент закрыл нашу и открыл свою
+// BEGIN), и не вышел, если тот же (ROLLBACK TO SAVEPOINT). Транзакция сломана
+// ошибкой, соединения нет — номер не спросить: вышел, если в ответах есть
+// закрывающая команда. Без закрывающей команды из транзакции не выйти, и
+// лишнего вопроса базе нет.
+func (s *Server) left(xid string, tags []string) (bool, error) {
+	if s.db == nil {
+		return closes(tags), nil
+	}
+	switch s.db.TxStatus() {
+	case pgwire.TxIdle:
+		return true, nil
+	case pgwire.TxFailed:
+		return closes(tags), nil
+	}
+	if !closes(tags) {
+		return false, nil
+	}
+	res, err := s.run("SELECT pg_current_xact_id_if_assigned()::text")
+	if err != nil {
+		return false, err
+	}
+	if len(res) != 1 || len(res[0].Rows) != 1 {
+		return false, errors.New("the server did not say which transaction is open")
+	}
+	now := res[0].Rows[0][0]
+	return now == nil || *now != xid, nil
+}
+
+// escaped завершает действие, чей SQL закрыл транзакцию сервера. Что он
+// изменил до своего COMMIT, база уже зафиксировала вместе с отметкой, без
+// проверки пределов; что после — отдельными транзакциями без отметки (их
+// сборщик назовёт no-action). Сказать агенту «ничего не изменилось» нельзя:
+// исход escaped, людям — тревога. Открытое сейчас (транзакция, которую агент
+// начал сам, или сломанная) откатывается, сеанс бросается: в нём остались
+// настройки, которые текст агента мог сменить.
+func (s *Server) escaped(rc *Receipt) error {
+	if s.db != nil && s.db.TxStatus() != pgwire.TxIdle {
+		s.run("ROLLBACK")
+	}
+	rc.Outcome, rc.Cause = "escaped", CauseEscaped
+	s.markRefused(rc, map[string]any{"xid": rc.XID, "tool": rc.Tool})
+	s.drop()
+	return errEscaped
+}
+
+var errEscaped = errors.New("left the server's transaction: its SQL ended it (COMMIT, ROLLBACK or the like), " +
+	"so what it changed may be committed without the row limits being checked. The operators are alerted; do not repeat it. " +
+	"The server runs the transaction itself: send the statements without BEGIN, COMMIT or ROLLBACK")
+
+// leftReadOnly — закрыло ли чтение свою транзакцию «только для чтения».
+// Номера у неё нет, поэтому признаков два: транзакции нет, или среди ответов
+// есть закрывающая команда.
+func (s *Server) leftReadOnly(res []pgwire.Result) bool {
+	if s.db.TxStatus() == pgwire.TxIdle {
+		return true
+	}
+	tags := make([]string, len(res))
+	for i, r := range res {
+		tags[i] = r.Tag
+	}
+	return closes(tags)
+}
+
+// escapedQuery — чтение вышло из своей транзакции: квитанция (это уже не
+// чтение) и тревога, как у действия.
+func (s *Server) escapedQuery(sql string) error {
+	rc := Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "query",
+		SQL: sql, Client: s.client}
+	err := s.escaped(&rc)
+	rc.Error = err.Error()
+	if werr := s.keep(rc); werr != nil {
+		s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
+	}
+	return fmt.Errorf("the read %s %w", rc.ActionID, err)
 }
 
 // changed — сколько строк изменила текущая транзакция. Счёт ведёт сама база
