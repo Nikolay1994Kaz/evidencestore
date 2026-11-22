@@ -596,11 +596,14 @@ const Path = "pg_catalog, pg_temp"
 // ключа, а esundo запускает человек правами владельца (R2 заход 2). Но и путь
 // только из pg_catalog нельзя: триггеры таблиц владельца в откате идут с путём
 // сеанса, и аудит с именем таблицы без схемы падал (R2 заход 3). Поэтому путь
-// — pg_catalog, путь сеанса, pg_temp последним, — и откат отказывает, если
-// роль, чью транзакцию он возвращает (или роль, которой она может стать),
-// может CREATE в какой-либо схеме этого пути. Типы колонок сборщик пишет со
-// схемой. Путь ставится на весь сеанс: следующий запрос человека в esundo —
-// тоже наш, MCP-сервер начинает вызов с DISCARD ALL.
+// — pg_catalog, путь сеанса, pg_temp последним, — и откат отказывает, если в
+// какой-либо схеме этого пути CREATE есть у кого-то, кроме её владельца (и
+// суперпользователей): «добавить схему в путь — значит доверять всем, у кого
+// там CREATE» (документация PostgreSQL после CVE-2018-1058). Проверять одну
+// роль транзакции мало: она — роль MCP-сервера, а у агента своя (DECISIONS,
+// п. 39). Типы колонок сборщик пишет со схемой. Путь ставится на весь сеанс:
+// следующий запрос человека в esundo — тоже наш, MCP-сервер начинает вызов с
+// DISCARD ALL.
 func (p *Plan) session(db DB) error {
 	res, err := db.Query("SELECT pg_catalog.array_to_string(pg_catalog.current_schemas(false), ',')")
 	if err != nil {
@@ -613,31 +616,32 @@ func (p *Plan) session(db DB) error {
 	if _, err := db.Query("SELECT pg_catalog.set_config('search_path', '" + Path + "', false)"); err != nil {
 		return err
 	}
-	var who struct{ Role string }
-	json.Unmarshal(p.Who, &who)
 	path := []string{"pg_catalog"}
 	for _, n := range schemas {
 		if n != "pg_catalog" {
 			path = append(path, pgwire.Ident(n))
 		}
 	}
-	if who.Role == "" || len(path) == 1 {
+	if len(path) == 1 {
 		return nil // путь — только Path
 	}
 	lits := make([]string, 0, len(schemas))
 	for _, n := range schemas {
 		lits = append(lits, pgwire.Literal(n))
 	}
-	res, err = db.Query("SELECT string_agg(DISTINCT format('%I can CREATE in schema %I', r.rolname, n.nspname) || " +
-		"CASE WHEN g.oid <> r.oid THEN format(' (as %I)', g.rolname) ELSE '' END, ', ') " +
-		"FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER') JOIN pg_namespace n ON n.nspname IN (" + strings.Join(lits, ", ") + ") " +
-		"WHERE r.rolname = " + pgwire.Literal(who.Role) + " AND n.nspname <> 'pg_catalog' AND has_schema_privilege(g.oid, n.oid, 'CREATE')")
+	// Кто, кроме владельца схемы (и тех, кто им может стать) и
+	// суперпользователей, может в ней CREATE. Право у PUBLIC — у всех: имён
+	// хватит пяти.
+	res, err = db.Query("SELECT string_agg(x, ', ') FROM (SELECT format('%I can CREATE in schema %I', g.rolname, n.nspname) AS x " +
+		"FROM pg_namespace n JOIN pg_roles g ON NOT g.rolsuper AND NOT pg_has_role(g.oid, n.nspowner, 'MEMBER') " +
+		"WHERE n.nspname IN (" + strings.Join(lits, ", ") + ") AND n.nspname <> 'pg_catalog' AND has_schema_privilege(g.oid, n.oid, 'CREATE') " +
+		"ORDER BY 1 LIMIT 5) AS w")
 	if err != nil {
 		return err
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
-		return refuse("%s, and that schema is on the search_path of this session: a function or operator of the role would run in the check "+
-			"and the undo with the rights of this session. Take the schema off the search_path (SET search_path) or revoke the right", *res[0].Rows[0][0])
+		return refuse("%s, and that schema is on the search_path of this session: a function or operator created there would run in the check "+
+			"and the undo with the rights of this session. Take the schema off the search_path (SET search_path) or let only its owner create there", *res[0].Rows[0][0])
 	}
 	path = append(path, "pg_temp")
 	_, err = db.Query("SELECT pg_catalog.set_config('search_path', " + pgwire.Literal(strings.Join(path, ", ")) + ", false)")

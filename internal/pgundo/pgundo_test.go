@@ -191,6 +191,9 @@ type fakeDB struct {
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
 	d.log = append(d.log, sql)
+	if strings.Contains(sql, "current_schemas(false)") {
+		return rows([]string{""}), nil // путь сеанса пуст: остаётся Path
+	}
 	return d.answer(sql)
 }
 

@@ -3,6 +3,7 @@ package pginput
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,6 +80,14 @@ func TestLiveMCP(t *testing.T) {
 		admin.Query("ALTER ROLE pgm_agent RESET standard_conforming_strings")
 		admin.Query("REVOKE CREATE ON SCHEMA public FROM pgm_agent")
 		admin.Query("DROP ROLE IF EXISTS pgm_group")
+		admin.Query("DROP OWNED BY pgm_writer")
+		admin.Query("DROP ROLE IF EXISTS pgm_writer")
+		admin.Query("REVOKE pgm_agent FROM pgm_ai")
+		admin.Query("REVOKE pg_signal_backend FROM pgm_ai")
+		admin.Query("REVOKE evidence_owner FROM pgm_agent")
+		admin.Query("REVOKE pgm_tap FROM pgm_ai")
+		admin.Query("DROP ROLE IF EXISTS pgm_other")
+		admin.Query("REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) FROM pgm_agent")
 	}
 	tidy()
 	defer tidy()
@@ -93,7 +102,7 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		admin.Query("DROP PUBLICATION IF EXISTS pgm_pub")
 		admin.Query("DROP SCHEMA IF EXISTS pgm CASCADE")
 	}()
-	cfg := Config{DSN: base + " user=pgm_tap", Slot: "pgm_slot", Publication: "pgm_pub", Dir: t.TempDir(), Roles: []string{"pgm_agent"}, Tables: []string{"pgm.docs"}}
+	cfg := Config{DSN: base + " user=pgm_tap", Slot: "pgm_slot", Publication: "pgm_pub", Dir: t.TempDir(), MCPRoles: []string{"pgm_agent"}, Roles: []string{"pgm_ai"}, Tables: []string{"pgm.docs"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +122,100 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 			c.Params = params
 			return pgwire.Dial(ctx, c)
 		}}, nil)
+
+	// Граница — роли базы (DECISIONS, п. 39): у сервера pgm_agent своя роль, у
+	// агента pgm_ai — своя, только чтение. Агент своей ролью не пишет, не
+	// ставит отметок, не обрывает сеансы сервера и не меняет умолчаний его
+	// роли — то, чем он пользовался в заходах 1–3 (P-255, P-259, P-275).
+	if err := s.CheckRole(); err != nil {
+		t.Fatalf("the role of the server: %v", err)
+	}
+	// Суперпользователь — не своя роль: он может стать любой.
+	su := mcpserver.New(mcpserver.Config{Agent: "live-bot", Version: "test",
+		Dial: func(params map[string]string) (mcpserver.DB, error) {
+			c, err := pgwire.ParseDSN(base + " user=postgres")
+			if err != nil {
+				return nil, err
+			}
+			c.Params = params
+			return pgwire.Dial(ctx, c)
+		}}, nil)
+	if err := su.CheckRole(); !errors.Is(err, mcpserver.ErrSharedRole) || !strings.Contains(err.Error(), "postgres is a superuser") {
+		t.Fatalf("esmcp as a superuser: %v", err)
+	}
+	aicfg, err := pgwire.ParseDSN(base + " user=pgm_ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ai, err := pgwire.Dial(ctx, aicfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ai.Close()
+	server := one("SELECT pid::text FROM pg_stat_activity WHERE usename = 'pgm_agent' AND application_name = 'esmcp/live-bot'")
+	if one("SELECT count(*) FROM pgm.docs") != "5" {
+		t.Fatal("the docs")
+	}
+	if _, _, err := ai.QueryRow("SELECT count(*) FROM pgm.docs"); err != nil {
+		t.Fatalf("the agent cannot read: %v", err)
+	}
+	for _, sql := range []string{
+		"UPDATE pgm.docs SET body = 'direct' WHERE id = 1",
+		"DELETE FROM pgm.docs",
+		"SELECT evidence.mark_action('{}')",
+		"SELECT evidence.mark_refused('{\"cause\":\"rate\"}')",
+		"SELECT pg_logical_emit_message(false, 'evidence/refused', '{\"cause\":\"rate\"}')",
+		"SELECT pg_terminate_backend(" + server + ")",
+		"ALTER ROLE pgm_agent SET statement_timeout = 1",
+	} {
+		if _, err := ai.Query(sql); err == nil || !strings.Contains(err.Error(), "42501") {
+			t.Fatalf("the agent's own role: %s: %v", sql, err)
+		}
+	}
+	// -setup-sql и esmcp не берут общей роли: агент — член роли сервера; агент
+	// в pg_signal_backend; запись через группу. Писать в журнал базы мимо
+	// отметок не может и сервер: SQL агента идёт в его сеансе. А права,
+	// выданные раньше (до п. 39 агент и сервер ходили одной ролью), скрипт отзывает.
+	// c[3] — что тогда отвечает esmcp (CheckRole); пусто — роль сервера своя.
+	for _, c := range [][4]string{
+		{"GRANT pgm_agent TO pgm_ai", "pgm_ai can become pgm_agent", "REVOKE pgm_agent FROM pgm_ai", "pgm_ai can become pgm_agent"},
+		{"CREATE ROLE pgm_other LOGIN; GRANT pgm_agent TO pgm_other", "pgm_other can become pgm_agent, the role of the MCP server", "DROP ROLE pgm_other", "pgm_other"},
+		{"GRANT pgm_tap TO pgm_ai", "pgm_ai can become pgm_tap", "REVOKE pgm_tap FROM pgm_ai", ""},
+		{"GRANT pg_signal_backend TO pgm_ai", "pgm_ai can become pg_signal_backend", "REVOKE pg_signal_backend FROM pgm_ai", ""},
+		{"CREATE ROLE pgm_writer NOLOGIN; GRANT UPDATE ON pgm.docs TO pgm_writer; GRANT pgm_writer TO pgm_ai", "pgm_ai can update pgm.docs (as pgm_writer)", "REVOKE UPDATE ON pgm.docs FROM pgm_writer; DROP ROLE pgm_writer", ""},
+		{"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text)", "REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) FROM pgm_agent", ""},
+		{"GRANT evidence_owner TO pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text) (as evidence_owner)", "REVOKE evidence_owner FROM pgm_agent", ""},
+	} {
+		exec(c[0])
+		if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), c[1]) {
+			t.Fatalf("the setup script took the roles after %s: %v", c[0], err)
+		}
+		exec("ROLLBACK")
+		err := s.CheckRole()
+		if c[3] == "" && err != nil || c[3] != "" && (!errors.Is(err, mcpserver.ErrSharedRole) || !strings.Contains(err.Error(), c[3])) {
+			t.Fatalf("esmcp after %s: %v", c[0], err)
+		}
+		exec(c[2])
+	}
+	// Установка до п. 39: у роли агента запись и отметки, функции отметок — у
+	// того, кто запускал скрипт, pg_logical_emit_message открыта PUBLIC (так в
+	// PostgreSQL по умолчанию). Скрипт переводит её на новую.
+	exec("GRANT UPDATE ON pgm.docs TO pgm_ai; GRANT USAGE ON SCHEMA evidence TO pgm_ai; GRANT EXECUTE ON FUNCTION evidence.mark_action(json) TO pgm_ai; " +
+		"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO PUBLIC; ALTER FUNCTION evidence.mark_action(json) OWNER TO postgres")
+	exec(script)
+	for _, sql := range []string{"UPDATE pgm.docs SET body = 'direct' WHERE id = 1", "SELECT evidence.mark_action('{}')", "SELECT pg_logical_emit_message(false, 'evidence/refused', '{}')"} {
+		if _, err := ai.Query(sql); err == nil {
+			t.Fatalf("the setup script left the agent a right of the old setup: %s", sql)
+		}
+	}
+	if got := one("SELECT has_schema_privilege('pgm_ai', 'evidence', 'USAGE')::text"); got != "false" {
+		t.Fatalf("the agent still uses the schema of the marks: %s", got)
+	}
+	// Владелец отметок — роль без входа и без прав суперпользователя.
+	if got := one("SELECT string_agg(DISTINCT pg_get_userbyid(p.proowner) || ' ' || r.rolsuper || ' ' || r.rolcanlogin, ',') FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.pronamespace = 'evidence'::regnamespace"); got != "evidence_owner false false" {
+		t.Fatalf("the owner of the marks: %s", got)
+	}
+
 	tool := func(name, args string) (string, bool) {
 		t.Helper()
 		var m struct {
@@ -493,7 +596,7 @@ func TestLiveMCPLostCommit(t *testing.T) {
 	tidy()
 	defer tidy()
 	exec(admin, "CREATE SCHEMA pgl; CREATE TABLE pgl.docs (id int PRIMARY KEY, body text); INSERT INTO pgl.docs SELECT g, 'v' FROM generate_series(1, 5) g")
-	cfg := Config{DSN: base + " user=pgl_tap", Slot: "pgl_slot", Publication: "pgl_pub", Dir: t.TempDir(), Roles: []string{"pgl_agent"}, Tables: []string{"pgl.docs"}}
+	cfg := Config{DSN: base + " user=pgl_tap", Slot: "pgl_slot", Publication: "pgl_pub", Dir: t.TempDir(), MCPRoles: []string{"pgl_agent"}, Tables: []string{"pgl.docs"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +646,10 @@ func TestLiveMCPLostCommit(t *testing.T) {
 			t.Fatal("the setting did not take")
 		}
 	}
-	killer := dial(base + " user=pgl_agent") // своя сессия агента мимо MCP
+	// Ответ на COMMIT теряется: сессию сервера, пока COMMIT ждёт реплику, рвут
+	// извне — как обрыв сети или администратор. Сам агент этого не может: его
+	// роль не член роли сервера (DECISIONS, п. 39; проверено в TestLiveMCP).
+	killer := admin
 	var told []string
 	for i := 1; i <= 3; i++ {
 		done := make(chan string, 1)

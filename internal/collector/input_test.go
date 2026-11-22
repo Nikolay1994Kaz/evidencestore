@@ -435,7 +435,7 @@ func TestInputRecordOverTheStoreLimitIsRefused(t *testing.T) {
 
 func TestInputConfig(t *testing.T) {
 	pg := func() *pginput.Config {
-		return &pginput.Config{DSN: "host=db user=tap dbname=shop", Roles: []string{"agent"}, Tables: []string{"public.accounts"}}
+		return &pginput.Config{DSN: "host=db user=tap dbname=shop", MCPRoles: []string{"esmcp"}, Roles: []string{"agent"}, Tables: []string{"public.accounts"}}
 	}
 	base := Config{Server: "https://x", CA: "ca", Cert: "c", Key: "k", SpoolDir: "/s", StoreKey: anyKey}
 	good := base
@@ -450,7 +450,7 @@ func TestInputConfig(t *testing.T) {
 	both.Postgres, both.File = pg(), "/a.log"
 	start.Postgres, start.FromStart = pg(), true
 	noRoles.Postgres = pg()
-	noRoles.Postgres.Roles = nil
+	noRoles.Postgres.MCPRoles = nil // роль агента необязательна, роль сервера — да
 	badTable.Postgres = pg()
 	badTable.Postgres.Tables = []string{"accounts"}
 	for name, c := range map[string]Config{"postgres и file": both, "from_start без файлов": start, "без ролей": noRoles, "таблица без схемы": badTable} {
@@ -475,7 +475,7 @@ func TestLoadConfigsWithSeveralSources(t *testing.T) {
 		"sources": [
 			{"cert": "app.crt", "key": "app.key", "spool_dir": "spool-app", "file": "/var/log/app.log", "batch": 8},
 			{"cert": "pg.crt", "key": "pg.key", "spool_dir": "spool-pg",
-			 "postgres": {"dsn": "host=db user=tap dbname=shop", "roles": ["agent"], "tables": ["public.accounts"], "dir": "pg"}}]}`))
+			 "postgres": {"dsn": "host=db user=tap dbname=shop", "mcp_roles": ["esmcp"], "roles": ["agent"], "tables": ["public.accounts"], "dir": "pg"}}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}

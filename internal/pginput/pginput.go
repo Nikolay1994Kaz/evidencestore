@@ -73,11 +73,16 @@ type Config struct {
 	// номерами записей), alerts.jsonl (тревоги), slot.json. По умолчанию —
 	// spool_dir сборщика. Справочник читают esundo и esmcp.
 	Dir string `json:"dir"`
-	// Roles — роли агентов: их транзакции идут в хранилище. Tables — таблицы
-	// ("schema.table"), которые агентам разрешено менять: по ним -setup-sql
-	// выдаёт права, ставит триггер отметки и собирает публикацию.
-	Roles  []string `json:"roles"`
-	Tables []string `json:"tables"`
+	// MCPRoles — роли MCP-серверов (esmcp): только они пишут в Tables и зовут
+	// отметки; ни одна другая роль со входом не может ими стать. Roles — роли
+	// агентов для прямого доступа: только чтение. UndoRoles — роли, которыми
+	// откатывает esundo. Транзакции ролей MCPRoles и Roles идут в хранилище
+	// (DECISIONS, п. 39). Tables — таблицы ("schema.table") под запись: по ним
+	// -setup-sql выдаёт права, ставит триггер отметки и собирает публикацию.
+	MCPRoles  []string `json:"mcp_roles"`
+	Roles     []string `json:"roles"`
+	UndoRoles []string `json:"undo_roles"`
+	Tables    []string `json:"tables"`
 	// AlertRows — тревога «массовое изменение» от стольких изменений строк в
 	// одной транзакции; 0 — не следить.
 	AlertRows int `json:"alert_rows"`
@@ -134,8 +139,25 @@ func (c *Config) Validate() error {
 	} else if _, err := pgwire.ParseDSN(c.DSN); err != nil {
 		errs = append(errs, fmt.Errorf("postgres.dsn: %w", err))
 	}
-	if len(c.Roles) == 0 {
-		errs = append(errs, errors.New("postgres.roles: name at least one agent role"))
+	if len(c.MCPRoles) == 0 {
+		errs = append(errs, errors.New("postgres.mcp_roles: name the role of the MCP server; the agent's own role (postgres.roles) is a different one, and only the server writes the tables"))
+	}
+	seen := map[string]string{}
+	for _, l := range []struct {
+		name  string
+		roles []string
+	}{{"mcp_roles", c.MCPRoles}, {"roles", c.Roles}, {"undo_roles", c.UndoRoles}} {
+		for _, r := range l.roles {
+			if was, ok := seen[r]; ok && was != l.name {
+				errs = append(errs, fmt.Errorf("postgres.%s: role %q is in postgres.%s too: the agent, the MCP server and the undo each have a role of their own", l.name, r, was))
+			}
+			seen[r] = l.name
+		}
+	}
+	if dsn, err := pgwire.ParseDSN(c.DSN); err == nil {
+		if _, ok := seen[dsn.User]; ok {
+			errs = append(errs, fmt.Errorf("postgres.dsn: the collector's role %q is also a role of the agent, the server or the undo", dsn.User))
+		}
 	}
 	if len(c.Tables) == 0 {
 		errs = append(errs, errors.New("postgres.tables: name at least one table"))
@@ -177,6 +199,11 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+// watched — роли, чьи транзакции идут в хранилище: серверов и агентов.
+// Транзакция без отметки действия — тревога no-action: у сервера это кто-то с
+// его паролем, у агента — запись мимо сервера (прав на неё у агента нет).
+func (c *Config) watched() []string { return append(slices.Clone(c.MCPRoles), c.Roles...) }
+
 func splitTable(t string) (schema, table string, err error) {
 	schema, table, ok := strings.Cut(t, ".")
 	if !ok || schema == "" || table == "" || strings.Contains(table, ".") {
@@ -184,6 +211,10 @@ func splitTable(t string) (schema, table string, err error) {
 	}
 	return schema, table, nil
 }
+
+// EvidenceOwner — роль-владелец функций отметок: без входа, без прав
+// суперпользователя, с одним правом — писать сообщения в журнал базы.
+const EvidenceOwner = "evidence_owner"
 
 // SetupSQL — настройка базы под запись до-образов (escollect -setup-sql).
 // Скрипт не исполняется сборщиком: его читает и запускает владелец таблиц.
@@ -257,6 +288,10 @@ func SetupSQL(c *Config) (string, error) {
 	p("-- агента pg_temp.text с проверкой на его функцию срабатывал бы в приведении ::text (R2, заход 3).")
 	p("CREATE SCHEMA IF NOT EXISTS evidence;")
 	p("REVOKE ALL ON SCHEMA evidence FROM PUBLIC;")
+	p("-- Владелец функций — роль без входа и без прав суперпользователя: перехват функции (P-269)")
+	p("-- дал бы агенту только её право — писать сообщения в журнал (DECISIONS, п. 39).")
+	p("DO $evidence$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s NOLOGIN; END IF; END $evidence$;", lit(EvidenceOwner), id(EvidenceOwner))
+	p("GRANT CREATE ON SCHEMA evidence TO %s;", id(EvidenceOwner))
 	p("CREATE OR REPLACE FUNCTION evidence.mark_who() RETURNS trigger")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
@@ -286,40 +321,133 @@ func SetupSQL(c *Config) (string, error) {
 	p("  PERFORM pg_logical_emit_message(false, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixRefused))
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_refused(json) FROM PUBLIC;")
+	p("ALTER FUNCTION evidence.mark_who() OWNER TO %s;", id(EvidenceOwner))
+	p("ALTER FUNCTION evidence.mark_action(json) OWNER TO %s;", id(EvidenceOwner))
+	p("ALTER FUNCTION evidence.mark_undo(json) OWNER TO %s;", id(EvidenceOwner))
+	p("ALTER FUNCTION evidence.mark_refused(json) OWNER TO %s;", id(EvidenceOwner))
 	p("")
-	p("-- Напрямую писать отметки больше не может никто, кроме владельца функций выше:")
+	p("-- Напрямую писать отметки не может никто, кроме владельца функций выше:")
 	p("-- иначе агент подложил бы отметку с чужой ролью.")
 	p("DO $evidence$ DECLARE f regprocedure; BEGIN")
 	p("  FOR f IN SELECT p.oid::regprocedure FROM pg_proc p")
 	p("    WHERE p.proname = 'pg_logical_emit_message' AND p.pronamespace = 'pg_catalog'::regnamespace LOOP")
 	p("    EXECUTE format('REVOKE EXECUTE ON FUNCTION %%s FROM PUBLIC', f);")
-	p("    EXECUTE format('GRANT EXECUTE ON FUNCTION %%s TO %%I', f, current_user);")
+	p("    EXECUTE format('GRANT EXECUTE ON FUNCTION %%s TO %%I', f, %s);", lit(EvidenceOwner))
 	p("  END LOOP;")
 	p("END $evidence$;")
 	p("")
-	p("-- Роли агентов: только строки названных таблиц. Ни TRUNCATE, ни владения —")
-	p("-- значит, ни TRUNCATE, ни DROP: то, что по записи не вернуть, агенту недоступно.")
-	var roles []string
-	for _, r := range c.Roles {
-		roles = append(roles, id(r))
+	// Роли: сервер и откат пишут, агент читает (DECISIONS, п. 39).
+	create := func(r string) {
 		p("DO $evidence$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s LOGIN; END IF; END $evidence$;", lit(r), id(r))
 		for _, s := range schemas {
 			p("GRANT USAGE ON SCHEMA %s TO %s;", id(s), id(r))
 		}
-		p("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s;", strings.Join(tables, ", "), id(r))
-		p("GRANT USAGE ON SCHEMA evidence TO %s;", id(r))
-		p("GRANT EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json), evidence.mark_refused(json) TO %s;", id(r))
-		// Таймауты роли — значения по умолчанию для любых её сессий, в том
-		// числе в обход MCP-сервера. Сессия может сменить их командой SET:
-		// жёсткий предел — таймер MCP-сервера (esmcp, statement_timeout).
+	}
+	timeouts := func(r string) {
+		// Таймауты роли — значения по умолчанию для её сессий; у MCP-сервера
+		// свои — параметры входа (P-259), здесь — второй рубеж.
 		p("ALTER ROLE %s SET statement_timeout = '60s';", id(r))
 		p("ALTER ROLE %s SET lock_timeout = '10s';", id(r))
 		p("ALTER ROLE %s SET idle_in_transaction_session_timeout = '5min';", id(r))
 	}
-	lits := make([]string, len(c.Roles))
-	for i, r := range c.Roles {
-		lits[i] = lit(r)
+	var writers []string
+	p("-- Роли MCP-серверов: только строки названных таблиц и отметки. Ни TRUNCATE, ни владения —")
+	p("-- значит, ни TRUNCATE, ни DROP: то, что по записи не вернуть, недоступно и SQL агента.")
+	for _, r := range c.MCPRoles {
+		writers = append(writers, id(r))
+		create(r)
+		p("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s;", strings.Join(tables, ", "), id(r))
+		p("GRANT USAGE ON SCHEMA evidence TO %s;", id(r))
+		p("GRANT EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json), evidence.mark_refused(json) TO %s;", id(r))
+		timeouts(r)
 	}
+	p("-- Роли отката (esundo): строки названных таблиц и отметка отката.")
+	for _, r := range c.UndoRoles {
+		writers = append(writers, id(r))
+		create(r)
+		p("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s;", strings.Join(tables, ", "), id(r))
+		p("GRANT USAGE ON SCHEMA evidence TO %s;", id(r))
+		p("GRANT EXECUTE ON FUNCTION evidence.mark_undo(json) TO %s;", id(r))
+	}
+	var readers []string
+	p("-- Роли агентов для прямого доступа: только чтение. Запись и отметки, выданные раньше (до п. 39")
+	p("-- агент и сервер ходили одной ролью), отзываются.")
+	for _, r := range c.Roles {
+		readers = append(readers, id(r))
+		create(r)
+		p("GRANT SELECT ON %s TO %s;", strings.Join(tables, ", "), id(r))
+		p("REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON %s FROM %s;", strings.Join(tables, ", "), id(r))
+		p("REVOKE EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json), evidence.mark_refused(json) FROM %s;", id(r))
+		p("REVOKE ALL ON SCHEMA evidence FROM %s;", id(r))
+		timeouts(r)
+	}
+	// Проверки ниже — для ролей агентов и серверов.
+	var lits, agents, servers []string
+	for _, r := range append(slices.Clone(c.Roles), c.MCPRoles...) {
+		lits = append(lits, lit(r))
+	}
+	for _, r := range c.Roles {
+		agents = append(agents, lit(r))
+	}
+	for _, r := range c.MCPRoles {
+		servers = append(servers, lit(r))
+	}
+	privileged := append(slices.Clone(servers), lit(EvidenceOwner), lit(tapRole))
+	for _, r := range c.UndoRoles {
+		privileged = append(privileged, lit(r))
+	}
+	if len(agents) > 0 {
+		p("-- Агент не становится ролью сервера, отката, сборщика или владельцем отметок, не обрывает чужие")
+		p("-- сеансы (pg_signal_backend), не пишет в таблицы и не зовёт отметки — ни сам, ни через свои роли.")
+		p("DO $evidence$ DECLARE bad text; BEGIN")
+		p("  SELECT string_agg(DISTINCT x, ', ') INTO bad FROM (")
+		p("    SELECT format('%%I can become %%I', r.rolname, g.rolname) AS x")
+		p("      FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER')")
+		p("      WHERE r.rolname IN (%s) AND (g.rolname IN (%s) OR g.rolname = 'pg_signal_backend')", strings.Join(agents, ", "), strings.Join(privileged, ", "))
+		p("    UNION ALL SELECT format('%%I can %%s %%I.%%I', r.rolname, lower(pr.p), n.nspname, c.relname) || CASE WHEN g.oid <> r.oid THEN format(' (as %%I)', g.rolname) ELSE '' END")
+		p("      FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER') CROSS JOIN %s", named)
+		p("      JOIN pg_class c ON c.oid = part.relid JOIN pg_namespace n ON n.oid = c.relnamespace")
+		p("      CROSS JOIN (VALUES ('INSERT'), ('UPDATE'), ('DELETE')) AS pr(p)")
+		p("      WHERE r.rolname IN (%s) AND has_table_privilege(g.oid, c.oid, pr.p)", strings.Join(agents, ", "))
+		p("    UNION ALL SELECT format('%%I can call %%s', r.rolname, f.f) || CASE WHEN g.oid <> r.oid THEN format(' (as %%I)', g.rolname) ELSE '' END")
+		p("      FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER')")
+		p("      CROSS JOIN (VALUES ('evidence.mark_action(json)'), ('evidence.mark_undo(json)'), ('evidence.mark_refused(json)')) AS f(f)")
+		p("      WHERE r.rolname IN (%s) AND has_function_privilege(g.oid, f.f, 'EXECUTE')) AS rights;", strings.Join(agents, ", "))
+		p("  IF bad IS NOT NULL THEN")
+		p("    RAISE EXCEPTION 'evidencestore: %%', bad USING HINT =")
+		p("      'The agent writes only through the MCP server, and the server has a role of its own: then the agent cannot change '")
+		p("      'its settings, end its sessions or put marks in the log. Revoke the right (or the membership) from the agent role.';")
+		p("  END IF;")
+		p("END $evidence$;")
+	}
+	p("-- Роль сервера — только его: ни одна другая роль со входом (кроме суперпользователей) не может ею")
+	p("-- стать. Иначе её умолчания, сеансы и отметки — в руках той роли.")
+	p("DO $evidence$ DECLARE bad text; BEGIN")
+	p("  SELECT string_agg(DISTINCT format('%%I can become %%I, the role of the MCP server', x.rolname, m.rolname), ', ') INTO bad")
+	p("    FROM pg_roles m JOIN pg_roles x ON x.oid <> m.oid AND x.rolcanlogin AND NOT x.rolsuper AND x.rolname <> current_user")
+	p("      AND pg_has_role(x.oid, m.oid, 'MEMBER')")
+	p("    WHERE m.rolname IN (%s);", strings.Join(servers, ", "))
+	p("  IF bad IS NOT NULL THEN")
+	p("    RAISE EXCEPTION 'evidencestore: %%', bad USING HINT = 'The role of the MCP server must be its own: revoke the membership.';")
+	p("  END IF;")
+	p("END $evidence$;")
+	// Сообщения в журнал базы напрямую пишет только владелец отметок. SQL
+	// агента идёт в сеансе сервера: с правом на pg_logical_emit_message он
+	// положил бы сообщение под любым префиксом — и «кто» (mark_who) тоже.
+	emitters := slices.Clone(lits)
+	for _, r := range c.UndoRoles {
+		emitters = append(emitters, lit(r))
+	}
+	p("-- Писать в журнал базы напрямую может только %s: ни роли агента, сервера и отката, ни их роли.", EvidenceOwner)
+	p("DO $evidence$ DECLARE bad text; BEGIN")
+	p("  SELECT string_agg(DISTINCT format('%%I can call %%s', r.rolname, f.oid::regprocedure) || CASE WHEN g.oid <> r.oid THEN format(' (as %%I)', g.rolname) ELSE '' END, ', ') INTO bad")
+	p("    FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER')")
+	p("    JOIN pg_proc f ON f.proname = 'pg_logical_emit_message' AND f.pronamespace = 'pg_catalog'::regnamespace")
+	p("    WHERE r.rolname IN (%s) AND has_function_privilege(g.oid, f.oid, 'EXECUTE');", strings.Join(emitters, ", "))
+	p("  IF bad IS NOT NULL THEN")
+	p("    RAISE EXCEPTION 'evidencestore: %%', bad USING HINT = 'Only %s writes messages to the database log, through the evidence.mark_* functions: revoke the right (or the membership).';", EvidenceOwner)
+	p("  END IF;")
+	p("END $evidence$;")
 	p("-- Своих объектов агенту заводить нельзя: схемы, функции, типы и таблицы в журнал базы не идут")
 	p("-- (это DDL), а функция или оператор под системным именем в схеме из его search_path заслонили бы")
 	p("-- системные (P-242). PostgreSQL 14 и старше даёт PUBLIC право CREATE на схеме public.")
@@ -336,7 +464,7 @@ func SetupSQL(c *Config) (string, error) {
 	p("      WHERE r.rolname IN (%s) AND has_database_privilege(g.oid, current_database(), 'CREATE')) AS rights;", strings.Join(lits, ", "))
 	p("  IF bad IS NOT NULL THEN")
 	p("    RAISE EXCEPTION 'evidencestore: %%', bad USING HINT =")
-	p("      'An agent role must not create objects: its DDL is not in the database log, and a function or operator of its own '")
+	p("      'The roles of the agent and the server must not create objects: their DDL is not in the database log, and a function or operator of their own '")
 	p("      'named like a system one would stand in for it. REVOKE CREATE ON SCHEMA … FROM PUBLIC (or from the role the right comes through); '")
 	p("      'PostgreSQL 14 and older grant it on schema public to PUBLIC.';")
 	p("  END IF;")
@@ -403,7 +531,13 @@ func SetupSQL(c *Config) (string, error) {
 	p("    EXECUTE format('CREATE TRIGGER evidence_who BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON %%s '")
 	p("      'FOR EACH STATEMENT EXECUTE FUNCTION evidence.mark_who()', leaf);")
 	// Имена ролей попадают в строку формата: знак процента в имени удваивается.
-	p("    EXECUTE format(%s, leaf);", lit("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO "+strings.ReplaceAll(strings.Join(roles, ", "), "%", "%%")))
+	if len(writers) > 0 {
+		p("    EXECUTE format(%s, leaf);", lit("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO "+strings.ReplaceAll(strings.Join(writers, ", "), "%", "%%")))
+	}
+	if len(readers) > 0 {
+		p("    EXECUTE format(%s, leaf);", lit("GRANT SELECT ON %s TO "+strings.ReplaceAll(strings.Join(readers, ", "), "%", "%%")))
+		p("    EXECUTE format(%s, leaf);", lit("REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON %s FROM "+strings.ReplaceAll(strings.Join(readers, ", "), "%", "%%")))
+	}
 	p("  END LOOP;")
 	p("END $evidence$;")
 	p("")
@@ -507,7 +641,7 @@ func New(cfg Config, log *slog.Logger) (*Source, error) {
 // Open — input.Input: справочник открыт, место входа принято.
 func (s *Source) Open(cursor uint64, sink input.Sink) (err error) {
 	s.sink = sink
-	s.tap, err = pgtap.Open(pgtap.Config{Dir: s.cfg.Dir, Roles: s.cfg.Roles, AlertRows: s.cfg.AlertRows,
+	s.tap, err = pgtap.Open(pgtap.Config{Dir: s.cfg.Dir, Roles: s.cfg.watched(), AlertRows: s.cfg.AlertRows,
 		RequireAction: s.cfg.RequireAction, Canaries: s.cfg.Canaries, PartSize: s.partSize}, catalog{s}, counted{s}, cursor, s.log)
 	return err
 }
@@ -639,7 +773,7 @@ func (s *Source) connect(ctx context.Context) (err error) {
 	start = max(start, from)
 	s.flushed, s.reported, s.lastReport = start, start, time.Now()
 	s.backoff, s.retryAt = 0, time.Time{}
-	s.log.Info("reading the database log", "slot", s.cfg.Slot, "publication", s.cfg.Publication, "from", start.String(), "roles", strings.Join(s.cfg.Roles, ","))
+	s.log.Info("reading the database log", "slot", s.cfg.Slot, "publication", s.cfg.Publication, "from", start.String(), "roles", strings.Join(s.cfg.watched(), ","))
 	return nil
 }
 

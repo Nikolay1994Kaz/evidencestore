@@ -172,7 +172,9 @@ cat >"$WORK/collector.json" <<EOF
      "postgres": {
        "dsn": "host=$WORK/sock port=$PGPORT user=evidence_tap dbname=shop",
        "dir": "pg-index",
+       "mcp_roles": ["esmcp_bot"],
        "roles": ["agent_bot"],
+       "undo_roles": ["undo_op"],
        "tables": ["public.accounts", "public.orders", "public.docs"],
        "alert_rows": 500,
        "require_action": true,
@@ -193,7 +195,7 @@ cat >"$WORK/collector.json" <<EOF
 EOF
 "$BIN/escollect" -config "$WORK/collector.json" -setup-sql >"$WORK/setup.sql"
 PGOPTIONS='-c client_min_messages=warning' "${OWNER[@]}" -q -f "$WORK/setup.sql"
-grep -c . "$WORK/setup.sql" | sed 's/$/ строк SQL (escollect -setup-sql): права роли agent_bot, триггер отметки на трёх таблицах, публикация, роль сборщика/'
+grep -c . "$WORK/setup.sql" | sed 's/$/ строк SQL (escollect -setup-sql): роли сервера esmcp_bot (запись), агента agent_bot (чтение) и отката undo_op, триггер отметки на трёх таблицах, публикация, роль сборщика/'
 touch "$WORK/mcp/receipts.jsonl"
 # Получатель тревог: местный приёмник вместо Telegram, Slack и своего адреса.
 HOOKS=$WORK/hooks.jsonl
@@ -230,7 +232,7 @@ ls "$WORK" | grep -c '^spool-' | sed 's/$/ буфера, процесс один
 # чем их проверить: ключ хранилища и доверие к меткам времени заданы здесь.
 cat >"$WORK/mcp.json" <<EOF
 {
-  "dsn": "host=$WORK/sock port=$PGPORT user=agent_bot dbname=shop",
+  "dsn": "host=$WORK/sock port=$PGPORT user=esmcp_bot dbname=shop",
   "agent": "support-bot",
   "receipts": "mcp/receipts.jsonl",
   "action_row_limit": $ROWS,
@@ -247,7 +249,7 @@ EOF
 # минуту, 50 строк за десять минут. Квитанции — в тот же файл.
 cat >"$WORK/mcp-strict.json" <<EOF
 {
-  "dsn": "host=$WORK/sock port=$PGPORT user=agent_bot dbname=shop",
+  "dsn": "host=$WORK/sock port=$PGPORT user=esmcp_bot dbname=shop",
   "agent": "batch-bot",
   "receipts": "mcp/receipts.jsonl",
   "statement_timeout": "1s",
@@ -258,7 +260,8 @@ cat >"$WORK/mcp-strict.json" <<EOF
 EOF
 mcp_strict() { python3 -I "$HERE/mcp_call.py" "$BIN/esmcp" "$WORK/mcp-strict.json" "$1" "$2" 2>>"$WORK/mcp.log"; }
 # Настройки оператора для esundo: база и то, как достать записи из хранилища.
-OPDSN="host=$WORK/sock port=$PGPORT user=postgres dbname=shop"
+# Оператор откатывает ролью отката: не владелец и не суперпользователь (DECISIONS, п. 39).
+OPDSN="host=$WORK/sock port=$PGPORT user=undo_op dbname=shop"
 cat >"$WORK/undo.json" <<EOF
 {
   "dsn": "$OPDSN",
@@ -361,15 +364,27 @@ grep -q "takes one SELECT" <<<"$out" || die "ждали отказ чтению:
 [ "$("${OWNER[@]}" -Atc "select md5(string_agg(id || coalesce(body, ''), ',' order by id)) from docs")" = "$DOCS" ] || die "таблица docs изменилась"
 echo "ни одна команда не исполнилась, docs не тронута: транзакцию ведёт сервер, команды агента идут в PREPARE"
 
-step "агент в обход MCP: прямое подключение своей ролью"
-BEFORE_ALERTS=$(wc -l <"$ALERTS" 2>/dev/null || echo 0)
-PGAPPNAME=some-script "$PGBIN/psql" "${PGCONN[@]}" -U agent_bot -X -q -d shop -c "update accounts set note = 'direct write' where id = 12"
-BYPASS=$("${OWNER[@]}" -Atc "select xmin from accounts where id = 12")
-wait_tx "$BYPASS"
-echo "транзакция $BYPASS записана и без MCP (отметку ставит база): $(field "$(entry "$BYPASS")" who)"
-[ "$(alerts "$BYPASS")" = "no-action" ] || die "ждали тревогу no-action, получили: $(alerts "$BYPASS")"
-echo "тревога no-action — у транзакции роли агента нет отметки действия. Как она пришла в Telegram:"
-hooked /bot123456:DEMO-TOKEN/sendMessage "agent transaction $BYPASS" | sed 's/^/    /'
+step "агент в обход MCP: своя роль agent_bot — только чтение, сервер — другая роль"
+AGENT=("$PGBIN/psql" "${PGCONN[@]}" -U agent_bot -X -q -d shop)
+"${AGENT[@]}" -Atc "select count(*) from accounts" | sed 's/$/ счетов агент читает своей ролью/'
+# Сеанс сервера на время проверки: держит его отдельный esmcp (stdio открыт, пока ждёт sleep).
+( sleep 3 | "$BIN/esmcp" -config "$WORK/mcp.json" >/dev/null 2>&1 ) &
+HOLD=$!
+for _ in $(seq 50); do
+  SERVER_PID=$("${OWNER[@]}" -Atc "select pid from pg_stat_activity where usename = 'esmcp_bot' limit 1")
+  [ -n "$SERVER_PID" ] && break; sleep 0.05
+done
+[ -n "$SERVER_PID" ] || die "сеанс esmcp в базе не появился"
+for a in "update accounts set note = 'direct write' where id = 12" \
+         "select evidence.mark_action('{\"action_id\": \"forged\"}')" \
+         "select pg_terminate_backend($SERVER_PID)" \
+         "alter role esmcp_bot set statement_timeout = 1"; do
+  if out=$("${AGENT[@]}" -c "$a" 2>&1); then die "агенту удалось: $a"; fi
+  echo "$(cut -c1-70 <<<"$a") → $(grep -o 'ERROR: .*' <<<"$out" | head -1)"
+done
+wait "$HOLD"
+[ "$("${OWNER[@]}" -Atc "select note from accounts where id = 12")" != "direct write" ] || die "агент записал мимо сервера"
+echo "ни записи, ни отметки, ни обрыва сеансов сервера, ни его настроек: граница — роли базы (п. 39)"
 
 # Снимок «как было до плохого действия» — только чтобы в конце сверить итог.
 "${OWNER[@]}" -q -c "create table snap.accounts as table accounts" -c "create table snap.orders as table orders" -c "create table snap.docs as table docs"

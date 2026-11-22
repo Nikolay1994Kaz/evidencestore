@@ -10,7 +10,7 @@ import (
 )
 
 func good() Config {
-	return Config{DSN: "host=db user=evidence_tap dbname=shop", Roles: []string{"agent_bot"}, Tables: []string{"public.accounts", "sales.orders"}}
+	return Config{DSN: "host=db user=evidence_tap dbname=shop", MCPRoles: []string{"esmcp_bot"}, Roles: []string{"agent_bot"}, Tables: []string{"public.accounts", "sales.orders"}}
 }
 
 func TestConfigDefaultsAndRefusals(t *testing.T) {
@@ -27,9 +27,13 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 		t.Fatalf("notify defaults: %v %+v", err, n.Notify)
 	}
 	for name, spoil := range map[string]func(*Config){
-		"no dsn":               func(c *Config) { c.DSN = "" },
-		"dsn that is not one":  func(c *Config) { c.DSN = "host" },
-		"no roles":             func(c *Config) { c.Roles = nil },
+		"no dsn":              func(c *Config) { c.DSN = "" },
+		"dsn that is not one": func(c *Config) { c.DSN = "host" },
+		"no mcp roles":        func(c *Config) { c.MCPRoles = nil },
+		// У агента, сервера и отката — по своей роли (DECISIONS, п. 39).
+		"agent = server":       func(c *Config) { c.Roles = []string{"esmcp_bot"} },
+		"undo = server":        func(c *Config) { c.UndoRoles = []string{"esmcp_bot"} },
+		"agent = collector":    func(c *Config) { c.Roles = []string{"evidence_tap"} },
 		"no tables":            func(c *Config) { c.Tables = nil },
 		"table without schema": func(c *Config) { c.Tables = []string{"accounts"} },
 		"three-part table":     func(c *Config) { c.Tables = []string{"db.public.accounts"} },
@@ -57,12 +61,14 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 	}
 }
 
-// Скрипт настройки базы: права агента — только строки названных таблиц,
-// отметку «кто» ставит триггер, прямой вызов pg_logical_emit_message закрыт,
-// имена берутся в кавычки.
+// Скрипт настройки базы: права сервера — только строки названных таблиц и
+// отметки, агента — только чтение, отката — строки и отметка отката; отметку
+// «кто» ставит триггер, прямой вызов pg_logical_emit_message закрыт, функции
+// отметок — у роли без входа; имена берутся в кавычки.
 func TestSetupSQL(t *testing.T) {
 	c := good()
-	c.Roles = []string{`agent "x"`, "50% off"}
+	c.MCPRoles = []string{`agent "x"`, "50% off"}
+	c.UndoRoles = []string{"undo_op"}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +88,20 @@ func TestSetupSQL(t *testing.T) {
 		`ALTER ROLE "agent ""x""" SET statement_timeout = '60s';`,
 		`ALTER ROLE "agent ""x""" SET lock_timeout = '10s';`,
 		`ALTER ROLE "agent ""x""" SET idle_in_transaction_session_timeout = '5min';`,
+		// Агент — только чтение; запись и отметки, выданные раньше, отозваны.
+		`GRANT SELECT ON "public"."accounts", "sales"."orders" TO "agent_bot";`,
+		`REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON "public"."accounts", "sales"."orders" FROM "agent_bot";`,
+		`REVOKE EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json), evidence.mark_refused(json) FROM "agent_bot";`,
+		`EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON %s FROM "agent_bot"', leaf);`,
+		// Откат — строки и отметка отката.
+		`GRANT EXECUTE ON FUNCTION evidence.mark_undo(json) TO "undo_op";`,
+		// Владелец отметок — роль без входа; писать в журнал может только она.
+		`CREATE ROLE "evidence_owner" NOLOGIN;`,
+		`ALTER FUNCTION evidence.mark_refused(json) OWNER TO "evidence_owner";`,
+		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', f, 'evidence_owner');`,
+		// Агент не становится ролью сервера; роль сервера — только его.
+		`format('%I can become %I', r.rolname, g.rolname)`,
+		`can become %I, the role of the MCP server'`,
 		// Публикация: с PostgreSQL 18 — вместе с хранимыми генерируемыми колонками.
 		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders" WITH (publish_generated_columns = stored)';`,
 		`EXECUTE 'CREATE PUBLICATION "evidence_pub" FOR TABLE "public"."accounts", "sales"."orders"';`,
@@ -93,7 +113,7 @@ func TestSetupSQL(t *testing.T) {
 		`(SELECT t.oid AS relid, 0 AS level FROM unnest(ARRAY['"public"."accounts"'::regclass, '"sales"."orders"'::regclass]) AS t(oid) UNION`,
 		`CROSS JOIN LATERAL pg_partition_tree(t.oid) AS tree) AS part`,
 		`EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', leaf);`,
-		`EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO "agent ""x""", "50%% off"', leaf);`,
+		`EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO "agent ""x""", "50%% off", "undo_op"', leaf);`,
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("the script lacks %s", want)

@@ -62,6 +62,43 @@ func (s *Server) connect() error {
 	return nil
 }
 
+// ErrSharedRole — роль сервера не только его: суперпользователь, или ею может
+// стать другая роль со входом.
+var ErrSharedRole = errors.New("the role of the MCP server is not its own")
+
+// CheckRole проверяет, что роль, которой сервер вошёл, — только его: не
+// суперпользователь, и ни одна другая роль со входом (кроме
+// суперпользователей) не может ею стать. Иначе её умолчания, сеансы и
+// отметки — в руках той роли, и граница между агентом и сервером — опять
+// перечень настроек, а не права базы (DECISIONS, п. 39). -setup-sql
+// проверяет то же, но права выдают и после него: esmcp зовёт CheckRole при
+// запуске.
+func (s *Server) CheckRole() error {
+	if err := s.connect(); err != nil {
+		return err
+	}
+	res, err := s.run("BEGIN; SET LOCAL search_path = pg_catalog, pg_temp; " +
+		"SELECT current_user::text, r.rolsuper::text, (SELECT string_agg(x.rolname::text, ', ' ORDER BY x.rolname) FROM pg_roles x " +
+		"WHERE x.oid <> r.oid AND x.rolcanlogin AND NOT x.rolsuper AND pg_has_role(x.oid, r.oid, 'MEMBER')) " +
+		"FROM pg_roles r WHERE r.rolname = current_user; COMMIT")
+	if err != nil {
+		return err
+	}
+	for _, r := range res {
+		if len(r.Rows) != 1 || len(r.Rows[0]) != 3 {
+			continue
+		}
+		row := r.Rows[0]
+		switch {
+		case row[1] != nil && *row[1] == "true":
+			return fmt.Errorf("%w: %s is a superuser", ErrSharedRole, *row[0])
+		case row[2] != nil:
+			return fmt.Errorf("%w: %s can become %s. Revoke the membership: the agent must not have the server's role", ErrSharedRole, *row[2], *row[0])
+		}
+	}
+	return nil
+}
+
 // sessionParams — параметры входа соединения сервера. Умолчания своей роли
 // агент ставит себе сам (ALTER ROLE … SET в своей сессии мимо сервера), и
 // DISCARD ALL возвращает сеанс к ним; параметры входа сильнее их, и

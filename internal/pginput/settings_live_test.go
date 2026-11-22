@@ -94,7 +94,7 @@ CREATE TRIGGER audit AFTER UPDATE ON pgs.tick FOR EACH ROW EXECUTE FUNCTION pgs.
 CREATE TABLE pgs.fanout (n int);
 CREATE FUNCTION pgs.fan() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $f$ BEGIN INSERT INTO pgs.fanout SELECT g FROM generate_series(1, 50) g; RETURN NEW; END $f$;
 CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fan()`)
-	cfg := Config{DSN: base + " user=pgs_tap", Slot: "pgs_slot", Publication: "pgs_pub", Dir: t.TempDir(), Roles: []string{"pgs_agent"}, Tables: []string{"pgs.vals", "pgs.tick"}}
+	cfg := Config{DSN: base + " user=pgs_tap", Slot: "pgs_slot", Publication: "pgs_pub", Dir: t.TempDir(), MCPRoles: []string{"pgs_agent"}, Tables: []string{"pgs.vals", "pgs.tick"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	}
 
 	// 1. Человек, esundo: база с array_nulls = off, сеанс — новый, правами владельца.
-	agent := dial("pgs_agent", "")
+	agent := dial("pgs_agent", "") // сеанс роли сервера мимо сервера (части 2–4)
 	tick := one(admin, "SELECT 'pgs.tick'::regclass::oid::text")
 	res, err := agent.Query("BEGIN; UPDATE pgs.vals SET tags = '{c}', span = '1 day', rel = 'pg_class' WHERE id = 1; SELECT pg_current_xact_id()::xid::text; COMMIT")
 	if err != nil {
@@ -164,9 +164,11 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 		t.Fatalf("the undo by a person: row %q (want {NULL,a} true -1 days -02:00:00 %s), differs %v", got, tick, done.Differ)
 	}
 
-	// 2. Агент, undo_apply: своей сессией мимо сервера ставит своей роли
-	// array_nulls = off и обрывает сеанс сервера — следующий вызов войдёт
-	// заново, с новым умолчанием.
+	// 2. undo_apply: сеансом роли сервера мимо сервера роли ставят
+	// array_nulls = off и обрывают сеанс сервера — следующий вызов войдёт
+	// заново, с новым умолчанием. Агенту это теперь не дано: его роль не член
+	// роли сервера (DECISIONS, п. 39). Здесь — вторая линия: умолчания роли
+	// сменил кто-то другой, а сервер всё равно ставит свои.
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -222,10 +224,10 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	}
 	exec(admin, "ALTER ROLE pgs_agent RESET array_nulls; ALTER ROLE pgs_agent RESET search_path")
 
-	// 3. Откат — под таймаутами сервера: агент снимает своей роли lock_timeout
-	// и statement_timeout и держит замок строки своей сессией. Раньше откат
-	// висел на нём сколько угодно, и под замком агента стояли все его
-	// действия (R2 заход 2).
+	// 3. Откат — под таймаутами сервера: у роли сервера сняты lock_timeout и
+	// statement_timeout, и сеанс этой роли держит замок строки. Раньше откат
+	// висел на нём сколько угодно, и под замком стояли все действия агента
+	// (R2 заход 2). Агенту и это теперь не дано (п. 39); проверка — вторая линия.
 	exec(agent, "ALTER ROLE pgs_agent SET lock_timeout = 0; ALTER ROLE pgs_agent SET statement_timeout = 0")
 	locked := mcpserver.New(mcpserver.Config{Agent: "pgs-bot", LockTimeout: 300 * time.Millisecond, Version: "test", Receipts: f, ReceiptsPath: path, Fetch: bodies,
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
@@ -258,11 +260,12 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	exec(agent, "ROLLBACK")
 	exec(admin, "ALTER ROLE pgs_agent RESET lock_timeout; ALTER ROLE pgs_agent RESET statement_timeout")
 
-	// 4. Свой оператор агента в сеансе человека: агенту позже дали CREATE на
-	// public, и он завёл =(varchar, varchar) — точное совпадение, которого в
-	// pg_catalog нет, выигрывало при любом порядке пути, и esundo звал функцию
-	// агента правами владельца (R2 заход 2). Путь сверки и отката — только
-	// pg_catalog (pgundo.Path), типы у сборщика — со схемой.
+	// 4. Чужой оператор в сеансе человека: роли, которая не владелец, позже
+	// дали CREATE на public, и она завела =(varchar, varchar) — точное
+	// совпадение, которого в pg_catalog нет, выигрывало при любом порядке пути,
+	// и esundo звал её функцию правами владельца (R2 заход 2). Сверка и откат
+	// отказывают, если в схеме пути может CREATE не владелец (п. 39); типы у
+	// сборщика — со схемой.
 	res, err = agent.Query("BEGIN; UPDATE pgs.tick SET note = 'agent' WHERE id = 'k1'; SELECT pg_current_xact_id()::xid::text; COMMIT")
 	if err != nil {
 		t.Fatal(err)
@@ -275,8 +278,8 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	exec(admin, "GRANT CREATE ON SCHEMA public TO pgs_agent")
 	exec(agent, `CREATE FUNCTION public.pgs_eq(varchar, varchar) RETURNS bool LANGUAGE plpgsql AS $f$BEGIN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END$f$;
 CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = public.pgs_eq)`)
-	// Агент может CREATE в public, а public — в пути сеанса: сверка отказана
-	// и ничего его не позвала.
+	// pgs_agent может CREATE в public, а public — в пути сеанса: сверка
+	// отказана и ничего чужого не позвала.
 	human = dial("postgres", "esundo")
 	if _, err = p.Check(human); !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema public") {
 		t.Fatalf("the check by a person with a schema of the agent on the path: %v", err)

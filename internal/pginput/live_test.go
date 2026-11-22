@@ -170,7 +170,7 @@ func TestLive(t *testing.T) {
 	}
 
 	cfg := Config{DSN: base + " user=pgin_tap", Slot: "pgin_slot", Publication: "pgin_pub", Dir: t.TempDir(),
-		Roles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}, RequireAction: true, SlotAlertMB: 4,
+		MCPRoles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}, RequireAction: true, SlotAlertMB: 4,
 		Notify: &Notify{To: []alert.Target{{Type: alert.TypeSlack, URL: hook.URL}}}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)

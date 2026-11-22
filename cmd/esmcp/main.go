@@ -4,8 +4,12 @@
 //
 //	esmcp -config mcp.json
 //
-// Подключается ролью агента: права этой роли и есть то, что агенту можно.
-// Базу готовит скрипт escollect -setup-sql (роль, функция отметки действия).
+// Подключается своей ролью сервера (mcp_roles в настройках сборщика): права
+// этой роли и есть то, что можно SQL агента. Роль — только сервера: при
+// запуске он отказывается работать суперпользователем или ролью, которой
+// может стать другая роль со входом. Настройки с паролем агенту читать нельзя:
+// esmcp — под другим пользователем ОС или в контейнере (DECISIONS, п. 39).
+// Базу готовит скрипт escollect -setup-sql (роли, функции отметок).
 package main
 
 import (
@@ -29,7 +33,7 @@ import (
 
 // Config — настройки сервера.
 type Config struct {
-	// DSN — подключение ролью агента: "host=db user=agent_bot dbname=shop
+	// DSN — подключение ролью сервера: "host=db user=esmcp_bot dbname=shop
 	// sslmode=verify-full". Пароль — здесь или в PGPASSWORD.
 	DSN string `json:"dsn"`
 	// Agent — имя агента в отметках действий и квитанциях.
@@ -153,6 +157,14 @@ func main() {
 		mc.Fetch = cfg.Undo.Fetch
 	}
 	srv := mcpserver.New(mc, log)
+	// Роль сервера — только его (DECISIONS, п. 39): иначе не начинать. База
+	// недоступна — проверка при следующем запуске, а соединяться сервер будет
+	// по первому вызову, как всегда.
+	if err := srv.CheckRole(); errors.Is(err, mcpserver.ErrSharedRole) {
+		fail(err)
+	} else if err != nil {
+		log.Warn("the role of the server is not checked: the database is unreachable", "err", err)
+	}
 	fail(srv.Serve(os.Stdin, os.Stdout))
 }
 

@@ -114,7 +114,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	version, _ := strconv.Atoi(one("SELECT current_setting('server_version_num')"))
 
 	cfg := Config{DSN: base + " user=pgu_tap", Slot: "pgu_slot", Publication: "pgu_pub", Dir: t.TempDir(),
-		Roles: []string{"pgu_agent"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident", "pgu.tag"}}
+		MCPRoles: []string{"pgu_agent"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident", "pgu.tag"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
