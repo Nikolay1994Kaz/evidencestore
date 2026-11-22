@@ -31,7 +31,7 @@ type fakeDB struct {
 	changed int
 	noStats bool
 	// roleCheck — свой ответ на проверку роли (checkRole); nil — «роль своя».
-	roleCheck func() ([]pgwire.Result, error)
+	roleCheck func(sql string) ([]pgwire.Result, error)
 }
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
@@ -40,11 +40,11 @@ func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
 	// на запросы действий. Саму проверку — TestCheckRole и TestLiveMCP.
 	if strings.Contains(sql, RoleCheck) {
 		if d.roleCheck != nil {
-			return d.roleCheck()
+			return d.roleCheck(sql)
 		}
-		me, no := "esmcp_bot", "false"
-		return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "SET"}, {Columns: []string{"current_user", "rolsuper", "member_of", "members", "calls"},
-			Rows: [][]*string{{&me, &no, nil, nil, nil}}, Tag: "SELECT 1"}, {Tag: "COMMIT"}}, nil
+		me, no, v := "esmcp_bot", "false", "140000"
+		return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "SET"}, {Columns: []string{"current_user", "rolsuper", "members", "rights", "version"},
+			Rows: [][]*string{{&me, &no, nil, nil, &v}}, Tag: "SELECT 1"}, {Tag: "COMMIT"}}, nil
 	}
 	d.log = append(d.log, sql)
 	res, err := d.answer(sql)
@@ -619,21 +619,27 @@ func TestRowCountIsTheActionsOwn(t *testing.T) {
 // после недоступности — проверка идёт тогда.
 func TestCheckRoleOnEveryConnection(t *testing.T) {
 	str := func(v string) *string { return &v }
-	row := func(super string, member, members, calls *string) func() ([]pgwire.Result, error) {
-		return func() ([]pgwire.Result, error) {
+	// Ответ проверки: суперпользователь, кто ещё станет ролью, сверх выданного,
+	// версия; params — ответ о параметрах (PostgreSQL 15+).
+	row := func(super string, members, rights *string, version string, params *string) func(string) ([]pgwire.Result, error) {
+		return func(sql string) ([]pgwire.Result, error) {
+			if strings.Contains(sql, "pg_parameter_acl") {
+				return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "SET"}, {Columns: []string{"x"}, Rows: [][]*string{{params}}, Tag: "SELECT 1"}, {Tag: "COMMIT"}}, nil
+			}
 			return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "SET"}, {Columns: []string{"a", "b", "c", "d", "e"},
-				Rows: [][]*string{{str("esmcp_bot"), str(super), member, members, calls}}, Tag: "SELECT 1"}, {Tag: "COMMIT"}}, nil
+				Rows: [][]*string{{str("esmcp_bot"), str(super), members, rights, str(version)}}, Tag: "SELECT 1"}, {Tag: "COMMIT"}}, nil
 		}
 	}
 	for name, c := range map[string]struct {
-		answer func() ([]pgwire.Result, error)
+		answer func(string) ([]pgwire.Result, error)
 		want   string
 	}{
-		"superuser":     {row("true", nil, nil, nil), "esmcp_bot is a superuser"},
-		"member of dba": {row("false", str("dba"), nil, nil), "esmcp_bot is a member of dba"},
-		"agent inside":  {row("false", nil, str("agent_bot"), nil), "agent_bot can become esmcp_bot"},
-		"may terminate": {row("false", nil, nil, str("pg_terminate_backend(integer,bigint)")), "esmcp_bot can call pg_terminate_backend(integer,bigint)"},
-		"no answer":     {func() ([]pgwire.Result, error) { return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "COMMIT"}}, nil }, "the check of the role gave no answer"},
+		"superuser":     {row("true", nil, nil, "160000", nil), "esmcp_bot is a superuser"},
+		"agent inside":  {row("false", str("agent_bot"), nil, "160000", nil), "agent_bot can become esmcp_bot"},
+		"a membership":  {row("false", nil, str("esmcp_bot is a member of dba"), "160000", nil), "esmcp_bot is a member of dba"},
+		"may terminate": {row("false", nil, str("esmcp_bot can call pg_terminate_backend(integer,bigint)"), "140000", nil), "can call pg_terminate_backend(integer,bigint)"},
+		"a parameter":   {row("false", nil, nil, "160000", str("esmcp_bot can SET parameter track_counts")), "esmcp_bot can SET parameter track_counts"},
+		"no answer":     {func(string) ([]pgwire.Result, error) { return []pgwire.Result{{Tag: "BEGIN"}, {Tag: "COMMIT"}}, nil }, "the check of the role gave no answer"},
 	} {
 		db := &fakeDB{roleCheck: c.answer}
 		s, _ := newServer(t, db)
@@ -645,9 +651,15 @@ func TestCheckRoleOnEveryConnection(t *testing.T) {
 			t.Errorf("%s: execute: %v %s; queries %q", name, isErr, text, db.log)
 		}
 	}
+	// Роль своя, версия 16: обе проверки прошли — действие идёт.
+	db := &fakeDB{roleCheck: row("false", nil, nil, "160000", nil)}
+	s, _ := newServer(t, db)
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 6","reason":"r"}`); isErr {
+		t.Fatalf("an own role: %s", text)
+	}
 	// База недоступна при запуске: проверка — при первом соединении.
-	db, up := &fakeDB{roleCheck: row("false", nil, str("agent_bot"), nil)}, false
-	s := New(Config{Agent: "a", Dial: func(map[string]string) (DB, error) {
+	db, up := &fakeDB{roleCheck: row("false", str("agent_bot"), nil, "140000", nil)}, false
+	s = New(Config{Agent: "a", Dial: func(map[string]string) (DB, error) {
 		if !up {
 			return nil, errors.New("connection refused")
 		}

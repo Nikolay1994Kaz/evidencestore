@@ -292,12 +292,26 @@ CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = publ
 	exec(admin, "DROP OPERATOR public.= (varchar, varchar); DROP FUNCTION public.pgs_eq(varchar, varchar); REVOKE CREATE ON SCHEMA public FROM pgs_agent")
 	// Член роли-владельца схемы может в ней всё, что владелец: такого не
 	// пропускает и сверка (R2-1; раньше член владельца считался доверенным).
-	exec(admin, "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgs_owner') THEN CREATE ROLE pgs_owner NOLOGIN; END IF; END$$; ALTER SCHEMA public OWNER TO pgs_owner; GRANT pgs_owner TO pgs_agent")
+	exec(admin, "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgs_owner') THEN CREATE ROLE pgs_owner NOLOGIN; END IF; END$$; ALTER SCHEMA public OWNER TO pgs_owner; GRANT pgs_owner TO pgs_agent; "+
+		// Член снимает CREATE у самой роли-владельца, но владелец вернёт его себе сам (R2-2, заход 2).
+		"REVOKE CREATE ON SCHEMA public FROM pgs_owner")
 	human = dial("postgres", "esundo")
 	_, err = p.Check(human)
-	exec(admin, "ALTER SCHEMA public OWNER TO pg_database_owner; DROP ROLE pgs_owner")
+	exec(admin, "GRANT CREATE ON SCHEMA public TO pgs_owner; ALTER SCHEMA public OWNER TO pg_database_owner; DROP ROLE pgs_owner")
 	if !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema public (as pgs_owner)") {
 		t.Fatalf("the check by a person with a schema the agent can become the owner of: %v", err)
+	}
+	// Владелец схемы — не доверенный сам по себе: с правом CREATE на базе
+	// агент заводит схему с именем роли сеанса ("$user" в пути), и его
+	// оператор шёл бы правами человека (R1-4, заход 2).
+	dbName := pgwire.Ident(one(admin, "SELECT current_database()"))
+	exec(admin, "GRANT CREATE ON DATABASE "+dbName+" TO pgs_agent")
+	exec(agent, "CREATE SCHEMA postgres")
+	human = dial("postgres", "esundo")
+	_, err = p.Check(human)
+	exec(admin, "DROP SCHEMA postgres; REVOKE CREATE ON DATABASE "+dbName+" FROM pgs_agent")
+	if !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema postgres") {
+		t.Fatalf("the check by a person with a schema of the agent named after the person: %v", err)
 	}
 	human = dial("postgres", "esundo")
 	if statuses, err = p.Check(human); err != nil {

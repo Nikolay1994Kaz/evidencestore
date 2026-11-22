@@ -115,7 +115,12 @@ func TestSetupSQL(t *testing.T) {
 		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', f, 'evidence_owner');`,
 		// Роли агента и сервера — разрешённым перечнем: ни членств, ни владения;
 		// ролью сервера и владельцем отметок не может стать никто другой.
-		`SELECT format('%I is a member of %I', r.rolname, g.rolname) AS x`,
+		`SELECT format('%I is a member of %I', r.rolname, g.rolname)`,
+		`a SECURITY DEFINER function of %I`,
+		`JOIN pg_foreign_server s ON has_server_privilege(g.oid, s.oid, 'USAGE')`,
+		`has_column_privilege(g.oid, c.oid, a.attnum, 'SELECT')`,
+		`EXECUTE $q$SELECT string_agg(DISTINCT x, ', ') FROM (SELECT format('%I can %s parameter %s', r.rolname, pr.p, a.parname) AS x`,
+		`WHERE r.rolname IN ('agent_bot', 'agent "x"', '50% off', 'undo_op') AND NOT g.rolsuper AND has_parameter_privilege`,
 		`WHERE r.rolname IN ('agent_bot', 'agent "x"', '50% off') AND g.oid <> r.oid`,
 		`SELECT format('%I owns %s', r.rolname, pg_describe_object(s.classid, s.objid, s.objsubid)) AS x`,
 		`SELECT format('%I can become %I', x.rolname, m.rolname) AS x`,

@@ -95,6 +95,15 @@ func TestLiveMCP(t *testing.T) {
 		admin.Query("REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text) FROM pgm_ai")
 		admin.Query("REVOKE SELECT ON pg_authid FROM pgm_ai")
 		admin.Query("REVOKE EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) FROM pgm_agent")
+		admin.Query("DROP EXTENSION IF EXISTS dblink")
+		admin.Query("DROP SCHEMA IF EXISTS pgm_ext")
+		admin.Query("DROP EXTENSION IF EXISTS pgstattuple")
+		admin.Query("DROP SCHEMA IF EXISTS pgm_ext2")
+		admin.Query("DROP SERVER IF EXISTS pgm_loop")
+		admin.Query("DROP FOREIGN DATA WRAPPER IF EXISTS pgm_fdw")
+		admin.Query("DROP FUNCTION IF EXISTS public.pgm_end(int)")
+		admin.Query("REVOKE SET ON PARAMETER track_counts FROM pgm_agent")
+		admin.Query("REVOKE SELECT (rolname, rolpassword) ON pg_authid FROM pgm_ai")
 		admin.Query("REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) FROM pgm_agent")
 	}
 	tidy()
@@ -210,8 +219,30 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		{"GRANT EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) TO pgm_agent", "pgm_agent can call pg_terminate_backend(integer,bigint)", "REVOKE EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) FROM pgm_agent", "pgm_agent can call pg_terminate_backend(integer,bigint)"},
 		{"GRANT pg_signal_backend TO pgm_agent", "pgm_agent is a member of pg_signal_backend", "REVOKE pg_signal_backend FROM pgm_agent", "pgm_agent is a member of pg_signal_backend"},
 		{"GRANT evidence_owner TO pgm_agent", "pgm_agent is a member of evidence_owner", "REVOKE evidence_owner FROM pgm_agent", "pgm_agent is a member of evidence_owner"},
-		{"CREATE ROLE pgm_dba SUPERUSER; GRANT pgm_dba TO pgm_agent", "pgm_agent is a superuser, may replicate or create roles (as pgm_dba)", "DROP ROLE pgm_dba", "pgm_agent is a member of pgm_dba"},
+		{"CREATE ROLE pgm_dba SUPERUSER; GRANT pgm_dba TO pgm_agent", "pgm_agent is a superuser, may replicate or create roles (as pgm_dba)", "DROP ROLE pgm_dba", "pgm_agent is a superuser, may replicate or create roles (as pgm_dba)"},
+		// Заход 2: права без членства и владения, через PUBLIC и прямые выдачи.
+		// Функция расширения вне pg_catalog, оставленная суперпользователям:
+		// dblink_connect_u входит любой ролью (R1-1).
+		{"CREATE SCHEMA pgm_ext; CREATE EXTENSION dblink SCHEMA pgm_ext; GRANT EXECUTE ON FUNCTION pgm_ext.dblink_connect_u(text, text) TO pgm_agent",
+			"pgm_agent can call pgm_ext.dblink_connect_u(text,text)", "DROP EXTENSION dblink; DROP SCHEMA pgm_ext", "pgm_agent can call pgm_ext.dblink_connect_u(text,text)"},
+		// То же правило без SECURITY DEFINER: функция pgstattuple, которую расширение
+		// оставило pg_stat_scan_tables (dblink_connect_u ловит и проверка SECURITY DEFINER).
+		{"CREATE SCHEMA pgm_ext2; CREATE EXTENSION pgstattuple SCHEMA pgm_ext2; GRANT EXECUTE ON FUNCTION pgm_ext2.pg_relpages(text) TO pgm_ai",
+			"pgm_ai can call pgm_ext2.pg_relpages(text)", "DROP EXTENSION pgstattuple; DROP SCHEMA pgm_ext2", ""},
+		// Сторонний сервер с сопоставлением FOR PUBLIC: SQL ролью владельца, мимо сборщика (R1-2).
+		{"CREATE FOREIGN DATA WRAPPER pgm_fdw; CREATE SERVER pgm_loop FOREIGN DATA WRAPPER pgm_fdw; GRANT USAGE ON FOREIGN SERVER pgm_loop TO PUBLIC",
+			"pgm_ai can use foreign server pgm_loop", "DROP SERVER pgm_loop; DROP FOREIGN DATA WRAPPER pgm_fdw", "pgm_agent can use foreign server pgm_loop"},
+		// Чужая функция SECURITY DEFINER, открытая PUBLIC по умолчанию: P-276 снова (R1-3, R2-4).
+		{"CREATE FUNCTION public.pgm_end(int) RETURNS bool LANGUAGE sql SECURITY DEFINER AS 'SELECT pg_terminate_backend($1)'",
+			"pgm_agent can call public.pgm_end(integer), a SECURITY DEFINER function of postgres", "DROP FUNCTION public.pgm_end(int)", "a SECURITY DEFINER function of postgres"},
+		// Параметр уровня суперпользователя: track_counts = off — и счёт строк молчит (R1-6).
+		{"GRANT SET ON PARAMETER track_counts TO pgm_agent", "pgm_agent can SET parameter track_counts", "REVOKE SET ON PARAMETER track_counts FROM pgm_agent", "pgm_agent can SET parameter track_counts"},
+		// Право на колонку таблицы, которую initdb оставил суперпользователям (R1-7).
+		{"GRANT SELECT (rolname, rolpassword) ON pg_authid TO pgm_ai", "pgm_ai can read pg_authid.rolpassword", "REVOKE SELECT (rolname, rolpassword) ON pg_authid FROM pgm_ai", ""},
 	} {
+		if strings.Contains(c[0], "ON PARAMETER") && one("SELECT current_setting('server_version_num')::int >= 150000") != "t" {
+			continue
+		}
 		exec(c[0])
 		if _, err := admin.Query(script); err == nil || !strings.Contains(err.Error(), c[1]) {
 			t.Fatalf("the setup script took the roles after %s: %v", c[0], err)
@@ -224,6 +255,13 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		}
 		exec(c[2])
 	}
+	// Большой объект и временная функция агента улик не касаются и прав не
+	// требуют: повторный скрипт из-за них не отказывает (R2-3, R1-8, заход 2).
+	if _, err := ai.Query("SELECT lo_from_bytea(0, 'x'); CREATE FUNCTION pg_temp.pgm_f() RETURNS int LANGUAGE sql AS 'SELECT 1'"); err != nil {
+		t.Fatal(err)
+	}
+	exec(script)
+	exec("SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE lomowner = 'pgm_ai'::regrole")
 	// Установка до п. 39: у роли агента запись и отметки, функции отметок — у
 	// того, кто запускал скрипт, pg_logical_emit_message открыта PUBLIC (так в
 	// PostgreSQL по умолчанию). Скрипт переводит её на новую.

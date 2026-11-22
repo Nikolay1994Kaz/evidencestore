@@ -29,6 +29,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pgrole"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
@@ -95,54 +96,79 @@ func (s *Server) CheckRole() error { return s.connect() }
 
 // checkRole проверяет, что роль, которой сервер вошёл, — только его. SQL
 // агента идёт этой ролью, поэтому:
-//   - не суперпользователь и ни в чём не состоит: всё, что ей можно, выдал
-//     ей самой escollect -setup-sql (через членство — set_config('role', …) —
-//     SQL агента взял бы права группы, суперпользователя тоже — T-3);
+//   - не суперпользователь;
 //   - никакая другая роль со входом, кроме суперпользователей, не может ею
 //     стать: иначе её умолчания, сеансы и отметки — в руках той роли;
-//   - не зовёт pg_logical_emit_message, pg_terminate_backend,
-//     pg_cancel_backend и того, что initdb оставил суперпользователям
-//     (pg_read_file…): иначе SQL агента ставил бы свои отметки, обрывал сеансы
-//     сервера, которые ставят отметки вне транзакции (R1-3, R2-6, T-1), и
-//     читал бы файлы сервера.
+//   - может только выданное ей самой — то же, что проверяет
+//     escollect -setup-sql (pgrole.Rights, pgrole.Params): ни членств, ни
+//     pg_terminate_backend, ни чужих SECURITY DEFINER, ни того, что initdb или
+//     расширение оставили суперпользователям, ни сторонних серверов, ни
+//     параметров уровня суперпользователя (P-276, P-277, P-280; заход 2).
 //
-// -setup-sql проверяет то же, но права выдают и после него (DECISIONS, п. 39).
+// Права выдают и после настройки (DECISIONS, пп. 39, 40). Чего здесь нет —
+// владения и CREATE: SQL агента в PREPARE не исполняет DDL; их проверяет
+// -setup-sql.
 func checkRole(db DB) error {
 	res, err := db.Query("BEGIN; SET LOCAL search_path = pg_catalog, pg_temp; " + RoleCheck +
 		"SELECT current_user::text, r.rolsuper::text, " +
-		"(SELECT string_agg(g.rolname::text, ', ' ORDER BY g.rolname) FROM pg_roles g WHERE g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'MEMBER')), " +
 		"(SELECT string_agg(x.rolname::text, ', ' ORDER BY x.rolname) FROM pg_roles x " +
 		"WHERE x.oid <> r.oid AND x.rolcanlogin AND NOT x.rolsuper AND pg_has_role(x.oid, r.oid, 'MEMBER')), " +
-		"(SELECT string_agg(f.oid::regprocedure::text, ', ' ORDER BY f.oid::regprocedure::text) FROM pg_proc f " +
-		"WHERE f.pronamespace = 'pg_catalog'::regnamespace AND has_function_privilege(r.oid, f.oid, 'EXECUTE') " +
-		"AND (f.proname IN ('pg_logical_emit_message', 'pg_terminate_backend', 'pg_cancel_backend') " +
-		"OR EXISTS (SELECT FROM pg_init_privs i WHERE i.classoid = 'pg_proc'::regclass AND i.objoid = f.oid AND i.objsubid = 0 " +
-		"AND NOT EXISTS (SELECT FROM aclexplode(i.initprivs) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')))) " +
+		"(SELECT string_agg(DISTINCT w.x, ', ') FROM (" + pgrole.Rights("current_user") + ") AS w), " +
+		"current_setting('server_version_num') " +
 		"FROM pg_roles r WHERE r.rolname = current_user; COMMIT")
 	if err != nil {
-		if tx := db.TxStatus(); tx != pgwire.TxIdle {
-			db.Query("ROLLBACK")
-		}
+		rollback(db)
 		return err
 	}
-	for _, r := range res {
-		if len(r.Rows) != 1 || len(r.Rows[0]) != 5 {
-			continue
-		}
-		row := r.Rows[0]
-		switch {
-		case row[1] != nil && *row[1] == "true":
-			return fmt.Errorf("%w: %s is a superuser. Give the MCP server a role of its own (mcp_roles in the collector config; escollect -setup-sql creates it)", ErrSharedRole, *row[0])
-		case row[2] != nil:
-			return fmt.Errorf("%w: %s is a member of %s, and the SQL of the agent takes the rights of a role it is a member of. Revoke the membership", ErrSharedRole, *row[0], *row[2])
-		case row[3] != nil:
-			return fmt.Errorf("%w: %s can become %s. Revoke the membership: whoever can become the role of the server sets its defaults, ends its sessions and puts marks in the log", ErrSharedRole, *row[3], *row[0])
-		case row[4] != nil:
-			return fmt.Errorf("%w: %s can call %s. Revoke EXECUTE (from PUBLIC too; escollect -setup-sql does it): the SQL of the agent runs as this role", ErrSharedRole, *row[0], *row[4])
-		}
+	row := roleRow(res, 5)
+	switch {
+	case row == nil:
+		return fmt.Errorf("%w: the check of the role gave no answer", ErrSharedRole)
+	case row[1] != nil && *row[1] == "true":
+		return fmt.Errorf("%w: %s is a superuser. Give the MCP server a role of its own (mcp_roles in the collector config; escollect -setup-sql creates it)", ErrSharedRole, *row[0])
+	case row[2] != nil:
+		return fmt.Errorf("%w: %s can become %s. Revoke the membership: whoever can become the role of the server sets its defaults, ends its sessions and puts marks in the log", ErrSharedRole, *row[2], *row[0])
+	case row[3] != nil:
+		return fmt.Errorf("%w: %s. %s", ErrSharedRole, *row[3], pgrole.Hint)
+	}
+	if v, _ := strconv.Atoi(deref(row[4])); v < 150000 {
 		return nil
 	}
-	return fmt.Errorf("%w: the check of the role gave no answer", ErrSharedRole)
+	res, err = db.Query("BEGIN; SET LOCAL search_path = pg_catalog, pg_temp; " + RoleCheck +
+		"SELECT string_agg(DISTINCT w.x, ', ') FROM (" + pgrole.Params("current_user") + ") AS w; COMMIT")
+	if err != nil {
+		rollback(db)
+		return err
+	}
+	if row := roleRow(res, 1); row == nil {
+		return fmt.Errorf("%w: the check of the parameters gave no answer", ErrSharedRole)
+	} else if row[0] != nil {
+		return fmt.Errorf("%w: %s. %s", ErrSharedRole, *row[0], pgrole.Hint)
+	}
+	return nil
+}
+
+// roleRow — единственная строка ответа с n колонками; nil — её нет.
+func roleRow(res []pgwire.Result, n int) []*string {
+	for _, r := range res {
+		if len(r.Rows) == 1 && len(r.Rows[0]) == n {
+			return r.Rows[0]
+		}
+	}
+	return nil
+}
+
+func rollback(db DB) {
+	if db.TxStatus() != pgwire.TxIdle {
+		db.Query("ROLLBACK")
+	}
+}
+
+func deref(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 // sessionParams — параметры входа соединения сервера. Умолчания своей роли

@@ -57,6 +57,7 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/input"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/metrics"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pgrole"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgtap"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -457,16 +458,18 @@ func SetupSQL(c *Config) (string, error) {
 	}
 	check("Суперпользователь, REPLICATION (удалить слот сборщика) и CREATEROLE (стать кем угодно) — ни у одной из трёх ролей.",
 		"    SELECT format('%%I is a superuser, may replicate or create roles', r.rolname) || "+as+" AS x\n"+
-			"      FROM "+member+" WHERE r.rolname IN (%s) AND (g.rolsuper OR g.rolreplication OR g.rolcreaterole)",
+			"      FROM "+member+" WHERE r.rolname IN (%s) AND (g.rolsuper OR g.rolreplication OR g.rolcreaterole)\n"+
+			// Суперпользователь «член» любой роли: называть его по каждой — шум (R2-6).
+			"        AND (g.oid = r.oid OR NOT r.rolsuper)",
 		"A role in mcp_roles, roles or undo_roles must be a role of its own, without these attributes: the script creates it and grants it what it needs. "+
 			"Take a superuser out of the list and name a new role; ALTER ROLE … NOREPLICATION NOCREATEROLE for the others.",
 		strings.Join(lits, ", "))
-	check("Роли агента и сервера ни в чём не состоят.",
-		"    SELECT format('%%I is a member of %%I', r.rolname, g.rolname) AS x\n"+
-			"      FROM "+member+" WHERE r.rolname IN (%s) AND g.oid <> r.oid",
-		"The roles of the agent and of the MCP server get every right from this script, to the role itself: a membership brings in rights "+
-			"the script does not see (a group that may UPDATE, pg_signal_backend, pg_read_server_files, the owner of a schema). Revoke the membership.",
-		strings.Join(pairs, ", "))
+	// Что роли агента и сервера могут сверх выданного им самим: членства,
+	// права через PUBLIC и прямые выдачи (pgrole.Rights) — то же проверяет
+	// esmcp на каждом соединении.
+	check("Роли агента и сервера могут только выданное им самим: ни членств, ни чужих SECURITY DEFINER, ни того, что\n"+
+		"-- initdb или расширение оставили суперпользователям, ни сторонних серверов (pgrole.Rights).",
+		"    "+pgrole.Escape(pgrole.Rights(strings.Join(pairs, ", "))), pgrole.Hint)
 	check("Ролью сервера и владельцем отметок не может стать никто другой со входом, кроме суперпользователей.",
 		"    SELECT format('%%I can become %%I', x.rolname, m.rolname) AS x\n"+
 			"      FROM pg_roles m JOIN pg_roles x ON x.oid <> m.oid AND x.rolcanlogin AND NOT x.rolsuper AND x.rolname <> current_user\n"+
@@ -482,9 +485,20 @@ func SetupSQL(c *Config) (string, error) {
 			"      CROSS JOIN (SELECT oid FROM pg_database WHERE datname = current_database()) AS db\n"+
 			"      WHERE s.deptype = 'o' AND r.rolname IN (%s)\n"+
 			"        AND (s.dbid = db.oid OR s.classid = 'pg_database'::regclass AND s.objid = db.oid)\n"+
-			"        AND NOT (s.classid = 'pg_class'::regclass AND EXISTS (SELECT FROM pg_class t WHERE t.oid = s.objid AND t.relpersistence = 't'))",
+			// Не в счёт то, что улик не касается и что роль заводит без всяких
+			// прав: большие объекты (lo_from_bytea), свои умолчания прав (ALTER
+			// DEFAULT PRIVILEGES FOR ROLE себе) и временные объекты сеанса. Иначе
+			// агент в любой момент ломал бы повторный запуск скрипта (R2-3, заход 2).
+			"        AND s.classid NOT IN ('pg_largeobject'::regclass, 'pg_default_acl'::regclass)\n"+
+			"        AND NOT (s.classid = 'pg_class'::regclass AND EXISTS (SELECT FROM pg_class t WHERE t.oid = s.objid AND t.relpersistence = 't'))\n"+
+			"        AND NOT (s.classid = 'pg_type'::regclass AND EXISTS (SELECT FROM pg_type t JOIN pg_namespace tn ON tn.oid = t.typnamespace\n"+
+			"          WHERE t.oid = s.objid AND (tn.nspname LIKE 'pg\\_temp\\_%%' OR tn.nspname LIKE 'pg\\_toast\\_temp\\_%%')))\n"+
+			"        AND NOT (s.classid = 'pg_proc'::regclass AND EXISTS (SELECT FROM pg_proc t JOIN pg_namespace tn ON tn.oid = t.pronamespace\n"+
+			"          WHERE t.oid = s.objid AND tn.nspname LIKE 'pg\\_temp\\_%%'))",
 		"The owner of an object alters and drops it past the log and may grant itself any right back. "+
-			"Give the objects to another role: REASSIGN OWNED BY <role> TO <owner> (or ALTER … OWNER TO).",
+			"What a role of the agent or of the server made is not to be trusted: look at it and drop it (DROP OWNED BY <role> drops its objects "+
+			"and revokes its rights; this script grants the rights again). Do not REASSIGN it to another role: a SECURITY DEFINER function "+
+			"of the agent would run as that role, and its operator would be taken for that role's own.",
 		strings.Join(pairs, ", "))
 	check("TRUNCATE (строк в журнале нет), TRIGGER и владение таблицей (снять триггер «кто») — ни у одной из трёх ролей,\n"+
 		"-- ни через PUBLIC, ни через роль, которой она может стать.",
@@ -519,29 +533,6 @@ func SetupSQL(c *Config) (string, error) {
 				"(a right on a column too: REVOKE UPDATE (col) …; a view over the table too).",
 			named, agentsOrNull, agentsOrNull)
 	}
-	// Что initdb оставил только суперпользователям (pg_read_file, lo_import,
-	// pg_authid с хешами паролей…), то и остаётся: читать файлы сервера — значит
-	// читать и настройки esmcp с паролем роли сервера (R1-2, T-6). Сюда же —
-	// три функции, которые скрипт отзывает у PUBLIC выше.
-	initOnly := func(class, priv string) string {
-		return "EXISTS (SELECT FROM pg_init_privs i WHERE i.classoid = '" + class + "'::regclass AND i.objoid = %s AND i.objsubid = 0\n" +
-			"          AND NOT EXISTS (SELECT FROM aclexplode(i.initprivs) a WHERE a.grantee = 0 AND a.privilege_type = '" + priv + "'))"
-	}
-	check("Ни одна из трёх ролей не пишет в журнал базы напрямую (это может только "+EvidenceOwner+"), не обрывает и не\n"+
-		"-- отменяет сеансы и не берёт того, что initdb оставил суперпользователям.",
-		"    SELECT format('%%I can call %%s', r.rolname, f.oid::regprocedure) || "+as+" AS x\n"+
-			"      FROM "+member+" JOIN pg_proc f ON f.pronamespace = 'pg_catalog'::regnamespace\n"+
-			"      WHERE r.rolname IN (%s) AND NOT g.rolsuper AND has_function_privilege(g.oid, f.oid, 'EXECUTE')\n"+
-			"        AND (f.proname IN ('pg_logical_emit_message', 'pg_terminate_backend', 'pg_cancel_backend')\n"+
-			"          OR "+fmt.Sprintf(initOnly("pg_proc", "EXECUTE"), "f.oid")+")\n"+
-			"    UNION ALL SELECT format('%%I can read %%s', r.rolname, c.oid::regclass) || "+as+"\n"+
-			"      FROM "+member+" JOIN pg_class c ON c.relnamespace = 'pg_catalog'::regnamespace\n"+
-			"      WHERE r.rolname IN (%s) AND NOT g.rolsuper AND has_table_privilege(g.oid, c.oid, 'SELECT')\n"+
-			"        AND "+fmt.Sprintf(initOnly("pg_class", "SELECT"), "c.oid"),
-		"The SQL of the agent runs as the role of the MCP server: with these it would put its own marks in the log, end the sessions that put them, "+
-			"or read the files of the server (the settings of esmcp with its password) and the password hashes. "+
-			"Only "+EvidenceOwner+" writes to the log, only superusers and pg_signal_backend end sessions: revoke EXECUTE (or SELECT) from the role and from PUBLIC.",
-		strings.Join(lits, ", "), strings.Join(lits, ", "))
 	// Умолчания прав (ALTER DEFAULT PRIVILEGES): выданное ими получит и
 	// секция, созданная после скрипта, — а на ней ещё нет триггера «кто», и
 	// запись туда сборщик не видит вовсе (R2-3).
@@ -558,7 +549,8 @@ func SetupSQL(c *Config) (string, error) {
 	// Своих объектов заводить нельзя: DDL в журнал не идёт, а функция или
 	// оператор под системным именем в схеме из пути заслонили бы системные
 	// (P-242). PostgreSQL 14 и старше даёт PUBLIC CREATE на схеме public.
-	check("Своих объектов ни одна из трёх ролей не заводит: ни CREATE на схеме, ни CREATE в базе.",
+	check("Роли агента и сервера своих объектов не заводят: ни CREATE на схеме, ни CREATE в базе. Роли отката можно:\n"+
+		"-- её объекты сверка и откат и так считают своими.",
 		"    SELECT format('%%I can CREATE in schema %%I', r.rolname, n.nspname) || "+as+" AS x\n"+
 			"      FROM "+member+" CROSS JOIN pg_namespace n\n"+
 			"      WHERE r.rolname IN (%s) AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'\n"+
@@ -566,20 +558,17 @@ func SetupSQL(c *Config) (string, error) {
 			"    UNION ALL SELECT format('%%I can CREATE schemas in this database', r.rolname) || "+as+"\n"+
 			"      FROM "+member+" WHERE r.rolname IN (%s) AND has_database_privilege(g.oid, current_database(), 'CREATE')",
 		"Their DDL is not in the database log, and a function or operator of their own named like a system one would stand in for it. "+
-			"REVOKE CREATE ON SCHEMA … FROM PUBLIC (or from the role); PostgreSQL 14 and older grant it on schema public to PUBLIC.",
-		strings.Join(lits, ", "), strings.Join(lits, ", "))
+			"REVOKE CREATE ON SCHEMA … FROM PUBLIC (or from the role, if the role is not the owner: an owner is refused above); "+
+			"PostgreSQL 14 and older grant it on schema public to PUBLIC.",
+		strings.Join(pairs, ", "), strings.Join(pairs, ", "))
 	p("-- С PostgreSQL 15 право на параметр выдают отдельно: SET session_replication_role = replica")
-	p("-- выключает триггеры, и отметки «кто» нет (R1, R2, заход 3).")
+	p("-- выключает триггеры, и отметки «кто» нет (R1, R2, заход 3); track_counts = off — счёт строк (R1-6).")
 	p("DO $evidence$ DECLARE bad text; BEGIN")
 	p("  IF current_setting('server_version_num')::int < 150000 THEN RETURN; END IF;")
-	p("  EXECUTE format($q$SELECT string_agg(DISTINCT format('%%%%I can %%%%s parameter %%%%s', r.rolname, pr.p, a.parname), ', ')")
-	p("    FROM pg_roles r JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'MEMBER') CROSS JOIN pg_parameter_acl a")
-	p("    LEFT JOIN pg_settings s ON s.name = a.parname CROSS JOIN (VALUES ('SET'), ('ALTER SYSTEM')) AS pr(p)")
-	p("    WHERE r.rolname IN (%%s) AND NOT g.rolsuper AND has_parameter_privilege(g.oid, a.parname, pr.p)")
-	p("      AND (pr.p = 'ALTER SYSTEM' OR coalesce(s.context, 'superuser') <> 'user')$q$, %s) INTO bad;", lit(strings.Join(lits, ", ")))
+	p("  EXECUTE $q$SELECT string_agg(DISTINCT x, ', ') FROM (%s) AS rights$q$ INTO bad;", pgrole.Params(strings.Join(lits, ", ")))
 	p("  IF bad IS NOT NULL THEN")
 	p("    RAISE EXCEPTION 'evidencestore: %%', bad USING HINT =")
-	p("      'With such a parameter the SQL switches off the trigger that names the role (session_replication_role) or the server settings. Revoke it.';")
+	p("      'With such a parameter the SQL switches off the trigger that names the role (session_replication_role), the row count (track_counts) or the server settings. Revoke it.';")
 	p("  END IF;")
 	p("END $evidence$;")
 	p("")
