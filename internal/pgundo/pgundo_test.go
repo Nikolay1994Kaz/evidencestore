@@ -259,10 +259,11 @@ func TestCheckAndApply(t *testing.T) {
 	if err != nil || done.XID != "900" || done.Steps != 2 || done.Order != OrderJournal || done.Differ != nil {
 		t.Fatal(done, err)
 	}
-	// Транзакция, отметка первой, шаг 2 (вернуть удалённую), шаг 4 (вернуть значения), сверка обеих
-	// команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
+	// Транзакция, отметка первой, шаг 2 (вернуть удалённую — со своим прежним номером, даже если колонка
+	// GENERATED ALWAYS AS IDENTITY), шаг 4 (вернуть значения: пишется только колонка, которую транзакция
+	// меняла), сверка обеих команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
 	if len(db.log) != 8 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], `SELECT evidence.mark_undo('{"by":"nikolay"}'`) ||
-		!strings.HasPrefix(db.log[3], `INSERT INTO "public"."t"`) || !strings.HasPrefix(db.log[4], `UPDATE "public"."t" t SET "id" = w.o0, "v" = w.o1`) ||
+		!strings.HasPrefix(db.log[3], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[4], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
 		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id" IS NOT DISTINCT FROM w.n0 AND t."v" IS NOT DISTINCT FROM w.n1`) ||
 		!strings.Contains(db.log[5], `LEFT JOIN "public"."t" t ON t."id" = w.o0`) || !strings.Contains(db.log[6], `NOT (t."v" IS NOT DISTINCT FROM w.o1)`) || db.log[7] != "COMMIT" {
 		t.Fatalf("%q", db.log)
@@ -370,8 +371,8 @@ func TestCheckTakesGeneratedAndUncomparableColumnsFromTheCatalog(t *testing.T) {
 	}
 	all := strings.Join(db.log, "\n")
 	for _, want := range []string{
-		`INSERT INTO "public"."t" ("id", "v", "place")` + "\n  SELECT w.o0, w.o1, w.o3",
-		`UPDATE "public"."t" t SET "id" = w.o0, "v" = w.o1, "place" = w.o3` + "\n",
+		`INSERT INTO "public"."t" ("id", "v", "place") OVERRIDING SYSTEM VALUE` + "\n  SELECT w.o0, w.o1, w.o3",
+		`UPDATE "public"."t" t SET "v" = w.o1, "place" = w.o3` + "\n",
 		`t."double" IS NOT DISTINCT FROM w.n2 AND t."place"::text IS NOT DISTINCT FROM w.n3::text`,
 		`NOT (t."place"::text IS NOT DISTINCT FROM w.o3::text)`,
 	} {
@@ -405,6 +406,8 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 			return rows([]string{fmt.Sprint(900 + attempt)}), nil
 		case strings.HasPrefix(sql, `INSERT INTO "public"."child"`) && attempt == 1:
 			return nil, violation
+		case strings.Contains(sql, "confdeltype"): // ключей с действием при удалении на таблицы плана нет
+			return rows(), nil
 		case strings.Contains(sql, "pg_constraint"):
 			return rows([]string{"public.child", "public.parent"}), nil
 		case strings.Contains(sql, "FOR UPDATE OF t"):
@@ -430,6 +433,9 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 	for _, q := range db.log[slices.Index(db.log, "ROLLBACK")+1:] {
 		what := map[string]string{"INSERT": "insert", "UPDATE": "update", "DELETE": "delete"}[strings.Fields(q)[0]]
 		switch {
+		case strings.Contains(q, "confdeltype"):
+			second = append(second, "references")
+			continue
 		case strings.Contains(q, "pg_constraint"):
 			second = append(second, "keys")
 			continue
@@ -451,7 +457,7 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 	}
 	// Замок и сверка заранее — у правки и уборки; родитель раньше детей; правка — двумя командами
 	// (первая — по прежнему ключу); уборка вставленной — последней; в конце сверка с до-образами.
-	want := "keys, lock other, lock other, insert parent, insert child, update-moved other, update other, delete other, after parent, after child, after other, after other"
+	want := "keys, lock other, lock other, references, insert parent, insert child, update-moved other, update other, delete other, after parent, after child, after other, after other"
 	if got := strings.Join(second, ", "); got != want {
 		t.Fatalf("the second attempt:\n got %s\nwant %s", got, want)
 	}
@@ -519,5 +525,121 @@ func TestRanks(t *testing.T) {
 	r := ranks([][2]string{{"b", "a"}, {"c", "b"}, {"d", "a"}, {"d", "c"}, {"e", "f"}, {"f", "e"}})
 	if r["a"] != 0 || r["b"] != 1 || r["c"] != 2 || r["d"] != 3 || r["g"] != 0 || r["e"]+r["f"] != 1 {
 		t.Fatalf("%v", r)
+	}
+}
+
+// Строка, которую вставила транзакция, обросла ссылками: кто-то позже добавил
+// строки, которые ссылаются на неё с ON DELETE CASCADE. Убрать её — молча удалить
+// их. Сверка называет такой шаг конфликтом; строки, которые откат уберёт сам, не в счёт.
+func TestCheckFlagsARowThatOthersReferTo(t *testing.T) {
+	pet := func(r m) { r["columns"], r["types"] = []string{"id", "owner_id"}, []string{"integer", "integer"} }
+	p := build(t, rel(2, "owner"), ch("I", 2, nil, v("9", "o")), rel(1, "pet", pet), ch("I", 1, nil, v("1", "9")))
+	// Шаг 1 — убрать питомца 1, шаг 2 — убрать хозяина 9. На питомца ссылается таблица leaf, которой в плане нет.
+	var asked []string
+	db := &fakeDB{answer: func(sql string) ([]pgwire.Result, error) {
+		switch {
+		case strings.Contains(sql, "confdeltype"):
+			return rows([]string{"public.owner", "pet", "n", `["owner_id"]`, `["id"]`, `["public.pet"]`},
+				[]string{"public.pet", "leaf", "c", `["pet_id"]`, `["id"]`, `[]`}), nil
+		case strings.Contains(sql, "pg_attribute") && strings.Contains(sql, `"pet"`):
+			return rows([]string{"id", ""}, []string{"owner_id", ""}), nil
+		case strings.Contains(sql, "pg_attribute"):
+			return rows([]string{"id", ""}, []string{"v", ""}), nil
+		case strings.HasPrefix(sql, "SELECT w.step, CASE") && strings.Contains(sql, `"pet"`):
+			return rows([]string{"1", "ok", "<null>"}), nil
+		case strings.HasPrefix(sql, "SELECT w.step, CASE"):
+			return rows([]string{"2", "ok", "<null>"}), nil
+		case strings.HasPrefix(sql, "SELECT w.step, count(*)"):
+			asked = append(asked, sql)
+			switch {
+			case strings.Contains(sql, "JOIN leaf x"): // три чужие строки ссылаются на питомца 1
+				return rows([]string{"1", "3"}), nil
+			case strings.Contains(sql, "AS own("): // на хозяина ссылается только свой питомец: он не в счёт
+				return rows(), nil
+			}
+			return rows([]string{"2", "1"}), nil // питомец стал конфликтом и хозяина больше не освобождает
+		}
+		return rows([]string{"t"}), nil
+	}}
+	st, err := p.Check(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0].State != StateReferenced || st[1].State != StateReferenced || p.OK != nil ||
+		st[0].Detail != "3 rows of leaf refer to it: ON DELETE CASCADE would delete them" || st[1].Detail != "1 rows of pet refer to it: ON DELETE SET NULL would clear their reference" {
+		t.Fatalf("%+v, apply %v", st, p.OK)
+	}
+	// Первый круг: хозяин — с оговоркой про своего питомца, питомец — без оговорок. Второй круг: хозяин уже без неё.
+	if len(asked) != 3 ||
+		!strings.Contains(asked[0], "(2, '9'::integer)\n) AS w(step, k0)\nJOIN pet x ON x.\"owner_id\" = w.k0\nWHERE NOT EXISTS (SELECT 1 FROM (VALUES\n  ('1'::integer)\n) AS own(p0) WHERE x.\"id\" = own.p0)") ||
+		!strings.Contains(asked[1], "(1, '1'::integer)\n) AS w(step, k0)\nJOIN leaf x ON x.\"pet_id\" = w.k0\nGROUP BY") ||
+		strings.Contains(asked[2], "AS own(") || !strings.Contains(asked[2], "JOIN pet x") {
+		t.Fatalf("the questions about referring rows:\n%s", strings.Join(asked, "\n---\n"))
+	}
+	// Свои строки из двух секций одной таблицы: ключ один, а колонки у секций стоят по-разному.
+	swapped := func(r m) { r["columns"], r["types"] = []string{"owner_id", "id"}, []string{"integer", "integer"} }
+	parts := build(t, rel(2, "owner"), ch("I", 2, nil, v("9", "o")), rel(1, "pet_1", pet), ch("I", 1, nil, v("1", "9")), rel(3, "pet_2", swapped), ch("I", 3, nil, v("9", "2")))
+	q := parts.dependents(reference{Table: "public.owner", Child: "pet", Cols: []string{"owner_id"}, RefCols: []string{"id"}}, parts.Steps[2:], parts.Steps[:2])
+	if !strings.Contains(q, "(VALUES\n  ('2'::integer),\n  ('1')\n) AS own(p0) WHERE x.\"id\" = own.p0)") {
+		t.Fatalf("own rows of two partitions:\n%s", q)
+	}
+	cs := p.Conflicts(st)
+	if len(cs) != 2 || cs[1].Detail != st[1].Detail || strings.Join(cs[1].Lines(), "|") != "the transaction inserted: id=«9», v=«o»|1 rows of pet refer to it: ON DELETE SET NULL would clear their reference" {
+		t.Fatalf("%+v", cs)
+	}
+}
+
+// То же перед самой уборкой, в транзакции отката: на строку сослались между
+// сверкой и откатом. Строки встают под замок, чужая ссылка отменяет откат целиком.
+func TestApplyRefusesToRemoveARowThatOthersReferTo(t *testing.T) {
+	p := build(t, rel(2, "parent"), ch("I", 2, nil, v("9", "p")))
+	p.OK = []int{1}
+	referring := [][]string{}
+	db := &fakeDB{}
+	db.answer = func(sql string) ([]pgwire.Result, error) {
+		switch {
+		case strings.Contains(sql, "confdeltype"):
+			return rows([]string{"public.parent", "child", "c", `["parent_id"]`, `["id"]`, `[]`}), nil
+		case strings.Contains(sql, "pg_constraint"):
+			return rows(), nil
+		case strings.Contains(sql, "FOR UPDATE OF t"):
+			return rows([]string{"1"}), nil
+		case strings.HasPrefix(sql, "SELECT w.step, count(*)"):
+			return rows(referring...), nil
+		case strings.HasPrefix(sql, "SELECT count(*) FROM"):
+			return rows([]string{"0"}), nil
+		case strings.Contains(sql, "pg_current_xact_id"):
+			return rows([]string{"900"}), nil
+		}
+		return []pgwire.Result{{Tag: "DELETE 1"}}, nil
+	}
+	// Никто не ссылается: замок, вопрос о ссылках, уборка, сверка.
+	if _, err := p.Apply(db, m{}); err != nil {
+		t.Fatal(err)
+	}
+	var what []string
+	for _, q := range db.log {
+		switch {
+		case strings.Contains(q, "confdeltype"):
+			what = append(what, "references")
+		case strings.Contains(q, "FOR UPDATE OF t"):
+			what = append(what, "lock")
+		case strings.HasPrefix(q, "SELECT w.step, count(*)"):
+			what = append(what, "referring")
+		case strings.HasPrefix(q, "DELETE"):
+			what = append(what, "delete")
+		}
+	}
+	if got := strings.Join(what, ", "); got != "references, lock, referring, delete" {
+		t.Fatalf("the undo of an insert: %s", got)
+	}
+	// Сослались: не убрано ничего. Порядок по внешним ключам пробуется (ребёнок мог стоять в плане позже), итог тот же.
+	referring, db.log = [][]string{{"1", "2"}}, nil
+	_, err := p.Apply(db, m{})
+	all := strings.Join(db.log, "\n")
+	if !errors.Is(err, ErrChanged) || !strings.Contains(err.Error(), "have rows of child referring to them, and ON DELETE CASCADE would delete them") ||
+		strings.Count(err.Error(), "referring to them") != 1 ||
+		strings.Contains(all, "DELETE FROM") || strings.Count(all, "BEGIN") != 2 || db.log[len(db.log)-1] != "ROLLBACK" {
+		t.Fatalf("%v\n%s", err, all)
 	}
 }

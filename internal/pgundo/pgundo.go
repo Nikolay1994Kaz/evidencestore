@@ -65,6 +65,9 @@ type Table struct {
 
 func (t *Table) rel() string { return pgwire.Ident(t.Schema) + "." + pgwire.Ident(t.Name) }
 
+// name — имя таблицы, как в плане: schema.table.
+func (t *Table) name() string { return t.Schema + "." + t.Name }
+
 func (t *Table) pkIndex() []int {
 	out := make([]int, len(t.PK))
 	for i, c := range t.PK {
@@ -461,14 +464,19 @@ const (
 	StateChanged  = "changed"   // конфликт: строку изменили после транзакции
 	StateExists   = "exists"    // конфликт: под ключом удалённой строки снова есть строка
 	StateKeyTaken = "key-taken" // конфликт: прежний ключ занят другой строкой
+	// StateReferenced — конфликт: на вставленную строку ссылаются строки, которые
+	// откат не возвращает и не убирает. Убрать её — и внешний ключ удалит их
+	// (ON DELETE CASCADE) или перепишет им ссылку (SET NULL, SET DEFAULT).
+	StateReferenced = "referenced"
 )
 
 // Status — что база ответила про шаг. Current — строка, какая она сейчас
-// (to_jsonb), у конфликтов.
+// (to_jsonb), у конфликтов. Detail — кто ссылается на строку (StateReferenced).
 type Status struct {
 	Step    int
 	State   string
 	Current json.RawMessage
+	Detail  string
 }
 
 // Conflict — шаг не годен и не сделан: решать человеку.
@@ -598,13 +606,18 @@ func (p *Plan) Check(db DB) ([]Status, error) {
 			byStep[n] = st
 		}
 	}
+	for _, s := range p.Steps {
+		if _, ok := byStep[s.N]; !ok {
+			return nil, fmt.Errorf("pgundo: check: the database did not answer about step %d", s.N)
+		}
+	}
+	if err := p.referenced(db, byStep); err != nil {
+		return nil, err
+	}
 	out := make([]Status, 0, len(p.Steps))
 	p.OK = nil
 	for _, s := range p.Steps {
-		st, ok := byStep[s.N]
-		if !ok {
-			return nil, fmt.Errorf("pgundo: check: the database did not answer about step %d", s.N)
-		}
+		st := byStep[s.N]
 		if st.State == StateOK {
 			p.OK = append(p.OK, s.N)
 		}
@@ -662,7 +675,9 @@ func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 	}
 	out, err := p.apply(db, string(mark), p.groups(only), OrderJournal)
 	var pg *pgwire.PgError
-	if !errors.As(err, &pg) || !strings.HasPrefix(pg.Code, "23") {
+	// errReferenced в порядке журнала — ещё не приговор: при отложенном внешнем
+	// ключе ребёнок мог быть вставлен раньше родителя, и его шаг стоит позже.
+	if !(errors.As(err, &pg) && strings.HasPrefix(pg.Code, "23")) && !errors.Is(err, errReferenced) {
 		return out, err
 	}
 	first := err
@@ -671,6 +686,9 @@ func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 		return nil, fmt.Errorf("%w (and the order by foreign keys could not be built: %v)", first, err)
 	}
 	if out, err = p.apply(db, string(mark), ordered, OrderKeys); err != nil {
+		if errors.Is(err, errReferenced) && errors.Is(first, errReferenced) {
+			return nil, err // обе попытки упёрлись в одно и то же: дважды не повторяем
+		}
 		return nil, fmt.Errorf("%w (in the order of the journal: %v)", err, first)
 	}
 	return out, nil
@@ -716,7 +734,23 @@ func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Appli
 			}
 		}
 	}
+	// Внешние ключи, по которым уборка вставленной строки задела бы чужие.
+	var tables []string
 	for _, g := range groups {
+		if g.op == OpDelete && !slices.Contains(tables, g.t.name()) {
+			tables = append(tables, g.t.name())
+		}
+	}
+	refs, err := p.references(db, tables)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		if g.op == OpDelete {
+			if err := p.guardReferences(db, g, refs, order); err != nil {
+				return nil, err
+			}
+		}
 		touched := 0
 		for _, stmt := range g.statements(order) {
 			res, err := db.Query(stmt)
@@ -762,7 +796,12 @@ func (g group) statements(order string) []string {
 		}
 		cols = append(cols, pgwire.Ident(c))
 		olds = append(olds, fmt.Sprintf("w.o%d", i))
-		sets = append(sets, fmt.Sprintf("%s = w.o%d", pgwire.Ident(c), i))
+		// Правка возвращает только то, что транзакция меняла: остальное и так на
+		// месте. Колонку GENERATED ALWAYS AS IDENTITY база не даёт писать вовсе,
+		// даже прежним значением.
+		if g.op == OpUpdate && slices.ContainsFunc(g.steps, func(s Step) bool { return !same(s.Old[i:i+1], s.New[i:i+1]) }) {
+			sets = append(sets, fmt.Sprintf("%s = w.o%d", pgwire.Ident(c), i))
+		}
 	}
 	guard := ""
 	if order == OrderJournal {
@@ -770,7 +809,9 @@ func (g group) statements(order string) []string {
 	}
 	switch g.op {
 	case OpInsert:
-		return []string{"INSERT INTO " + g.t.rel() + " (" + strings.Join(cols, ", ") + ")\n  SELECT " + strings.Join(olds, ", ") + "\n  FROM " + g.values()}
+		// OVERRIDING SYSTEM VALUE — ради колонки GENERATED ALWAYS AS IDENTITY: строка
+		// возвращается со своим прежним номером. Остальным таблицам слово безразлично.
+		return []string{"INSERT INTO " + g.t.rel() + " (" + strings.Join(cols, ", ") + ") OVERRIDING SYSTEM VALUE\n  SELECT " + strings.Join(olds, ", ") + "\n  FROM " + g.values()}
 	case OpDelete:
 		return []string{"DELETE FROM " + g.t.rel() + " t\n  USING " + g.values() + "\n  WHERE " + g.join("t", 'n') + guard}
 	}
@@ -856,6 +897,255 @@ func count(db DB, sql string) (int, error) {
 		return 0, errors.New("pgundo: unexpected answer to a count")
 	}
 	return strconv.Atoi(deref(res[0].Rows[0][0]))
+}
+
+// reference — внешний ключ, по которому уборка вставленной строки задевает
+// строки другой таблицы: ON DELETE CASCADE удаляет их, SET NULL и SET DEFAULT
+// переписывают им ссылку. Ключ без такого действия сюда не входит: с ним база
+// просто откажет в удалении, и это видно.
+type reference struct {
+	Table   string   // таблица плана, на которую ссылаются
+	Child   string   // кто ссылается: имя для запроса
+	Action  string   // c — CASCADE, n — SET NULL, d — SET DEFAULT
+	Cols    []string // колонки ссылки
+	RefCols []string // колонки таблицы плана, на которые она указывает
+	// Covered — таблицы плана, которые и есть ссылающаяся таблица (она сама или
+	// её секции): строки их годных шагов откат уберёт или перенаправит сам.
+	Covered []string
+}
+
+func (f reference) effect() string {
+	switch f.Action {
+	case "c":
+		return "ON DELETE CASCADE would delete them"
+	case "n":
+		return "ON DELETE SET NULL would clear their reference"
+	}
+	return "ON DELETE SET DEFAULT would reset their reference"
+}
+
+// errReferenced — на строку, которую откат убирает, ссылаются чужие строки.
+var errReferenced = errors.New("rows the undo does not own refer to a row it removes")
+
+// references — внешние ключи с действием при удалении, которые указывают на
+// названные таблицы плана. Секция отвечает за свою таблицу: ключ объявлен у неё.
+func (p *Plan) references(db DB, tables []string) ([]reference, error) {
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	var vals []string
+	for _, name := range p.tableNames() {
+		vals = append(vals, fmt.Sprintf("(%s, to_regclass(%s), %t)", pgwire.Literal(name), pgwire.Literal(p.Tables[name].rel()), slices.Contains(tables, name)))
+	}
+	columns := func(key, rel string) string {
+		return "(SELECT json_agg(a.attname ORDER BY k.ord) FROM unnest(c." + key + ") WITH ORDINALITY AS k(num, ord) " +
+			"JOIN pg_attribute a ON a.attrelid = c." + rel + " AND a.attnum = k.num)::text"
+	}
+	res, err := db.Query("WITH t(name, oid, removes) AS (VALUES " + strings.Join(vals, ", ") + "),\n" +
+		"r AS (SELECT name, removes, coalesce(pg_partition_root(oid), oid)::oid AS root FROM t WHERE oid IS NOT NULL)\n" +
+		"SELECT parent.name, c.conrelid::regclass::text, c.confdeltype::text, " + columns("conkey", "conrelid") + ", " + columns("confkey", "confrelid") + ",\n" +
+		"  coalesce((SELECT json_agg(own.name ORDER BY own.name) FROM r own WHERE own.root = c.conrelid), '[]')::text\n" +
+		"FROM pg_constraint c JOIN r parent ON parent.root = c.confrelid AND parent.removes\n" +
+		"WHERE c.contype = 'f' AND c.conparentid = 0 AND c.confdeltype IN ('c', 'n', 'd') ORDER BY 1, 2, c.conname")
+	if err != nil {
+		return nil, err
+	}
+	if len(res) != 1 {
+		return nil, errors.New("pgundo: unexpected answer about foreign keys with an action on delete")
+	}
+	var out []reference
+	for _, r := range res[0].Rows {
+		if len(r) != 6 {
+			return nil, errors.New("pgundo: unexpected row about foreign keys with an action on delete")
+		}
+		f := reference{Table: deref(r[0]), Child: deref(r[1]), Action: deref(r[2])}
+		if json.Unmarshal([]byte(deref(r[3])), &f.Cols) != nil || json.Unmarshal([]byte(deref(r[4])), &f.RefCols) != nil ||
+			json.Unmarshal([]byte(deref(r[5])), &f.Covered) != nil || len(f.Cols) == 0 || len(f.Cols) != len(f.RefCols) {
+			return nil, fmt.Errorf("pgundo: the foreign key of %s to %s is described in an unexpected way", f.Child, f.Table)
+		}
+		t := p.Tables[f.Table]
+		if t == nil || slices.ContainsFunc(f.RefCols, func(c string) bool { return !slices.Contains(t.Columns, c) }) {
+			return nil, refuse("%s: the foreign key of %s points at a column the journal does not list", f.Table, f.Child)
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// dependents — запрос: какие из строк rows (их новые образы — строки, которые
+// откат убирает) держат на себе по ключу f строки вне covered и сколько их.
+// Ответ: шаг, число строк.
+func (p *Plan) dependents(f reference, rows, covered []Step) string {
+	t := p.Tables[f.Table]
+	var b strings.Builder
+	b.WriteString("SELECT w.step, count(*) FROM (VALUES\n  ")
+	for i, s := range rows {
+		if i > 0 {
+			b.WriteString(",\n  ")
+		}
+		b.WriteString("(" + strconv.Itoa(s.N))
+		for _, c := range f.RefCols {
+			k := slices.Index(t.Columns, c)
+			b.WriteString(", " + literal(s.New[k]))
+			if i == 0 {
+				b.WriteString("::" + t.Types[k])
+			}
+		}
+		b.WriteString(")")
+	}
+	b.WriteString("\n) AS w(step")
+	var on []string
+	for i, c := range f.Cols {
+		fmt.Fprintf(&b, ", k%d", i)
+		on = append(on, fmt.Sprintf("x.%s = w.k%d", pgwire.Ident(c), i))
+	}
+	b.WriteString(")\nJOIN " + f.Child + " x ON " + strings.Join(on, " AND "))
+	if len(covered) > 0 {
+		// Свои строки — по первичному ключу, под которым они сейчас. Шаги могут
+		// быть из разных секций одной таблицы: ключ у них один, а порядок колонок
+		// у каждой секции свой — место ключа берётся по таблице шага.
+		b.WriteString("\nWHERE NOT EXISTS (SELECT 1 FROM (VALUES\n  ")
+		for i, s := range covered {
+			if i > 0 {
+				b.WriteString(",\n  ")
+			}
+			b.WriteString("(")
+			own := p.Tables[s.Table]
+			for j, k := range own.pkIndex() {
+				if j > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(literal(s.New[k]))
+				if i == 0 {
+					b.WriteString("::" + own.Types[k])
+				}
+			}
+			b.WriteString(")")
+		}
+		b.WriteString("\n) AS own(")
+		var match []string
+		for j, c := range p.Tables[covered[0].Table].PK {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "p%d", j)
+			match = append(match, fmt.Sprintf("x.%s = own.p%d", pgwire.Ident(c), j))
+		}
+		b.WriteString(") WHERE " + strings.Join(match, " AND ") + ")")
+	}
+	b.WriteString("\nGROUP BY w.step ORDER BY w.step")
+	return b.String()
+}
+
+func literal(v *string) string {
+	if v == nil {
+		return "NULL"
+	}
+	return pgwire.Literal(*v)
+}
+
+// referenced — часть сверки: шаг «убрать вставленную строку» не годен, если на
+// строку ссылаются строки, которых откат сам не убирает и не перенаправляет.
+// Их добавили или перенаправили на неё после транзакции; убрать строку —
+// значит молча удалить их или переписать им ссылку.
+//
+// «Свои» — строки годных шагов правки и уборки: правка вернёт ссылку туда,
+// куда она смотрела до транзакции, уборка уберёт строку раньше родителя. Шаг,
+// ставший конфликтом, свои строки уже не покрывает, поэтому сверка идёт
+// кругами, пока есть что менять: конфликт ребёнка делает конфликтом и родителя.
+func (p *Plan) referenced(db DB, byStep map[int]Status) error {
+	removing := func() map[string][]Step {
+		out := map[string][]Step{}
+		for _, s := range p.Steps {
+			if s.Op == OpDelete && byStep[s.N].State == StateOK {
+				out[s.Table] = append(out[s.Table], s)
+			}
+		}
+		return out
+	}
+	refs, err := p.references(db, slices.Sorted(maps.Keys(removing())))
+	if err != nil || len(refs) == 0 {
+		return err
+	}
+	for again := true; again; {
+		again = false
+		rows := removing()
+		for _, f := range refs {
+			if len(rows[f.Table]) == 0 {
+				continue
+			}
+			var covered []Step
+			for _, s := range p.Steps {
+				if s.Op != OpInsert && byStep[s.N].State == StateOK && slices.Contains(f.Covered, s.Table) {
+					covered = append(covered, s)
+				}
+			}
+			res, err := db.Query(p.dependents(f, rows[f.Table], covered))
+			if err != nil {
+				return err
+			}
+			if len(res) != 1 {
+				return errors.New("pgundo: check: unexpected answer about the rows that refer to a row")
+			}
+			for _, r := range res[0].Rows {
+				n, err := strconv.Atoi(deref(r[0]))
+				st, known := byStep[n]
+				if err != nil || len(r) != 2 || !known {
+					return errors.New("pgundo: check: unexpected row about the rows that refer to a row")
+				}
+				// На строку могут ссылаться по нескольким ключам: названы все.
+				detail := fmt.Sprintf("%s rows of %s refer to it: %s", deref(r[1]), f.Child, f.effect())
+				if st.State == StateReferenced {
+					detail = st.Detail + "; " + detail
+				}
+				st.State, st.Detail = StateReferenced, detail
+				byStep[n] = st
+				again = true
+			}
+		}
+	}
+	return nil
+}
+
+// guardReferences — та же проверка перед самой уборкой, уже в транзакции
+// отката и с замком: между сверкой и откатом на строку могли сослаться. Замок
+// на строках не даёт сослаться на них и позже: проверка внешнего ключа у
+// новой ссылки встанет в очередь и после уборки получит отказ.
+// К этому времени свои строки откат уже убрал или перенаправил; не убраны
+// только строки этой же команды, если таблица ссылается сама на себя.
+func (p *Plan) guardReferences(db DB, g group, refs []reference, order string) error {
+	locked := order == OrderKeys // в порядке внешних ключей замок взят в начале
+	for _, f := range refs {
+		if f.Table != g.t.name() {
+			continue
+		}
+		if !locked {
+			n, err := count(db, "SELECT count(*) FROM (SELECT 1 FROM "+g.t.rel()+" t\n  JOIN "+g.valuesOf("n")+"\n  ON "+g.join("t", 'n')+" AND "+g.same('n')+" FOR UPDATE OF t) locked")
+			if err != nil {
+				return err
+			}
+			if n != len(g.steps) {
+				return g.changed(n)
+			}
+			locked = true
+		}
+		var own []Step
+		if slices.Contains(f.Covered, f.Table) {
+			own = g.steps
+		}
+		res, err := db.Query(p.dependents(f, g.steps, own))
+		if err != nil {
+			return err
+		}
+		if len(res) != 1 {
+			return errors.New("pgundo: unexpected answer about the rows that refer to a row")
+		}
+		if len(res[0].Rows) > 0 {
+			return fmt.Errorf("%w: %s: %w: %d of the rows have rows of %s referring to them, and %s (steps %d–%d)", ErrChanged,
+				g.t.name(), errReferenced, len(res[0].Rows), f.Child, f.effect(), g.steps[0].N, g.steps[len(g.steps)-1].N)
+		}
+	}
+	return nil
 }
 
 // byKeys раскладывает годные шаги по внешним ключам. Возврат удалённых строк —

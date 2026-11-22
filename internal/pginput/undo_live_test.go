@@ -26,7 +26,8 @@ import (
 //
 // Что здесь проверено и чего нет в стенде из трёх таблиц: каскады внешних
 // ключей, секционированная таблица, колонки без оператора равенства,
-// генерируемые колонки, триггер, который переписывает строку при правке.
+// генерируемые колонки и колонка-номер, триггер, который переписывает строку
+// при правке, строки, которые сослались на вставленную после транзакции.
 func TestLiveUndo(t *testing.T) {
 	base := os.Getenv("PGINPUT_TEST_DSN")
 	if base == "" {
@@ -96,6 +97,9 @@ CREATE TABLE pgu.part_2 PARTITION OF pgu.part FOR VALUES FROM ('2026-02-01') TO 
 -- Типы без оператора равенства.
 CREATE TABLE pgu.place (id int PRIMARY KEY, spot point, doc json, label text);
 CREATE TABLE pgu.calc (id int PRIMARY KEY, a int, twice int GENERATED ALWAYS AS (a * 2) STORED);
+-- Номер строки выдаёт база и писать его не даёт: ни вставкой, ни правкой.
+CREATE TABLE pgu.ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+INSERT INTO pgu.ident (v) VALUES ('a'), ('b'), ('c');
 INSERT INTO pgu.parent SELECT g, 'parent ' || g FROM generate_series(1, 4) g;
 INSERT INTO pgu.child (id, parent_id, note) SELECT g * 10 + k, g, 'child ' || k FROM generate_series(1, 4) g, generate_series(0, 1) k;
 INSERT INTO pgu.loose SELECT g * 100, g, 'loose ' || g FROM generate_series(1, 4) g;
@@ -105,7 +109,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	version, _ := strconv.Atoi(one("SELECT current_setting('server_version_num')"))
 
 	cfg := Config{DSN: base + " user=pgu_tap", Slot: "pgu_slot", Publication: "pgu_pub", Dir: t.TempDir(),
-		Roles: []string{"pgu_agent"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc"}}
+		Roles: []string{"pgu_agent"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +218,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	}
 	state := func(touched bool) string {
 		out := dump("SELECT * FROM pgu.parent") + dump("SELECT id, parent_id, note FROM pgu.child") + dump("SELECT * FROM pgu.loose") +
-			dump("SELECT tableoid::regclass, * FROM pgu.part") + dump("SELECT * FROM pgu.place") + dump("SELECT * FROM pgu.calc")
+			dump("SELECT tableoid::regclass, * FROM pgu.part") + dump("SELECT * FROM pgu.place") + dump("SELECT * FROM pgu.calc") + dump("SELECT * FROM pgu.ident")
 		if touched {
 			out += dump("SELECT id, touched FROM pgu.child")
 		}
@@ -352,5 +356,62 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	roundTrip("the partition after the setup ran again", "UPDATE pgu.part SET amount = 3 WHERE id = 9", true)
 	if strings.Count(said(), "no REPLICA IDENTITY FULL on") != alerts {
 		t.Fatal("the alert about the partition came again after the setup")
+	}
+
+	// 9. Колонка GENERATED ALWAYS AS IDENTITY: правка её не пишет, удалённая строка
+	// возвращается со своим прежним номером.
+	_, done = roundTrip("an identity column", "UPDATE pgu.ident SET v = 'x' WHERE id = 1; DELETE FROM pgu.ident WHERE id = 2", true)
+	if done.Differ != nil {
+		t.Fatalf("an identity column: %+v", done)
+	}
+
+	// 10. Агент вставил строку, а потом на неё сослались другие: человек добавил
+	// ребёнка (ON DELETE CASCADE) и ссылку (ON DELETE SET NULL). Убрать строку —
+	// молча удалить одно и обнулить другое. Сверка называет шаг конфликтом и
+	// говорит, кто ссылается; откату нечего применять.
+	xid = act("INSERT INTO pgu.parent VALUES (50, 'agent')")
+	exec(admin, "INSERT INTO pgu.child (id, parent_id, note) VALUES (500, 50, 'human'); INSERT INTO pgu.loose VALUES (5000, 50, 'human')")
+	held = state(true)
+	referred, err := plan(xid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := referred.Check(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].State != pgundo.StateReferenced || referred.OK != nil ||
+		statuses[0].Detail != "1 rows of pgu.child refer to it: ON DELETE CASCADE would delete them; 1 rows of pgu.loose refer to it: ON DELETE SET NULL would clear their reference" {
+		t.Fatalf("a row others refer to: %+v", statuses)
+	}
+	if _, err := referred.Apply(admin, map[string]any{"by": "test"}); err == nil || state(true) != held {
+		t.Fatalf("a row others refer to was removed: %v", err)
+	}
+
+	// 11. То же, но сослались между сверкой и откатом: откат проверяет это сам,
+	// под замком, прямо перед уборкой. Не убрано ничего.
+	xid = act("INSERT INTO pgu.parent VALUES (60, 'agent')")
+	if referred, err = plan(xid); err != nil {
+		t.Fatal(err)
+	}
+	if statuses, err = referred.Check(admin); err != nil || statuses[0].State != pgundo.StateOK {
+		t.Fatalf("%+v %v", statuses, err)
+	}
+	exec(admin, "INSERT INTO pgu.child (id, parent_id, note) VALUES (600, 60, 'human')")
+	held = state(true)
+	if _, err := referred.Apply(admin, map[string]any{"by": "test"}); !errors.Is(err, pgundo.ErrChanged) || !strings.Contains(err.Error(), "have rows of pgu.child referring to them") || state(true) != held {
+		t.Fatalf("a row someone referred to after the check: %v", err)
+	}
+
+	// 12. Свои ссылки откату не мешают. Агент вставил родителя и детей одной
+	// транзакцией: дети уходят раньше родителя. Агент перенаправил на новую
+	// строку чужую ссылку: откат сначала вернёт ссылку, потом уберёт строку.
+	p, done = roundTrip("the transaction's own children", "INSERT INTO pgu.parent VALUES (70, 'agent'); INSERT INTO pgu.child (id, parent_id, note) VALUES (700, 70, 'a'), (701, 70, 'b')", true)
+	if done.Steps != 3 || done.Differ != nil {
+		t.Fatalf("the transaction's own children: %+v", done)
+	}
+	p, done = roundTrip("a reference the transaction moved", "INSERT INTO pgu.parent VALUES (80, 'agent'); UPDATE pgu.loose SET parent_id = 80 WHERE id = 100", true)
+	if p.Changes != 2 || done.Steps != 2 || done.Differ != nil {
+		t.Fatalf("a reference the transaction moved: %d changes, %+v", p.Changes, done)
 	}
 }

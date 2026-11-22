@@ -16,6 +16,7 @@ type Conflict struct {
 	Key     string           `json:"key"`
 	State   string           `json:"state"`
 	Why     string           `json:"why"`
+	Detail  string           `json:"detail,omitempty"` // кто ссылается на строку (StateReferenced)
 	Columns []ConflictColumn `json:"columns"`
 }
 
@@ -30,10 +31,11 @@ type ConflictColumn struct {
 }
 
 var why = map[string]string{
-	StateGone:     "the row is gone",
-	StateChanged:  "the row was changed after the transaction",
-	StateExists:   "a row with this key exists again",
-	StateKeyTaken: "the old key is taken by another row",
+	StateGone:       "the row is gone",
+	StateChanged:    "the row was changed after the transaction",
+	StateExists:     "a row with this key exists again",
+	StateKeyTaken:   "the old key is taken by another row",
+	StateReferenced: "rows the undo does not own refer to it: removing it would delete them or rewrite their reference",
 }
 
 // Conflicts отбирает из ответов Check шаги, которые решать человеку.
@@ -49,7 +51,7 @@ func (p *Plan) Conflicts(statuses []Status) []Conflict {
 		}
 		s := steps[st.Step]
 		t := p.Tables[s.Table]
-		c := Conflict{Step: s.N, Op: s.Op, Table: s.Table, Key: p.Key(s), State: st.State, Why: why[st.State]}
+		c := Conflict{Step: s.N, Op: s.Op, Table: s.Table, Key: p.Key(s), State: st.State, Why: why[st.State], Detail: st.Detail}
 		var cur map[string]any
 		if st.Current != nil {
 			dec := json.NewDecoder(bytes.NewReader(st.Current))
@@ -163,6 +165,9 @@ func (c Conflict) Lines() []string {
 		return []string{"the transaction deleted: " + row(func(col ConflictColumn) *string { return col.Was }), "now under this key:      " + row(now)}
 	case OpDelete:
 		out := []string{"the transaction inserted: " + row(func(col ConflictColumn) *string { return col.Left })}
+		if c.State == StateReferenced {
+			return append(out, c.Detail)
+		}
 		if c.State != StateGone {
 			out = append(out, "now:                      "+row(now))
 		}
