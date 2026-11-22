@@ -17,12 +17,16 @@ package mcpserver
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -106,20 +110,17 @@ const dbBackstop = 5 * time.Second
 
 // guards — таймауты базы на одну транзакцию агента (SET LOCAL): страховка под
 // таймером сервера и срок ожидания чужой блокировки. Это значения по
-// умолчанию — SQL агента может их сменить; таймер сервера (timed) ему
-// недоступен. "" — задавать нечего.
-func (s *Server) guards() string {
-	var sql string
+// умолчанию — SQL агента может их сменить (set_config); таймер сервера
+// (timed) ему недоступен, а после команд агента сервер ставит их снова.
+func (s *Server) guards() []string {
+	var out []string
 	if s.cfg.StatementTimeout > 0 {
-		sql = fmt.Sprintf("SET LOCAL statement_timeout = %d", (s.cfg.StatementTimeout + dbBackstop).Milliseconds())
+		out = append(out, fmt.Sprintf("SET LOCAL statement_timeout = %d", (s.cfg.StatementTimeout+dbBackstop).Milliseconds()))
 	}
 	if s.cfg.LockTimeout > 0 {
-		if sql != "" {
-			sql += "; "
-		}
-		sql += fmt.Sprintf("SET LOCAL lock_timeout = %d", s.cfg.LockTimeout.Milliseconds())
+		out = append(out, fmt.Sprintf("SET LOCAL lock_timeout = %d", s.cfg.LockTimeout.Milliseconds()))
 	}
-	return sql
+	return out
 }
 
 // spent — одно действие из файла квитанций: когда, сколько строк изменило
@@ -159,12 +160,12 @@ func (l *ledger) refresh(now time.Time) error {
 		// берётся с запасом и растёт, пока не покроет окно или весь файл.
 		for tail := int64(256 << 10); ; tail *= 16 {
 			start := max(fi.Size()-tail, 0)
-			items, covered, err := l.read(f, start, fi.Size(), now, start > 0)
+			items, covered, end, err := l.read(f, start, fi.Size(), now, start > 0)
 			if err != nil {
 				return err
 			}
 			if covered || start == 0 {
-				l.items, l.off, l.primed = items, fi.Size(), true
+				l.items, l.off, l.primed = items, end, true
 				break
 			}
 		}
@@ -172,11 +173,11 @@ func (l *ledger) refresh(now time.Time) error {
 		if fi.Size() < l.off {
 			l.off, l.items = 0, nil // файл заменили (ротация): в нём всё новое
 		}
-		items, _, err := l.read(f, l.off, fi.Size(), now, false)
+		items, _, end, err := l.read(f, l.off, fi.Size(), now, false)
 		if err != nil {
 			return err
 		}
-		l.items, l.off = append(l.items, items...), fi.Size()
+		l.items, l.off = append(l.items, items...), end
 	}
 	fresh := l.items[:0]
 	for _, it := range l.items {
@@ -190,25 +191,33 @@ func (l *ledger) refresh(now time.Time) error {
 
 // read разбирает квитанции файла от start до end. midline — start взят
 // наугад (хвост файла) и может стоять посреди строки. covered — среди
-// прочитанных есть квитанция старше keep: хвост покрыл окно.
-func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool) (items []spent, covered bool, err error) {
+// прочитанных есть квитанция старше keep: хвост покрыл окно. done — докуда
+// прочитаны целые строки: обрывок в конце ещё дописывается другим сеансом, и
+// следующее чтение начнётся с его начала. Раньше чтение продолжалось с конца
+// файла, и квитанция, застигнутая недописанной, пропадала из счёта насовсем
+// (P-244).
+func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool) (items []spent, covered bool, done int64, err error) {
 	r := bufio.NewReaderSize(io.NewSectionReader(f, start, end-start), 1<<16)
+	done = start
 	if midline {
 		// Остаток строки, посреди которой началось чтение, — не квитанция.
-		if _, err := r.ReadBytes('\n'); err == io.EOF {
-			return nil, false, nil
+		skip, err := r.ReadBytes('\n')
+		if err == io.EOF {
+			return nil, false, start, nil
 		} else if err != nil {
-			return nil, false, err
+			return nil, false, start, err
 		}
+		done += int64(len(skip))
 	}
 	for {
 		line, err := r.ReadBytes('\n')
 		if err == io.EOF {
-			return items, covered, nil // обрывок без перевода строки ещё дописывается
+			return items, covered, done, nil // обрывок без перевода строки ещё дописывается
 		}
 		if err != nil {
-			return nil, false, err
+			return nil, false, start, err
 		}
+		done += int64(len(line))
 		var rc Receipt
 		if json.Unmarshal(line, &rc) != nil {
 			continue
@@ -228,12 +237,12 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 	}
 }
 
-// count — идёт ли квитанция в счёт. Считаются действия execute этого агента,
-// кроме отказанных за частоту: те в базу не ходили, и считать их — значит
-// держать агента под отказом, пока он пробует. Строки — только у
-// зафиксированных.
+// count — идёт ли квитанция в счёт. Считаются действия этого агента — execute
+// и откаты undo_apply (откат меняет те же строки обратно, P-249), — кроме
+// отказанных за частоту: те в базу не ходили, и считать их — значит держать
+// агента под отказом, пока он пробует. Строки — только у зафиксированных.
 func (l *ledger) count(rc Receipt, at time.Time) (spent, bool) {
-	if rc.Agent != l.agent || rc.Tool != "execute" || rc.Cause == CauseRate {
+	if rc.Agent != l.agent || (rc.Tool != "execute" && rc.Tool != "undo_apply") || rc.Cause == CauseRate {
 		return spent{}, false
 	}
 	it := spent{at: at}
@@ -289,12 +298,56 @@ func (s *Server) usage(now time.Time) (actions, rows int, alerted time.Time, err
 
 // markRefused оставляет в журнале базы отметку об отказе: по ней сборщик
 // поднимает тревогу для людей. Сообщение не транзакционное, поэтому годится и
-// внутри транзакции, которая сейчас откатится, и вне транзакции.
-func (s *Server) markRefused(rc *Receipt, info map[string]any) {
+// внутри транзакции, которая сейчас откатится, и вне транзакции. Внутри —
+// после своих настроек (own), вне — с чистого сеанса (fresh): SQL агента не
+// меняет, как база прочтёт отметку с его причиной (P-243, P-256). false —
+// отметки нет, и тревоги не будет.
+func (s *Server) markRefused(rc *Receipt, info map[string]any) bool {
 	info["action_id"], info["agent"], info["reason"], info["cause"] = rc.ActionID, rc.Agent, rc.Reason, rc.Cause
 	mark, _ := json.Marshal(info)
-	if _, err := s.run("SELECT evidence.mark_refused(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
+	if _, err := s.run("SELECT evidence.mark_refused(" + pgwire.Literal(string(mark)) + "::pg_catalog.json)"); err != nil {
 		s.log.Error("the refusal is not marked in the database log, so no alert is raised for it (is the database prepared with the current escollect -setup-sql?)",
 			"action", rc.ActionID, "cause", rc.Cause, "err", err)
+		return false
+	}
+	return true
+}
+
+// actionLock — замок на действие агента для всех его сеансов: flock на файле
+// рядом с квитанциями, свой у каждого агента. Проверка частоты и окна,
+// действие и квитанция идут под ним: без замка одновременные сеансы проходили
+// проверку разом, и при пределе 4 действия в минуту из 30 одновременных
+// проходило до 30 (P-252). Ждёт не дольше, чем может идти одно действие: дольше
+// — другое действие агента зависло, и агенту честнее так и сказать. Без файла
+// квитанций на чтение (тесты) замка нет.
+func (s *Server) actionLock() (func(), error) {
+	if s.cfg.ReceiptsPath == "" {
+		return func() {}, nil
+	}
+	sum := sha256.Sum256([]byte(s.cfg.Agent))
+	f, err := os.OpenFile(s.cfg.ReceiptsPath+"."+hex.EncodeToString(sum[:8])+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("the lock of the agent's actions could not be opened, so the limits cannot be checked: %w", err)
+	}
+	wait := lockWait
+	if s.cfg.StatementTimeout > 0 {
+		wait = s.cfg.StatementTimeout + dbBackstop + lockWait
+	}
+	for deadline := time.Now().Add(wait); ; {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN); f.Close() }, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) || time.Now().After(deadline) {
+			f.Close()
+			if errors.Is(err, unix.EWOULDBLOCK) {
+				return nil, fmt.Errorf("another action of this agent has been running for more than %s: wait for it and do not retry in a loop", wait)
+			}
+			return nil, fmt.Errorf("the lock of the agent's actions failed, so the limits cannot be checked: %w", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// lockWait — сколько ждать замок сверх времени одного действия (в тестах — меньше).
+var lockWait = 10 * time.Second

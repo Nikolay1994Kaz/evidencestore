@@ -262,6 +262,33 @@ func TestTargetFormats(t *testing.T) {
 	}
 }
 
+// Причина агента с разметкой Slack не зовёт весь канал и не рисует ссылку с
+// чужой подписью: &, <, > — сущностями, за @ упоминания всех — U+2060. До
+// исправления P-254 <!channel> из причины звал канал, а
+// <https://…|Approve the undo> был ссылкой с этой подписью. Telegram и свой
+// адрес получают текст как есть.
+func TestSlackTextIsNotMarkup(t *testing.T) {
+	h := newHook(t)
+	r := newRig(t, t.TempDir(), Target{Type: TypeSlack, URL: h.srv.URL + "/slack"}, Target{Type: TypeJSON, URL: h.srv.URL + "/json"})
+	e := Event{XID: 9, Actions: []json.RawMessage{json.RawMessage(`{"role":"agent_bot","info":{"action_id":"a-1","agent":"bot","reason":"<!channel> <https://evil.example|Approve the undo> @here @Everyone R&D"}}`)}}
+	e.Add(KindNoAction, "x")
+	if err := r.log.Append(e); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "two deliveries", func() bool { return len(h.calls()) == 2 })
+	by := map[string]string{}
+	for _, c := range h.calls() {
+		by[c.path] = c.body["text"].(string)
+	}
+	want := "&lt;!channel&gt; &lt;https://evil.example|Approve the undo&gt; @\u2060here @\u2060Everyone R&amp;D"
+	if sl := by["/slack"]; !strings.Contains(sl, want) || strings.ContainsAny(sl, "<>") {
+		t.Fatalf("slack: %q", sl)
+	}
+	if js := by["/json"]; !strings.Contains(js, "<!channel> <https://evil.example|Approve the undo> @here @Everyone R&D") {
+		t.Fatalf("json: %q", js)
+	}
+}
+
 // Файл — очередь: тревога уходит один раз. Прежние тревоги новому получателю
 // не идут; после перезапуска отправленное не повторяется, а то, что легло в
 // файл, пока доставка стояла, уходит.
@@ -553,4 +580,36 @@ func TestReplacedFileIsReadFromItsStart(t *testing.T) {
 	if len(h.calls()) != 3 {
 		t.Fatal("the line that is not an alert was sent, or the alert was sent twice")
 	}
+}
+
+// Тревога длиннее блока чтения (4 МиБ) доставляется, и тревоги после неё —
+// тоже; длиннее предела разбора — вместо неё уходит короткая с местом в файле.
+// До исправления P-245 такая строка считалась «ещё дописывается», и доставка
+// всем получателям вставала навсегда, а показатели говорили «ничего не ждёт».
+// Длинную строку агент делал одной причиной отказа в 5 МБ.
+func TestLongAlertLineDoesNotStopDelivery(t *testing.T) {
+	h := newHook(t)
+	r := newRig(t, t.TempDir(), Target{Type: TypeSlack, URL: h.srv.URL})
+	r.raise(1, KindNoAction, "before")
+	waitFor(t, "the first delivery", func() bool { return len(h.calls()) == 1 })
+	big := Event{Time: time.Now().UTC().Format(time.RFC3339Nano),
+		Actions: []json.RawMessage{json.RawMessage(`{"role":"agent_bot","info":{"cause":"row-limit","reason":"` + strings.Repeat("x", 5<<20) + `"}}`)}}
+	big.Add(KindRefused, "the MCP server stopped an action")
+	if err := r.log.Append(big); err != nil {
+		t.Fatal(err)
+	}
+	huge := Event{Time: time.Now().UTC().Format(time.RFC3339Nano),
+		Actions: []json.RawMessage{json.RawMessage(`{"reason":"` + strings.Repeat("y", maxEvent) + `"}`)}}
+	huge.Add(KindRefused, "too long to parse")
+	if err := r.log.Append(huge); err != nil {
+		t.Fatal(err)
+	}
+	r.raise(2, KindCanary, "public.accounts: the canary row id=3 was touched (U)")
+	waitFor(t, "every alert after the long ones", func() bool { return len(h.calls()) == 4 })
+	calls := strings.Join(h.texts(), "\n")
+	if !strings.Contains(calls, "the MCP server stopped an action") || !strings.Contains(calls, "too long to send") || !strings.Contains(calls, "canary") {
+		t.Fatalf("%s", calls[:min(len(calls), 2000)])
+	}
+	// Показатели доставка обновляет после ответа получателя: ждём и их.
+	waitFor(t, "nothing waiting", func() bool { st := r.n.Stats(); return st[0].Waiting == 0 && !st[0].Failing })
 }

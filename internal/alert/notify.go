@@ -140,7 +140,7 @@ func (t Target) request(ctx context.Context, text, title string, events []Event)
 		}
 		body = map[string]any{"chat_id": chat, "text": text, "link_preview_options": map[string]bool{"is_disabled": true}}
 	case TypeSlack:
-		addr, body = t.URL, map[string]string{"text": text}
+		addr, body = t.URL, map[string]string{"text": slackText(text)}
 	default:
 		addr, body = t.URL, map[string]any{"text": text, "title": title, "events": events}
 	}
@@ -154,6 +154,33 @@ func (t Target) request(ctx context.Context, text, title string, events []Event)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	return req, nil
+}
+
+// slackText — текст для Slack и совместимых: &, < и > — сущностями, как
+// требует Slack, а за @ упоминания всех (@channel, @here, @all, @everyone) —
+// невидимый U+2060, и упоминанием это уже не читается. В тексте тревоги —
+// причина и имена от агента: иначе его <!channel> звал бы весь канал, а
+// <https://…|подпись> рисовал бы ссылку с любой подписью (P-254). Telegram
+// текст без parse_mode не разбирает.
+func slackText(s string) string {
+	s = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '@' {
+			continue
+		}
+		for _, m := range []string{"channel", "here", "all", "everyone"} {
+			if len(s)-i-1 >= len(m) && strings.EqualFold(s[i+1:i+1+len(m)], m) {
+				b.WriteString(s[last : i+1])
+				b.WriteString("\u2060")
+				last = i + 1
+				break
+			}
+		}
+	}
+	b.WriteString(s[last:])
+	return b.String()
 }
 
 // sendError — получатель не принял сообщение.
@@ -237,6 +264,9 @@ const (
 	maxRetry = 5 * time.Minute
 	// readChunk — столько байт очереди читается за раз.
 	readChunk = 4 << 20
+	// maxEvent — тревога длиннее этого не разбирается: вместо неё уходит
+	// короткая (KindDropped) с местом в файле.
+	maxEvent = 16 << 20
 )
 
 // Notifier несёт тревоги из файла получателям: по потоку на каждого.
@@ -441,7 +471,50 @@ func (s *sender) pending() ([]item, error) {
 		}
 		out = append(out, item{event: e, end: at})
 	}
+	if len(out) == 0 && at == s.offset && fi.Size()-s.offset > readChunk {
+		// Первая строка длиннее блока: её перевод строки — дальше. Считать её
+		// «ещё дописывается» нельзя — так доставка вставала навсегда, и
+		// показатели говорили, что ничего не ждёт (P-245).
+		return s.long(f, fi.Size())
+	}
 	return out, nil
+}
+
+// long — первая строка очереди длиннее readChunk. Дописана — разбирается, если
+// не длиннее maxEvent; длиннее или не тревога — вместо неё короткая тревога с
+// местом в файле: молча пропустить её нельзя.
+func (s *sender) long(f *os.File, size int64) ([]item, error) {
+	r := bufio.NewReaderSize(io.NewSectionReader(f, s.offset, size-s.offset), 1<<16)
+	var n int64
+	for {
+		part, err := r.ReadSlice('\n')
+		n += int64(len(part))
+		if err == nil {
+			break
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			return nil, nil // перевода строки ещё нет: дописывается
+		}
+		return nil, err
+	}
+	end := s.offset + n
+	if n <= maxEvent {
+		line := make([]byte, n)
+		if _, err := f.ReadAt(line, s.offset); err != nil {
+			return nil, err
+		}
+		var e Event
+		if json.Unmarshal(line, &e) == nil && len(e.Signals) > 0 {
+			return []item{{event: e, end: end}}, nil
+		}
+	}
+	s.log.Warn("an alert line is too long to send: a short alert goes instead", "bytes", n, "offset", s.offset)
+	e := Event{Time: time.Now().UTC().Format(time.RFC3339Nano)}
+	e.Add(KindDropped, fmt.Sprintf("an alert of %d bytes is too long to send; it is in %s at byte %d", n, s.o.File, s.offset))
+	return []item{{event: e, end: end}}, nil
 }
 
 // message — одно сообщение получателю и докуда очередь им закрыта.

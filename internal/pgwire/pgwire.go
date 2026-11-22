@@ -699,9 +699,22 @@ func parseDataRow(msg []byte) ([]*string, error) {
 	return row, nil
 }
 
-// Literal — строковый литерал SQL: одинарные кавычки удвоены. Рассчитан на
-// standard_conforming_strings = on (по умолчанию с PostgreSQL 9.1).
-func Literal(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+// Literal — строковый литерал SQL при любом standard_conforming_strings:
+// одинарные кавычки удвоены, а строка с обратной косой чертой — в виде E'…'
+// с удвоенной чертой (так же делает PQescapeLiteral в libpq, и пробел перед
+// E — оттуда же: литерал не слипается с предыдущим словом). Раньше черта
+// шла как есть: при standard_conforming_strings = off (умолчание базы или
+// роли — его ставят старые приложения, а роли агента — он сам) значение
+// с чертой в конце съедало закрывающую кавычку, и следующее значение
+// становилось текстом SQL. Значения строк в SQL отката пишет агент, а
+// esundo запускает человек с правами владельца (P-256).
+func Literal(s string) string {
+	q := strings.ReplaceAll(s, "'", "''")
+	if !strings.Contains(q, `\`) {
+		return "'" + q + "'"
+	}
+	return " E'" + strings.ReplaceAll(q, `\`, `\\`) + "'"
+}
 
 // Ident — идентификатор SQL в двойных кавычках.
 func Ident(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }

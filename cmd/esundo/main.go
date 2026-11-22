@@ -34,6 +34,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -95,7 +96,8 @@ func fail(err error) {
 	if err == nil {
 		return
 	}
-	fmt.Fprintln(os.Stderr, "error:", err)
+	// В ошибке базы бывают значения строк — от агента (P-251).
+	fmt.Fprintln(os.Stderr, "error:", pgundo.Shown(err.Error()))
 	switch {
 	case errors.Is(err, pgundo.ErrRefused):
 		os.Exit(2)
@@ -180,41 +182,7 @@ func check(args []string) {
 	p, err := pgundo.Build(uint32(*xid), lines)
 	fail(err)
 
-	fmt.Printf("transaction %d: %d store records, %d row changes\n", p.XID, len(lines), p.Changes)
-	var who struct{ Role, App string }
-	if json.Unmarshal(p.Who, &who) == nil && who.Role != "" {
-		fmt.Printf("  who: role %s, session %q\n", who.Role, who.App)
-	}
-	if p.Undo != nil {
-		fmt.Printf("  this is an undo transaction: %s\n", p.Undo)
-	}
-	for _, a := range p.Actions {
-		var m struct {
-			Info struct {
-				ActionID string `json:"action_id"`
-				Agent    string `json:"agent"`
-				Tool     string `json:"tool"`
-				Reason   string `json:"reason"`
-			} `json:"info"`
-		}
-		json.Unmarshal(a, &m)
-		fmt.Printf("  action %s: agent %s, tool %s, reason: %s\n", m.Info.ActionID, m.Info.Agent, m.Info.Tool, m.Info.Reason)
-	}
-	if p.Who != nil && len(p.Actions) == 0 {
-		fmt.Println("  no action marker: the transaction did not come through the MCP server")
-	}
-	var names []string
-	for n := range p.Counts {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		c := p.Counts[n]
-		fmt.Printf("  %s: inserts %d, updates %d, deletes %d\n", n, c.I, c.U, c.D)
-	}
-	s := p.Summary()
-	fmt.Printf("  undo steps %d: restore values %d, restore deleted rows %d, remove inserted rows %d; rows touched more than once %d; no net change %d\n",
-		s.Steps, s.Restore, s.Reinsert, s.Remove, s.Twice, p.Noop)
+	describe(os.Stdout, p, len(lines))
 	if len(p.Steps) == 0 {
 		fmt.Println("  nothing to undo: the transaction changed no rows")
 		return
@@ -233,7 +201,7 @@ func check(args []string) {
 			fmt.Printf("  … and %d more\n", bad-i)
 			break
 		}
-		fmt.Printf("  CONFLICT, step %d: %s (%s): %s\n", c.Step, c.Table, c.Key, c.Why)
+		fmt.Printf("  CONFLICT, step %d: %s (%s): %s\n", c.Step, pgundo.Shown(c.Table), pgundo.Shown(c.Key), pgundo.Shown(c.Why))
 		for _, line := range c.Lines() {
 			fmt.Printf("      %s\n", line)
 		}
@@ -292,6 +260,48 @@ func apply(args []string) {
 	fmt.Println("  checked after the undo: the rows are back, but not all values are as they were before the transaction.")
 	fmt.Println("  Triggers of these tables rewrote what the undo put back (the undo does not switch triggers off):")
 	for _, d := range done.Differ {
-		fmt.Printf("    %s.%s: %d rows\n", d.Table, d.Column, d.Rows)
+		fmt.Printf("    %s.%s: %d rows\n", pgundo.Shown(d.Table), pgundo.Shown(d.Column), d.Rows)
 	}
+}
+
+// describe — что сделала транзакция и что сделает откат. Всё, что пришло из
+// журнала (отметки агента, имена, значения), печатается через pgundo.Shown:
+// агент не дописывает в этот вывод своих строк (P-251).
+func describe(w io.Writer, p *pgundo.Plan, records int) {
+	fmt.Fprintf(w, "transaction %d: %d store records, %d row changes\n", p.XID, records, p.Changes)
+	var who struct{ Role, App string }
+	if json.Unmarshal(p.Who, &who) == nil && who.Role != "" {
+		fmt.Fprintf(w, "  who: role %s, session %q\n", pgundo.Shown(who.Role), who.App)
+	}
+	if p.Undo != nil {
+		fmt.Fprintf(w, "  this is an undo transaction: %s\n", pgundo.Shown(string(p.Undo)))
+	}
+	for _, a := range p.Actions {
+		var m struct {
+			Info struct {
+				ActionID string `json:"action_id"`
+				Agent    string `json:"agent"`
+				Tool     string `json:"tool"`
+				Reason   string `json:"reason"`
+			} `json:"info"`
+		}
+		json.Unmarshal(a, &m)
+		// Всё в отметке — от агента: причина, имена, номер действия (P-251).
+		fmt.Fprintf(w, "  action %s: agent %s, tool %s, reason: %s\n", pgundo.Shown(m.Info.ActionID), pgundo.Shown(m.Info.Agent), pgundo.Shown(m.Info.Tool), pgundo.Shown(m.Info.Reason))
+	}
+	if p.Who != nil && len(p.Actions) == 0 {
+		fmt.Fprintln(w, "  no action marker: the transaction did not come through the MCP server")
+	}
+	var names []string
+	for n := range p.Counts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		c := p.Counts[n]
+		fmt.Fprintf(w, "  %s: inserts %d, updates %d, deletes %d\n", pgundo.Shown(n), c.I, c.U, c.D)
+	}
+	s := p.Summary()
+	fmt.Fprintf(w, "  undo steps %d: restore values %d, restore deleted rows %d, remove inserted rows %d; rows touched more than once %d; no net change %d\n",
+		s.Steps, s.Restore, s.Reinsert, s.Remove, s.Twice, p.Noop)
 }

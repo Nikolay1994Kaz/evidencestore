@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -105,9 +106,14 @@ func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 	}
 	v := "751"
 	switch {
-	case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_get_xact_tuples"):
-		zero := "0" // счёт строк до SQL агента
-		return []pgwire.Result{{Columns: []string{"xid", "rows"}, Rows: [][]*string{{&v, &zero}}, Tag: "SELECT 1"}}, nil
+	case strings.Contains(sql, "pg_current_xact_id()::xid::text, pg_current_xact_id()::text"):
+		// Номер транзакции (32 бита и с эпохой), при пределах — счёт строк до SQL агента.
+		cols, row := []string{"xid", "xid8"}, []*string{&v, &v}
+		if strings.Contains(sql, "pg_stat_get_xact_tuples") {
+			zero := "0"
+			cols, row = append(cols, "rows"), append(row, &zero)
+		}
+		return []pgwire.Result{{Columns: cols, Rows: [][]*string{row}, Tag: "SELECT 1"}}, nil
 	case strings.Contains(sql, "pg_current_xact_id"):
 		return []pgwire.Result{{Columns: []string{"xid"}, Rows: [][]*string{{&v}}, Tag: "SELECT 1"}}, nil
 	case strings.HasPrefix(sql, "SELECT id"):
@@ -223,11 +229,16 @@ func TestExecuteMarksTheActionAndKeepsAReceipt(t *testing.T) {
 	if out["action_id"] != "a-1" || out["xid"] != "751" || out["outcome"] != "committed" || out["statements"].([]any)[0] != "UPDATE 3" {
 		t.Fatalf("%v", out)
 	}
-	// Порядок: чистый сеанс, транзакция, отметка действия первой, номер
-	// транзакции, команда агента — подготовкой и исполнением, фиксация.
-	if len(db.log) != 7 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SELECT evidence.mark_action('{") ||
-		!strings.Contains(db.log[2], `"action_id":"a-1"`) || !strings.Contains(db.log[2], `"agent":"support-bot"`) ||
-		db.log[4] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[5] != "EXECUTE es_agent_0" || db.log[6] != "COMMIT" {
+	// Порядок: чистый сеанс, транзакция, свои настройки сеанса, отметка
+	// действия первой, номер транзакции; пачка — путь агента, команда агента
+	// подготовкой и исполнением, отложенное — сразу, свои настройки снова;
+	// фиксация.
+	if len(db.log) != 13 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
+		!strings.HasPrefix(db.log[3], "SELECT evidence.mark_action('{") ||
+		!strings.Contains(db.log[3], `"action_id":"a-1"`) || !strings.Contains(db.log[3], `"agent":"support-bot"`) ||
+		db.log[5] != "SET LOCAL search_path TO DEFAULT" ||
+		db.log[6] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[7] != "EXECUTE es_agent_0" ||
+		db.log[8] != "SET CONSTRAINTS ALL IMMEDIATE" || db.log[9] != "SET LOCAL search_path = pg_catalog, pg_temp" || db.log[12] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
 	data, _ := os.ReadFile(path)
@@ -267,8 +278,9 @@ func TestQueryIsReadOnlyAndBounded(t *testing.T) {
 	if isErr || text != `{"columns":["id","note"],"rows":[["1",null]],"truncated":true}` {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	if db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN TRANSACTION READ ONLY" || db.log[2] != "PREPARE es_agent_0 AS SELECT id, note FROM accounts" ||
-		db.log[3] != "EXECUTE es_agent_0" || db.log[4] != "ROLLBACK" {
+	if db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN TRANSACTION READ ONLY" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
+		db.log[3] != "SET LOCAL search_path TO DEFAULT" || db.log[4] != "PREPARE es_agent_0 AS SELECT id, note FROM accounts" ||
+		db.log[5] != "EXECUTE es_agent_0" || db.log[len(db.log)-1] != "ROLLBACK" || slices.Contains(db.log, "SET CONSTRAINTS ALL IMMEDIATE") {
 		t.Fatalf("%q", db.log)
 	}
 	if data, _ := os.ReadFile(path); len(data) != 0 {
@@ -321,7 +333,7 @@ func TestServeAnswersLineByLine(t *testing.T) {
 
 // journalLine — транзакция 751 одной записью сборщика: строка 6 была "a", стала "b".
 func journalLine() []byte {
-	stream := `{"t":"H","v":1,"xid":751}
+	stream := `{"t":"H","v":1,"xid":751,"actions":[{"role":"support_bot","info":{"action_id":"a-1","agent":"support-bot","tool":"execute"}}]}
 {"t":"R","id":1,"schema":"public","table":"accounts","identity":"f","columns":["id","note"],"types":["integer","text"],"pk":["id"]}
 {"t":"U","r":1,"old":["6","a"],"new":["6","b"]}
 {"t":"U","r":1,"old":["7","a"],"new":["7","b"]}
@@ -403,6 +415,20 @@ func TestUndoPreviewAndApply(t *testing.T) {
 	if !strings.Contains(mark, `"action_id":"u-1"`) || !strings.Contains(mark, `"undoes_action":"a-1"`) || !strings.Contains(update, "(1, '7'::integer") || strings.Contains(update, "'6'") {
 		t.Fatalf("mark %s\nupdate %s", mark, update)
 	}
+	// Сверка и откат — с чистого сеанса и pg_catalog первым в пути: функции и
+	// операторы под системными именами из схем роли агента их не подменят.
+	var path0, catalog int = -1, -1
+	for i, q := range db.log[before:] {
+		if q == "DISCARD ALL" && path0 < 0 {
+			path0 = i
+		}
+		if strings.Contains(q, "set_config('search_path', pg_catalog.concat_ws(', ', 'pg_catalog', ") && catalog < 0 {
+			catalog = i
+		}
+	}
+	if path0 < 0 || catalog < path0 || !strings.Contains(db.log[before+catalog+1], "pg_attribute") {
+		t.Fatalf("the session of the undo: %q", db.log[before:])
+	}
 	data, _ := os.ReadFile(path)
 	if !strings.Contains(string(data), `"tool":"undo_apply"`) || !strings.Contains(string(data), `"undoes":"a-1"`) || fetched != 2 {
 		t.Fatalf("fetched %d\n%s", fetched, data)
@@ -429,7 +455,7 @@ func limitedFrom(t *testing.T, limit int, before, stat string) (*Server, *fakeDB
 		switch {
 		case stat == "":
 		case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_get_xact_tuples"):
-			return []pgwire.Result{{Columns: []string{"xid", "rows"}, Rows: [][]*string{{&xid, &before}}, Tag: "SELECT 1"}}, true
+			return []pgwire.Result{{Columns: []string{"xid", "xid8", "rows"}, Rows: [][]*string{{&xid, &xid, &before}}, Tag: "SELECT 1"}}, true
 		case strings.Contains(sql, "pg_stat_get_xact_tuples"):
 			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
 		}
@@ -456,13 +482,13 @@ func TestRowLimitRefusesBeforeCommit(t *testing.T) {
 	}
 	// Порядок: изменения, счёт строк, отметка об отказе, откат. Фиксации нет.
 	n := len(db.log)
-	if n != 9 || db.log[5] != "EXECUTE es_agent_0" || !strings.Contains(db.log[6], "pg_stat_get_xact_tuples") ||
-		!strings.HasPrefix(db.log[7], "SELECT evidence.mark_refused('{") || db.log[8] != "ROLLBACK" {
+	if db.log[n-4] != "SET LOCAL ROLE NONE" || !strings.Contains(db.log[n-3], "pg_stat_get_xact_tuples") ||
+		!strings.Contains(db.log[n-2], "SELECT evidence.mark_refused('{") || db.log[n-1] != "ROLLBACK" || slices.Contains(db.log, "COMMIT") {
 		t.Fatalf("%q", db.log)
 	}
 	for _, want := range []string{`"action_id":"a-1"`, `"agent":"support-bot"`, `"rows":700`, `"limit":500`, `"reason":"close inactive accounts"`} {
-		if !strings.Contains(db.log[7], want) {
-			t.Fatalf("the refusal marker lacks %s: %s", want, db.log[7])
+		if !strings.Contains(db.log[n-2], want) {
+			t.Fatalf("the refusal marker lacks %s: %s", want, db.log[n-2])
 		}
 	}
 	data, _ := os.ReadFile(path)
@@ -542,7 +568,7 @@ func TestRowCountIsTheActionsOwn(t *testing.T) {
 		t.Fatalf("%v %s", isErr, text)
 	}
 	// Счёт «до» — в одном запросе с номером транзакции, лишнего обмена нет.
-	if !strings.Contains(db.log[3], "pg_current_xact_id") || !strings.Contains(db.log[3], "pg_stat_get_xact_tuples") {
+	if !strings.Contains(db.log[4], "pg_current_xact_id") || !strings.Contains(db.log[4], "pg_stat_get_xact_tuples") {
 		t.Fatalf("%q", db.log)
 	}
 	data, _ := os.ReadFile(path)

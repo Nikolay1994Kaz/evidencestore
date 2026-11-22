@@ -58,8 +58,9 @@ type Table struct {
 	// Generated — колонки журнала, которые база считает сама (GENERATED …
 	// STORED, с PostgreSQL 18 они идут в журнал): откат их не пишет.
 	Generated []string `json:"generated,omitempty"`
-	// AsText — колонки типа без оператора равенства (point, json, xml): с
-	// образом они сравниваются текстом.
+	// AsText — колонки типа без оператора равенства (point, json, xml). С
+	// образом текстом сравниваются все колонки (equal); эти — ещё и потому,
+	// что иначе нельзя.
 	AsText []string `json:"as_text,omitempty"`
 }
 
@@ -443,15 +444,17 @@ func (g group) same(side byte) string {
 	return strings.Join(parts, " AND ")
 }
 
-// equal — колонка i строки t равна образу side. У типа без оператора
-// равенства сравнивается текст: образ в VALUES приведён к типу колонки, так что
-// обе стороны пишет одна функция вывода в одном сеансе.
+// equal — колонка i строки t такая же, как образ side. Сравнивается текст, а
+// не равенство типа: у citext, недетерминированных правил сортировки, numeric
+// (1.0 и 1.00), interval ('1 day' и '24 hours') равенство грубее значения, и
+// правку человека, сменившую только регистр или шкалу, сверка считала
+// «строкой, какой её оставила транзакция» — откат её перезаписывал (P-248).
+// Образ в VALUES приведён к типу колонки, так что обе стороны пишет одна
+// функция вывода в одном сеансе; у типа без оператора равенства (AsText)
+// иначе и нельзя.
 func (t *Table) equal(i int, side byte) string {
 	col, img := "t."+pgwire.Ident(t.Columns[i]), fmt.Sprintf("w.%c%d", side, i)
-	if slices.Contains(t.AsText, t.Columns[i]) {
-		col, img = col+"::text", img+"::text"
-	}
-	return col + " IS NOT DISTINCT FROM " + img
+	return col + "::text IS NOT DISTINCT FROM " + img + "::text"
 }
 
 func (g group) missing() string { return "t." + pgwire.Ident(g.t.PK[0]) + " IS NULL" }
@@ -708,7 +711,7 @@ func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Appli
 		return nil, fmt.Errorf("the undo marker could not be set (is the database prepared with escollect -setup-sql?): %w", err)
 	}
 	out := &Applied{Order: order}
-	res, err := db.Query("SELECT pg_current_xact_id()::text")
+	res, err := db.Query("SELECT pg_current_xact_id()::xid::text") // 32 бита — как в журнале базы, справочнике и тревогах
 	if err != nil {
 		return nil, err
 	}

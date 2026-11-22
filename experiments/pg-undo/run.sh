@@ -118,6 +118,9 @@ insert into orders select g, 1 + (g * 7) % :rows, 'item ' || g, g % 2 = 0 from g
 insert into orders values (:rows + 1, 5, 'gift', true), (:rows + 2, 5, 'gift wrap', false);
 insert into docs values (1, 'contract'), (2, 'note');
 create schema snap;
+-- PostgreSQL 14 и старше дают PUBLIC право CREATE на схеме public; роль агента
+-- с ним -setup-sql не берёт (свои функции заслонили бы системные, P-242).
+revoke create on schema public from public;
 SQL
 echo "accounts: $ROWS строк, orders: $((ROWS / 2 + 2))"
 

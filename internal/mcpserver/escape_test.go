@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -26,9 +27,18 @@ func (d *textDB) Pipeline(sqls []string) ([]pgwire.Result, error) {
 		return d.fakeDB.Pipeline(sqls)
 	}
 	d.log = append(d.log, sqls...)
+	// Голова и подготовка — как всегда; команда агента отвечает заданными
+	// тегами (первый — её ответ) и оставляет транзакцию как задано.
 	var res []pgwire.Result
-	for range len(sqls) / 2 {
-		res = append(res, pgwire.Result{Tag: "PREPARE"})
+	for _, sql := range sqls {
+		if strings.HasPrefix(sql, "EXECUTE ") {
+			break
+		}
+		tag := "SET"
+		if strings.HasPrefix(sql, "PREPARE ") {
+			tag = "PREPARE"
+		}
+		res = append(res, pgwire.Result{Tag: tag})
 	}
 	for _, tag := range d.tags {
 		res = append(res, pgwire.Result{Tag: tag})
@@ -118,10 +128,11 @@ func TestSQLThatEndsTheTransactionIsNotReportedAsRolledBack(t *testing.T) {
 // ROLLBACK TO SAVEPOINT даёт тег ROLLBACK, но транзакцию не закрывает: номер
 // тот же, действие идёт обычным путём.
 func TestRollbackToSavepointStaysInTheTransaction(t *testing.T) {
-	db := &textDB{tags: []string{"SAVEPOINT", "UPDATE 1", "ROLLBACK", "UPDATE 1"}, after: pgwire.TxOpen, xid: "751"}
+	db := &textDB{tags: []string{"ROLLBACK"}, after: pgwire.TxOpen, xid: "751"}
 	s := serverOn(t, db, filepath.Join(t.TempDir(), "receipts.jsonl"), nil)
 	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE docs SET body = 'x' WHERE id = 1"}`)
-	if isErr || !strings.Contains(text, `"outcome":"committed"`) || db.log[len(db.log)-1] != "COMMIT" {
+	if isErr || !strings.Contains(text, `"outcome":"committed"`) || db.log[len(db.log)-1] != "COMMIT" ||
+		!slices.ContainsFunc(db.log, func(q string) bool { return strings.Contains(q, "pg_current_xact_id_if_assigned") }) {
 		t.Fatalf("%v %s %q", isErr, text, db.log)
 	}
 }

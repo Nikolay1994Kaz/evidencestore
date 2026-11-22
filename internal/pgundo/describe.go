@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // Conflict — шаг, который откат не возьмёт сам: что было, что оставила
@@ -140,22 +141,39 @@ func Tally(statuses []Status) (ok, done, conflicts int) {
 	return
 }
 
+// Shown — значение одной строкой для терминала человека: управляющие символы
+// (C0, C1, DEL — и перевод строки), разделители строк и символы направления
+// текста — кодом \uXXXX. Значения строк, причина и имена — от агента: иначе
+// агент дописал бы в вывод esundo свои строки («nothing to undo») и спрятал
+// настоящие ESC-последовательностью (P-251).
+func Shown(s string) string {
+	var b strings.Builder
+	for _, c := range s {
+		if unicode.IsControl(c) || unicode.Is(unicode.Bidi_Control, c) || unicode.In(c, unicode.Zl, unicode.Zp) {
+			fmt.Fprintf(&b, "\\u%04x", c)
+			continue
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
+
 // Lines — конфликт строками для человека.
 func (c Conflict) Lines() []string {
 	q := func(s *string) string {
 		if s == nil {
 			return "NULL"
 		}
-		v := *s
+		v := []rune(*s)
 		if len(v) > 60 {
-			v = v[:57] + "…"
+			v = append(v[:57], '…')
 		}
-		return "«" + v + "»"
+		return "«" + Shown(string(v)) + "»"
 	}
 	row := func(pick func(ConflictColumn) *string) string {
 		var parts []string
 		for _, col := range c.Columns {
-			parts = append(parts, col.Name+"="+q(pick(col)))
+			parts = append(parts, Shown(col.Name)+"="+q(pick(col)))
 		}
 		return strings.Join(parts, ", ")
 	}
@@ -166,7 +184,7 @@ func (c Conflict) Lines() []string {
 	case OpDelete:
 		out := []string{"the transaction inserted: " + row(func(col ConflictColumn) *string { return col.Left })}
 		if c.State == StateReferenced {
-			return append(out, c.Detail)
+			return append(out, Shown(c.Detail))
 		}
 		if c.State != StateGone {
 			out = append(out, "now:                      "+row(now))
@@ -175,7 +193,7 @@ func (c Conflict) Lines() []string {
 	}
 	var out []string
 	for _, col := range c.Columns {
-		line := fmt.Sprintf("%s: was %s, the transaction left %s", col.Name, q(col.Was), q(col.Left))
+		line := fmt.Sprintf("%s: was %s, the transaction left %s", Shown(col.Name), q(col.Was), q(col.Left))
 		if !col.Gone {
 			line += ", now " + q(col.Now)
 		}

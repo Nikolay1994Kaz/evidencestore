@@ -151,7 +151,9 @@ func TestStatementTimeoutCancelsAndDropsTheConnection(t *testing.T) {
 	// После зависшей пачки в закрытое соединение ничего не шло: ни ROLLBACK,
 	// ни COMMIT. Отметка для тревоги — уже по новому соединению.
 	n := len(db.log)
-	if !strings.Contains(db.log[n-4], "pg_sleep") || db.log[n-2] != "EXECUTE es_agent_1" || !strings.HasPrefix(db.log[n-1], "SELECT evidence.mark_refused('{") ||
+	sleep := slices.IndexFunc(db.log, func(q string) bool { return strings.Contains(q, "pg_sleep") })
+	if sleep < 0 || slices.Contains(db.log[sleep:], "ROLLBACK") || slices.Contains(db.log[sleep:], "COMMIT") ||
+		!strings.Contains(db.log[n-1], "SELECT evidence.mark_refused('{") ||
 		!strings.Contains(db.log[n-1], `"cause":"timeout"`) || !strings.Contains(db.log[n-1], `"timeout":"30ms"`) {
 		t.Fatalf("%q", db.log)
 	}
@@ -195,7 +197,7 @@ func TestTimeoutsLeaveFastActionsAlone(t *testing.T) {
 	if isErr || !strings.Contains(text, `"outcome":"committed"`) {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	if db.log[1] != "BEGIN" || db.log[2] != "SET LOCAL statement_timeout = 65000; SET LOCAL lock_timeout = 5000" ||
+	if db.log[1] != "BEGIN" || !strings.HasSuffix(db.log[2], "; SET LOCAL statement_timeout = 65000; SET LOCAL lock_timeout = 5000") ||
 		!strings.Contains(db.log[3], "mark_action") || db.log[len(db.log)-1] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
@@ -242,9 +244,10 @@ func TestActionsPerMinuteAcrossSessions(t *testing.T) {
 	if !isErr || !strings.Contains(text, "was refused: 3 actions in the last minute, and the limit is 3") || !strings.Contains(text, "do not retry in a loop") {
 		t.Fatalf("the fourth action in a minute: %v %s", isErr, text)
 	}
-	// В базу ушла только отметка для тревоги: ни BEGIN, ни SQL агента.
-	if got := db.log[before:]; len(got) != 1 || !strings.HasPrefix(got[0], "SELECT evidence.mark_refused('{") ||
-		!strings.Contains(got[0], `"cause":"rate"`) || !strings.Contains(got[0], `"actions":3`) || !strings.Contains(got[0], `"limit":3`) {
+	// В базу ушла только отметка для тревоги, с чистого сеанса: ни BEGIN, ни
+	// SQL агента.
+	if got := db.log[before:]; len(got) != 2 || got[0] != "DISCARD ALL" || !strings.Contains(got[1], "SELECT evidence.mark_refused('{") ||
+		!strings.Contains(got[1], `"cause":"rate"`) || !strings.Contains(got[1], `"actions":3`) || !strings.Contains(got[1], `"limit":3`) {
 		t.Fatalf("%q", got)
 	}
 	before = len(db.log)
@@ -271,7 +274,7 @@ func TestActionsPerMinuteAcrossSessions(t *testing.T) {
 		now = now.Add(time.Second)
 	}
 	before = len(db.log)
-	if _, isErr := exec(third); !isErr || len(db.log) != before+1 || !strings.Contains(db.log[before], `"cause":"rate"`) {
+	if _, isErr := exec(third); !isErr || len(db.log) != before+2 || !strings.Contains(db.log[before+1], `"cause":"rate"`) {
 		t.Fatalf("a minute after the alert the agent loops again, and nobody is told: %q", db.log[before:])
 	}
 	// Счёт минуты — от последней тревоги, а не от первой.
@@ -416,5 +419,48 @@ func TestRateLimitDoesNotFailOpen(t *testing.T) {
 	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`)
 	if !isErr || !strings.Contains(text, "cannot be checked") || len(db.log) != 0 {
 		t.Fatalf("%v %s %q", isErr, text, db.log)
+	}
+}
+
+// Квитанция другого сеанса, застигнутая недописанной, входит в счёт, когда её
+// допишут. До исправления P-244 чтение продолжалось с конца файла, и остаток
+// строки не разбирался: квитанция пропадала из счёта сеанса насовсем, а
+// предел за окно пропускал действие сверх себя.
+func TestLedgerCountsAReceiptCaughtMidWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	stat := "40"
+	db := &fakeDB{answers: func(sql string) ([]pgwire.Result, bool) {
+		if strings.Contains(sql, "pg_stat_get_xact_tuples") && !strings.Contains(sql, "pg_current_xact_id") {
+			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
+		}
+		return nil, false
+	}}
+	b := serverOn(t, db, path, func(c *Config) { c.WindowRows, c.Window = 50, 10*time.Minute })
+	b.now = func() time.Time { return now }
+	if _, rows, _, err := b.usage(now); err != nil || rows != 0 {
+		t.Fatal(rows, err)
+	}
+	// Другой сеанс этого агента дописывает квитанцию о действии в 40 строк;
+	// этот читает, когда в файле лишь её начало.
+	line, _ := json.Marshal(Receipt{ActionID: "a-x", Time: now.Add(-time.Second).Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+		SQL: "UPDATE accounts SET note = 'x' WHERE id <= 40", Outcome: "committed", Rows: 40, XID: "900"})
+	line = append(line, '\n')
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.Write(line[:len(line)/2])
+	if _, rows, _, err := b.usage(now); err != nil || rows != 0 {
+		t.Fatalf("half a receipt counted: %d rows, %v", rows, err)
+	}
+	f.Write(line[len(line)/2:])
+	if _, rows, _, err := b.usage(now); err != nil || rows != 40 {
+		t.Fatalf("the receipt completed after a read: %d rows counted, want 40 (%v)", rows, err)
+	}
+	// И предел за окно держит: ещё 40 строк при пределе 50 — отказ.
+	if text, isErr := callText(t, b, "execute", `{"sql":"UPDATE accounts SET note = 'y' WHERE id > 40"}`); !isErr || !strings.Contains(text, "would have changed 80 rows") {
+		t.Fatalf("%v %s", isErr, text)
 	}
 }

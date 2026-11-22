@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -21,10 +22,11 @@ func TestStatementsArePreparedFirstInOneBatch(t *testing.T) {
 	if isErr || !strings.Contains(text, `"statements":["UPDATE 3","UPDATE 3"]`) {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	want := []string{"PREPARE es_agent_0 AS UPDATE accounts SET balance = balance - 1 WHERE id = 1", "PREPARE es_agent_1 AS UPDATE accounts SET balance = balance + 1 WHERE id = 2",
-		"EXECUTE es_agent_0", "EXECUTE es_agent_1", "COMMIT"}
-	if got := db.log[len(db.log)-5:]; strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("%q", got)
+	want := []string{"SET LOCAL search_path TO DEFAULT", "PREPARE es_agent_0 AS UPDATE accounts SET balance = balance - 1 WHERE id = 1",
+		"PREPARE es_agent_1 AS UPDATE accounts SET balance = balance + 1 WHERE id = 2", "EXECUTE es_agent_0", "EXECUTE es_agent_1", "SET CONSTRAINTS ALL IMMEDIATE"}
+	at := slices.Index(db.log, want[0])
+	if at < 0 || len(db.log) < at+len(want) || strings.Join(db.log[at:at+len(want)], "\n") != strings.Join(want, "\n") || db.log[len(db.log)-1] != "COMMIT" {
+		t.Fatalf("%q", db.log)
 	}
 	rc := receipts(t, path)
 	if len(rc) != 1 || len(rc[0].Statements) != 2 || rc[0].SQL != rc[0].Statements[0]+";\n"+rc[0].Statements[1] {
@@ -64,7 +66,7 @@ func TestRefusedStatementIsNamedAndNothingRuns(t *testing.T) {
 		t.Fatal(text)
 	}
 	// Чтение — свой совет.
-	db.fail = map[string]error{"; ": &pgwire.PgError{Severity: "ERROR", Code: "42601", Message: "cannot insert multiple commands into a prepared statement"}}
+	db.fail = map[string]error{"SELECT 1; SELECT 2": &pgwire.PgError{Severity: "ERROR", Code: "42601", Message: "cannot insert multiple commands into a prepared statement"}}
 	if text, _ := callText(t, s, "query", `{"sql":"SELECT 1; SELECT 2"}`); !strings.Contains(text, "`query` takes one SELECT") {
 		t.Fatal(text)
 	}

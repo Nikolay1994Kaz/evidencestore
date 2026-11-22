@@ -99,6 +99,11 @@ CREATE TABLE pgu.place (id int PRIMARY KEY, spot point, doc json, label text);
 CREATE TABLE pgu.calc (id int PRIMARY KEY, a int, twice int GENERATED ALWAYS AS (a * 2) STORED);
 -- Номер строки выдаёт база и писать его не даёт: ни вставкой, ни правкой.
 CREATE TABLE pgu.ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+-- Равенство грубее значения: 'alice' = 'ALICE' у citext (в public, как его
+-- обычно ставят: оператор = виден), 1.0 = 1.00 у numeric.
+CREATE EXTENSION IF NOT EXISTS citext SCHEMA public;
+CREATE TABLE pgu.tag (id int PRIMARY KEY, name public.citext, amount numeric);
+INSERT INTO pgu.tag VALUES (1, 'Alice', 1), (2, 'Bob', 2);
 INSERT INTO pgu.ident (v) VALUES ('a'), ('b'), ('c');
 INSERT INTO pgu.parent SELECT g, 'parent ' || g FROM generate_series(1, 4) g;
 INSERT INTO pgu.child (id, parent_id, note) SELECT g * 10 + k, g, 'child ' || k FROM generate_series(1, 4) g, generate_series(0, 1) k;
@@ -109,7 +114,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	version, _ := strconv.Atoi(one("SELECT current_setting('server_version_num')"))
 
 	cfg := Config{DSN: base + " user=pgu_tap", Slot: "pgu_slot", Publication: "pgu_pub", Dir: t.TempDir(),
-		Roles: []string{"pgu_agent"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident"}}
+		Roles: []string{"pgu_agent"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident", "pgu.tag"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +223,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	}
 	state := func(touched bool) string {
 		out := dump("SELECT * FROM pgu.parent") + dump("SELECT id, parent_id, note FROM pgu.child") + dump("SELECT * FROM pgu.loose") +
-			dump("SELECT tableoid::regclass, * FROM pgu.part") + dump("SELECT * FROM pgu.place") + dump("SELECT * FROM pgu.calc") + dump("SELECT * FROM pgu.ident")
+			dump("SELECT tableoid::regclass, * FROM pgu.part") + dump("SELECT * FROM pgu.place") + dump("SELECT * FROM pgu.calc") + dump("SELECT * FROM pgu.ident") + dump("SELECT * FROM pgu.tag")
 		if touched {
 			out += dump("SELECT id, touched FROM pgu.child")
 		}
@@ -321,6 +326,31 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 		t.Fatalf("a row changed after the check, the order of foreign keys: %v", err)
 	}
 
+	// Строки после агента правит человек, и его правка равна правке агента
+	// по равенству типа (регистр у citext, шкала у numeric): сверка видит
+	// изменение, откат не применён. Раньше сверка шла через =, правка
+	// человека считалась строкой, какой её оставил агент, и откат молча её
+	// затирал (P-248).
+	xid = act("UPDATE pgu.tag SET name = 'alice' WHERE id = 1; UPDATE pgu.tag SET amount = 1.0 WHERE id = 2")
+	if raced, err = plan(xid); err != nil {
+		t.Fatal(err)
+	}
+	exec(admin, "UPDATE pgu.tag SET name = 'ALICE' WHERE id = 1; UPDATE pgu.tag SET amount = 1.00 WHERE id = 2")
+	statuses, err := raced.Check(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _, bad := pgundo.Tally(statuses); ok != 0 || bad != 2 {
+		t.Fatalf("equality coarser than the value: %d steps to apply, %d conflicts: %+v", ok, bad, statuses)
+	}
+	held = state(true)
+	if _, err := raced.Apply(admin, map[string]any{"by": "test"}); err == nil || state(true) != held ||
+		one("SELECT name || ' ' || amount FROM pgu.tag WHERE id = 1") != "ALICE 1" || one("SELECT amount::text FROM pgu.tag WHERE id = 2") != "1.00" {
+		t.Fatalf("the undo overwrote the change of a person: %v", err)
+	}
+	// А сама правка агента в таких колонках откатывается как обычно.
+	roundTrip("citext and numeric", "UPDATE pgu.tag SET name = 'BOB', amount = 2.000 WHERE id = 2", true)
+
 	// 8. Секция, созданная после настройки базы: вход говорит о ней при
 	// подключении, откат её правки отказан. Скрипт, выполненный заново, это чинит.
 	exec(admin, "CREATE TABLE pgu.part_3 PARTITION OF pgu.part FOR VALUES FROM ('2026-03-01') TO ('2026-04-01'); INSERT INTO pgu.part VALUES (9, '2026-03-05', 1)")
@@ -376,7 +406,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	statuses, err := referred.Check(admin)
+	statuses, err = referred.Check(admin)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -91,6 +91,14 @@ func TestLiteralAndIdent(t *testing.T) {
 	if Literal("it's") != "'it''s'" || Ident(`a"b`) != `"a""b"` {
 		t.Fatal(Literal("it's"), Ident(`a"b`))
 	}
+	// С чертой — E'…' и черта удвоена: литерал не зависит от
+	// standard_conforming_strings (P-256). Как его читает база — TestLive.
+	if got := Literal(`x\`); got != ` E'x\\'` {
+		t.Fatal(got)
+	}
+	if got := Literal(`a\'b`); got != ` E'a\\''b'` {
+		t.Fatal(got)
+	}
 }
 
 func TestParseError(t *testing.T) {

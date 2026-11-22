@@ -264,8 +264,8 @@ func TestCheckAndApply(t *testing.T) {
 	// меняла), сверка обеих команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
 	if len(db.log) != 8 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], `SELECT evidence.mark_undo('{"by":"nikolay"}'`) ||
 		!strings.HasPrefix(db.log[3], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[4], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
-		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id" IS NOT DISTINCT FROM w.n0 AND t."v" IS NOT DISTINCT FROM w.n1`) ||
-		!strings.Contains(db.log[5], `LEFT JOIN "public"."t" t ON t."id" = w.o0`) || !strings.Contains(db.log[6], `NOT (t."v" IS NOT DISTINCT FROM w.o1)`) || db.log[7] != "COMMIT" {
+		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id"::text IS NOT DISTINCT FROM w.n0::text AND t."v"::text IS NOT DISTINCT FROM w.n1::text`) ||
+		!strings.Contains(db.log[5], `LEFT JOIN "public"."t" t ON t."id" = w.o0`) || !strings.Contains(db.log[6], `NOT (t."v"::text IS NOT DISTINCT FROM w.o1::text)`) || db.log[7] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
 
@@ -373,7 +373,7 @@ func TestCheckTakesGeneratedAndUncomparableColumnsFromTheCatalog(t *testing.T) {
 	for _, want := range []string{
 		`INSERT INTO "public"."t" ("id", "v", "place") OVERRIDING SYSTEM VALUE` + "\n  SELECT w.o0, w.o1, w.o3",
 		`UPDATE "public"."t" t SET "v" = w.o1, "place" = w.o3` + "\n",
-		`t."double" IS NOT DISTINCT FROM w.n2 AND t."place"::text IS NOT DISTINCT FROM w.n3::text`,
+		`t."double"::text IS NOT DISTINCT FROM w.n2::text AND t."place"::text IS NOT DISTINCT FROM w.n3::text`,
 		`NOT (t."place"::text IS NOT DISTINCT FROM w.o3::text)`,
 	} {
 		if !strings.Contains(all, want) {
@@ -444,7 +444,7 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 		case strings.Contains(q, "NOT EXISTS"):
 			what = "update-moved"
 			// Строка под прежним ключом, ещё не равная до-образу, а под новым ключом её уже нет.
-			if !strings.Contains(q, `WHERE ROW(w.o0) IS DISTINCT FROM ROW(w.n0) AND t."id" = w.o0 AND NOT (t."id" IS NOT DISTINCT FROM w.o0 AND t."v" IS NOT DISTINCT FROM w.o1)`+
+			if !strings.Contains(q, `WHERE ROW(w.o0) IS DISTINCT FROM ROW(w.n0) AND t."id" = w.o0 AND NOT (t."id"::text IS NOT DISTINCT FROM w.o0::text AND t."v"::text IS NOT DISTINCT FROM w.o1::text)`+
 				` AND NOT EXISTS (SELECT 1 FROM "public"."other" x WHERE x."id" = w.n0)`) {
 				t.Fatalf("the statement for rows a cascade moved back:\n%s", q)
 			}

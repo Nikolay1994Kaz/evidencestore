@@ -124,10 +124,14 @@ type Receipt struct {
 	SQL        string   `json:"sql"`
 	Statements []string `json:"statements,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
-	XID        string   `json:"xid,omitempty"`
-	// Outcome — committed, failed, refused (остановлено пределом) или escaped
+	// XID — номер транзакции, 32 бита, как в журнале базы и хранилище;
+	// FullXID — он же с эпохой (xid8): различает номера, занятые заново.
+	XID     string `json:"xid,omitempty"`
+	FullXID string `json:"xid8,omitempty"`
+	// Outcome — committed, failed, refused (остановлено пределом), escaped
 	// (SQL агента сам закрыл транзакцию сервера: что он изменил после этого,
-	// могло зафиксироваться мимо пределов).
+	// могло зафиксироваться мимо пределов) или unknown (связь оборвалась на
+	// COMMIT: зафиксировано ли, неизвестно).
 	Outcome string   `json:"outcome"`
 	Tags    []string `json:"tags,omitempty"`
 	Rows    int      `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
@@ -472,14 +476,42 @@ func (s *Server) history() []Receipt {
 	if err != nil {
 		return s.recent
 	}
+	// Файл квитанций может быть общим у нескольких агентов: свои — только
+	// этого (P-247). Чужое действие агент не видит и не откатывает.
 	var out []Receipt
 	for _, line := range strings.Split(string(data), "\n") {
 		var rc Receipt
-		if line != "" && json.Unmarshal([]byte(line), &rc) == nil {
+		if line != "" && json.Unmarshal([]byte(line), &rc) == nil && rc.Agent == s.cfg.Agent {
 			out = append(out, rc)
 		}
 	}
 	return out
+}
+
+// marks — несёт ли транзакция плана отметку действия actionID.
+func marks(p *pgundo.Plan, actionID string) bool {
+	for _, a := range p.Actions {
+		var m struct {
+			Info struct {
+				ActionID string `json:"action_id"`
+			} `json:"info"`
+		}
+		if json.Unmarshal(a, &m) == nil && m.Info.ActionID == actionID {
+			return true
+		}
+	}
+	return false
+}
+
+// undoSession — search_path для сверки и отката (сеанс — после fresh, прочее
+// DISCARD ALL уже вернул). pg_catalog — первым: системные функции, операторы и
+// типы ничем не заслонить; за ним путь роли (типы колонок в журнале — как их
+// назвал format_type у сборщика, свои типы базы без схемы); pg_temp —
+// последним. Сам запрос — с полными именами: путь роли агент выбирает сам.
+func (s *Server) undoSession() error {
+	_, err := s.run("SELECT pg_catalog.set_config('search_path', pg_catalog.concat_ws(', ', 'pg_catalog', " +
+		"NULLIF(pg_catalog.current_setting('search_path'), ''), 'pg_temp'), false)")
+	return err
 }
 
 // undo показывает или применяет откат действия. До-образы — только из
@@ -496,22 +528,54 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 		return "", fmt.Errorf("action %s is not in this server's receipts", actionID)
 	case target.Outcome != "committed":
 		return "", fmt.Errorf("action %s did not commit (%s): there is nothing to undo", actionID, target.Outcome)
+	case target.Tool == "undo_apply":
+		// Откат отката повторил бы то изменение, которое откат вернул (P-249).
+		return "", fmt.Errorf("action %s is itself an undo (of %s): undoing it would make that change again. Ask a person", actionID, target.Undoes)
 	}
-	xid, err := strconv.ParseUint(target.XID, 10, 32)
+	// Откат — тоже действие агента: под тем же замком и пределами, что
+	// execute (P-249). Частота — раньше базы.
+	var rc Receipt
+	if apply {
+		unlock, err := s.actionLock()
+		if err != nil {
+			return "", fmt.Errorf("the undo of action %s did not run: %w", actionID, err)
+		}
+		defer unlock()
+		rc = Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "undo_apply",
+			Reason: reason, Undoes: actionID, Client: s.client, Outcome: "failed"}
+		if err := s.throttle(&rc); err != nil {
+			rc.Error = err.Error()
+			s.keep(rc)
+			return "", fmt.Errorf("undo %s was refused: %w", rc.ActionID, err)
+		}
+	}
+	// В квитанциях до 22.11 номер — с эпохой (xid8); журнал базы и хранилище
+	// знают его младшие 32 бита.
+	full, err := strconv.ParseUint(target.XID, 10, 64)
 	if err != nil {
 		return "", fmt.Errorf("action %s has no transaction id in its receipt", actionID)
 	}
-	lines, err := s.cfg.Fetch(uint32(xid))
+	xid := uint32(full)
+	lines, err := s.cfg.Fetch(xid)
 	if err != nil {
 		return "", fmt.Errorf("the row images of action %s could not be taken from the evidence store: %w", actionID, err)
 	}
-	plan, err := pgundo.Build(uint32(xid), lines)
+	plan, err := pgundo.Build(xid, lines)
 	if err != nil {
 		return "", err
 	}
-	// Сверка и откат читают и пишут значения текстом: настройки сеанса,
-	// которые SQL агента мог сменить (DateStyle, search_path…), им не нужны.
+	// Транзакция с этим номером — та, что несёт отметку действия: номер
+	// бывает занят заново (база восстановлена из копии, счётчик обошёл
+	// 32 бита), и откат чужой транзакции вышел бы откатом этого действия.
+	if !marks(plan, actionID) {
+		return "", fmt.Errorf("transaction %d in the evidence store carries no marker of action %s: the transaction id was taken again "+
+			"(the database was restored from a backup, or the counter wrapped). This action is not undone here: ask a person", xid, actionID)
+	}
+	// Сверка и откат — с чистого сеанса и со своими настройками (undoSession).
 	if err := s.fresh(); err != nil {
+		return "", err
+	}
+	if err := s.undoSession(); err != nil {
 		return "", err
 	}
 	statuses, err := plan.Check(s.db)
@@ -532,13 +596,35 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	if ok == 0 {
 		return "", fmt.Errorf("nothing to apply for action %s: %d steps are already as before, %d are conflicts", actionID, done, bad)
 	}
-	rc := Receipt{ActionID: s.newID(), Time: s.now().UTC().Format(time.RFC3339Nano), Agent: s.cfg.Agent, Tool: "undo_apply",
-		Reason: reason, Undoes: actionID, Client: s.client, Outcome: "failed"}
+	// Пределы строк — по шагам отката: столько строк он изменит.
+	refuse := func(cause string, info map[string]any, why error) (string, error) {
+		rc.Outcome, rc.Cause, rc.Rows, rc.Error = "refused", cause, ok, why.Error()
+		s.markRefused(&rc, info)
+		if werr := s.keep(rc); werr != nil {
+			s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
+		}
+		return "", fmt.Errorf("undo %s was refused, nothing changed: %w", rc.ActionID, why)
+	}
+	if s.cfg.RowLimit > 0 && ok > s.cfg.RowLimit {
+		return refuse(CauseRowLimit, map[string]any{"rows": ok, "limit": s.cfg.RowLimit},
+			fmt.Errorf("it would change %d rows, and one action may change at most %d: ask a person to undo it", ok, s.cfg.RowLimit))
+	}
+	if s.cfg.WindowRows > 0 {
+		_, before, _, err := s.usage(s.now())
+		if err != nil {
+			return "", fmt.Errorf("the receipts journal could not be read, so the limit of %d rows in %s cannot be checked: %w", s.cfg.WindowRows, s.cfg.Window, err)
+		}
+		if before+ok > s.cfg.WindowRows {
+			return refuse(CauseWindowRows, map[string]any{"rows": ok, "window_rows": before, "limit": s.cfg.WindowRows, "window": s.cfg.Window.String()},
+				fmt.Errorf("with its %d rows the agent would have changed %d rows in the last %s, and the limit is %d: ask a person to undo it",
+					ok, before+ok, s.cfg.Window, s.cfg.WindowRows))
+		}
+	}
 	// Откат — тоже действие: его отметка несёт и номер действия, и что он возвращает.
 	applied, err := plan.Apply(s.db, map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": reason,
 		"undoes_action": actionID, "undoes_xid": target.XID, "steps_applied": ok, "conflicts_left": bad})
 	if err == nil {
-		rc.XID, rc.Outcome = applied.XID, "committed"
+		rc.XID, rc.Outcome, rc.Rows = applied.XID, "committed", applied.Steps
 	} else {
 		rc.Error = err.Error()
 	}
@@ -636,65 +722,6 @@ func statements(sql string, list []string) ([]string, error) {
 	return list, nil
 }
 
-// agentStmt — имя подготовленной команды агента под номером i.
-func agentStmt(i int) string { return fmt.Sprintf("es_agent_%d", i) }
-
-// prepared — пачка для команд агента: сначала PREPARE каждой, потом EXECUTE
-// каждой. Разбор пачки (Parse) допускает в тексте одну команду, грамматика
-// PREPARE — только SELECT, INSERT, UPDATE, DELETE, MERGE и VALUES: всё прочее
-// база отвергает при разборе, и раз все PREPARE идут первыми, не исполняется
-// ни одна команда агента. Склейка текста безопасна: «;» отвергнет Parse, а
-// после AS грамматика другого не примет.
-func prepared(stmts []string) []string {
-	batch := make([]string, 0, 2*len(stmts))
-	for i, st := range stmts {
-		batch = append(batch, "PREPARE "+agentStmt(i)+" AS "+st)
-	}
-	for i := range stmts {
-		batch = append(batch, "EXECUTE "+agentStmt(i))
-	}
-	return batch
-}
-
-// agentResults — ответы на команды агента из ответов пачки prepared: первые
-// n — подготовка.
-func agentResults(res []pgwire.Result, n int) []pgwire.Result {
-	if len(res) <= n {
-		return nil
-	}
-	return res[n:]
-}
-
-// refusedStmt объясняет ошибку пачки prepared: на какой команде агента и
-// почему. done — сколько команд пачки прошло; n — команд агента. Отказ при
-// подготовке с синтаксической ошибкой — почти всегда команда, которой нельзя
-// (COMMIT, SET…), или две в одном тексте: об этом и сказано.
-func refusedStmt(err error, done, n int, read bool) error {
-	var pg *pgwire.PgError
-	if !errors.As(err, &pg) {
-		return err
-	}
-	if done >= n {
-		if n == 1 {
-			return err
-		}
-		return fmt.Errorf("statement %d: %w", done-n+1, err)
-	}
-	which := "the statement"
-	if n > 1 {
-		which = fmt.Sprintf("statement %d", done+1)
-	}
-	if pg.Code != "42601" {
-		return fmt.Errorf("%s: %w", which, err)
-	}
-	if read {
-		return fmt.Errorf("%s was not taken: %w. `query` takes one SELECT (or VALUES) and nothing else; several statements in one string are refused, and changes go through `execute`", which, err)
-	}
-	return fmt.Errorf("%s was not taken, nothing ran: %w. Each statement must be a single SELECT, INSERT, UPDATE, DELETE, MERGE or VALUES: "+
-		"the server runs the transaction itself, so BEGIN, COMMIT, ROLLBACK, SET, DO, CALL and schema changes are not taken, "+
-		"and several statements go as separate items of `statements`", which, err)
-}
-
 func (s *Server) query(sql string) (string, error) {
 	if err := s.fresh(); err != nil {
 		return "", err
@@ -702,14 +729,13 @@ func (s *Server) query(sql string) (string, error) {
 	if _, err := s.run("BEGIN TRANSACTION READ ONLY"); err != nil {
 		return "", err
 	}
-	if guards := s.guards(); guards != "" {
-		if _, err := s.run(guards); err != nil {
-			s.run("ROLLBACK")
-			return "", err
-		}
+	if _, err := s.run(strings.Join(append(slices.Clone(own), s.guards()...), "; ")); err != nil {
+		s.run("ROLLBACK")
+		return "", err
 	}
-	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(prepared([]string{sql})) })
-	res := agentResults(all, 1)
+	b := newBatch([]string{sql}, false, s.guards())
+	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(b.sqls) })
+	res := b.agent(all)
 	if s.db != nil && s.leftReadOnly(res) {
 		// Чтение закрыло свою транзакцию «только для чтения»: всё, что шло
 		// после этого, исполнялось с правами роли и могло зафиксироваться. С
@@ -720,7 +746,7 @@ func (s *Server) query(sql string) (string, error) {
 		s.run("ROLLBACK")
 	}
 	if err != nil {
-		return "", refusedStmt(err, len(all), 1, true)
+		return "", b.refused(err, len(all), true)
 	}
 	type set struct {
 		Columns   []string    `json:"columns"`
@@ -755,7 +781,12 @@ func (s *Server) execute(stmts []string, reason string) (string, error) {
 	if len(stmts) > 1 {
 		rc.Statements = stmts
 	}
-	err := s.throttle(&rc)
+	unlock, err := s.actionLock()
+	if err != nil {
+		return "", fmt.Errorf("action %s did not run: %w", rc.ActionID, err)
+	}
+	defer unlock()
+	err = s.throttle(&rc)
 	if err == nil {
 		err = s.transaction(&rc, stmts)
 	}
@@ -772,6 +803,9 @@ func (s *Server) execute(stmts []string, reason string) (string, error) {
 	}
 	if err != nil && rc.Outcome == "escaped" {
 		return "", fmt.Errorf("action %s %w", rc.ActionID, err)
+	}
+	if err != nil && rc.Outcome == "unknown" {
+		return "", fmt.Errorf("action %s: %w", rc.ActionID, err)
 	}
 	if err != nil && rc.Outcome == "refused" {
 		return "", fmt.Errorf("action %s was refused and rolled back, nothing changed: %w", rc.ActionID, err)
@@ -804,8 +838,10 @@ func (s *Server) throttle(rc *Receipt) error {
 	// цикле не должен завалить их сообщениями. В квитанциях — каждый отказ, и
 	// по ним же видно, когда тревога уже была: сеансов у агента много.
 	if now.Sub(alerted) >= time.Minute {
-		rc.Alerted = true
-		s.markRefused(rc, map[string]any{"actions": actions, "limit": s.cfg.ActionsPerMinute})
+		// С чистого сеанса: отказ раньше базы идёт до транзакции, а сеанс
+		// остался от прошлого вызова (P-243). В квитанции «тревога ушла» —
+		// только если отметка легла.
+		rc.Alerted = s.fresh() == nil && s.markRefused(rc, map[string]any{"actions": actions, "limit": s.cfg.ActionsPerMinute})
 	}
 	return fmt.Errorf("%d actions in the last minute, and the limit is %d. Wait before the next one and do not retry in a loop; if this pace is needed, ask a person to raise the limit",
 		actions, s.cfg.ActionsPerMinute)
@@ -824,10 +860,10 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		}
 		return err
 	}
-	if guards := s.guards(); guards != "" {
-		if _, err := s.run(guards); err != nil {
-			return fail(err)
-		}
+	// Свои настройки — раньше своих запросов: сеанс после DISCARD ALL несёт
+	// умолчания роли агента, а их агент меняет сам (P-242).
+	if _, err := s.run(strings.Join(append(slices.Clone(own), s.guards()...), "; ")); err != nil {
+		return fail(err)
 	}
 	mark, _ := json.Marshal(map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": rc.Reason, "client": rc.Client})
 	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
@@ -835,9 +871,11 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		return fail(fmt.Errorf("the action marker could not be set (is the database prepared with escollect -setup-sql?): %w", err))
 	}
 	// Номер транзакции, а при пределах строк — и счёт строк до SQL агента
-	// (changed): тем же запросом, без лишнего обмена с базой.
+	// (changed): тем же запросом, без лишнего обмена с базой. Номер — 32
+	// бита, как в журнале базы, справочнике, хранилище и тревогах; полный
+	// (с эпохой) — рядом (P-247).
 	counting := s.cfg.RowLimit > 0 || s.cfg.WindowRows > 0
-	ask := "SELECT pg_current_xact_id()::text"
+	ask := "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text"
 	if counting {
 		ask += ", " + xactRows
 	}
@@ -848,17 +886,18 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		}
 		return fail(err)
 	}
-	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
-		rc.XID = *res[0].Rows[0][0]
+	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) >= 2 && res[0].Rows[0][0] != nil && res[0].Rows[0][1] != nil {
+		rc.XID, rc.FullXID = *res[0].Rows[0][0], *res[0].Rows[0][1]
 	}
 	before := 0
 	if counting {
-		if before, err = countIn(res, 1); err != nil {
+		if before, err = countIn(res, 2); err != nil {
 			return fail(fmt.Errorf("the rows the action changes could not be counted, so the row limits cannot be checked: %w", err))
 		}
 	}
-	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(prepared(stmts)) })
-	for _, r := range agentResults(all, len(stmts)) {
+	b := newBatch(stmts, true, s.guards())
+	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(b.sqls) })
+	for _, r := range b.agent(all) {
 		rc.Tags = append(rc.Tags, r.Tag)
 	}
 	if errors.Is(err, errTimeout) {
@@ -878,7 +917,7 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		return s.escaped(rc)
 	}
 	if err != nil {
-		return fail(refusedStmt(err, len(all), len(stmts), false))
+		return fail(b.refused(err, len(all), false))
 	}
 	if s.cfg.RowLimit > 0 || s.cfg.WindowRows > 0 {
 		// Предохранитель: до фиксации известно, сколько строк действие изменило.
@@ -916,6 +955,15 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		}
 	}
 	if _, err := s.run("COMMIT"); err != nil {
+		var pg *pgwire.PgError
+		if !errors.As(err, &pg) {
+			// Связь оборвалась на COMMIT: зафиксировала ли база, отсюда не
+			// узнать. «Откатилось» сказать нельзя — агент повторил бы
+			// действие (P-250).
+			rc.Outcome = "unknown"
+			return fmt.Errorf("lost the connection to the database during COMMIT: the action may have been committed (transaction %s). "+
+				"Do not repeat it: ask a person to check the transaction", rc.XID)
+		}
 		return fail(err)
 	}
 	rc.Outcome = "committed"
@@ -952,7 +1000,7 @@ func (s *Server) left(xid string, tags []string) (bool, error) {
 	if !closes(tags) {
 		return false, nil
 	}
-	res, err := s.run("SELECT pg_current_xact_id_if_assigned()::text")
+	res, err := s.run("SELECT pg_current_xact_id_if_assigned()::xid::text")
 	if err != nil {
 		return false, err
 	}

@@ -46,6 +46,30 @@ func TestLive(t *testing.T) {
 	if row, ok, err := c.QueryRow("SELECT " + Literal("still here")); err != nil || !ok || *row[0] != "still here" {
 		t.Fatal(row, ok, err)
 	}
+	// Литерал читается базой как то же значение при любом
+	// standard_conforming_strings, и соседний литерал остаётся значением, а
+	// не текстом SQL. Раньше при off черта в конце съедала кавычку, и
+	// следующее значение исполнялось (P-256).
+	nasty := []string{`x\`, `)) v(a); SELECT 'injected'; --`, `a\'b`, `\\`, `\x41\n`, `it's`, "line\nbreak", ""}
+	for _, mode := range []string{"off", "on"} {
+		if _, err := c.Query("SET escape_string_warning = off; SET standard_conforming_strings = " + mode); err != nil {
+			t.Fatal(err)
+		}
+		var lits []string
+		for _, v := range nasty {
+			lits = append(lits, Literal(v))
+		}
+		res, err := c.Query("SELECT * FROM (VALUES (" + strings.Join(lits, ", ") + ")) v")
+		if err != nil || len(res) != 1 || len(res[0].Rows) != 1 || len(res[0].Rows[0]) != len(nasty) {
+			t.Fatalf("standard_conforming_strings = %s: %+v %v", mode, res, err)
+		}
+		for i, v := range nasty {
+			if got := res[0].Rows[0][i]; got == nil || *got != v {
+				t.Fatalf("standard_conforming_strings = %s: %q came back as %v", mode, v, got)
+			}
+		}
+	}
+	c.Query("RESET standard_conforming_strings; RESET escape_string_warning")
 	// Неверный пароль — отказ (если сервер его вообще спрашивает).
 	bad := cfg
 	bad.Password = "wrong-" + cfg.Password
