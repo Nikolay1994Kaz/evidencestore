@@ -327,25 +327,32 @@ func SetupSQL(c *Config) (string, error) {
 	p("-- бы функции отметок и подложил свои (R1-6). Обе — как обещано, что бы ни было до скрипта.")
 	p("ALTER ROLE %s NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD NULL;", id(EvidenceOwner))
 	p("ALTER SCHEMA evidence OWNER TO %s;", id(EvidenceOwner))
+	p("-- Ключ отметок: функции ниже кладут его в каждую отметку, прочесть его может только сборщик.")
+	p("-- Отметку с тем же префиксом пишет и роль, которой дали pg_logical_emit_message (outbox), —")
+	p("-- с чужой ролью или «откатом»; без ключа сборщик её подлинной не считает (DECISIONS, п. 41).")
+	p("CREATE TABLE IF NOT EXISTS evidence.marker_key (k text NOT NULL);")
+	p("ALTER TABLE evidence.marker_key OWNER TO %s;", id(EvidenceOwner))
+	p("REVOKE ALL ON evidence.marker_key FROM PUBLIC;")
+	p("INSERT INTO evidence.marker_key SELECT replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '') WHERE NOT EXISTS (SELECT FROM evidence.marker_key);")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_who() RETURNS trigger")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
 	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object(", lit(pgtap.PrefixWho))
 	p("    'role', session_user, 'app', current_setting('application_name', true),")
-	p("    'op', TG_OP, 'table', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME)::text);")
+	p("    'op', TG_OP, 'table', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);")
 	p("  RETURN NULL;")
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_who() FROM PUBLIC;")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_action(info json) RETURNS void")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
-	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixAction))
+	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);", lit(pgtap.PrefixAction))
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_action(json) FROM PUBLIC;")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_undo(info json) RETURNS void")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
-	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixUndo))
+	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);", lit(pgtap.PrefixUndo))
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_undo(json) FROM PUBLIC;")
 	p("-- Отказ: MCP-сервер остановил действие пределом строк и откатывает его. Сообщение не")
@@ -353,7 +360,7 @@ func SetupSQL(c *Config) (string, error) {
 	p("CREATE OR REPLACE FUNCTION evidence.mark_refused(info json) RETURNS void")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
 	p("BEGIN")
-	p("  PERFORM pg_logical_emit_message(false, %s, json_build_object('role', session_user, 'info', info)::text);", lit(pgtap.PrefixRefused))
+	p("  PERFORM pg_logical_emit_message(false, %s, json_build_object('role', session_user, 'info', info, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);", lit(pgtap.PrefixRefused))
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_refused(json) FROM PUBLIC;")
 	p("ALTER FUNCTION evidence.mark_who() OWNER TO %s;", id(EvidenceOwner))
@@ -628,8 +635,10 @@ func SetupSQL(c *Config) (string, error) {
 	p("  END IF;")
 	p("END $evidence$;")
 	p("")
-	p("-- Роль сборщика: читает поток репликации, к таблицам доступа не имеет.")
+	p("-- Роль сборщика: читает поток репликации и ключ отметок, к таблицам доступа не имеет.")
 	p("DO $evidence$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s LOGIN REPLICATION; END IF; END $evidence$;", lit(tapRole), id(tapRole))
+	p("GRANT USAGE ON SCHEMA evidence TO %s;", id(tapRole))
+	p("GRANT SELECT ON evidence.marker_key TO %s;", id(tapRole))
 	p("COMMIT;")
 	return b.String(), nil
 }
@@ -789,7 +798,11 @@ func (s *Source) connect(ctx context.Context) (err error) {
 	// так же пишет значения regclass, regtype и подобных — откат читает их с
 	// путём своего сеанса, и имя без схемы там нашлось бы не то (R2 заход 2,
 	// R1 заход 3).
-	pinned := map[string]string{"search_path": "pg_catalog, pg_temp"}
+	// TimeZone и bytea_output — ещё и ради хеша отпечатка: текст значения не
+	// зависит от умолчаний сервера, базы и роли, и строку из бэкапа сверяют с
+	// ним в сеансе с теми же настройками (README; R2-4, T-4). DateStyle,
+	// IntervalStyle и extra_float_digits ставит pgwire у любого соединения.
+	pinned := map[string]string{"search_path": "pg_catalog, pg_temp", "TimeZone": "UTC", "bytea_output": "hex"}
 	catDSN := s.dsn
 	catDSN.Params = pinned
 	cat, err := pgwire.Dial(ctx, catDSN)
@@ -810,6 +823,12 @@ func (s *Source) connect(ctx context.Context) (err error) {
 		return err
 	} else if !ok {
 		return fmt.Errorf("publication %s does not exist: run the script printed by escollect -setup-sql", s.cfg.Publication)
+	}
+	// Ключ отметок (DECISIONS, п. 41): без него поддельную отметку не отличить.
+	if row, ok, err := cat.QueryRow("SELECT k FROM evidence.marker_key LIMIT 1"); err != nil || !ok || row[0] == nil || *row[0] == "" {
+		return fmt.Errorf("the marker key (evidence.marker_key) cannot be read (%v): run the script printed by escollect -setup-sql — this version needs it", err)
+	} else {
+		s.tap.SetMarkerKey(*row[0])
 	}
 	s.watchIdentity(cat)
 	start, err := s.ensureSlot(cat)

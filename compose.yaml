@@ -44,7 +44,10 @@ services:
       - ./state/db:/run/es:ro
       - ./deploy/docker/demo.sql:/docker-entrypoint-initdb.d/demo.sql:ro
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "shop"]
+      # По TCP, как к ней ходят остальные: при первом запуске образ гоняет
+      # скрипты initdb на временном сервере только с сокетом, и проверка по
+      # сокету сказала бы «готова» раньше времени (R1-8, R2-6).
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "shop"]
       interval: 2s
       retries: 30
 

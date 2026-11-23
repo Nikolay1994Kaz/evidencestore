@@ -97,7 +97,8 @@ func (f *Fetcher) Fetch(xid uint32) ([][]byte, error) {
 			break
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("transaction %d is not in the collector's index: it changed no watched table, or the collector has not read it yet", xid)
+			return nil, fmt.Errorf("transaction %d is not in the collector's index: it changed no watched table, or the collector has not read it yet "+
+				"(the fingerprints of roles outside the collector's lists reach the index in packs, up to a minute after the commit)", xid)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

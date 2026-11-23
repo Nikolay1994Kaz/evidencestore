@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,7 @@ const (
 	KindIdentity   = "identity"       // таблица без REPLICA IDENTITY FULL
 	KindLateMarker = "late-marker"    // отметка пришла после пропущенных изменений
 	KindNoWho      = "no-who"         // изменения без отметки «кто»: триггер выключен или его нет
+	KindForged     = "forged-marker"  // отметка не от функций evidence: её написали pg_logical_emit_message напрямую
 	KindRefused    = "refused"        // MCP-сервер остановил действие пределом строк
 	KindEscaped    = "escaped"        // SQL агента сам закрыл транзакцию MCP-сервера
 	KindUnknown    = "commit-unknown" // связь MCP-сервера с базой оборвалась на COMMIT: действие могло зафиксироваться
@@ -84,6 +86,9 @@ type Event struct {
 	Undo     json.RawMessage   `json:"undo,omitempty"`
 	FirstSeq uint64            `json:"first_seq,omitempty"`
 	LastSeq  uint64            `json:"last_seq,omitempty"`
+	// Fingerprint — от транзакции в хранилище только отпечаток (роль не из
+	// списков сборщика): откатить её нельзя.
+	Fingerprint bool `json:"fingerprint,omitempty"`
 }
 
 // Add добавляет повод; точный повтор (ловушку тронули дважды одним и тем же
@@ -277,6 +282,10 @@ func Text(e Event, o TextOptions) string {
 	switch {
 	case e.XID != 0 && e.Undo != nil:
 		fmt.Fprintf(&b, "evidencestore, %s: undo transaction %d", title, e.XID)
+	case e.XID != 0 && e.Fingerprint:
+		fmt.Fprintf(&b, "evidencestore, %s: transaction %d of a role outside the collector's lists (only its fingerprint is kept)", title, e.XID)
+	case e.XID != 0 && slices.Contains(e.Kinds(), KindNoWho):
+		fmt.Fprintf(&b, "evidencestore, %s: transaction %d without a who marker", title, e.XID)
 	case e.XID != 0:
 		fmt.Fprintf(&b, "evidencestore, %s: agent transaction %d", title, e.XID)
 	default:
@@ -313,7 +322,7 @@ func Text(e Event, o TextOptions) string {
 		} else {
 			fmt.Fprintf(&tail, "\nstore records: %d–%d", e.FirstSeq, e.LastSeq)
 		}
-		if o.UndoHint != "" && e.Undo == nil {
+		if o.UndoHint != "" && e.Undo == nil && !e.Fingerprint {
 			fmt.Fprintf(&tail, "\nundo preview: %s", short(strings.ReplaceAll(o.UndoHint, "{xid}", strconv.FormatUint(uint64(e.XID), 10))))
 		}
 	}

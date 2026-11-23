@@ -171,7 +171,9 @@ func check(args []string) {
 	var err error
 	var schemas []string
 	if *searchPath != "" {
-		schemas = strings.Split(*searchPath, ",")
+		for _, n := range strings.Split(*searchPath, ",") {
+			schemas = append(schemas, strings.TrimSpace(n))
+		}
 	}
 	if *cfgPath != "" {
 		// Записи — из хранилища: пакет на каждую, проверка — командой из настроек.
@@ -246,16 +248,18 @@ func apply(args []string) {
 	by := fs.String("by", "", "who undoes (goes into the journal)")
 	reason := fs.String("reason", "", "why (goes into the journal)")
 	fs.Parse(args)
-	if *cfgPath != "" && *dsn == "" {
-		*dsn = loadConfig(*cfgPath).DSN
+	var cfg *Config
+	if *cfgPath != "" {
+		cfg = loadConfig(*cfgPath)
+		if *dsn == "" {
+			*dsn = cfg.DSN
+		}
 	}
 	if *path == "" || *dsn == "" || *by == "" {
 		usage()
 	}
-	data, err := os.ReadFile(*path)
+	p, err := loadPlan(*path, cfg)
 	fail(err)
-	var p pgundo.Plan
-	fail(json.Unmarshal(data, &p))
 	if len(p.OK) == 0 {
 		fmt.Println("nothing to apply: the check found no step to take")
 		return
@@ -278,6 +282,24 @@ func apply(args []string) {
 	for _, d := range done.Differ {
 		fmt.Printf("    %s.%s: %d rows\n", pgundo.Shown(d.Table), pgundo.Shown(d.Column), d.Rows)
 	}
+}
+
+// loadPlan читает сверенный план. С настройками путь поиска — из них: их и
+// правят, когда триггер не нашёл таблицу без схемы (T-5); сеанс отката снова
+// проверяет каждую схему пути.
+func loadPlan(path string, cfg *Config) (*pgundo.Plan, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var p pgundo.Plan
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if cfg != nil {
+		p.SearchPath = cfg.SearchPath
+	}
+	return &p, nil
 }
 
 // describe — что сделала транзакция и что сделает откат. Всё, что пришло из

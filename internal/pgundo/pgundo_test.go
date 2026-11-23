@@ -697,3 +697,12 @@ func TestSessionSearchPath(t *testing.T) {
 		t.Fatalf("a bad path in a plan file: %v", err)
 	}
 }
+
+// Отпечаток своими частями (pgtap, крупнее fpInline) по телам записей — тоже
+// отказ: строк «до» в нём нет, только хеши (P-300).
+func TestBuildRefusesAFingerprintStream(t *testing.T) {
+	_, err := Build(7, journal(1<<30, m{"fingerprint": true}, m{"t": "U", "r": "public.t", "k": []any{"1"}, "o": "x", "n": "y"}))
+	if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "only its fingerprint") {
+		t.Fatalf("a fingerprint stream: %v", err)
+	}
+}

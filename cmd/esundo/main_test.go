@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -43,5 +45,20 @@ func TestDescribeKeepsTheAgentsTextOnItsLine(t *testing.T) {
 	c := pgundo.Conflict{Op: pgundo.OpUpdate, Columns: []pgundo.ConflictColumn{{Name: "note", Was: &v, Left: &v, Now: &v}}}
 	if got := c.Lines(); len(got) != 1 || strings.ContainsAny(got[0], "\n\x1b") {
 		t.Fatalf("%q", got)
+	}
+}
+
+// esundo apply -config берёт путь поиска из настроек, а не из плана (T-5).
+func TestApplyTakesTheSearchPathOfTheSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plan.json")
+	os.WriteFile(path, []byte(`{"xid":7,"search_path":["old"],"apply":[1]}`), 0o600)
+	p, err := loadPlan(path, nil)
+	if err != nil || len(p.SearchPath) != 1 || p.SearchPath[0] != "old" {
+		t.Fatalf("without settings: %v %v", p, err)
+	}
+	cfg := &Config{}
+	cfg.SearchPath = []string{"public", "app"}
+	if p, err = loadPlan(path, cfg); err != nil || strings.Join(p.SearchPath, ",") != "public,app" {
+		t.Fatalf("with settings: %v %v", p, err)
 	}
 }

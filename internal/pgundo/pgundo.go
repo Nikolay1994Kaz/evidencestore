@@ -150,6 +150,10 @@ func Build(xid uint32, lines [][]byte) (*Plan, error) {
 	if v, _ := head["v"].(float64); v != pgtap.FormatVersion {
 		return nil, refuse("the journal stream is of version %v, this build reads %d", head["v"], pgtap.FormatVersion)
 	}
+	if head["fingerprint"] == true {
+		return nil, refuse("transaction %d is of a role outside the collector's lists: the store keeps only its fingerprint — who, the keys of the rows "+
+			"and their hashes, not the rows — so it cannot be undone from the store. Restore the rows from a backup", xid)
+	}
 	p := &Plan{XID: xid, Counts: map[string]pgtap.Counts{}, Tables: map[string]*Table{}}
 	p.Who, _ = raw(head["who"])
 	p.Undo, _ = raw(head["undo"])
@@ -654,7 +658,7 @@ func (p *Plan) session(db DB) error {
 		return err
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
-		return refuse("no schema %s in the database, and it is named in search_path of the undo settings", *res[0].Rows[0][0])
+		return refuse("no schema %s in the database, and it is named in the search_path of the undo (search_path in the undo settings or esundo check -search-path)", *res[0].Rows[0][0])
 	}
 	// Кто может CREATE в схеме пути — сам или через роль, которой может
 	// стать (SET ROLE); владелец схемы может всегда (право у себя он вернёт
@@ -686,7 +690,7 @@ func (p *Plan) session(db DB) error {
 		return err
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
-		return refuse("%s, and that schema is in search_path of the undo settings: a function or operator created there would run in the check "+
+		return refuse("%s, and that schema is in the search_path of the undo (the undo settings or esundo check -search-path): a function or operator created there would run in the check "+
 			"and the undo with the rights of this session. Take the schema off search_path (then triggers of the tables must name their "+
 			"tables and functions with the schema) or let only its owner create there. If such a role could create there before, look at "+
 			"what it made: its functions and operators stay, whoever owns them now", *res[0].Rows[0][0])
@@ -714,7 +718,7 @@ func (p *Plan) pathHint(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w (the undo runs with search_path %s: if a trigger of the table names a table or a function without "+
-		"its schema, add that schema to search_path in the undo settings)", err, p.Path())
+		"its schema, add that schema to search_path in the undo settings — esundo apply -config takes it from there — or name it in esundo check -search-path)", err, p.Path())
 }
 
 // Check спрашивает базу про каждый шаг и запоминает годные в p.OK.

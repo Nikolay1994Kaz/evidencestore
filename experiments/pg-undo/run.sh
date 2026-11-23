@@ -449,20 +449,8 @@ delete from orders where id = $((ROWS + 3));
 update accounts set note = 'called the client' where id = 1;
 SQL
 )
-# Роль владельца не в списках сборщика: её транзакция ложится отпечатком —
-# кто, ключи, хеши строк, без самих строк (DECISIONS, п. 41). Пачка уходит,
-# когда ей минута (или перед полной транзакцией): ждём; до этого сборщик
-# не подтверждает базе место.
-wait_tx "$HUMAN"
-HE=$(entry "$HUMAN")
-[ "$(field "$HE" kind)" = fingerprint ] || die "транзакция владельца $HUMAN должна лечь отпечатком: $HE"
-[ "$(field "$HE" who)" = '{"role": "postgres"}' ] || die "в справочнике у отпечатка нет роли: $HE"
-[ -z "$(alerts "$HUMAN")" ] || die "правка владельца подняла тревогу: $(alerts "$HUMAN")"
-ship
-"$BIN/esundo" check -config "$WORK/undo.json" -xid "$HUMAN" >"$WORK/human-undo.txt" 2>&1 && die "esundo взялся откатывать отпечаток"
-grep -q "the store keeps only its fingerprint" "$WORK/human-undo.txt" || die "esundo не объяснил отказ: $(cat "$WORK/human-undo.txt")"
-echo "транзакция владельца $HUMAN в хранилище — отпечатком в пачке (запись $(field "$HE" first_seq)): $(field "$HE" changes) изменения, роль $(field "$HE" who)"
-echo "esundo: $(head -1 "$WORK/human-undo.txt" | cut -c1-160)…"
+# Его транзакцию сборщик кладёт отпечатком в пачку; пачка уйдёт с первой
+# полной транзакцией (здесь — откатом) или через минуту: проверка — после отката.
 
 # ---------------------------------------------------------------- до-образы и откат
 
@@ -537,6 +525,21 @@ fetch "$UNDO" "$WORK/undo-tx" >/dev/null
 "$BIN/esundo" check -bodies "$WORK/undo-tx/bodies" -xid "$UNDO" >"$WORK/undo-tx/plan.txt"
 head -2 "$WORK/undo-tx/plan.txt" | cut -c1-230
 grep -q "\"undoes_xid\":\"$BAD\"" "$WORK/undo-tx/plan.txt" || die "в записи отката нет ссылки на транзакцию $BAD"
+
+step "правка человека в хранилище — отпечатком: кто, ключи, хеши строк, без самих строк"
+# Роль владельца не в списках сборщика: её транзакция ложится отпечатком —
+# кто, ключи, хеши строк, без самих строк (DECISIONS, п. 41). Пачка ушла перед
+# полной транзакцией — откатом; до этого сборщик не подтверждал базе место.
+wait_tx "$HUMAN"
+HE=$(entry "$HUMAN")
+[ "$(field "$HE" kind)" = fingerprint ] || die "транзакция владельца $HUMAN должна лечь отпечатком: $HE"
+[ "$(field "$HE" who)" = '{"role": "postgres"}' ] || die "в справочнике у отпечатка нет роли: $HE"
+[ -z "$(alerts "$HUMAN")" ] || die "правка владельца подняла тревогу: $(alerts "$HUMAN")"
+ship
+"$BIN/esundo" check -config "$WORK/undo.json" -xid "$HUMAN" >"$WORK/human-undo.txt" 2>&1 && die "esundo взялся откатывать отпечаток"
+grep -q "the store keeps only its fingerprint" "$WORK/human-undo.txt" || die "esundo не объяснил отказ: $(cat "$WORK/human-undo.txt")"
+echo "транзакция владельца $HUMAN в хранилище — отпечатком в пачке (запись $(field "$HE" first_seq)): $(field "$HE" changes) изменения, роль $(field "$HE" who)"
+echo "esundo: $(head -1 "$WORK/human-undo.txt" | cut -c1-160)…"
 
 step "квитанция действия из источника agent-mcp: что агент просил"
 ship_receipts
@@ -699,7 +702,9 @@ want = [int(x) for x in sys.argv[3:]]
 tail = [e for e in entries if e["xid"] in want]
 assert [e["xid"] for e in tail] == want, f"в справочнике {[e['xid'] for e in tail]}, ждали {want}"
 for a, b in zip(entries, entries[1:]):
-    assert b["first_seq"] == a["last_seq"] + 1, f"между транзакциями {a['xid']} и {b['xid']} номера записей идут не подряд"
+    # Отпечатки одной пачки — на одной записи.
+    same_pack = a.get("kind") == b.get("kind") == "fingerprint" and b["first_seq"] == a["first_seq"]
+    assert same_pack or b["first_seq"] == a["last_seq"] + 1, f"между транзакциями {a['xid']} и {b['xid']} номера записей идут не подряд"
 assert entries[-1]["last_seq"] == int(sys.argv[2]), f"в хранилище {sys.argv[2]} записей, по справочнику {entries[-1]['last_seq']}"
 print(f"транзакций в справочнике {len(entries)}, записей в хранилище {sys.argv[2]}: каждая один раз, номера подряд, пропусков нет")
 PY

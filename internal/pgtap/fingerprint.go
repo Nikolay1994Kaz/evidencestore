@@ -46,6 +46,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
@@ -87,7 +88,7 @@ type fpEntry struct {
 	Changes    int               `json:"changes"`
 	Tables     map[string]Counts `json:"tables,omitempty"`
 	Truncated  []string          `json:"truncated,omitempty"`
-	Rows       []fpRow           `json:"rows,omitempty"`
+	Rows       []json.RawMessage `json:"rows,omitempty"` // fpRow
 
 	end uint64 // EndLSN числом
 }
@@ -124,15 +125,33 @@ func (t *Tap) Flush() (flushed uint64, err error) {
 	return t.flushPack()
 }
 
-// hashRow — хеш массива значений строки (см. заголовок файла).
-func hashRow(vals []any) (string, error) {
-	b, err := json.Marshal(vals)
-	if err != nil {
-		return "", err
+// hashRow — хеш строки (см. заголовок файла): по колонкам подряд NULL — «-»,
+// значение — «длина в байтах:байты» текста, как его отдал журнал. Значение,
+// которого в журнале нет (не менялось и лежит в TOAST, а старой строки
+// целиком нет), — хеша нет: ok = false.
+func hashRow(tuple []pgoutput.Value) (_ string, ok bool) {
+	h := sha256.New()
+	var n [20]byte
+	for _, v := range tuple {
+		switch v.Kind {
+		case pgoutput.Null:
+			h.Write([]byte{'-'})
+		case pgoutput.Text:
+			h.Write(strconv.AppendInt(n[:0], int64(len(v.Data)), 10))
+			h.Write([]byte{':'})
+			h.Write(v.Data)
+		default:
+			return "", false
+		}
 	}
-	sum := sha256.Sum256(b)
-	return base64.RawStdEncoding.EncodeToString(sum[:16]), nil
+	return base64.RawStdEncoding.EncodeToString(h.Sum(nil)[:16]), true
 }
+
+// fpInline — сколько байт строк отпечатка транзакция держит в памяти до
+// фиксации, чтобы лечь в пачку. Больше — она пишется своими частями, как
+// полная, только отпечатком (Kind в справочнике тот же): память сборщика и
+// запись хранилища не зависят от размера транзакции (R1-2, R2-2, T-2).
+func (t *Tap) fpInline() int { return min(256<<10, t.cfg.PartSize/2) }
 
 // fpChange — изменение строки транзакции-отпечатка.
 func (t *Tap) fpChange(tx *txState, op byte, id uint32, oldKind byte, old, fresh []pgoutput.Value) error {
@@ -150,21 +169,53 @@ func (t *Tap) fpChange(tx *txState, op byte, id uint32, oldKind byte, old, fresh
 	}
 	full := oldKind == 'O'
 	row := fpRow{T: string(op), R: rel.Namespace + "." + rel.Name, Partial: op != 'I' && !full}
-	vals := func(tuple []pgoutput.Value, isNew bool) ([]any, error) {
-		if len(tuple) != len(rel.Columns) {
-			return nil, fmt.Errorf("pgtap: %s: a row of %d values for %d columns", row.R, len(tuple), len(rel.Columns))
+	if rel.Identity != 'f' {
+		t.alert(tx, "identity", fmt.Sprintf("%s is not REPLICA IDENTITY FULL: the fingerprint has no hash of the old row, and of the new one only when all its values are in the journal", row.R))
+	}
+	for _, tuple := range [][]pgoutput.Value{old, fresh} {
+		if tuple != nil && len(tuple) != len(rel.Columns) {
+			return fmt.Errorf("pgtap: %s: a row of %d values for %d columns", row.R, len(tuple), len(rel.Columns))
+		}
+	}
+	// Значение, которое не менялось и лежит в TOAST, — из старой строки,
+	// если она в журнале целиком.
+	if fresh != nil && full && old != nil {
+		fresh = slices.Clone(fresh)
+		for i, v := range fresh {
+			if v.Kind == pgoutput.Unchanged {
+				fresh[i] = old[i]
+			}
+		}
+	}
+	vals := func(tuple []pgoutput.Value) ([]any, error) {
+		if tuple == nil {
+			return nil, nil
 		}
 		out := make([]any, len(tuple))
 		for i, v := range tuple {
-			if v.Kind == pgoutput.Unchanged && isNew && full {
-				v = old[i]
-			}
 			var err error
 			if out[i], err = value(v); err != nil {
 				return nil, fmt.Errorf("pgtap: %s.%s: %w", row.R, rel.Columns[i].Name, err)
 			}
 		}
 		return out, nil
+	}
+	ov, err := vals(old)
+	if err != nil {
+		return err
+	}
+	nv, err := vals(fresh)
+	if err != nil {
+		return err
+	}
+	if old != nil && full {
+		row.O, _ = hashRow(old)
+	}
+	if fresh != nil {
+		var whole bool
+		if row.N, whole = hashRow(fresh); !whole {
+			row.Partial = true
+		}
 	}
 	key := func(v []any) []any {
 		var k []any
@@ -174,26 +225,6 @@ func (t *Tap) fpChange(tx *txState, op byte, id uint32, oldKind byte, old, fresh
 			}
 		}
 		return k
-	}
-	var ov, nv []any
-	var err error
-	if old != nil {
-		if ov, err = vals(old, false); err != nil {
-			return err
-		}
-		if full {
-			if row.O, err = hashRow(ov); err != nil {
-				return err
-			}
-		}
-	}
-	if fresh != nil {
-		if nv, err = vals(fresh, true); err != nil {
-			return err
-		}
-		if row.N, err = hashRow(nv); err != nil {
-			return err
-		}
 	}
 	switch {
 	case ov != nil:
@@ -220,14 +251,35 @@ func (t *Tap) fpChange(tx *txState, op byte, id uint32, oldKind byte, old, fresh
 	}
 	tx.tables[row.R] = c
 	tx.changes++
-	tx.rows = append(tx.rows, row)
 	// Старое значение без REPLICA IDENTITY FULL — только ключ: ловушку по
 	// другой колонке видно по новому.
-	old4canary := ov
 	if !full {
-		old4canary = nil
+		ov = nil
 	}
-	t.canaries(tx, rel, op, old4canary, nv)
+	t.canaries(tx, rel, op, ov, nv)
+	if tx.header {
+		// Отпечаток пишется своими частями (fpInline): строка — сразу в поток.
+		return t.write(tx, row)
+	}
+	line, err := json.Marshal(row)
+	if err != nil {
+		return err
+	}
+	tx.rows = append(tx.rows, line)
+	tx.rowBytes += len(line) + 1
+	if tx.rowBytes <= t.fpInline() {
+		return nil
+	}
+	// Отпечаток не для пачки: заголовок, накопленные строки — в свой поток.
+	if err := t.start(tx); err != nil {
+		return err
+	}
+	for _, l := range tx.rows {
+		if err := t.write(tx, l); err != nil {
+			return err
+		}
+	}
+	tx.rows, tx.rowBytes = nil, 0
 	return nil
 }
 
@@ -238,7 +290,15 @@ func jsonEqual(a, b []any) bool {
 }
 
 // fpCommit — транзакция-отпечаток закончена: в пачку; полная пачка — в буфер.
+// Отпечаток, который пишется своими частями (fpInline), заканчивается как
+// полная транзакция (finish).
 func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err error) {
+	if tx.header {
+		if err := t.finish(tx, c); err != nil {
+			return 0, err
+		}
+		return c.EndLSN, nil
+	}
 	e := fpEntry{
 		XID: tx.begin.XID, CommitTime: tx.begin.CommitTime.UTC().Format(time.RFC3339Nano),
 		CommitLSN: pgwire.LSN(tx.begin.FinalLSN).String(), EndLSN: pgwire.LSN(c.EndLSN).String(),
@@ -248,7 +308,15 @@ func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err erro
 	if err != nil {
 		return 0, err
 	}
+	e.Rows = nil // в пачке они уже сжаты: в памяти — только для справочника
 	p := &t.pack
+	// Пачка не перерастает часть: сжатое не длиннее несжатого больше чем на
+	// немного, и отпечаток в пачке не длиннее fpInline (R1-2, R2-2, T-2).
+	if len(p.entries) > 0 && p.buf.Len()+len(line)+4096 > t.cfg.PartSize {
+		if flushed, err = t.flushPack(); err != nil {
+			return 0, err
+		}
+	}
 	if len(p.entries) == 0 {
 		p.buf.Reset()
 		p.gz = gzip.NewWriter(&p.buf)
@@ -275,10 +343,10 @@ func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err erro
 	if err := t.flushAlerts(tx, &IndexEntry{Changes: tx.changes, Tables: tx.tables}); err != nil {
 		return 0, err
 	}
-	if len(p.entries) >= t.cfg.PackTx || p.buf.Len() >= t.cfg.PartSize {
+	if len(p.entries) >= t.cfg.PackTx {
 		return t.flushPack()
 	}
-	return 0, nil
+	return flushed, nil
 }
 
 // flushPack кладёт пачку в буфер: строки справочника — раньше записи (как у

@@ -42,6 +42,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -91,6 +92,10 @@ type Canary struct {
 type Config struct {
 	Dir   string   // каталог справочника: index.jsonl, alerts.jsonl
 	Roles []string // роли, чьи транзакции брать
+	// MarkerKey — ключ из evidence.marker_key: его кладут в отметки функции
+	// evidence, и отметка без него — поддельная (authentic). Пусто — не
+	// проверять (тесты). Вход ставит его при подключении (SetMarkerKey).
+	MarkerKey string
 	// AlertRows — транзакция с таким числом изменений строк и больше поднимает
 	// тревогу «массовое изменение». 0 — не следить.
 	AlertRows int
@@ -196,7 +201,12 @@ type txState struct {
 	// fp — транзакция другой роли (Config.All): отпечаток в пачку, а не поток.
 	// unknown — изменения пришли раньше отметки «кто»: берётся целиком.
 	fp, unknown bool
-	rows        []fpRow
+	rows        []json.RawMessage // строки отпечатка (fpRow) до фиксации, пока не больше fpInline
+	rowBytes    int
+	// forged — в транзакции отметка не от функций evidence (без их ключа):
+	// транзакция берётся целиком, отметка — в заголовке как улика.
+	forged      bool
+	forgedMarks []json.RawMessage
 
 	who, undo json.RawMessage
 	actions   []json.RawMessage
@@ -368,6 +378,11 @@ func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 		if tx.dup {
 			return 0, nil
 		}
+		if !tx.capture && t.cfg.All {
+			// TRUNCATE раньше отметки «кто» — как изменение строки без неё
+			// (change): целиком и тревога no-who (R1-1, R2-1, T-1).
+			tx.capture, tx.unknown = true, true
+		}
 		if !tx.capture {
 			tx.skipped++
 			return 0, nil
@@ -404,9 +419,9 @@ func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 // mark разбирает отметку в журнале: чья транзакция, какое действие, откат ли.
 func (t *Tap) mark(m pgoutput.Message) error {
 	tx := t.tx
-	content := json.RawMessage(m.Content)
-	if !json.Valid(content) {
-		content, _ = json.Marshal(string(m.Content))
+	content, ok := t.authentic(m.Content)
+	if !ok {
+		return t.forgedMark(tx, m.Prefix, content)
 	}
 	var who struct {
 		Role string `json:"role"`
@@ -435,9 +450,13 @@ func (t *Tap) mark(m pgoutput.Message) error {
 		case !tx.capture:
 			// Другая роль (Config.All): отпечаток. Решение — до первого изменения.
 			tx.capture, tx.fp, tx.who = true, true, content
-		case tx.unknown && tx.who == nil:
-			// Изменения шли без отметки, потом она пришла: кто — в потоке.
+		case (tx.unknown || tx.forged) && tx.who == nil:
+			// Изменения шли без отметки (или после поддельной), потом она
+			// пришла: кто — в заголовке или, если он уже записан, в потоке.
 			tx.who = content
+			if !tx.header {
+				return nil
+			}
 			return t.write(tx, struct {
 				T       string          `json:"t"`
 				Prefix  string          `json:"prefix"`
@@ -473,6 +492,100 @@ func (t *Tap) mark(m pgoutput.Message) error {
 	return nil
 }
 
+// authentic — отметка от функций evidence: в ней ключ (MarkerKey), который
+// они берут из evidence.marker_key, а прочесть его, кроме них, может только
+// сборщик. Отметку с тем же префиксом пишет и любая роль, которой дали
+// pg_logical_emit_message (README разрешает его outbox-приложениям), — с
+// чужой ролью или «откатом» (R1-3, T-3). content — отметка без ключа: в
+// хранилище и справочник ключ не идёт. Без MarkerKey (тесты) — всё подлинно.
+func (t *Tap) authentic(raw []byte) (content json.RawMessage, ok bool) {
+	if !json.Valid(raw) {
+		content, _ = json.Marshal(string(raw))
+		return content, t.cfg.MarkerKey == ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return raw, t.cfg.MarkerKey == ""
+	}
+	var out bytes.Buffer
+	out.WriteByte('{')
+	var key string
+	keys := 0
+	for dec.More() {
+		name, err := dec.Token()
+		if err != nil {
+			return raw, false
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return raw, false
+		}
+		if name == markerKeyField {
+			json.Unmarshal(v, &key)
+			keys++
+			continue
+		}
+		if out.Len() > 1 {
+			out.WriteByte(',')
+		}
+		n, _ := json.Marshal(name)
+		out.Write(n)
+		out.WriteByte(':')
+		json.Compact(&out, v)
+	}
+	out.WriteByte('}')
+	if t.cfg.MarkerKey == "" {
+		return out.Bytes(), true
+	}
+	return out.Bytes(), keys == 1 && subtle.ConstantTimeCompare([]byte(key), []byte(t.cfg.MarkerKey)) == 1
+}
+
+// markerKeyField — поле ключа в отметке.
+const markerKeyField = "key"
+
+// forgedMark — отметка не от функций evidence. Она не решает, чья транзакция
+// и что это за действие: транзакция берётся целиком (если её строки ещё не
+// пошли отпечатком), поддельная отметка ложится в запись уликой, и тревога.
+func (t *Tap) forgedMark(tx *txState, prefix string, content json.RawMessage) error {
+	var who struct {
+		Role string `json:"role"`
+	}
+	json.Unmarshal(content, &who)
+	t.alert(tx, alert.KindForged, fmt.Sprintf("a %s marker the evidence functions did not write (it names role %q): someone wrote it with pg_logical_emit_message; "+
+		"it does not decide whose the transaction is, and the transaction is kept whole", prefix, alert.Field(who.Role)))
+	mark := struct {
+		T       string          `json:"t,omitempty"`
+		Prefix  string          `json:"prefix"`
+		Content json.RawMessage `json:"content"`
+		Forged  bool            `json:"forged,omitempty"`
+	}{Prefix: prefix, Content: content}
+	switch {
+	case tx.fp:
+		return nil // строки уже отпечатком: улика — тревога
+	case tx.header:
+		mark.T, mark.Forged = "M", true
+		return t.write(tx, mark)
+	case t.cfg.All || tx.capture:
+		line, _ := json.Marshal(mark)
+		tx.capture, tx.forged = true, true
+		tx.forgedMarks = append(tx.forgedMarks, line)
+		return nil
+	default:
+		return t.flushAlerts(tx, nil) // режим ролей: транзакция не наша
+	}
+}
+
+// watched — отметка «кто» называет роль из списков сборщика.
+func (t *Tap) watched(who json.RawMessage) bool {
+	var w struct {
+		Role string `json:"role"`
+	}
+	return who != nil && json.Unmarshal(who, &w) == nil && t.roles[w.Role]
+}
+
+// SetMarkerKey — ключ отметок, прочитанный из базы при подключении.
+func (t *Tap) SetMarkerKey(key string) { t.cfg.MarkerKey = key }
+
 // refused — не транзакционное сообщение: MCP-сервер остановил действие агента
 // пределом строк и откатил его. В базе ничего не изменилось, записей в
 // хранилище нет — есть тревога: человек должен знать, что агент пытался.
@@ -496,7 +609,13 @@ func (t *Tap) refused(m pgoutput.Message) error {
 			Tool       string `json:"tool"`
 		} `json:"info"`
 	}
-	if json.Unmarshal(m.Content, &c) != nil || !t.roles[c.Role] {
+	content, ok := t.authentic(m.Content)
+	if !ok {
+		ev := alert.Event{Time: t.now().UTC().Format(time.RFC3339Nano), Actions: []json.RawMessage{content}}
+		ev.Add(alert.KindForged, "a refusal marker the evidence functions did not write: someone wrote it with pg_logical_emit_message; no action was refused by it")
+		return t.raise(ev)
+	}
+	if json.Unmarshal(content, &c) != nil || !t.roles[c.Role] {
 		return nil
 	}
 	t.lastRefused = m.LSN
@@ -539,7 +658,7 @@ func (t *Tap) refused(m pgoutput.Message) error {
 	default:
 		detail = fmt.Sprintf("the MCP server stopped an action (%s): nothing changed", alert.Field(i.Cause))
 	}
-	ev := alert.Event{Time: t.now().UTC().Format(time.RFC3339Nano), Actions: []json.RawMessage{m.Content}}
+	ev := alert.Event{Time: t.now().UTC().Format(time.RFC3339Nano), Actions: []json.RawMessage{content}}
 	ev.Add(kind, detail)
 	return t.raise(ev)
 }
@@ -567,7 +686,7 @@ func (t *Tap) flushAlerts(tx *txState, entry *IndexEntry) error {
 	ev := tx.alert
 	tx.alert = alert.Event{}
 	ev.Time, ev.XID = t.now().UTC().Format(time.RFC3339Nano), tx.begin.XID
-	ev.Who, ev.Actions, ev.Undo = tx.who, tx.actions, tx.undo
+	ev.Who, ev.Actions, ev.Undo, ev.Fingerprint = tx.who, tx.actions, tx.undo, tx.fp
 	if entry != nil {
 		ev.Changes, ev.Tables, ev.FirstSeq, ev.LastSeq = entry.Changes, entry.Tables, entry.FirstSeq, entry.LastSeq
 	}
@@ -595,7 +714,12 @@ func (t *Tap) start(tx *txState) error {
 		Who        json.RawMessage   `json:"who,omitempty"`
 		Actions    []json.RawMessage `json:"actions,omitempty"`
 		Undo       json.RawMessage   `json:"undo,omitempty"`
-	}{"H", FormatVersion, tx.begin.XID, tx.begin.CommitTime.UTC().Format(time.RFC3339Nano), pgwire.LSN(tx.begin.FinalLSN).String(), tx.who, tx.actions, tx.undo})
+		// Fingerprint — дальше строки отпечатка (fpRow), а не образы строк:
+		// откатить нельзя. Forged — отметки не от функций evidence.
+		Fingerprint bool              `json:"fingerprint,omitempty"`
+		Forged      []json.RawMessage `json:"forged,omitempty"`
+	}{"H", FormatVersion, tx.begin.XID, tx.begin.CommitTime.UTC().Format(time.RFC3339Nano), pgwire.LSN(tx.begin.FinalLSN).String(), tx.who, tx.actions, tx.undo,
+		tx.fp, tx.forgedMarks})
 }
 
 func (t *Tap) write(tx *txState, v any) error {
@@ -834,6 +958,9 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 		CommitTime: tx.begin.CommitTime.UTC().Format(time.RFC3339Nano),
 		CommitLSN:  pgwire.LSN(tx.begin.FinalLSN).String(), EndLSN: pgwire.LSN(c.EndLSN).String(),
 	}
+	if tx.fp {
+		entry.Kind, entry.Who = KindFingerprint, whoRole(tx.who)
+	}
 	line, err := json.Marshal(entry)
 	if err != nil {
 		return err
@@ -852,15 +979,24 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 			tx.begin.XID, firstSeq, lastSeq, tx.firstSeq, tx.firstSeq+uint64(tx.parts-1))
 	}
 	t.lastCommit = tx.begin.FinalLSN
-	t.stats.Captured++
-	t.stats.Changes += uint64(tx.changes)
+	if tx.fp {
+		t.stats.Fingerprinted++
+		t.stats.FingerprintChanges += uint64(tx.changes)
+	} else {
+		t.stats.Captured++
+		t.stats.Changes += uint64(tx.changes)
+	}
 	if t.cfg.AlertRows > 0 && tx.changes >= t.cfg.AlertRows {
-		t.alert(tx, "mass-change", fmt.Sprintf("%d row changes in one transaction (the threshold is %d)", tx.changes, t.cfg.AlertRows))
+		detail := fmt.Sprintf("%d row changes in one transaction (the threshold is %d)", tx.changes, t.cfg.AlertRows)
+		if tx.fp {
+			detail += " by a role outside the collector's lists: the store keeps only a fingerprint"
+		}
+		t.alert(tx, "mass-change", detail)
 	}
 	if tx.unknown {
 		t.alert(tx, alert.KindNoWho, "changes of the transaction came without a who marker: the trigger is off or the table has none (a partition made after escollect -setup-sql); the transaction is kept whole")
 	}
-	if t.cfg.RequireAction && tx.who != nil && !tx.unknown && len(tx.actions) == 0 && tx.undo == nil {
+	if t.cfg.RequireAction && t.watched(tx.who) && !tx.unknown && len(tx.actions) == 0 && tx.undo == nil {
 		t.alert(tx, "no-action", "a transaction of a watched role carries no action or undo marker: it did not come through the MCP server or esundo")
 	}
 	return t.flushAlerts(tx, &entry)

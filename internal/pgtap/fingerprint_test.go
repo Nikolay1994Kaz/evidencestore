@@ -1,9 +1,10 @@
 package pgtap
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -52,8 +53,8 @@ func TestAllTakesEveryTransaction(t *testing.T) {
 	if r["t"] != "U" || r["r"] != "public.accounts" || r["k"].([]any)[0] != "1" || strings.Contains(string(h.parts()[0]), "before") {
 		t.Fatalf("the fingerprint: %v", r)
 	}
-	b, _ := json.Marshal([]any{"1", "before"})
-	sum := sha256.Sum256(b)
+	// Хеш — по рецепту README: «длина:байты» каждой колонки подряд, NULL — «-».
+	sum := sha256.Sum256([]byte("1:16:before"))
 	if r["o"] != base64.RawStdEncoding.EncodeToString(sum[:16]) {
 		t.Fatalf("the old row's hash is not the one of its values: %v", r["o"])
 	}
@@ -162,5 +163,129 @@ func TestFingerprintWaitsAndAlerts(t *testing.T) {
 	}
 	if got[0].XID != 3 || got[0].FirstSeq != 0 || got[0].Changes != 2 || !strings.Contains(string(got[0].Who), "app") {
 		t.Fatalf("the alert of a fingerprint: %+v", got[0])
+	}
+}
+
+// TRUNCATE без отметки «кто» — целиком и с тревогами no-who и truncate, как
+// изменение строки без неё; место за ним не подтверждается раньше записи
+// (R1-1, R2-1, T-1).
+func TestTruncateWithoutWho(t *testing.T) {
+	h := open(t, t.TempDir(), all)
+	f := h.run(1, accounts, pgoutput.Truncate{RelIDs: []uint32{7}}, pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("1"), txt("again")}})
+	idx := h.index()
+	if f == 0 || len(h.parts()) != 1 || len(idx) != 1 || idx[0].Kind != "" || len(idx[0].Truncated) != 1 {
+		t.Fatalf("confirmed %d, records %d, index %+v", f, len(h.parts()), idx)
+	}
+	recs, err := ReadTransaction(1, h.parts())
+	if err != nil || recs[1]["t"] != "T" {
+		t.Fatalf("the stream: %v %v", recs, err)
+	}
+	if k := strings.Join(h.alertKinds(), ","); !strings.Contains(k, "truncate") || !strings.Contains(k, alert.KindNoWho) {
+		t.Fatalf("alerts: %s", k)
+	}
+}
+
+func fpUpdates(base, n int) []any {
+	msgs := []any{who("app"), accounts}
+	for i := 0; i < n; i++ {
+		id := fmt.Sprint(base + i)
+		msgs = append(msgs, pgoutput.Update{RelID: 7, OldKind: 'O', Old: []pgoutput.Value{txt(id), txt("a")}, New: []pgoutput.Value{txt(id), txt("b")}})
+	}
+	return msgs
+}
+
+// Запись пачки не больше части: большой отпечаток пишется своими частями,
+// как полная транзакция, а пачка уходит раньше, чем перерастёт часть. Раньше
+// запись в 1,5 МБ отвергал буфер сборщика, и вход вставал (R1-2, R2-2, T-2).
+func TestFingerprintNeverOutgrowsAPart(t *testing.T) {
+	h := open(t, t.TempDir(), func(c *Config) { c.All = true })
+	small := h.run(1, fpUpdates(0, 10)...)
+	f := h.run(2, fpUpdates(100, 30000)...)
+	if small != 0 || f == 0 {
+		t.Fatalf("confirmed %d and %d", small, f)
+	}
+	for i, b := range h.parts() {
+		if len(b) > evidence.MaxBodyLen {
+			t.Fatalf("record %d: %d bytes, the spool takes %d", i+1, len(b), evidence.MaxBodyLen)
+		}
+	}
+	idx := h.index()
+	last := idx[len(idx)-1]
+	if len(idx) != 2 || idx[0].FirstSeq != 1 || last.XID != 2 || last.Kind != KindFingerprint || last.FirstSeq != 2 || last.LastSeq < 3 || int(last.LastSeq) != len(h.parts()) {
+		t.Fatalf("index %+v, %d records", idx, len(h.parts()))
+	}
+	recs, err := ReadTransaction(2, h.parts()[1:])
+	if err != nil || recs[0]["fingerprint"] != true || len(recs) != 30002 || recs[1]["o"] == nil || recs[1]["old"] != nil {
+		t.Fatalf("the stream of a big fingerprint: %d lines, %v, %v", len(recs), err, recs[0])
+	}
+	if s := h.tap.Stats(); s.Fingerprinted != 2 || s.Captured != 0 {
+		t.Fatalf("%+v", s)
+	}
+	// Пачка из многих отпечатков поменьше тоже не перерастает часть.
+	h = open(t, t.TempDir(), func(c *Config) { c.All = true })
+	for x, n := range []int{2500, 2500, 2500, 2500, 2500, 2500, 2500, 2500, 2500} {
+		h.run(uint32(x+1), fpUpdates(x*10000, n)...)
+	}
+	h.tap.Flush()
+	for i, b := range h.parts() {
+		if len(b) > evidence.MaxBodyLen {
+			t.Fatalf("pack %d: %d bytes", i+1, len(b))
+		}
+	}
+	if n := len(h.parts()); n < 2 {
+		t.Fatalf("%d records for nine transactions of 2500 rows", n)
+	}
+}
+
+// Значение в TOAST, которого нет в журнале (таблица без REPLICA IDENTITY
+// FULL), — хеша новой строки нет, а не хеш заглушки, и тревога identity (R1-4).
+func TestFingerprintWithoutTheWholeRow(t *testing.T) {
+	h := open(t, t.TempDir(), all)
+	keyOnly := accounts
+	keyOnly.Identity = 'd'
+	h.run(1, who("app"), keyOnly, pgoutput.Update{RelID: 7, OldKind: 'K', Old: []pgoutput.Value{txt("1"), {Kind: pgoutput.Null}},
+		New: []pgoutput.Value{txt("1"), {Kind: pgoutput.Unchanged}}})
+	h.tap.Flush()
+	entries, _ := ReadPack(h.parts()[0])
+	r := entries[0]["rows"].([]any)[0].(map[string]any)
+	if r["n"] != nil || r["o"] != nil || r["partial"] != true || !strings.Contains(strings.Join(h.alertKinds(), ","), "identity") {
+		t.Fatalf("the fingerprint %v, alerts %v", r, h.alertKinds())
+	}
+}
+
+// Отметки — от функций evidence, с ключом. Отметка без него (её пишет любая
+// роль с pg_logical_emit_message) не решает, чья транзакция: та берётся
+// целиком, поддельная отметка — в заголовке, тревога forged-marker (R1-3,
+// T-3). Ключ в хранилище и справочник не идёт.
+func TestForgedMarkers(t *testing.T) {
+	keyed := func(prefix, content string) pgoutput.Message {
+		return pgoutput.Message{Transactional: true, Prefix: prefix, Content: []byte(content[:len(content)-1] + `,"key":"k-1"}`)}
+	}
+	h := open(t, t.TempDir(), func(c *Config) { all(c); c.MarkerKey = "k-1"; c.RequireAction = true })
+	upd := pgoutput.Update{RelID: 7, OldKind: 'O', Old: []pgoutput.Value{txt("1"), txt("a")}, New: []pgoutput.Value{txt("1"), txt("b")}}
+	// Подлинные отметки агента: ключ снят.
+	h.run(1, keyed(PrefixWho, `{"role":"agent","app":"esmcp/bot"}`), keyed(PrefixAction, `{"role":"agent","info":{"action_id":"a-1"}}`), accounts, upd)
+	// Приложение называет себя агентом и ставит действие; подлинная отметка
+	// триггера — его роль.
+	h.run(2, who("agent"), action("agent", "a-2"), keyed(PrefixWho, `{"role":"app"}`), accounts, upd)
+	idx := h.index()
+	if len(idx) != 2 || string(idx[0].Who) != `{"role":"agent","app":"esmcp/bot"}` || len(idx[0].Actions) != 1 || strings.Contains(string(idx[0].Actions[0]), "k-1") {
+		t.Fatalf("the genuine markers: %+v", idx[0])
+	}
+	if idx[1].Kind != "" || string(idx[1].Who) != `{"role":"app"}` || len(idx[1].Actions) != 0 {
+		t.Fatalf("a forged transaction: %+v", idx[1])
+	}
+	recs, err := ReadTransaction(2, h.parts()[1:2])
+	if err != nil || len(recs[0]["forged"].([]any)) != 2 || bytes.Contains(h.parts()[0], []byte("k-1")) {
+		t.Fatalf("the forged markers in the record: %v %v", recs[0], err)
+	}
+	k := strings.Join(h.alertKinds(), ",")
+	if strings.Count(k, alert.KindForged) != 2 || strings.Contains(k, alert.KindNoAction) {
+		t.Fatalf("alerts: %s", k)
+	}
+	// Поддельный отказ — тревога forged-marker, а не refused.
+	h.tap.Handle(pgoutput.Message{Prefix: PrefixRefused, LSN: 99999, Content: []byte(`{"role":"agent","info":{"rows":9,"limit":1}}`)})
+	if k := h.alertKinds(); k[len(k)-1] != alert.KindForged {
+		t.Fatalf("a forged refusal: %v", k)
 	}
 }

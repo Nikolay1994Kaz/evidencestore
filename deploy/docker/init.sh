@@ -89,11 +89,13 @@ touch "$S/receipts/receipts.jsonl"
 	echo "ALTER ROLE agent_bot PASSWORD '$PW_AGENT';"
 } >"$S/setup/setup.sql"
 printf '%s' "$PW_PG" >"$S/setup/postgres-password"
-# Базе пароль нужен её пользователем (postgres, не root): файл — на чтение всем
-# в каталоге, который монтируется только ей.
+# Базе пароль нужен её пользователем: postgres образа postgres (Debian), uid 999.
+# Файл и каталог — только ему: пароль суперпользователя сильнее всех паролей
+# в ./state (R1-5, R2-3).
 printf '%s' "$PW_PG" >"$S/db/postgres-password"
-chmod 755 "$S/db"
-chmod 444 "$S/db/postgres-password"
+chown -R "${PG_UID:-999}:${PG_UID:-999}" "$S/db"
+chmod 700 "$S/db"
+chmod 400 "$S/db/postgres-password"
 
 cat >"$S/mcp/mcp.json" <<EOF
 {
