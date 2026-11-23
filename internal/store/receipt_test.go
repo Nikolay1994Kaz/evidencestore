@@ -348,6 +348,46 @@ func TestReceiptVerdictLieIsSeen(t *testing.T) {
 	}
 }
 
+// staleLiar — хранилище, которое называет квитанцию действия p-hide
+// повтором (stale): повтор цепочку не двигает, и следующую можно было бы
+// выдать за цепочку от предыдущей.
+type staleLiar struct{ gateway.Checker }
+
+func (l staleLiar) Check(line []byte) gateway.Verdict {
+	v := l.Checker.Check(line)
+	if r, _ := gateway.ParseReceipt(line); r.Action == "p-hide" {
+		v.Link, v.Problem = gateway.LinkStale, "a copy"
+	}
+	return v
+}
+
+// Хранилище назвало повтором квитанцию новее последней (P-346): по seq в
+// пакете она не повтор, и пакет не проходит.
+func TestReceiptStaleLieIsSeen(t *testing.T) {
+	key, pub := receiptGateway(t, 11)
+	c := newClock()
+	s := openStore(t, testConfig(t, withReceipts(pub)), c)
+	s.sources["shop"].gw = staleLiar{s.sources["shop"].gw}
+	gw, _ := gateway.NewSigner(key, "shop-gw", nil)
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // 10:00
+	c.add(time.Minute)
+	ingestShop(t, s, 1, sign(t, gw, "p-1", "mandate"))
+	ingestShop(t, s, 2, sign(t, gw, "p-hide", "mandate"))
+	ingestShop(t, s, 3, sign(t, gw, "p-1", "cart"))
+	c.add(5 * time.Minute)
+	mustStamp(t, s) // 10:06
+	mustStampNow(t, s)
+	b, err := s.ProofSource("shop", clockAt(10, 0, 30), clockAt(10, 3, 30), false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.VerifySource(sourceRoundTrip(t, b), receiptTrust(t, s, pub), time.Time{}, time.Time{})
+	if r.Valid() || !strings.Contains(r.Text(), "a repeat of an earlier one, and it is newer than its seq 1 in the bundle: the verdict is false") {
+		t.Fatalf("a false stale verdict passed:\n%s", r.Text())
+	}
+}
+
 // hashLiar — хранилище, которое пишет в вердикт квитанции действия p-lie
 // чужой хэш: тело и вердикт расходятся.
 type hashLiar struct{ gateway.Checker }

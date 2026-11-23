@@ -237,7 +237,7 @@ checkpoints-conflict.jsonl  головы, которые прежнюю не п�
 ```
 go build ./... && go vet ./... && go test -race ./...     # гейт (его же гоняет GitHub Actions на пуш в master, на тег и на PR)
 scripts/release.sh dist                                   # бинарники релиза и SHA256SUMS (на тег v* — в Actions)
-python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config|ship|cosign|pgreceipts   # мутации: каждая поломка должна уронить тест
+python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config|ship|cosign|pgreceipts|pgreview   # мутации: каждая поломка должна уронить тест
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # демо с настоящим Pipelock
 scripts/demo.sh                                           # демо на бинарниках, без интернета
 scripts/demo-intruder.sh                                  # взломщик почистил auth.log: удалённые строки — из хранилища

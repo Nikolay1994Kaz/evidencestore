@@ -9,7 +9,7 @@
   "./internal/pgtap/",
   "./internal/mcpserver/"
  ],
- "run": "^Test(Deal|LinkDeal|Receipt|Append|Sign|Intent|Stale|Voided|Truncated|Forged|Outcomes|LiveRestored|ReviewSlotMoved|LiveSetupSQL|LiveMigration|ReviewUpgrade|SetupSQL|Oversized|WindowRows|Ledger|ActionsPerMinute|LostCommit|TornReceipt|UndoIs|Execute)",
+ "run": "^Test(Deal|LinkDeal|Receipt|Append|SignRefuses|SignConcurrent|Intent|Stale|Voided|Truncated|Forged|Outcomes|LiveRestored|ReviewSlotMoved|LiveSetupSQL|LiveMigration|ReviewUpgrade|SetupSQL|Oversized|WindowRows|Ledger|ActionsPerMinute|LostCommit|TornReceipt|UndoIs|Execute)",
  "mutations": [
   {
    "name": "V1 сделка не смотрит на месяцы без открытого тела",

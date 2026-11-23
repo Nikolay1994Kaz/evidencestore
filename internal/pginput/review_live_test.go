@@ -451,12 +451,16 @@ func TestReviewSlotMovedWhileAway(t *testing.T) {
 	if len(r.sink.gaps) != 1 || !strings.Contains(r.sink.gaps[0], "a role with REPLICATION advanced or re-created it") || !gap {
 		t.Fatalf("gaps %q, alerts %+v", r.sink.gaps, r.alerts())
 	}
-	// Дальше — как обычно: ни нового пропуска, ни тревоги.
+	// Дальше — как обычно: свои подтверждения сборщика (и последнее, при
+	// закрытии) — не «сдвинул кто-то другой»: ни нового пропуска, ни тревоги.
 	s.Close()
 	r.xact(owner, "UPDATE public.rv_acc SET note = 'after' WHERE id = 4")
-	s = r.open()
-	if _, err := s.ReadAll(context.Background()); err != nil {
-		t.Fatal(err)
+	for range 2 {
+		s = r.open()
+		if _, err := s.ReadAll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
 	}
 	if len(r.sink.gaps) != 1 {
 		t.Fatalf("a second gap: %q", r.sink.gaps)
