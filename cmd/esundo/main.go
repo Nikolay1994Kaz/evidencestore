@@ -40,6 +40,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -284,9 +285,7 @@ func apply(args []string) {
 	}
 }
 
-// loadPlan читает сверенный план. С настройками путь поиска — из них: их и
-// правят, когда триггер не нашёл таблицу без схемы (T-5); сеанс отката снова
-// проверяет каждую схему пути.
+// loadPlan читает сверенный план.
 func loadPlan(path string, cfg *Config) (*pgundo.Plan, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -296,8 +295,13 @@ func loadPlan(path string, cfg *Config) (*pgundo.Plan, error) {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if cfg != nil {
-		p.SearchPath = cfg.SearchPath
+	// Путь — тот, с которым план сверен. Настройки с другим путём — отказ:
+	// молча подменить путь сверенного плана нельзя, а план со старым путём
+	// после правки настроек тоже не годится (T-5; R1-8, R2-9, заход 2).
+	if cfg != nil && !slices.Equal(p.SearchPath, cfg.SearchPath) {
+		var checked, settings pgundo.Plan
+		checked.SearchPath, settings.SearchPath = p.SearchPath, cfg.SearchPath
+		return nil, fmt.Errorf("the plan was checked with search_path %s, and the undo settings now say %s: run esundo check again", checked.Path(), settings.Path())
 	}
 	return &p, nil
 }
@@ -340,6 +344,16 @@ func describe(w io.Writer, p *pgundo.Plan, records int) {
 	}
 	if p.Who != nil && len(p.Actions) == 0 {
 		fmt.Fprintln(w, "  no action marker: the transaction did not come through the MCP server")
+	}
+	// Отметки без метки функций evidence: их написали pg_logical_emit_message
+	// напрямую (или функции прежней версии). Ни «кто», ни действием они не
+	// считаются; здесь — чтобы оператор их видел (R2-4, заход 2).
+	for _, f := range p.Forged {
+		s := pgundo.Shown(string(f))
+		if r := []rune(s); len(r) > 300 {
+			s = string(r[:300]) + "…"
+		}
+		fmt.Fprintf(w, "  FORGED marker (not written by the evidence functions, ignored): %s\n", s)
 	}
 	var names []string
 	for n := range p.Counts {

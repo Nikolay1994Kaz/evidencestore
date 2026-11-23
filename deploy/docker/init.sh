@@ -1,6 +1,9 @@
 #!/bin/sh
-# Первый запуск docker compose: сертификаты, ключ хранилища, настройки всех
-# программ и пароли ролей базы — в ./state. Второй запуск ничего не трогает.
+# Запуск docker compose. Первый: сертификаты, ключ хранилища, настройки всех
+# программ и пароли ролей базы — в ./state, пароль суперпользователя базы — в
+# томе dbsecret. Каждый: SQL настройки базы этой версии (escollect -setup-sql)
+# — db-setup применяет его, и после обновления образа база получает функции
+# отметок той же версии, что сборщик (заход 2, R1-5).
 #
 # Это проба на одной машине, как evidencestore dev-setup: демонстрационный УЦ,
 # метки времени от встроенной службы хранилища. Настоящая установка —
@@ -12,14 +15,29 @@
 #   mcp/        MCP-сервер: пароль роли сервера
 #   pg-index/   справочник и тревоги сборщика (сборщик пишет, esundo читает)
 #   receipts/   квитанции MCP (сервер пишет, сборщик читает)
-#   db/         пароль суперпользователя базы; setup/ — SQL настройки базы
+#   setup/      SQL настройки базы и пароли ролей для него (только root)
 #   agent.txt   подключение для агента напрямую: только чтение
+# Пароль суперпользователя базы — не в ./state, а в томе dbsecret: каталог
+# хоста с uid 999 читал бы пользователь хоста с тем же uid (заход 2, R1-10).
 set -eu
 S=${ES_STATE:-/state}
 UID_ES=${ES_UID:-10001}
 
+D=${ES_DBSECRET:-/dbsecret}
+
+# setup_sql — SQL настройки базы этой версии и пароли ролей (каждый запуск).
+setup_sql() {
+	umask 077
+	{
+		escollect -config "$S/collector/collector.json" -setup-sql
+		cat "$S/setup/passwords.sql"
+	} >"$S/setup/setup.sql.new"
+	mv "$S/setup/setup.sql.new" "$S/setup/setup.sql"
+}
+
 if [ -f "$S/.done" ]; then
-	echo "es-init: $S is set up already; to start over: docker compose down -v && rm -rf ./state"
+	setup_sql
+	echo "es-init: $S is set up already (the database setup SQL is renewed); to start over: docker compose down -v && rm -rf ./state"
 	exit 0
 fi
 if [ -n "$(ls -A "$S" 2>/dev/null)" ]; then
@@ -27,7 +45,7 @@ if [ -n "$(ls -A "$S" 2>/dev/null)" ]; then
 	exit 1
 fi
 umask 077
-for d in pki store collector mcp pg-index receipts db setup; do mkdir -p "$S/$d"; done
+for d in pki store collector mcp pg-index receipts setup; do mkdir -p "$S/$d"; done
 
 # Пароль: 32 шестнадцатеричных знака — без кавычек в строке подключения.
 pw() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
@@ -80,22 +98,20 @@ touch "$S/receipts/receipts.jsonl"
 # "notify" у входа "postgres" (Telegram, Slack, свой адрес), с командой отката
 # "undo_hint": "docker compose exec store esundo check -config /state/store/undo.json -xid {xid}".
 
-# SQL настройки базы и пароли ролей, которые он заводит: применяет db-setup.
+# Пароли ролей, которые заводит SQL настройки: применяет db-setup.
 {
-	escollect -config "$S/collector/collector.json" -setup-sql
 	echo "ALTER ROLE evidence_tap PASSWORD '$PW_TAP';"
 	echo "ALTER ROLE esmcp_bot PASSWORD '$PW_MCP';"
 	echo "ALTER ROLE undo_op PASSWORD '$PW_UNDO';"
 	echo "ALTER ROLE agent_bot PASSWORD '$PW_AGENT';"
-} >"$S/setup/setup.sql"
+} >"$S/setup/passwords.sql"
 printf '%s' "$PW_PG" >"$S/setup/postgres-password"
 # Базе пароль нужен её пользователем: postgres образа postgres (Debian), uid 999.
-# Файл и каталог — только ему: пароль суперпользователя сильнее всех паролей
-# в ./state (R1-5, R2-3).
-printf '%s' "$PW_PG" >"$S/db/postgres-password"
-chown -R "${PG_UID:-999}:${PG_UID:-999}" "$S/db"
-chmod 700 "$S/db"
-chmod 400 "$S/db/postgres-password"
+# Файл — только ему (R1-5, R2-3), в томе, а не в каталоге хоста.
+mkdir -p "$D"
+printf '%s' "$PW_PG" >"$D/postgres-password"
+chown "${PG_UID:-999}:${PG_UID:-999}" "$D/postgres-password"
+chmod 400 "$D/postgres-password"
 
 cat >"$S/mcp/mcp.json" <<EOF
 {
@@ -121,5 +137,6 @@ printf 'host=db user=agent_bot dbname=shop password=%s\n' "$PW_AGENT" >"$S/agent
 
 chown -R "$UID_ES:$UID_ES" "$S/store" "$S/collector" "$S/mcp" "$S/pg-index" "$S/receipts" "$S/agent.txt"
 chmod 711 "$S"
+setup_sql
 touch "$S/.done"
 echo "es-init: set up in ./state; the store key: $KEY"

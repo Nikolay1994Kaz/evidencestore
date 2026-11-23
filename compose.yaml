@@ -25,6 +25,7 @@ services:
     command: ["es-init"]
     volumes:
       - ./state:/state
+      - dbsecret:/dbsecret
 
   db:
     image: postgres:${PG_VERSION:-17}
@@ -41,7 +42,7 @@ services:
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_slot_wal_keep_size=2GB"]
     volumes:
       - db:/var/lib/postgresql
-      - ./state/db:/run/es:ro
+      - dbsecret:/run/es:ro
       - ./deploy/docker/demo.sql:/docker-entrypoint-initdb.d/demo.sql:ro
     healthcheck:
       # По TCP, как к ней ходят остальные: при первом запуске образ гоняет
@@ -51,7 +52,8 @@ services:
       interval: 2s
       retries: 30
 
-  # SQL настройки базы (escollect -setup-sql) — при каждом запуске: он повторяем.
+  # SQL настройки базы (escollect -setup-sql) — при каждом запуске: он повторяем,
+  # а init пишет его заново той версией, что в образе.
   db-setup:
     image: postgres:${PG_VERSION:-17}
     depends_on:
@@ -104,3 +106,5 @@ services:
 
 volumes:
   db:
+  # Пароль суперпользователя базы: только пользователю базы, не в каталоге хоста.
+  dbsecret:

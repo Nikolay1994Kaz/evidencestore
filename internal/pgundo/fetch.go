@@ -105,9 +105,13 @@ func (f *Fetcher) Fetch(xid uint32) ([][]byte, error) {
 	if entry.Kind == pgtap.KindFingerprint {
 		// Транзакция роли не из списков: в хранилище только её отпечаток —
 		// кто, ключи строк и их хеши (DECISIONS, п. 41). Строк «до» нет.
-		return nil, refuse("transaction %d is of a role outside the collector's lists (%s): the store keeps only its fingerprint, in record %d — "+
+		where := fmt.Sprintf("record %d", entry.FirstSeq)
+		if entry.LastSeq > entry.FirstSeq {
+			where = fmt.Sprintf("records %d–%d", entry.FirstSeq, entry.LastSeq)
+		}
+		return nil, refuse("transaction %d is of a role outside the collector's lists (%s): the store keeps only its fingerprint, in %s — "+
 			"who, the keys of the rows and their hashes, not the rows — so it cannot be undone from the store. Restore the rows from a backup; "+
-			"the hashes tell whether a backup row is the one it changed", xid, entry.Who, entry.FirstSeq)
+			"the hashes tell whether a backup row is the one it changed (the recipe is in the README)", xid, entry.Who, where)
 	}
 	dir, err := os.MkdirTemp("", "esundo-fetch-")
 	if err != nil {

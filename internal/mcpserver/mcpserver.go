@@ -585,6 +585,14 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	// бывает занят заново (база восстановлена из копии, счётчик обошёл
 	// 32 бита), и откат чужой транзакции вышел бы откатом этого действия.
 	if !marks(plan, actionID) {
+		for _, f := range plan.Forged {
+			if strings.Contains(string(f), actionID) {
+				// Отметка этого действия — без метки функций evidence (функции
+				// прежней версии или подделка): причина не в номере (T-5, заход 2).
+				return "", fmt.Errorf("the marker of action %s in transaction %d is not marked by the evidence functions (an older escollect -setup-sql, "+
+					"or someone wrote it with pg_logical_emit_message). This action is not undone here: ask a person", actionID, xid)
+			}
+		}
 		return "", fmt.Errorf("transaction %d in the evidence store carries no marker of action %s: the transaction id was taken again "+
 			"(the database was restored from a backup, or the counter wrapped). This action is not undone here: ask a person", xid, actionID)
 	}

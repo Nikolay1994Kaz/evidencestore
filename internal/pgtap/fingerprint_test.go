@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -253,21 +254,22 @@ func TestFingerprintWithoutTheWholeRow(t *testing.T) {
 	}
 }
 
-// Отметки — от функций evidence, с ключом. Отметка без него (её пишет любая
-// роль с pg_logical_emit_message) не решает, чья транзакция: та берётся
-// целиком, поддельная отметка — в заголовке, тревога forged-marker (R1-3,
-// T-3). Ключ в хранилище и справочник не идёт.
+// Отметки — от функций evidence, с меткой по ключу и xid. Отметка без неё
+// (её пишет любая роль с pg_logical_emit_message) не решает, чья транзакция:
+// та берётся целиком, поддельная отметка — в заголовке, тревога
+// forged-marker (R1-3, T-3). Метка в хранилище и справочник не идёт; чужое
+// сообщение (outbox) — не отметка вовсе.
 func TestForgedMarkers(t *testing.T) {
-	keyed := func(prefix, content string) pgoutput.Message {
-		return pgoutput.Message{Transactional: true, Prefix: prefix, Content: []byte(content[:len(content)-1] + `,"key":"k-1"}`)}
+	keyed := func(xid uint32, prefix, content string) pgoutput.Message {
+		return pgoutput.Message{Transactional: true, Prefix: prefix, Content: []byte(MarkerMAC("k-1", xid, prefix, []byte(content)) + content)}
 	}
 	h := open(t, t.TempDir(), func(c *Config) { all(c); c.MarkerKey = "k-1"; c.RequireAction = true })
 	upd := pgoutput.Update{RelID: 7, OldKind: 'O', Old: []pgoutput.Value{txt("1"), txt("a")}, New: []pgoutput.Value{txt("1"), txt("b")}}
 	// Подлинные отметки агента: ключ снят.
-	h.run(1, keyed(PrefixWho, `{"role":"agent","app":"esmcp/bot"}`), keyed(PrefixAction, `{"role":"agent","info":{"action_id":"a-1"}}`), accounts, upd)
+	h.run(1, keyed(1, PrefixWho, `{"role":"agent","app":"esmcp/bot"}`), keyed(1, PrefixAction, `{"role":"agent","info":{"action_id":"a-1"}}`), accounts, upd)
 	// Приложение называет себя агентом и ставит действие; подлинная отметка
 	// триггера — его роль.
-	h.run(2, who("agent"), action("agent", "a-2"), keyed(PrefixWho, `{"role":"app"}`), accounts, upd)
+	h.run(2, who("agent"), action("agent", "a-2"), keyed(2, PrefixWho, `{"role":"app"}`), accounts, upd)
 	idx := h.index()
 	if len(idx) != 2 || string(idx[0].Who) != `{"role":"agent","app":"esmcp/bot"}` || len(idx[0].Actions) != 1 || strings.Contains(string(idx[0].Actions[0]), "k-1") {
 		t.Fatalf("the genuine markers: %+v", idx[0])
@@ -283,9 +285,144 @@ func TestForgedMarkers(t *testing.T) {
 	if strings.Count(k, alert.KindForged) != 2 || strings.Contains(k, alert.KindNoAction) {
 		t.Fatalf("alerts: %s", k)
 	}
+	// Метка другой транзакции не подходит: отметку из журнала не переложить.
+	h.run(3, keyed(1, PrefixWho, `{"role":"agent","app":"esmcp/bot"}`), accounts, upd)
+	if idx := h.index(); string(idx[len(idx)-1].Who) == `{"role":"agent","app":"esmcp/bot"}` {
+		t.Fatalf("a marker of transaction 1 counted in transaction 3: %+v", idx[len(idx)-1])
+	}
+	// Outbox приложения — не отметка: ни тревоги, ни транзакции целиком.
+	n := len(h.alerts())
+	h.run(4, keyed(4, PrefixWho, `{"role":"app"}`), pgoutput.Message{Transactional: true, Prefix: "outbox.orders", Content: []byte(`{"order":1}`)}, accounts, upd)
+	if k := h.alerts(); len(k) != n || !h.tap.Pending() {
+		t.Fatalf("an outbox message raised %v", k[n:])
+	}
 	// Поддельный отказ — тревога forged-marker, а не refused.
 	h.tap.Handle(pgoutput.Message{Prefix: PrefixRefused, LSN: 99999, Content: []byte(`{"role":"agent","info":{"rows":9,"limit":1}}`)})
 	if k := h.alertKinds(); k[len(k)-1] != alert.KindForged {
 		t.Fatalf("a forged refusal: %v", k)
+	}
+}
+
+func inserts(base, n int) []any {
+	var out []any
+	for i := 0; i < n; i++ {
+		out = append(out, pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt(fmt.Sprint(base + i)), txt(fmt.Sprintf("%032x", base+i))}})
+	}
+	return out
+}
+
+var other = pgoutput.Relation{ID: 8, Namespace: "public", Name: "other", Identity: 'f',
+	Columns: []pgoutput.Column{{Key: true, Name: "id"}, {Key: true, Name: "note"}}}
+
+// Заход 2 (R1-1, R2-2): TRUNCATE в отпечатке, перешедшем на свои части, —
+// строкой T в потоке, на своём месте, до строк и после них. Счёт по таблицам
+// у такого отпечатка — всей транзакции (R1-7, R2-6).
+func TestTruncateInAFingerprintOfItsOwnParts(t *testing.T) {
+	for _, first := range []bool{true, false} {
+		h := open(t, t.TempDir(), func(c *Config) { c.All = true })
+		msgs := []any{who("app"), accounts, other}
+		if first {
+			msgs = append(msgs, pgoutput.Truncate{RelIDs: []uint32{8}})
+		}
+		msgs = append(msgs, inserts(0, 10000)...)
+		if !first {
+			msgs = append(msgs, pgoutput.Truncate{RelIDs: []uint32{8}})
+		}
+		h.run(1, msgs...)
+		idx := h.index()
+		e := idx[len(idx)-1]
+		recs, err := ReadTransaction(1, h.parts()[e.FirstSeq-1:e.LastSeq])
+		if err != nil || e.Kind != KindFingerprint || recs[0]["fingerprint"] != true {
+			t.Fatalf("%+v %v", e, err)
+		}
+		at := -1
+		for i, r := range recs {
+			if r["t"] == "T" {
+				at = i
+			}
+		}
+		if want := map[bool]int{true: 1, false: len(recs) - 2}[first]; at != want || e.Tables["public.accounts"].I != 10000 || e.Changes != 10000 {
+			t.Fatalf("truncate first %v: T at line %d of %d (want %d), counts %v", first, at, len(recs), want, e.Tables)
+		}
+	}
+}
+
+// Заход 2 (R1-6, R2-3): поддельная отметка в транзакции, решённой
+// отпечатком. Строк ещё нет — транзакция целиком; строки уже пошли — отпечаток,
+// и поддельная отметка в нём.
+func TestForgedMarkerInAFingerprint(t *testing.T) {
+	keyed := func(xid uint32, prefix, content string) pgoutput.Message {
+		return pgoutput.Message{Transactional: true, Prefix: prefix, Content: []byte(MarkerMAC("k-1", xid, prefix, []byte(content)) + content)}
+	}
+	h := open(t, t.TempDir(), func(c *Config) { all(c); c.MarkerKey = "k-1"; c.RequireAction = true })
+	upd := pgoutput.Update{RelID: 7, OldKind: 'O', Old: []pgoutput.Value{txt("1"), txt("a")}, New: []pgoutput.Value{txt("1"), txt("b")}}
+	h.run(1, keyed(1, PrefixWho, `{"role":"app"}`), who("agent"), action("agent", "a-9"), accounts, upd)
+	h.run(2, keyed(2, PrefixWho, `{"role":"app"}`), accounts, upd, action("agent", "a-10"))
+	h.tap.Flush()
+	idx := h.index()
+	if len(idx) != 2 || idx[0].Kind != "" || string(idx[0].Who) != `{"role":"app"}` || len(idx[0].Actions) != 0 || idx[1].Kind != KindFingerprint {
+		t.Fatalf("index %+v", idx)
+	}
+	var pack []map[string]any
+	for _, b := range h.parts() {
+		if p, err := ReadPack(b); err == nil {
+			pack = p
+		}
+	}
+	if len(pack) != 1 || !strings.Contains(fmt.Sprint(pack[0]["forged"]), "a-10") {
+		t.Fatalf("the forged marker is not in the fingerprint: %v", pack)
+	}
+	for _, a := range h.alerts() {
+		if a.XID == 2 && !strings.Contains(a.Signals[0].Detail, "kept as a fingerprint") {
+			t.Fatalf("the alert of xid 2: %v", a.Signals)
+		}
+	}
+}
+
+// Заход 2 (T-1, T-6): отметок в памяти до заголовка — не больше maxMarks,
+// каждая не длиннее maxMarkBytes; лишние — счёт, тревога many-markers. В
+// справочнике и тревоге — не больше восьми, по 2 КБ. Раньше сто тысяч отметок
+// действия одним SELECT агента роняли сборщик по памяти.
+func TestMarkersAreBounded(t *testing.T) {
+	h := open(t, t.TempDir(), func(c *Config) { all(c); c.RequireAction = true })
+	pad := strings.Repeat("z", 40<<10)
+	msgs := []any{who("agent")}
+	for i := 0; i < 20000; i++ {
+		msgs = append(msgs, action("agent", fmt.Sprint("a-", i)))
+	}
+	msgs = append(msgs, pgoutput.Message{Transactional: true, Prefix: PrefixUndo, Content: []byte(`{"role":"agent","info":{"pad":"` + pad + `"}}`)})
+	msgs = append(msgs, accounts, pgoutput.Update{RelID: 7, OldKind: 'O', Old: []pgoutput.Value{txt("1"), txt("a")}, New: []pgoutput.Value{txt("1"), txt("b")}})
+	for i := 0; i < 100; i++ {
+		msgs = append(msgs, action("agent", fmt.Sprint("after-", i))) // после заголовка — в поток
+	}
+	h.run(1, msgs...)
+	recs, err := ReadTransaction(1, h.parts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := recs[0]
+	if n := len(head["actions"].([]any)); n != maxMarks || head["markers_dropped"] != float64(20000-maxMarks) {
+		t.Fatalf("the header: %d actions, %v dropped", n, head["markers_dropped"])
+	}
+	if u := fmt.Sprint(head["undo"]); len(u) > maxMarkBytes+200 || !strings.Contains(u, "cut") {
+		t.Fatalf("a marker of %d bytes is not cut: %d", len(pad), len(u))
+	}
+	m := 0
+	for _, r := range recs {
+		if r["t"] == "M" {
+			m++
+		}
+	}
+	idx := h.index()
+	if m != 100 || len(idx[0].Actions) != 8 {
+		t.Fatalf("%d markers after the header in the stream, %d in the index", m, len(idx[0].Actions))
+	}
+	var big int
+	for _, a := range h.alerts() {
+		b, _ := json.Marshal(a)
+		big = max(big, len(b))
+	}
+	if k := strings.Join(h.alertKinds(), ","); !strings.Contains(k, "many-markers") || big > 8<<10 {
+		t.Fatalf("alerts %s, the largest %d bytes", k, big)
 	}
 }

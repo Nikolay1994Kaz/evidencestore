@@ -284,6 +284,8 @@ func Text(e Event, o TextOptions) string {
 		fmt.Fprintf(&b, "evidencestore, %s: undo transaction %d", title, e.XID)
 	case e.XID != 0 && e.Fingerprint:
 		fmt.Fprintf(&b, "evidencestore, %s: transaction %d of a role outside the collector's lists (only its fingerprint is kept)", title, e.XID)
+	case e.XID != 0 && slices.Contains(e.Kinds(), KindForged):
+		fmt.Fprintf(&b, "evidencestore, %s: transaction %d with forged evidence markers", title, e.XID)
 	case e.XID != 0 && slices.Contains(e.Kinds(), KindNoWho):
 		fmt.Fprintf(&b, "evidencestore, %s: transaction %d without a who marker", title, e.XID)
 	case e.XID != 0:
@@ -322,7 +324,8 @@ func Text(e Event, o TextOptions) string {
 		} else {
 			fmt.Fprintf(&tail, "\nstore records: %d–%d", e.FirstSeq, e.LastSeq)
 		}
-		if o.UndoHint != "" && e.Undo == nil && !e.Fingerprint {
+		// Откат TRUNCATE esundo не делает: подсказывать его нечего (T-8, заход 2).
+		if o.UndoHint != "" && e.Undo == nil && !e.Fingerprint && !slices.Contains(e.Kinds(), KindTruncate) {
 			fmt.Fprintf(&tail, "\nundo preview: %s", short(strings.ReplaceAll(o.UndoHint, "{xid}", strconv.FormatUint(uint64(e.XID), 10))))
 		}
 	}

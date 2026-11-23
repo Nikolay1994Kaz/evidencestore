@@ -639,3 +639,26 @@ func TestLongAlertLineDoesNotStopDelivery(t *testing.T) {
 	// Показатели доставка обновляет после ответа получателя: ждём и их.
 	waitFor(t, "nothing waiting", func() bool { st := r.n.Stats(); return st[0].Waiting == 0 && !st[0].Failing })
 }
+
+// Заголовок тревоги — по тому, что известно о транзакции: отпечаток, поддельные
+// отметки, без отметки «кто» — не «agent transaction» (P-306; заход 2).
+func TestTitleSaysWhatTheTransactionIs(t *testing.T) {
+	for kind, want := range map[string]string{KindForged: "transaction 5 with forged evidence markers", KindNoWho: "transaction 5 without a who marker", KindNoAction: "agent transaction 5"} {
+		e := Event{XID: 5}
+		e.Add(kind, "x")
+		if text := Text(e, TextOptions{Title: "db"}); !strings.Contains(strings.SplitN(text, "\n", 2)[0], want) {
+			t.Errorf("%s: %q", kind, text)
+		}
+	}
+	e := Event{XID: 5, Fingerprint: true, FirstSeq: 3, LastSeq: 3}
+	e.Add(KindMassChange, "x")
+	if text := Text(e, TextOptions{Title: "db", UndoHint: "esundo -xid {xid}"}); !strings.Contains(text, "only its fingerprint is kept") || strings.Contains(text, "undo preview") {
+		t.Errorf("a fingerprint: %q", text)
+	}
+	// TRUNCATE esundo не откатывает: и подсказки нет (T-8, заход 2).
+	e = Event{XID: 5, FirstSeq: 3, LastSeq: 3}
+	e.Add(KindTruncate, "x")
+	if text := Text(e, TextOptions{Title: "db", UndoHint: "esundo -xid {xid}"}); strings.Contains(text, "undo preview") {
+		t.Errorf("TRUNCATE: %q", text)
+	}
+}

@@ -88,7 +88,10 @@ type fpEntry struct {
 	Changes    int               `json:"changes"`
 	Tables     map[string]Counts `json:"tables,omitempty"`
 	Truncated  []string          `json:"truncated,omitempty"`
-	Rows       []json.RawMessage `json:"rows,omitempty"` // fpRow
+	Forged     []json.RawMessage `json:"forged,omitempty"` // отметки без метки функций evidence
+	// MarksDropped — отметок сверх maxMarks: их нет нигде, кроме счёта.
+	MarksDropped int               `json:"markers_dropped,omitempty"`
+	Rows         []json.RawMessage `json:"rows,omitempty"` // fpRow и строки T (TRUNCATE) по порядку журнала
 
 	end uint64 // EndLSN числом
 }
@@ -270,7 +273,8 @@ func (t *Tap) fpChange(tx *txState, op byte, id uint32, oldKind byte, old, fresh
 	if tx.rowBytes <= t.fpInline() {
 		return nil
 	}
-	// Отпечаток не для пачки: заголовок, накопленные строки — в свой поток.
+	// Отпечаток не для пачки: заголовок и накопленные строки (с TRUNCATE) —
+	// в свой поток.
 	if err := t.start(tx); err != nil {
 		return err
 	}
@@ -302,7 +306,7 @@ func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err erro
 	e := fpEntry{
 		XID: tx.begin.XID, CommitTime: tx.begin.CommitTime.UTC().Format(time.RFC3339Nano),
 		CommitLSN: pgwire.LSN(tx.begin.FinalLSN).String(), EndLSN: pgwire.LSN(c.EndLSN).String(),
-		Who: tx.who, Changes: tx.changes, Tables: tx.tables, Truncated: tx.truncated, Rows: tx.rows, end: c.EndLSN,
+		Who: tx.who, Changes: tx.changes, Tables: tx.tables, Truncated: tx.truncated, Forged: tx.forgedMarks, MarksDropped: tx.marksDropped, Rows: tx.rows, end: c.EndLSN,
 	}
 	line, err := json.Marshal(e)
 	if err != nil {

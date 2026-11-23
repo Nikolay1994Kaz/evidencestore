@@ -706,3 +706,15 @@ func TestBuildRefusesAFingerprintStream(t *testing.T) {
 		t.Fatalf("a fingerprint stream: %v", err)
 	}
 }
+
+// Поддельная отметка действия (строка M с forged, pgtap.forgedMark) — улика в
+// Plan.Forged, а не действие транзакции (R2-4, заход 2).
+func TestBuildKeepsForgedMarkersApart(t *testing.T) {
+	p, err := Build(7, journal(1<<30, m{"forged": []any{m{"prefix": "evidence/who", "content": m{"role": "esmcp_bot"}}}},
+		rel(1, "t"),
+		ch("U", 1, []any{"1", "a"}, []any{"1", "b"}),
+		m{"t": "M", "prefix": "evidence/action", "content": m{"role": "esmcp_bot", "info": m{"action_id": "act-77"}}, "forged": true}))
+	if err != nil || len(p.Actions) != 0 || len(p.Forged) != 2 {
+		t.Fatalf("actions %s, forged %s, %v", p.Actions, p.Forged, err)
+	}
+}

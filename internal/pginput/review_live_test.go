@@ -128,6 +128,8 @@ func newReviewRig(t *testing.T) *reviewRig {
 		"SELECT pg_sleep(0.2)",
 		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'rv_slot'",
 		"DROP TABLE IF EXISTS public.rv_acc, public.rv_part, public.rv_doc, public.rv_ts",
+		// Таблица ключа — заново: её свойства (RLS) не должны доживать с прошлого прогона.
+		"DROP TABLE IF EXISTS evidence.marker_key",
 		"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rv_owner') THEN CREATE ROLE rv_owner LOGIN; END IF; END $$",
 		"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rv_app') THEN CREATE ROLE rv_app LOGIN; END IF; END $$",
 		"REVOKE EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text) FROM rv_app",
@@ -137,8 +139,9 @@ func newReviewRig(t *testing.T) *reviewRig {
 		"CREATE TABLE public.rv_part_1 PARTITION OF public.rv_part FOR VALUES FROM (0) TO (100)",
 		"CREATE TABLE public.rv_doc (id int PRIMARY KEY, note text, big text) PARTITION BY RANGE (id)",
 		"CREATE TABLE public.rv_doc_1 PARTITION OF public.rv_doc FOR VALUES FROM (0) TO (100)",
-		"CREATE TABLE public.rv_ts (id int PRIMARY KEY, at timestamptz, f float8, b bytea, n numeric, note text)",
-		"INSERT INTO public.rv_ts VALUES (1, '2026-11-23 15:00:00+05', 0.1, '\\x00ff', 1.50, 'a&b <c>')",
+		"CREATE TABLE public.rv_ts (id int PRIMARY KEY, at timestamptz, f float8, b bytea, n numeric, flag bool, code char(4), ip inet, rel regclass, note text, " +
+			"twice int GENERATED ALWAYS AS (id * 2) STORED)",
+		"INSERT INTO public.rv_ts VALUES (1, '2026-11-23 15:00:00+05', 0.1, '\\x00ff', 1.50, true, 'ab', '10.0.0.1', 'public.rv_acc', 'a&b <c>')",
 		"ALTER TABLE public.rv_acc OWNER TO rv_owner", "ALTER TABLE public.rv_part OWNER TO rv_owner",
 		"ALTER TABLE public.rv_part_1 OWNER TO rv_owner", "ALTER TABLE public.rv_doc OWNER TO rv_owner",
 		"ALTER TABLE public.rv_doc_1 OWNER TO rv_owner", "ALTER TABLE public.rv_ts OWNER TO rv_owner",
@@ -296,12 +299,22 @@ func TestReviewHashRecipe(t *testing.T) {
 	e, _, _ := pgtap.Lookup(r.index(), x)
 	pack, _ := pgtap.ReadPack(r.sink.bodies[e.FirstSeq-1])
 	row := pack[len(pack)-1]["rows"].([]any)[0].(map[string]any)
-	// Рецепт README («Что сборщик берёт и что обещает»).
+	// Рецепт README («Что сборщик берёт и что обещает»): текст — функцией
+	// вывода (format), не приведением ::text (bool, char(n), inet — заход 2,
+	// R1-4, R2-5); генерируемой колонки до PostgreSQL 18 в журнале нет.
 	col := func(c string) string {
-		return fmt.Sprintf("CASE WHEN %[1]s IS NULL THEN '-' ELSE octet_length(%[1]s::text) || ':' || %[1]s::text END", c)
+		return fmt.Sprintf("CASE WHEN %[1]s IS NULL THEN '-' ELSE octet_length(convert_to(format('%%s', %[1]s), 'UTF8')) || ':' || format('%%s', %[1]s) END", c)
+	}
+	cols := []string{"id", "at", "f", "b", "n", "flag", "code", "ip", "rel", "note"}
+	if r.one(r.admin, "SHOW server_version_num") >= "180000" {
+		cols = append(cols, "twice")
+	}
+	var parts []string
+	for _, c := range cols {
+		parts = append(parts, col(c))
 	}
 	recipe := "SET TimeZone = 'UTC'; SET DateStyle = 'ISO, YMD'; SET IntervalStyle = 'postgres'; SET extra_float_digits = 3; SET bytea_output = 'hex'; " +
-		"SELECT rtrim(encode(substr(sha256(convert_to(concat(" + strings.Join([]string{col("id"), col("at"), col("f"), col("b"), col("n"), col("note")}, ", ") +
+		"SET search_path = pg_catalog, pg_temp; SELECT rtrim(encode(substr(sha256(convert_to(concat(" + strings.Join(parts, ", ") +
 		"), 'UTF8')), 1, 16), 'base64'), '=') FROM public.rv_ts WHERE id = 1"
 	human := r.dial("postgres")
 	res, err := human.Query(recipe)
@@ -334,4 +347,150 @@ func TestReviewFingerprintAlertText(t *testing.T) {
 		return
 	}
 	t.Fatalf("no alert of xid %d", x)
+}
+
+// Заход 2 (R1-2, R2-1): ключа отметок нет в журнале — роль с REPLICATION
+// видит в своём слоте только метки; член pg_read_all_data таблицу ключа не
+// читает (RLS). Метку из журнала к своей транзакции не приложить: она — от
+// xid. Сообщения outbox — не отметки (R1-3).
+func TestReviewMarkerKeyStaysSecret(t *testing.T) {
+	r := newReviewRig(t)
+	for _, q := range []string{
+		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'rv_cdc'",
+		"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rv_cdc') THEN CREATE ROLE rv_cdc LOGIN REPLICATION; END IF; END $$",
+		"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rv_bi') THEN CREATE ROLE rv_bi LOGIN; END IF; END $$",
+		"GRANT pg_read_all_data TO rv_bi",
+		"GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text) TO rv_app",
+	} {
+		r.exec(r.admin, q)
+	}
+	t.Cleanup(func() {
+		r.admin.Query("SELECT pg_drop_replication_slot('rv_cdc')")
+		r.admin.Query("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text) FROM rv_app")
+	})
+	key := r.one(r.admin, "SELECT k FROM evidence.marker_key")
+	if n := r.one(r.dial("rv_bi"), "SELECT count(*) FROM evidence.marker_key"); n != "0" {
+		t.Fatalf("a member of pg_read_all_data sees %s rows of the marker key", n)
+	}
+	cdc := r.dial("rv_cdc")
+	r.exec(cdc, "SELECT pg_create_logical_replication_slot('rv_cdc', 'test_decoding')")
+	owner := r.dial("rv_owner")
+	s := r.open()
+	seen := r.xact(owner, "UPDATE public.rv_acc SET note = 'seen' WHERE id = 1")
+	log := r.one(cdc, "SELECT string_agg(data, E'\\n') FROM pg_logical_slot_get_changes('rv_cdc', NULL, NULL)")
+	if strings.Contains(log, key) {
+		t.Fatal("the marker key is in the database log")
+	}
+	// Метка отметки триггера из журнала — в чужой транзакции.
+	i := strings.Index(log, "evidence/who")
+	j := strings.Index(log[i:], "content: ")
+	genuine := strings.SplitN(log[i+j+len("content: "):], "\n", 2)[0]
+	if len(genuine) < 65 || !strings.Contains(genuine, `"rv_owner"`) {
+		t.Fatalf("no marked marker in the log: %q", genuine)
+	}
+	forged := strings.Replace(genuine, `"rv_owner"`, `"rv_mcp"`, 1)
+	app := r.dial("rv_app")
+	x := r.xact(app, "SELECT pg_logical_emit_message(true, 'evidence/who', "+pgwire.Literal(genuine)+"); SELECT pg_logical_emit_message(true, 'evidence/who', "+
+		pgwire.Literal(forged)+"); SELECT pg_logical_emit_message(true, 'outbox.orders', '{\"order\":1}'); UPDATE public.rv_acc SET note = 'by app' WHERE id = 3")
+	y := r.xact(app, "SELECT pg_logical_emit_message(true, 'outbox.orders', '{\"order\":2}'); UPDATE public.rv_acc SET note = 'paid' WHERE id = 4")
+	if _, err := s.ReadAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e, _, _ := pgtap.Lookup(r.index(), x)
+	if e.Kind != "" || !strings.Contains(string(e.Who), `"role":"rv_app"`) {
+		t.Fatalf("a transaction with markers copied from the log of transaction %d: %+v", seen, e)
+	}
+	ey, _, _ := pgtap.Lookup(r.index(), y)
+	for _, a := range r.alerts() {
+		if a.XID == y {
+			t.Fatalf("an outbox message raised %v", a.Kinds())
+		}
+	}
+	if ey.Kind != pgtap.KindFingerprint {
+		t.Fatalf("a transaction of rv_app with an outbox message: %+v", ey)
+	}
+}
+
+// Заход 2 (R2-1): таблица ключа, заведённая до скрипта не им, — заменяется:
+// её ключ мог быть известен тому, кто её завёл.
+func TestReviewForeignMarkerKeyIsReplaced(t *testing.T) {
+	r := newReviewRig(t)
+	r.exec(r.admin, "DROP TABLE evidence.marker_key; CREATE TABLE evidence.marker_key (k text NOT NULL); INSERT INTO evidence.marker_key VALUES ('known-to-the-owner'); "+
+		"ALTER TABLE evidence.marker_key OWNER TO rv_owner")
+	setup, err := SetupSQL(&r.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.exec(r.admin, setup)
+	if k := r.one(r.admin, "SELECT k FROM evidence.marker_key"); k == "known-to-the-owner" || len(k) != 64 {
+		t.Fatalf("the key after the script: %q", k)
+	}
+	if o := r.one(r.admin, "SELECT relowner::regrole::text FROM pg_class WHERE oid = 'evidence.marker_key'::regclass"); o != EvidenceOwner {
+		t.Fatalf("the owner of the key table: %s", o)
+	}
+}
+
+// Заход 2 (R1-5, R2-8): отметки функций прежней версии (без метки) — тревога
+// с объяснением, транзакция целиком, а не тихая потеря роли.
+func TestReviewMarkersOfOlderFunctions(t *testing.T) {
+	r := newReviewRig(t)
+	r.exec(r.admin, `CREATE OR REPLACE FUNCTION evidence.mark_action(info json) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN PERFORM pg_logical_emit_message(true, 'evidence/action', json_build_object('role', session_user, 'info', info)::text); END $f$`)
+	mcp := r.dial("rv_mcp")
+	s := r.open()
+	x := r.xact(mcp, `SELECT evidence.mark_action('{"action_id":"a-1","agent":"bot","tool":"execute"}'); UPDATE public.rv_acc SET note = 'by the server' WHERE id = 8`)
+	if _, err := s.ReadAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e, _, _ := pgtap.Lookup(r.index(), x)
+	var detail string
+	for _, a := range r.alerts() {
+		if a.XID == x {
+			for _, sg := range a.Signals {
+				if sg.Kind == alert.KindForged {
+					detail = sg.Detail
+				}
+			}
+		}
+	}
+	if e.Kind != "" || !strings.Contains(string(e.Who), `"rv_mcp"`) || len(e.Actions) != 0 || !strings.Contains(detail, "older escollect -setup-sql") {
+		t.Fatalf("a transaction marked by older functions: %+v, alert %q", e, detail)
+	}
+}
+
+// Заход 2 (R1-5, R2-8, T-5): обновление. Транзакция, зафиксированная до
+// появления ключа (функции прежней версии, без метки), — как раньше: роль и
+// действие верны, тревоги о подделке нет.
+func TestReviewUpgradeKeepsOlderMarkers(t *testing.T) {
+	r := newReviewRig(t)
+	s := r.open()
+	s.Close()
+	setup, _ := SetupSQL(&r.cfg)
+	r.exec(r.admin, `DROP TABLE evidence.marker_key;
+CREATE OR REPLACE FUNCTION evidence.mark_who() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN PERFORM pg_logical_emit_message(true, 'evidence/who', json_build_object('role', session_user, 'app', current_setting('application_name', true),
+ 'op', TG_OP, 'table', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME)::text); RETURN NULL; END $f$;
+CREATE OR REPLACE FUNCTION evidence.mark_action(info json) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN PERFORM pg_logical_emit_message(true, 'evidence/action', json_build_object('role', session_user, 'info', info)::text); END $f$`)
+	mcp := r.dial("rv_mcp")
+	x := r.xact(mcp, `SELECT evidence.mark_action('{"action_id":"a-1","agent":"bot","tool":"execute"}'); UPDATE public.rv_acc SET note = 'by the server' WHERE id = 8`)
+	r.exec(r.admin, setup)
+	s = r.open()
+	e, found, _ := pgtap.Lookup(r.index(), x)
+	for _, a := range r.alerts() {
+		if a.XID == x {
+			t.Fatalf("alerts of a transaction of the older version: %v", a.Kinds())
+		}
+	}
+	if !found || !strings.Contains(string(e.Who), `"rv_mcp"`) || len(e.Actions) != 1 {
+		t.Fatalf("a transaction marked by the older functions before the upgrade: %+v", e)
+	}
+	// После скрипта — уже с метками.
+	y := r.xact(mcp, `SELECT evidence.mark_action('{"action_id":"a-2","agent":"bot","tool":"execute"}'); UPDATE public.rv_acc SET note = 'after' WHERE id = 8`)
+	if _, err := s.ReadAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if e, _, _ := pgtap.Lookup(r.index(), y); len(e.Actions) != 1 {
+		t.Fatalf("after the upgrade: %+v", e)
+	}
 }

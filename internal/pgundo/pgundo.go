@@ -102,12 +102,15 @@ type Step struct {
 
 // Plan — откат одной транзакции.
 type Plan struct {
-	XID     uint32                  `json:"xid"`
-	Who     json.RawMessage         `json:"who,omitempty"`     // отметка роли из журнала
-	Actions []json.RawMessage       `json:"actions,omitempty"` // отметки действий MCP
-	Undo    json.RawMessage         `json:"undo,omitempty"`    // это сама транзакция отката
-	Changes int                     `json:"changes"`           // изменений строк в транзакции
-	Noop    int                     `json:"noop"`              // строк без итогового изменения
+	XID     uint32            `json:"xid"`
+	Who     json.RawMessage   `json:"who,omitempty"`     // отметка роли из журнала
+	Actions []json.RawMessage `json:"actions,omitempty"` // отметки действий MCP
+	// Forged — отметки без метки функций evidence (pgtap.authentic): ни
+	// «кто», ни действием они не считаются; их показывает esundo.
+	Forged  []json.RawMessage       `json:"forged,omitempty"`
+	Undo    json.RawMessage         `json:"undo,omitempty"` // это сама транзакция отката
+	Changes int                     `json:"changes"`        // изменений строк в транзакции
+	Noop    int                     `json:"noop"`           // строк без итогового изменения
 	Counts  map[string]pgtap.Counts `json:"counts"`
 	Tables  map[string]*Table       `json:"tables"`
 	Steps   []Step                  `json:"steps"` // в порядке применения
@@ -163,6 +166,12 @@ func Build(xid uint32, lines [][]byte) (*Plan, error) {
 			p.Actions = append(p.Actions, r)
 		}
 	}
+	if list, ok := head["forged"].([]any); ok {
+		for _, a := range list {
+			r, _ := raw(a)
+			p.Forged = append(p.Forged, r)
+		}
+	}
 	rels := map[float64]string{}
 	live, dead := map[string]*row{}, map[string]*row{}
 	var order []*row
@@ -196,6 +205,12 @@ func Build(xid uint32, lines [][]byte) (*Plan, error) {
 			rels[id.ID], p.Tables[name] = name, &t
 			continue
 		case "M":
+			if r["forged"] == true {
+				// Поддельная отметка — улика, а не действие (R2-4, заход 2).
+				f, _ := raw(map[string]any{"prefix": r["prefix"], "content": r["content"]})
+				p.Forged = append(p.Forged, f)
+				continue
+			}
 			if r["prefix"] == pgtap.PrefixAction {
 				a, _ := raw(r["content"])
 				p.Actions = append(p.Actions, a)
@@ -718,7 +733,7 @@ func (p *Plan) pathHint(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w (the undo runs with search_path %s: if a trigger of the table names a table or a function without "+
-		"its schema, add that schema to search_path in the undo settings — esundo apply -config takes it from there — or name it in esundo check -search-path)", err, p.Path())
+		"its schema, add that schema to search_path in the undo settings (or to esundo check -search-path) and check the plan again)", err, p.Path())
 }
 
 // Check спрашивает базу про каждый шаг и запоминает годные в p.OK.

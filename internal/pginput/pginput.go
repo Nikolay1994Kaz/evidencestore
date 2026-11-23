@@ -327,40 +327,67 @@ func SetupSQL(c *Config) (string, error) {
 	p("-- бы функции отметок и подложил свои (R1-6). Обе — как обещано, что бы ни было до скрипта.")
 	p("ALTER ROLE %s NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD NULL;", id(EvidenceOwner))
 	p("ALTER SCHEMA evidence OWNER TO %s;", id(EvidenceOwner))
-	p("-- Ключ отметок: функции ниже кладут его в каждую отметку, прочесть его может только сборщик.")
-	p("-- Отметку с тем же префиксом пишет и роль, которой дали pg_logical_emit_message (outbox), —")
-	p("-- с чужой ролью или «откатом»; без ключа сборщик её подлинной не считает (DECISIONS, п. 41).")
-	p("CREATE TABLE IF NOT EXISTS evidence.marker_key (k text NOT NULL);")
+	p("-- Ключ отметок (DECISIONS, п. 41): функции ниже ставят в начало каждой отметки метку —")
+	p("-- SHA-256(ключ ‖ SHA-256(xid:префикс:тело)) в hex. Отметку с тем же префиксом пишет и роль, которой")
+	p("-- дали pg_logical_emit_message (outbox), — с чужой ролью или «откатом»; без верной метки сборщик её")
+	p("-- подлинной не считает. Ключа в журнале нет; прочесть его может только сборщик (RLS: и не члены")
+	p("-- pg_read_all_data). Таблицу, заведённую до скрипта не им, скрипт заменяет: её ключ мог быть известен.")
+	p("DO $evidence$ BEGIN")
+	p("  IF EXISTS (SELECT FROM pg_class WHERE oid = to_regclass('evidence.marker_key') AND relkind <> 'r') THEN")
+	p("    RAISE EXCEPTION 'evidence.marker_key is not a table: drop it and run the script again';")
+	p("  END IF;")
+	p("  IF EXISTS (SELECT FROM pg_class WHERE oid = to_regclass('evidence.marker_key') AND relowner <> (SELECT oid FROM pg_roles WHERE rolname = %s)) THEN", lit(EvidenceOwner))
+	p("    DROP TABLE evidence.marker_key;")
+	p("  END IF;")
+	p("END $evidence$;")
+	p("-- since — место журнала, с которого ключ есть: отметки без метки в транзакциях, зафиксированных")
+	p("-- раньше, писали функции прежней версии, и сборщик их принимает как раньше (обновление).")
+	p("CREATE TABLE IF NOT EXISTS evidence.marker_key (k text NOT NULL, since pg_lsn NOT NULL);")
+	p("ALTER TABLE evidence.marker_key ADD COLUMN IF NOT EXISTS since pg_lsn NOT NULL DEFAULT '0/0';")
 	p("ALTER TABLE evidence.marker_key OWNER TO %s;", id(EvidenceOwner))
 	p("REVOKE ALL ON evidence.marker_key FROM PUBLIC;")
-	p("INSERT INTO evidence.marker_key SELECT replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '') WHERE NOT EXISTS (SELECT FROM evidence.marker_key);")
+	p("ALTER TABLE evidence.marker_key ENABLE ROW LEVEL SECURITY;")
+	p("INSERT INTO evidence.marker_key SELECT replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''), pg_current_wal_lsn() WHERE NOT EXISTS (SELECT FROM evidence.marker_key);")
+	// emit — отметка с меткой (pgtap.MarkerMAC). Байты тела — в кодировке
+	// базы, как их отдаёт журнал; у отказа (не транзакционного) xid — 0.
+	emit := func(transactional bool, prefix, body string) {
+		xid := "'0'"
+		if transactional {
+			xid = "pg_current_xact_id()::xid::text"
+		}
+		p("  body := %s;", body)
+		p("  PERFORM pg_logical_emit_message(%t, %s, encode(sha256(convert_to(coalesce((SELECT k FROM evidence.marker_key LIMIT 1), ''), 'UTF8') ||", transactional, lit(prefix))
+		p("    sha256(convert_to(%s || ':' || %s || ':' || body, current_setting('server_encoding')))), 'hex') || body);", xid, lit(prefix))
+	}
 	p("CREATE OR REPLACE FUNCTION evidence.mark_who() RETURNS trigger")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
+	p("DECLARE body text;")
 	p("BEGIN")
-	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object(", lit(pgtap.PrefixWho))
-	p("    'role', session_user, 'app', current_setting('application_name', true),")
-	p("    'op', TG_OP, 'table', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);")
+	emit(true, pgtap.PrefixWho, "json_build_object('role', session_user, 'app', current_setting('application_name', true), 'op', TG_OP, 'table', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME)::text")
 	p("  RETURN NULL;")
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_who() FROM PUBLIC;")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_action(info json) RETURNS void")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
+	p("DECLARE body text;")
 	p("BEGIN")
-	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);", lit(pgtap.PrefixAction))
+	emit(true, pgtap.PrefixAction, "json_build_object('role', session_user, 'info', info)::text")
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_action(json) FROM PUBLIC;")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_undo(info json) RETURNS void")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
+	p("DECLARE body text;")
 	p("BEGIN")
-	p("  PERFORM pg_logical_emit_message(true, %s, json_build_object('role', session_user, 'info', info, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);", lit(pgtap.PrefixUndo))
+	emit(true, pgtap.PrefixUndo, "json_build_object('role', session_user, 'info', info)::text")
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_undo(json) FROM PUBLIC;")
 	p("-- Отказ: MCP-сервер остановил действие пределом строк и откатывает его. Сообщение не")
 	p("-- транзакционное (false): откат транзакции его из журнала не убирает, и сборщик о нём узнаёт.")
 	p("CREATE OR REPLACE FUNCTION evidence.mark_refused(info json) RETURNS void")
 	p("  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $evidence$")
+	p("DECLARE body text;")
 	p("BEGIN")
-	p("  PERFORM pg_logical_emit_message(false, %s, json_build_object('role', session_user, 'info', info, 'key', (SELECT k FROM evidence.marker_key LIMIT 1))::text);", lit(pgtap.PrefixRefused))
+	emit(false, pgtap.PrefixRefused, "json_build_object('role', session_user, 'info', info)::text")
 	p("END $evidence$;")
 	p("REVOKE ALL ON FUNCTION evidence.mark_refused(json) FROM PUBLIC;")
 	p("ALTER FUNCTION evidence.mark_who() OWNER TO %s;", id(EvidenceOwner))
@@ -639,6 +666,8 @@ func SetupSQL(c *Config) (string, error) {
 	p("DO $evidence$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s LOGIN REPLICATION; END IF; END $evidence$;", lit(tapRole), id(tapRole))
 	p("GRANT USAGE ON SCHEMA evidence TO %s;", id(tapRole))
 	p("GRANT SELECT ON evidence.marker_key TO %s;", id(tapRole))
+	p("DROP POLICY IF EXISTS collector ON evidence.marker_key;")
+	p("CREATE POLICY collector ON evidence.marker_key FOR SELECT TO %s USING (true);", id(tapRole))
 	p("COMMIT;")
 	return b.String(), nil
 }
@@ -825,11 +854,18 @@ func (s *Source) connect(ctx context.Context) (err error) {
 		return fmt.Errorf("publication %s does not exist: run the script printed by escollect -setup-sql", s.cfg.Publication)
 	}
 	// Ключ отметок (DECISIONS, п. 41): без него поддельную отметку не отличить.
-	if row, ok, err := cat.QueryRow("SELECT k FROM evidence.marker_key LIMIT 1"); err != nil || !ok || row[0] == nil || *row[0] == "" {
-		return fmt.Errorf("the marker key (evidence.marker_key) cannot be read (%v): run the script printed by escollect -setup-sql — this version needs it", err)
-	} else {
-		s.tap.SetMarkerKey(*row[0])
+	row, ok, err := cat.QueryRow("SELECT k, since::text FROM evidence.marker_key LIMIT 1")
+	if err == nil && (!ok || row[0] == nil || *row[0] == "" || row[1] == nil) {
+		err = errors.New("the table is empty")
 	}
+	if err != nil {
+		return fmt.Errorf("the marker key (evidence.marker_key) cannot be read (%v): run the script printed by escollect -setup-sql — this version needs it", err)
+	}
+	since, err := pgwire.ParseLSN(*row[1])
+	if err != nil {
+		return fmt.Errorf("evidence.marker_key: %w", err)
+	}
+	s.tap.SetMarkerKey(*row[0], uint64(since))
 	s.watchIdentity(cat)
 	start, err := s.ensureSlot(cat)
 	if err != nil {

@@ -48,8 +48,9 @@ func TestDescribeKeepsTheAgentsTextOnItsLine(t *testing.T) {
 	}
 }
 
-// esundo apply -config берёт путь поиска из настроек, а не из плана (T-5).
-func TestApplyTakesTheSearchPathOfTheSettings(t *testing.T) {
+// esundo apply идёт с путём, с которым план сверен; настройки с другим путём —
+// отказ «сверьте заново», а не тихая подмена (T-5; R1-8, R2-9, заход 2).
+func TestApplyKeepsTheSearchPathOfTheCheck(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "plan.json")
 	os.WriteFile(path, []byte(`{"xid":7,"search_path":["old"],"apply":[1]}`), 0o600)
 	p, err := loadPlan(path, nil)
@@ -58,7 +59,11 @@ func TestApplyTakesTheSearchPathOfTheSettings(t *testing.T) {
 	}
 	cfg := &Config{}
 	cfg.SearchPath = []string{"public", "app"}
-	if p, err = loadPlan(path, cfg); err != nil || strings.Join(p.SearchPath, ",") != "public,app" {
-		t.Fatalf("with settings: %v %v", p, err)
+	if _, err = loadPlan(path, cfg); err == nil || !strings.Contains(err.Error(), `checked with search_path pg_catalog, "old", pg_temp`) || !strings.Contains(err.Error(), "run esundo check again") {
+		t.Fatalf("with other settings: %v", err)
+	}
+	cfg.SearchPath = []string{"old"}
+	if p, err = loadPlan(path, cfg); err != nil || strings.Join(p.SearchPath, ",") != "old" {
+		t.Fatalf("with the same settings: %v %v", p, err)
 	}
 }
