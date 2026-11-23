@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,12 +31,46 @@ func txt(s string) pgoutput.Value { return pgoutput.Value{Kind: pgoutput.Text, D
 var accounts = pgoutput.Relation{ID: 7, Namespace: "public", Name: "accounts", Identity: 'f',
 	Columns: []pgoutput.Column{{Key: true, Name: "id"}, {Key: true, Name: "note"}}}
 
-func who(role string) pgoutput.Message {
-	return pgoutput.Message{Transactional: true, Prefix: PrefixWho, Content: []byte(`{"role":"` + role + `"}`)}
+// Намерения шлюза в тестах. who("agent") и action("agent", id) в списке
+// сообщений транзакции — не сообщения журнала: харнесс до её Begin кладёт
+// намерение шлюза о ней (fakeIntents) и в Handle их не подаёт. Другая роль —
+// намерения нет: транзакция не через шлюз.
+type testWho struct{ role string }
+type testAction struct{ role, id, step string }
+
+func who(role string) testWho           { return testWho{role} }
+func action(role, id string) testAction { return testAction{role, id, alert.StepIntent} }
+func undo(id string) testAction         { return testAction{"agent", id, alert.StepUndo} }
+
+// fakeIntents — намерения шлюза в памяти: xid → действие.
+type fakeIntents map[uint32]Intent
+
+func (f fakeIntents) Intent(xid uint32, _ time.Time) (Intent, bool, error) {
+	in, ok := f[xid]
+	return in, ok, nil
 }
 
-func action(role, id string) pgoutput.Message {
-	return pgoutput.Message{Transactional: true, Prefix: PrefixAction, Content: []byte(`{"role":"` + role + `","info":{"action_id":"` + id + `"}}`)}
+// intents кладёт намерения транзакции xid по её тестовым сообщениям и
+// отдаёт остальные сообщения.
+func (h *harness) intents(xid uint32, msgs []any) []any {
+	var out []any
+	for _, m := range msgs {
+		switch m := m.(type) {
+		case testAction:
+			if m.role == "agent" {
+				h.seq++
+				h.gw[xid] = Intent{ID: m.id, Gateway: "esmcp", Seq: h.seq, Hash: fmt.Sprintf("%064x", h.seq), Step: m.step, Agent: "bot"}
+			}
+		case testWho:
+			if _, ok := h.gw[xid]; !ok && m.role == "agent" {
+				h.seq++
+				h.gw[xid] = Intent{ID: fmt.Sprint("tx-", xid), Gateway: "esmcp", Seq: h.seq, Hash: fmt.Sprintf("%064x", h.seq), Step: alert.StepIntent}
+			}
+		default:
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // fakeSink — буфер сборщика: помнит записи, номера с единицы и место входа.
@@ -70,6 +105,8 @@ type harness struct {
 	cat  *fakeCatalog
 	sink *fakeSink
 	lsn  uint64
+	gw   fakeIntents
+	seq  uint64
 }
 
 func open(t *testing.T, dir string, mod func(*Config)) *harness {
@@ -81,7 +118,8 @@ func open(t *testing.T, dir string, mod func(*Config)) *harness {
 // то, что в нём лежит.
 func openOn(t *testing.T, dir string, sink *fakeSink, mod func(*Config)) *harness {
 	t.Helper()
-	cfg := Config{Dir: dir, Roles: []string{"agent"}}
+	gw := fakeIntents{}
+	cfg := Config{Dir: dir, Intents: gw}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -91,11 +129,12 @@ func openOn(t *testing.T, dir string, sink *fakeSink, mod func(*Config)) *harnes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { tap.Close() })
-	return &harness{t: t, dir: dir, tap: tap, cat: cat, sink: sink, lsn: 1000}
+	return &harness{t: t, dir: dir, tap: tap, cat: cat, sink: sink, lsn: 1000, gw: gw}
 }
 
 // feed подаёт транзакцию и отдаёт ошибку Handle, если она была.
 func (h *harness) feed(xid uint32, commit uint64, msgs ...any) error {
+	msgs = h.intents(xid, msgs)
 	all := append([]any{pgoutput.Begin{FinalLSN: commit, CommitTime: time.Unix(1_800_000_000, 0), XID: xid}}, msgs...)
 	all = append(all, pgoutput.Commit{CommitLSN: commit, EndLSN: commit + 50})
 	for _, m := range all {
@@ -115,6 +154,7 @@ func (h *harness) run(xid uint32, msgs ...any) uint64 {
 
 func (h *harness) runAt(xid uint32, commit uint64, msgs ...any) uint64 {
 	h.t.Helper()
+	msgs = h.intents(xid, msgs)
 	all := append([]any{pgoutput.Begin{FinalLSN: commit, CommitTime: time.Unix(1_800_000_000, 0), XID: xid}}, msgs...)
 	all = append(all, pgoutput.Commit{CommitLSN: commit, EndLSN: commit + 50})
 	var flushed uint64
@@ -210,7 +250,7 @@ func TestAgentTransactionIsJournaled(t *testing.T) {
 	if got := strings.Join(kinds, ""); got != "HRUDIC" {
 		t.Fatalf("stream %s", got)
 	}
-	if recs[0]["who"].(map[string]any)["role"] != "agent" || len(recs[0]["actions"].([]any)) != 1 {
+	if a, _ := recs[0]["action"].(map[string]any); a["id"] != "42" || a["gateway"] != "esmcp" || a["step"] != alert.StepIntent || recs[0]["v"] != float64(FormatVersion) {
 		t.Fatalf("header %v", recs[0])
 	}
 	if r := recs[1]; r["schema"] != "public" || r["identity"] != "f" || r["pk"].([]any)[0] != "id" || r["types"].([]any)[1] != "text" {
@@ -224,7 +264,7 @@ func TestAgentTransactionIsJournaled(t *testing.T) {
 	}
 	idx := h.index()
 	if len(idx) != 1 || idx[0].XID != 751 || idx[0].FirstSeq != 1 || idx[0].LastSeq != 1 || idx[0].Changes != 3 ||
-		idx[0].Tables["public.accounts"] != (Counts{I: 1, U: 1, D: 1}) || len(idx[0].Actions) != 1 {
+		idx[0].Tables["public.accounts"] != (Counts{I: 1, U: 1, D: 1}) || idx[0].Action == nil || idx[0].Action.ID != "42" {
 		t.Fatalf("index %+v", idx)
 	}
 	if h.cat.calls != 1 {
@@ -238,23 +278,55 @@ func TestAgentTransactionIsJournaled(t *testing.T) {
 	}
 }
 
-func TestOtherTransactionsAreSkipped(t *testing.T) {
+// Транзакция без намерения шлюза — не через шлюз: отпечатком в пачке, а не
+// целиком, какая бы роль её ни писала (п. 42). Сообщения журнала (outbox
+// приложения) ничего не решают.
+func TestTransactionsWithoutIntentAreFingerprints(t *testing.T) {
 	h := open(t, t.TempDir(), nil)
 	ins := pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("1"), txt("x")}}
-	if f := h.run(1, who("postgres"), accounts, ins); f == 0 {
-		t.Fatal("a skipped transaction must still move the confirmed position")
+	h.run(1, who("postgres"), accounts, ins)
+	h.run(2, accounts, ins)
+	h.run(3, pgoutput.Message{Transactional: true, Prefix: "evidence/who", Content: []byte(`{"role":"agent"}`)}, ins) // подделка отметки прежних версий
+	if n := len(h.parts()); n != 0 || !h.tap.Pending() {
+		t.Fatalf("%d journal lines before the pack, pending %v", n, h.tap.Pending())
 	}
-	h.run(2, accounts, ins)                // без отметки вовсе
-	h.run(3, action("postgres", "1"), ins) // отметка действия не от наблюдаемой роли
-	if n := len(h.parts()); n != 0 {
-		t.Fatalf("%d journal lines", n)
+	if _, err := h.tap.Flush(); err != nil {
+		t.Fatal(err)
 	}
-	if s := h.tap.Stats(); s.Skipped != 3 || s.SkippedChanges != 3 || s.Captured != 0 {
+	if s := h.tap.Stats(); s.Fingerprinted != 3 || s.FingerprintChanges != 3 || s.Captured != 0 || s.Packs != 1 {
 		t.Fatalf("%+v", s)
 	}
-	if h.cat.calls != 0 {
-		t.Fatal("the catalog was asked about a skipped transaction")
+	for _, e := range h.index() {
+		if e.Kind != KindFingerprint || e.Action != nil {
+			t.Fatalf("index %+v", e)
+		}
 	}
+	// Без источника намерений шлюза нет вовсе: каждая транзакция целиком.
+	g := open(t, t.TempDir(), func(c *Config) { c.Intents = nil })
+	g.run(4, accounts, ins)
+	if s := g.tap.Stats(); s.Captured != 1 || s.Fingerprinted != 0 {
+		t.Fatalf("without intents: %+v", s)
+	}
+	recs, err := ReadTransaction(4, g.parts())
+	if err != nil || recs[0]["action"] != nil || recs[0]["fingerprint"] != nil {
+		t.Fatalf("without intents: %v %v", recs, err)
+	}
+}
+
+// Источник намерений отказал — транзакция не решается наугад: ошибка, вход
+// переподключится, и база пришлёт её снова.
+func TestIntentsErrorStopsTheTransaction(t *testing.T) {
+	h := open(t, t.TempDir(), func(c *Config) { c.Intents = brokenIntents{} })
+	err := h.feed(1, 1100, accounts, pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("1"), txt("x")}})
+	if err == nil || !strings.Contains(err.Error(), "the gateway's intents") || h.tap.InTransaction() {
+		t.Fatalf("%v, in transaction %v", err, h.tap.InTransaction())
+	}
+}
+
+type brokenIntents struct{}
+
+func (brokenIntents) Intent(uint32, time.Time) (Intent, bool, error) {
+	return Intent{}, false, errors.New("receipts file unreadable")
 }
 
 func TestBigValueSpansParts(t *testing.T) {
@@ -463,7 +535,7 @@ func TestCrashBetweenIndexAndLastPart(t *testing.T) {
 func TestResetDropsTheOpenTransaction(t *testing.T) {
 	h := open(t, t.TempDir(), nil)
 	ins := pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("1"), txt("x")}}
-	for _, m := range []any{pgoutput.Begin{FinalLSN: 500, XID: 30}, who("agent"), accounts, ins} {
+	for _, m := range h.intents(30, []any{pgoutput.Begin{FinalLSN: 500, XID: 30}, who("agent"), accounts, ins}) {
 		if _, err := h.tap.Handle(m); err != nil {
 			t.Fatal(err)
 		}
@@ -506,131 +578,71 @@ func TestResentTransactionReadsFromItsLastWholeCopy(t *testing.T) {
 func TestAlerts(t *testing.T) {
 	h := open(t, t.TempDir(), func(c *Config) {
 		c.AlertRows = 2
-		c.RequireAction = true
+		c.RequireGateway = true
 		c.Canaries = []Canary{{Table: "public.accounts", Column: "id", Value: "7"}}
 	})
 	ins := func(id string) pgoutput.Insert {
 		return pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt(id), txt("x")}}
 	}
-	h.run(1, action("agent", "1"), who("agent"), accounts, ins("1")) // тихо
+	h.run(1, action("agent", "1"), accounts, ins("1")) // тихо
 	if k := h.alertKinds(); len(k) != 0 {
 		t.Fatalf("alerts %v", k)
 	}
-	h.run(2, who("agent"), accounts, ins("1"), ins("7"), pgoutput.Truncate{RelIDs: []uint32{7}})
-	want := "canary truncate mass-change no-action"
+	h.run(2, action("agent", "2"), accounts, ins("1"), ins("7"), pgoutput.Truncate{RelIDs: []uint32{7}})
+	want := "canary truncate mass-change"
 	if got := strings.Join(h.alertKinds(), " "); got != want {
 		t.Fatalf("alerts %q, want %q", got, want)
 	}
-	// Отметка после пропущенных изменений: транзакция в журнале была бы не вся.
-	h.run(3, accounts, ins("1"), who("agent"), ins("2"))
-	if k := h.alertKinds(); k[len(k)-1] != "late-marker" {
-		t.Fatalf("alerts %v", k)
-	}
-	if len(h.index()) != 2 {
-		t.Fatal("the late-marked transaction was journaled in part")
+	// Без намерения шлюза, где пишет только он: тревога not-via-gateway, и
+	// поводы отпечатка — те же, что у полной транзакции.
+	h.run(3, accounts, ins("7"), ins("8"))
+	ev := h.alerts()
+	fp := ev[len(ev)-1]
+	if fp.XID != 3 || !fp.Fingerprint || fp.Action != nil || strings.Join(fp.Kinds(), " ") != "canary mass-change not-via-gateway" {
+		t.Fatalf("a transaction past the gateway: %+v", fp)
 	}
 	// Одна строка на транзакцию: все её поводы и сводка — то, что уйдёт
 	// человеку одним сообщением. Ловушку тронули дважды одинаково — повод один.
-	h.run(4, action("agent", "9"), who("agent"), accounts, ins("7"), ins("7"), ins("8"))
-	ev := h.alerts()
+	h.run(4, action("agent", "9"), accounts, ins("7"), ins("7"), ins("8"))
+	ev = h.alerts()
 	last := ev[len(ev)-1]
 	idx := h.index()
 	if len(ev) != 3 || last.XID != 4 || strings.Join(last.Kinds(), " ") != "canary mass-change" {
 		t.Fatalf("%d alert lines, the last: %+v", len(ev), last)
 	}
-	if last.Changes != 3 || last.Tables["public.accounts"].I != 3 || last.FirstSeq != idx[2].FirstSeq || last.LastSeq != idx[2].LastSeq ||
-		!strings.Contains(string(last.Who), `"agent"`) || len(last.Actions) != 1 || last.Time == "" {
+	e := idx[len(idx)-1]
+	if last.Changes != 3 || last.Tables["public.accounts"].I != 3 || last.FirstSeq != e.FirstSeq || last.LastSeq != e.LastSeq ||
+		last.Action == nil || last.Action.ID != "9" || last.Time == "" {
 		t.Fatalf("the alert lacks the summary of its transaction: %+v", last)
 	}
-	// У транзакции с поздней отметкой записей в хранилище нет — и номеров нет.
-	if late := ev[1]; late.XID != 3 || late.FirstSeq != 0 || late.Changes != 0 {
-		t.Fatalf("late-marker alert: %+v", late)
-	}
-}
-
-// MCP-сервер остановил действие пределом строк и откатил его: в журнале базы
-// от него осталось только не транзакционное сообщение. Сборщик поднимает
-// тревогу — о том, чего в базе не случилось.
-func TestRefusedActionRaisesAnAlert(t *testing.T) {
-	h := open(t, t.TempDir(), nil)
-	refused := func(lsn uint64, role string) pgoutput.Message {
-		return pgoutput.Message{LSN: lsn, Prefix: PrefixRefused,
-			Content: []byte(`{"role":"` + role + `","info":{"action_id":"a-7","agent":"support-bot","reason":"close all","rows":3000,"limit":500}}`)}
-	}
-	for _, m := range []pgoutput.Message{
-		refused(900, "agent"),
-		refused(900, "agent"),    // база прислала его ещё раз после обрыва связи
-		refused(950, "postgres"), // не наблюдаемая роль
-		{LSN: 960, Prefix: "someone/else", Content: []byte(`{"role":"agent"}`)},
-		{LSN: 970, Prefix: PrefixWho, Content: []byte(`{"role":"agent"}`)}, // отметка «кто» вне транзакции ничего не значит
-	} {
-		if f, err := h.tap.Handle(m); err != nil || f != 0 {
-			t.Fatalf("%v %d", err, f)
-		}
-	}
-	ev := h.alerts()
-	if len(ev) != 1 || ev[0].XID != 0 || strings.Join(ev[0].Kinds(), " ") != "refused" || len(ev[0].Actions) != 1 {
-		t.Fatalf("alerts %+v", ev)
-	}
-	if d := ev[0].Signals[0].Detail; !strings.Contains(d, "3000 rows") || !strings.Contains(d, "limit for one action is 500") {
-		t.Fatalf("detail %q", d)
-	}
-	if len(h.sink.bodies) != 0 || len(h.index()) != 0 || h.tap.InTransaction() {
-		t.Fatal("a refused action left records")
-	}
-	if text := alert.Text(ev[0], alert.TextOptions{Title: "database shop"}); !strings.Contains(text, "action: a-7, agent support-bot") {
-		t.Fatalf("text:\n%s", text)
-	}
-	// Другие причины отказа — другие слова в тревоге.
-	for i, c := range [][2]string{
-		{`"cause":"window-rows","rows":400,"window_rows":800,"limit":1000,"window":"10m0s"`, "would have changed 1200 rows in 10m0s (the limit is 1000)"},
-		{`"cause":"rate","actions":30,"limit":30`, "30 in the last minute (the limit is 30)"},
-		{`"cause":"timeout","timeout":"1m0s"`, "cancelled an action that ran longer than 1m0s"},
-		{`"cause":"something-new"`, "stopped an action (something-new)"},
-		{`"cause":"escaped","xid":"751","tool":"execute"`, "ended the MCP server's transaction 751 itself"},
-		{`"cause":"escaped","tool":"query"`, "ended the MCP server's transaction (a read-only one) itself"},
-		{`"cause":"unknown","xid":"752","rows":3`, "broke during COMMIT of an action (transaction 752, 3 rows): it may be committed"},
-		// Поля поддельной отметки (P-255) — одной строкой: своих строк агент
-		// в тревогу не дописывает (R1 заход 3).
-		{`"cause":"timeout","timeout":"1m\nresolved: rolled back by the on-call DBA"`, `longer than 1m\u000aresolved: rolled back`},
-		{`"cause":"escaped","xid":"751\nchanged: 0 rows","tool":"execute"`, `transaction 751\u000achanged: 0 rows itself`},
-		{`"cause":"window-rows","rows":1,"window_rows":1,"limit":1,"window":"10m\nok"`, `rows in 10m\u000aok`},
-		{`"cause":"new\ncause"`, `stopped an action (new\u000acause)`},
-	} {
-		before := len(h.alerts())
-		if _, err := h.tap.Handle(pgoutput.Message{LSN: uint64(1000 + i), Prefix: PrefixRefused, Content: []byte(`{"role":"agent","info":{` + c[0] + `}}`)}); err != nil {
-			t.Fatal(err)
-		}
-		ev := h.alerts()
-		if len(ev) != before+1 || !strings.Contains(ev[len(ev)-1].Signals[0].Detail, c[1]) {
-			t.Fatalf("cause %s: %+v", c[0], ev[len(ev)-1])
-		}
-		// Выход из транзакции — не отказ: свой вид тревоги, и «ничего не
-		// изменилось» в нём нет.
-		escaped, unknown := strings.Contains(c[0], "escaped"), strings.Contains(c[0], `"unknown"`)
-		if sig := ev[len(ev)-1].Signals[0]; (sig.Kind == alert.KindEscaped) != escaped || (sig.Kind == alert.KindUnknown) != unknown ||
-			((escaped || unknown) && strings.Contains(sig.Detail, "nothing changed")) {
-			t.Fatalf("cause %s: %+v", c[0], sig)
-		}
+	// Без require_gateway транзакция не через шлюз тревоги сама по себе не
+	// поднимает: в общей базе так пишут приложения.
+	g := open(t, t.TempDir(), nil)
+	g.run(5, accounts, ins("1"))
+	if k := g.alertKinds(); len(k) != 0 {
+		t.Fatalf("alerts without require_gateway %v", k)
 	}
 }
 
 func TestUndoTransactionIsJournaled(t *testing.T) {
-	h := open(t, t.TempDir(), func(c *Config) { c.RequireAction = true })
-	h.run(8, pgoutput.Message{Transactional: true, Prefix: PrefixUndo, Content: []byte(`{"undoes_xid":"751"}`)}, who("postgres"), accounts,
-		pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("5"), txt("back")}})
+	h := open(t, t.TempDir(), func(c *Config) { c.RequireGateway = true })
+	h.run(8, undo("u-1"), accounts, pgoutput.Insert{RelID: 7, New: []pgoutput.Value{txt("5"), txt("back")}})
 	idx := h.index()
-	if len(idx) != 1 || string(idx[0].Undo) != `{"undoes_xid":"751"}` || idx[0].Who != nil {
+	if len(idx) != 1 || idx[0].Action == nil || idx[0].Action.Step != alert.StepUndo || idx[0].Kind != "" {
 		t.Fatalf("index %+v", idx)
 	}
 	if k := h.alertKinds(); len(k) != 0 {
 		t.Fatalf("alerts %v", k)
 	}
+	recs, err := ReadTransaction(8, h.parts())
+	if a, _ := recs[0]["action"].(map[string]any); err != nil || a["step"] != alert.StepUndo {
+		t.Fatalf("header %v %v", recs, err)
+	}
 }
 
 func TestTransactionWithoutChangesIsStillRecorded(t *testing.T) {
 	h := open(t, t.TempDir(), nil)
-	h.run(6, action("agent", "7"), who("agent")) // UPDATE, не тронувший ни одной строки
+	h.run(6, action("agent", "7")) // UPDATE, не тронувший ни одной строки
 	recs, err := ReadTransaction(6, h.parts())
 	if err != nil || len(recs) != 2 || recs[1]["changes"] != float64(0) {
 		t.Fatalf("%v %v", recs, err)
@@ -638,7 +650,7 @@ func TestTransactionWithoutChangesIsStillRecorded(t *testing.T) {
 }
 
 func TestOpenRefusesBadConfig(t *testing.T) {
-	for _, cfg := range []Config{{Dir: t.TempDir()}, {Dir: t.TempDir(), Roles: []string{"a"}, PartSize: MaxPartSize + 1}} {
+	for _, cfg := range []Config{{Dir: t.TempDir(), PartSize: MaxPartSize + 1}, {Dir: t.TempDir(), PartSize: 10}} {
 		if _, err := Open(cfg, &fakeCatalog{}, &fakeSink{}, 0, nil); err == nil {
 			t.Errorf("opened with %+v", cfg)
 		}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pgtap"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
@@ -44,7 +45,7 @@ func journal(size int, header m, lines ...m) [][]byte {
 			n++
 		}
 	}
-	head := m{"t": "H", "v": 1, "xid": 7}
+	head := m{"t": "H", "v": pgtap.FormatVersion, "xid": 7}
 	for k, v := range header {
 		head[k] = v
 	}
@@ -119,19 +120,46 @@ func TestBuild(t *testing.T) {
 	}
 }
 
-func TestBuildMarkersAndCounts(t *testing.T) {
-	p, err := Build(7, journal(1<<30, m{"who": m{"role": "agent"}, "actions": []m{{"info": m{"action_id": "42"}}}},
-		rel(1, "t"), ch("I", 1, nil, v("1", "a")), ch("U", 1, v("1", "a"), v("1", "b")), m{"t": "M", "prefix": "evidence/action", "content": m{"info": m{"action_id": "43"}}}))
+// Действие шлюза — из заголовка потока: его намерение взял сборщик (п. 42).
+func TestBuildActionAndCounts(t *testing.T) {
+	p, err := Build(7, journal(1<<30, m{"action": m{"id": "42", "gateway": "esmcp", "seq": 9, "hash": strings.Repeat("ab", 32), "step": "intent", "agent": "bot"}},
+		rel(1, "t"), ch("I", 1, nil, v("1", "a")), ch("U", 1, v("1", "a"), v("1", "b"))))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Actions) != 2 || !strings.Contains(string(p.Actions[1]), "43") || !strings.Contains(string(p.Who), "agent") || p.Changes != 2 || p.Counts["public.t"].U != 1 {
+	if p.Action == nil || p.Action.ID != "42" || p.Action.Gateway != "esmcp" || p.Action.Seq != 9 || p.Changes != 2 || p.Counts["public.t"].U != 1 {
 		t.Fatalf("%+v", p)
 	}
 	if p.Key(p.Steps[0]) != "id=1" {
 		t.Fatal(p.Key(p.Steps[0]))
 	}
+	// Без действия — транзакция целиком без шлюза (вход без receipts).
+	if p := build(t, rel(1, "t"), ch("I", 1, nil, v("1", "a"))); p.Action != nil {
+		t.Fatalf("an action out of nothing: %+v", p.Action)
+	}
+	// Действие без номера и поток другой версии — отказ.
+	for want, j := range map[string][][]byte{
+		"malformed": journal(1<<30, m{"action": m{"gateway": "esmcp"}}, rel(1, "t")),
+		"version 1": journal(1<<30, m{"v": 1}, rel(1, "t")),
+	} {
+		if _, err := Build(7, j); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", want, err)
+		}
+	}
 }
+
+// intents — намерение отката в тестах: помнит номера транзакций отката.
+type intents struct {
+	xid, xid8 []string
+	err       error
+}
+
+func (n *intents) intent(xid, xid8 string) error {
+	n.xid, n.xid8 = append(n.xid, xid), append(n.xid8, xid8)
+	return n.err
+}
+
+func okIntent(string, string) error { return nil }
 
 func TestBuildFromManyPartsAndAResentCopy(t *testing.T) {
 	lines := []m{rel(1, "t")}
@@ -169,7 +197,7 @@ func TestBuildRefuses(t *testing.T) {
 		"not all here":          journal(1<<30, m{"_count": 2}, rel(1, "t"), up),
 		"never described":       journal(1<<30, nil, ch("I", 9, nil, v("1", "a"))),
 		"altered inside":        journal(1<<30, nil, rel(1, "t"), up, rel(1, "t", func(r m) { r["columns"] = []string{"id", "w"} })),
-		"version":               journal(1<<30, m{"v": 2}, rel(1, "t"), up),
+		"version":               journal(1<<30, m{"v": pgtap.FormatVersion + 1}, rel(1, "t"), up),
 		"not 8":                 nil,
 	}
 	for want, lines := range cases {
@@ -227,7 +255,7 @@ func TestCheckAndApply(t *testing.T) {
 		case strings.HasPrefix(sql, "SELECT w.step"):
 			return rows([]string{"1", "done", "<null>"}), nil
 		case strings.Contains(sql, "pg_current_xact_id"):
-			return rows([]string{"900"}), nil
+			return rows([]string{"900", "4294968196"}), nil
 		}
 		return []pgwire.Result{{Tag: tag[strings.Fields(sql)[0]]}}, nil
 	}}
@@ -255,29 +283,45 @@ func TestCheckAndApply(t *testing.T) {
 	}
 
 	db.log = nil
-	done, err := p.Apply(db, m{"by": "nikolay"})
+	var in intents
+	var atIntent int // сколько запросов база получила к намерению
+	done, err := p.Apply(db, func(xid, xid8 string) error { atIntent = len(db.log); return in.intent(xid, xid8) })
 	if err != nil || done.XID != "900" || done.Steps != 2 || done.Order != OrderJournal || done.Differ != nil {
 		t.Fatal(done, err)
 	}
-	// Транзакция, отметка первой, шаг 2 (вернуть удалённую — со своим прежним номером, даже если колонка
+	// Намерение — с номером транзакции отката, раньше её изменений.
+	if fmt.Sprint(in.xid, in.xid8) != "[900] [4294968196]" || atIntent != 3 {
+		t.Fatalf("the intent: %v %v after %d queries", in.xid, in.xid8, atIntent)
+	}
+	// Транзакция, её номер, шаг 2 (вернуть удалённую — со своим прежним номером, даже если колонка
 	// GENERATED ALWAYS AS IDENTITY), шаг 4 (вернуть значения: пишется только колонка, которую транзакция
 	// меняла), сверка обеих команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
 	// Перед всем — путь поиска (session): схем в настройках нет — только Path.
-	if len(db.log) != 9 || db.log[0] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" {
+	if len(db.log) != 8 || db.log[0] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" {
 		t.Fatalf("%q", db.log)
 	}
 	db.log = db.log[1:]
-	if len(db.log) != 8 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], `SELECT evidence.mark_undo('{"by":"nikolay"}'`) ||
-		!strings.HasPrefix(db.log[3], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[4], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
-		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id"::text IS NOT DISTINCT FROM w.n0::text AND t."v"::text IS NOT DISTINCT FROM w.n1::text`) ||
-		!strings.Contains(db.log[5], `LEFT JOIN "public"."t" t ON t."id" = w.o0`) || !strings.Contains(db.log[6], `NOT (t."v"::text IS NOT DISTINCT FROM w.o1::text)`) || db.log[7] != "COMMIT" {
+	if len(db.log) != 7 || db.log[0] != "BEGIN" || db.log[1] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text" ||
+		!strings.HasPrefix(db.log[2], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[3], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
+		!strings.Contains(db.log[3], `WHERE t."id" = w.n0 AND t."id"::text IS NOT DISTINCT FROM w.n0::text AND t."v"::text IS NOT DISTINCT FROM w.n1::text`) ||
+		!strings.Contains(db.log[4], `LEFT JOIN "public"."t" t ON t."id" = w.o0`) || !strings.Contains(db.log[5], `NOT (t."v"::text IS NOT DISTINCT FROM w.o1::text)`) || db.log[6] != "COMMIT" {
 		t.Fatalf("%q", db.log)
+	}
+	// Квитанция не записалась — отката нет: ни одного шага, ROLLBACK.
+	db.log = nil
+	failed := &intents{err: errors.New("disk full")}
+	if _, err := p.Apply(db, failed.intent); err == nil || !strings.Contains(err.Error(), "receipt could not be written") || !strings.Contains(err.Error(), "disk full") ||
+		db.log[len(db.log)-1] != "ROLLBACK" || strings.Contains(strings.Join(db.log, "\n"), "INSERT") {
+		t.Fatalf("%v %q", err, db.log)
+	}
+	if _, err := p.Apply(db, nil); err == nil || !strings.Contains(err.Error(), "gateway's intent") {
+		t.Fatalf("without an intent: %v", err)
 	}
 
 	// Строка изменилась после сверки: команда тронула не столько строк — откат отменён целиком.
 	tag["UPDATE"] = "UPDATE 0"
 	db.log = nil
-	if _, err := p.Apply(db, m{}); !errors.Is(err, ErrChanged) || db.log[len(db.log)-1] != "ROLLBACK" {
+	if _, err := p.Apply(db, okIntent); !errors.Is(err, ErrChanged) || db.log[len(db.log)-1] != "ROLLBACK" {
 		t.Fatalf("%v %q", err, db.log)
 	}
 }
@@ -294,7 +338,7 @@ func TestCheckRefusesAChangedTable(t *testing.T) {
 			t.Errorf("%s: %v", want, err)
 		}
 	}
-	if _, err := (&Plan{}).Apply(&fakeDB{}, nil); err == nil {
+	if _, err := (&Plan{}).Apply(&fakeDB{}, okIntent); err == nil {
 		t.Error("applied a plan that was not checked")
 	}
 }
@@ -351,7 +395,7 @@ func TestCheckTakesGeneratedAndUncomparableColumnsFromTheCatalog(t *testing.T) {
 		case strings.HasPrefix(sql, "SELECT w.step"):
 			return rows([]string{"2", "ok", "<null>"}), nil
 		case strings.Contains(sql, "pg_current_xact_id"):
-			return rows([]string{"900"}), nil
+			return rows([]string{"900", "4294968196"}), nil
 		case strings.HasPrefix(sql, "SELECT count(*) FILTER"):
 			return rows([]string{"0", "0", "0", "0", "0"}), nil
 		}
@@ -371,7 +415,7 @@ func TestCheckTakesGeneratedAndUncomparableColumnsFromTheCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.log = nil
-	if _, err := p.Apply(db, m{}); err != nil {
+	if _, err := p.Apply(db, okIntent); err != nil {
 		t.Fatal(err)
 	}
 	all := strings.Join(db.log, "\n")
@@ -408,7 +452,7 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 		case sql == "BEGIN":
 			attempt++
 		case strings.Contains(sql, "pg_current_xact_id"):
-			return rows([]string{fmt.Sprint(900 + attempt)}), nil
+			return rows([]string{fmt.Sprint(900 + attempt), fmt.Sprint(4294968196 + attempt)}), nil
 		case strings.HasPrefix(sql, `INSERT INTO "public"."child"`) && attempt == 1:
 			return nil, violation
 		case strings.Contains(sql, "confdeltype"): // ключей с действием при удалении на таблицы плана нет
@@ -428,7 +472,7 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 		}
 		return []pgwire.Result{{Tag: map[string]string{"INSERT": "INSERT 0 1", "UPDATE": "UPDATE 1", "DELETE": "DELETE 1"}[strings.Fields(sql)[0]]}}, nil
 	}
-	done, err := p.Apply(db, m{})
+	done, err := p.Apply(db, okIntent)
 	if err != nil || done.Order != OrderKeys || done.XID != "902" || done.Steps != 5 {
 		t.Fatal(done, err)
 	}
@@ -476,7 +520,7 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 
 	// Строка шага изменилась после сверки: под замок встало меньше строк — откат отменён.
 	attempt, locked, db.log = 0, "0", nil
-	if _, err := p.Apply(db, m{}); !errors.Is(err, ErrChanged) || db.log[len(db.log)-1] != "ROLLBACK" || !strings.Contains(err.Error(), "in the order of the journal") {
+	if _, err := p.Apply(db, okIntent); !errors.Is(err, ErrChanged) || db.log[len(db.log)-1] != "ROLLBACK" || !strings.Contains(err.Error(), "in the order of the journal") {
 		t.Fatalf("%v %q", err, db.log[len(db.log)-1])
 	}
 	// Отказ не по ограничению второй попытки не даёт.
@@ -487,7 +531,7 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 		return rows([]string{"900"}), nil
 	}
 	db.log = nil
-	if _, err := p.Apply(db, m{}); err == nil || strings.Count(strings.Join(db.log, " "), "BEGIN") != 1 {
+	if _, err := p.Apply(db, okIntent); err == nil || strings.Count(strings.Join(db.log, " "), "BEGIN") != 1 {
 		t.Fatalf("%v %q", err, db.log)
 	}
 }
@@ -505,11 +549,11 @@ func TestApplyChecksTheRowsAfterTheUndo(t *testing.T) {
 		case strings.HasPrefix(sql, "SELECT count(*) FROM"):
 			return rows([]string{left}), nil
 		case strings.Contains(sql, "pg_current_xact_id"):
-			return rows([]string{"900"}), nil
+			return rows([]string{"900", "4294968196"}), nil
 		}
 		return []pgwire.Result{{Tag: map[string]string{"UPDATE": "UPDATE 2", "DELETE": "DELETE 1"}[strings.Fields(sql)[0]]}}, nil
 	}}
-	done, err := p.Apply(db, m{})
+	done, err := p.Apply(db, okIntent)
 	if err != nil || len(done.Differ) != 1 || done.Differ[0] != (Difference{Table: "public.t", Column: "v", Rows: 2}) || db.log[len(db.log)-1] != "COMMIT" {
 		t.Fatalf("%+v %v", done, err)
 	}
@@ -525,7 +569,7 @@ func TestApplyChecksTheRowsAfterTheUndo(t *testing.T) {
 	} {
 		after, left = tc.after, tc.left
 		db.log = nil
-		if _, err := p.Apply(db, m{}); err == nil || !strings.Contains(err.Error(), tc.name) || db.log[len(db.log)-1] != "ROLLBACK" {
+		if _, err := p.Apply(db, okIntent); err == nil || !strings.Contains(err.Error(), tc.name) || db.log[len(db.log)-1] != "ROLLBACK" {
 			t.Errorf("%s: %v, then %s", tc.name, err, db.log[len(db.log)-1])
 		}
 	}
@@ -620,12 +664,12 @@ func TestApplyRefusesToRemoveARowThatOthersReferTo(t *testing.T) {
 		case strings.HasPrefix(sql, "SELECT count(*) FROM"):
 			return rows([]string{"0"}), nil
 		case strings.Contains(sql, "pg_current_xact_id"):
-			return rows([]string{"900"}), nil
+			return rows([]string{"900", "4294968196"}), nil
 		}
 		return []pgwire.Result{{Tag: "DELETE 1"}}, nil
 	}
 	// Никто не ссылается: замок, вопрос о ссылках, уборка, сверка.
-	if _, err := p.Apply(db, m{}); err != nil {
+	if _, err := p.Apply(db, okIntent); err != nil {
 		t.Fatal(err)
 	}
 	var what []string
@@ -646,7 +690,7 @@ func TestApplyRefusesToRemoveARowThatOthersReferTo(t *testing.T) {
 	}
 	// Сослались: не убрано ничего. Порядок по внешним ключам пробуется (ребёнок мог стоять в плане позже), итог тот же.
 	referring, db.log = [][]string{{"1", "2"}}, nil
-	_, err := p.Apply(db, m{})
+	_, err := p.Apply(db, okIntent)
 	all := strings.Join(db.log, "\n")
 	if !errors.Is(err, ErrChanged) || !strings.Contains(err.Error(), "have rows of child referring to them, and ON DELETE CASCADE would delete them") ||
 		strings.Count(err.Error(), "referring to them") != 1 ||
@@ -704,17 +748,5 @@ func TestBuildRefusesAFingerprintStream(t *testing.T) {
 	_, err := Build(7, journal(1<<30, m{"fingerprint": true}, m{"t": "U", "r": "public.t", "k": []any{"1"}, "o": "x", "n": "y"}))
 	if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "only its fingerprint") {
 		t.Fatalf("a fingerprint stream: %v", err)
-	}
-}
-
-// Поддельная отметка действия (строка M с forged, pgtap.forgedMark) — улика в
-// Plan.Forged, а не действие транзакции (R2-4, заход 2).
-func TestBuildKeepsForgedMarkersApart(t *testing.T) {
-	p, err := Build(7, journal(1<<30, m{"forged": []any{m{"prefix": "evidence/who", "content": m{"role": "esmcp_bot"}}}},
-		rel(1, "t"),
-		ch("U", 1, []any{"1", "a"}, []any{"1", "b"}),
-		m{"t": "M", "prefix": "evidence/action", "content": m{"role": "esmcp_bot", "info": m{"action_id": "act-77"}}, "forged": true}))
-	if err != nil || len(p.Actions) != 0 || len(p.Forged) != 2 {
-		t.Fatalf("actions %s, forged %s, %v", p.Actions, p.Forged, err)
 	}
 }

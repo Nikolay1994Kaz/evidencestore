@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -94,7 +93,9 @@ CREATE TRIGGER audit AFTER UPDATE ON pgs.tick FOR EACH ROW EXECUTE FUNCTION pgs.
 CREATE TABLE pgs.fanout (n int);
 CREATE FUNCTION pgs.fan() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $f$ BEGIN INSERT INTO pgs.fanout SELECT g FROM generate_series(1, 50) g; RETURN NEW; END $f$;
 CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fan()`)
-	cfg := Config{DSN: base + " user=pgs_tap", Slot: "pgs_slot", Publication: "pgs_pub", Dir: t.TempDir(), MCPRoles: []string{"pgs_agent"}, Tables: []string{"pgs.vals", "pgs.tick"}}
+	gw, undoGW := newLiveGateway(t, "esmcp"), newLiveGateway(t, "esundo")
+	cfg := Config{DSN: base + " user=pgs_tap", Slot: "pgs_slot", Publication: "pgs_pub", Dir: t.TempDir(), MCPRoles: []string{"pgs_agent"}, Tables: []string{"pgs.vals", "pgs.tick"},
+		Receipts: liveReceipts(gw, undoGW)}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -137,11 +138,7 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	// 1. Человек, esundo: база с array_nulls = off, сеанс — новый, правами владельца.
 	agent := dial("pgs_agent", "") // сеанс роли сервера мимо сервера (части 2–4)
 	tick := one(admin, "SELECT 'pgs.tick'::regclass::oid::text")
-	res, err := agent.Query("BEGIN; UPDATE pgs.vals SET tags = '{c}', span = '1 day', rel = 'pg_class' WHERE id = 1; SELECT pg_current_xact_id()::xid::text; COMMIT")
-	if err != nil {
-		t.Fatal(err)
-	}
-	xid, _ := strconv.ParseUint(*res[len(res)-2].Rows[0][0], 10, 32)
+	xid := uint64(gw.act(agent, "UPDATE pgs.vals SET tags = '{c}', span = '1 day', rel = 'pg_class' WHERE id = 1"))
 	lines, _ := bodies(uint32(xid))
 	p, err := pgundo.Build(uint32(xid), lines)
 	if err != nil {
@@ -156,7 +153,7 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	if ok, _, bad := pgundo.Tally(statuses); ok != 1 || bad != 0 {
 		t.Fatalf("check: %d steps to apply, %d conflicts", ok, bad)
 	}
-	done, err := p.Apply(human, map[string]any{"by": "test"})
+	done, err := p.Apply(human, undoGW.undo(uint32(xid)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,22 +166,16 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	// заново, с новым умолчанием. Агенту это теперь не дано: его роль не член
 	// роли сервера (DECISIONS, п. 39). Здесь — вторая линия: умолчания роли
 	// сменил кто-то другой, а сервер всё равно ставит свои.
-	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
 	dcfg, err := pgwire.ParseDSN(base + " user=pgs_agent application_name=esmcp/pgs-bot")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := mcpserver.New(mcpserver.Config{Agent: "pgs-bot", RowLimit: 5, Version: "test", Receipts: f, ReceiptsPath: path, Fetch: bodies,
+	s := mcpserver.New(gw.server(mcpserver.Config{Agent: "pgs-bot", RowLimit: 5, Version: "test", Fetch: bodies,
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
 			return pgwire.Dial(ctx, c)
-		}}, nil)
+		}}), nil)
 	tool := func(name, args string) (string, bool) {
 		t.Helper()
 		var m struct {
@@ -230,12 +221,12 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	// висел на нём сколько угодно, и под замком стояли все действия агента
 	// (R2 заход 2). Агенту и это теперь не дано (п. 39); проверка — вторая линия.
 	exec(agent, "ALTER ROLE pgs_agent SET lock_timeout = 0; ALTER ROLE pgs_agent SET statement_timeout = 0")
-	locked := mcpserver.New(mcpserver.Config{Agent: "pgs-bot", LockTimeout: 300 * time.Millisecond, Version: "test", Receipts: f, ReceiptsPath: path, Fetch: bodies,
+	locked := mcpserver.New(gw.server(mcpserver.Config{Agent: "pgs-bot", LockTimeout: 300 * time.Millisecond, Version: "test", Fetch: bodies,
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
 			return pgwire.Dial(ctx, c)
-		}}, nil)
+		}}), nil)
 	s = locked
 	text, isErr = tool("execute", `{"sql":"UPDATE pgs.vals SET tags = '{e}' WHERE id = 1","reason":"test"}`)
 	if isErr {
@@ -267,11 +258,7 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	// и esundo звал её функцию правами владельца (R2 заход 2). Сверка и откат
 	// отказывают, если в схеме пути может CREATE не владелец (п. 39); типы у
 	// сборщика — со схемой.
-	res, err = agent.Query("BEGIN; UPDATE pgs.tick SET note = 'agent' WHERE id = 'k1'; SELECT pg_current_xact_id()::xid::text; COMMIT")
-	if err != nil {
-		t.Fatal(err)
-	}
-	xid, _ = strconv.ParseUint(*res[len(res)-2].Rows[0][0], 10, 32)
+	xid = uint64(gw.act(agent, "UPDATE pgs.tick SET note = 'agent' WHERE id = 'k1'"))
 	lines, _ = bodies(uint32(xid))
 	if p, err = pgundo.Build(uint32(xid), lines); err != nil {
 		t.Fatal(err)
@@ -282,7 +269,7 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	if _, err = p.Check(human); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = p.Apply(human, map[string]any{"by": "test"}); err == nil || !strings.Contains(err.Error(), `"pgs_tick_audit" does not exist`) ||
+	if _, err = p.Apply(human, undoGW.undo(uint32(xid))); err == nil || !strings.Contains(err.Error(), `"pgs_tick_audit" does not exist`) ||
 		!strings.Contains(err.Error(), "the undo runs with search_path pg_catalog, pg_temp: if a trigger") {
 		t.Fatalf("the undo with a trigger that names its table without the schema, and no search_path: %v", err)
 	}
@@ -328,7 +315,7 @@ CREATE OPERATOR postgres.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = po
 	if statuses, err = p.Check(human); err != nil {
 		t.Fatalf("the check by a person: %v", err)
 	}
-	if done, err = p.Apply(human, map[string]any{"by": "test"}); err != nil {
+	if done, err = p.Apply(human, undoGW.undo(uint32(xid))); err != nil {
 		t.Fatalf("the undo by a person: %v", err)
 	}
 	if got := one(admin, "SELECT note || ' ' || (SELECT count(*) FROM public.pgs_tick_audit) FROM pgs.tick WHERE id = 'k1'"); got != "human 2" {
@@ -338,12 +325,12 @@ CREATE OPERATOR postgres.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = po
 	// 5. Строки отката — по статистике его транзакции: вернуть удалённую
 	// строку — одна по шагам, а триггер владельца на вставку пишет ещё 50.
 	// Раньше откат шёл как одна строка мимо предела 5 (T заход 2).
-	s = mcpserver.New(mcpserver.Config{Agent: "pgs-bot", RowLimit: 5, Version: "test", Receipts: f, ReceiptsPath: path, Fetch: bodies,
+	s = mcpserver.New(gw.server(mcpserver.Config{Agent: "pgs-bot", RowLimit: 5, Version: "test", Fetch: bodies,
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
 			return pgwire.Dial(ctx, c)
-		}}, nil)
+		}}), nil)
 	text, isErr = tool("execute", `{"sql":"DELETE FROM pgs.vals WHERE id = 3","reason":"test"}`)
 	if isErr {
 		t.Fatal(text)

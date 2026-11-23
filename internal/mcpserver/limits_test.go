@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
@@ -96,12 +97,8 @@ func (d *slowDB) counts() (cancels, closes int) {
 // «сеансов»): каждый вызов — новый сеанс агента.
 func serverOn(t *testing.T, db DB, path string, mod func(*Config)) *Server {
 	t.Helper()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { f.Close() })
-	cfg := Config{Agent: "support-bot", Receipts: f, ReceiptsPath: path, Version: "test", Dial: func(map[string]string) (DB, error) { return db, nil }}
+	cfg := Config{Agent: "support-bot", Version: "test", Dial: func(map[string]string) (DB, error) { return db, nil }}
+	gatewayOn(&cfg, path)
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -109,22 +106,6 @@ func serverOn(t *testing.T, db DB, path string, mod func(*Config)) *Server {
 	n := 0
 	s.newID = func() string { n++; return fmt.Sprintf("a-%d", n) }
 	return s
-}
-
-func receipts(t *testing.T, path string) []Receipt {
-	t.Helper()
-	data, _ := os.ReadFile(path)
-	var out []Receipt
-	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
-		var rc Receipt
-		if len(line) > 0 {
-			if err := json.Unmarshal(line, &rc); err != nil {
-				t.Fatal(err)
-			}
-			out = append(out, rc)
-		}
-	}
-	return out
 }
 
 // Запрос агента идёт дольше предела: он отменяется на сервере базы,
@@ -149,17 +130,17 @@ func TestStatementTimeoutCancelsAndDropsTheConnection(t *testing.T) {
 		t.Fatalf("cancels %d, closes %d", cancels, closes)
 	}
 	// После зависшей пачки в закрытое соединение ничего не шло: ни ROLLBACK,
-	// ни COMMIT. Отметка для тревоги — уже по новому соединению.
-	n := len(db.log)
+	// ни COMMIT, ни что-то ещё. Тревога — по квитанции исхода.
 	sleep := slices.IndexFunc(db.log, func(q string) bool { return strings.Contains(q, "pg_sleep") })
-	if sleep < 0 || slices.Contains(db.log[sleep:], "ROLLBACK") || slices.Contains(db.log[sleep:], "COMMIT") ||
-		!strings.Contains(db.log[n-1], "SELECT evidence.mark_refused('{") ||
-		!strings.Contains(db.log[n-1], `"cause":"timeout"`) || !strings.Contains(db.log[n-1], `"timeout":"30ms"`) {
+	if sleep < 0 || slices.Contains(db.log[sleep:], "ROLLBACK") || slices.Contains(db.log[sleep:], "COMMIT") {
 		t.Fatalf("%q", db.log)
 	}
 	rc := receipts(t, path)
 	if len(rc) != 1 || rc[0].Outcome != "failed" || rc[0].Cause != CauseTimeout || !strings.Contains(rc[0].Error, "cancelled") {
 		t.Fatalf("receipt %+v", rc)
+	}
+	if o := outcomes(t, path); o[0]["timeout"] != "30ms" {
+		t.Fatalf("the outcome lacks what the alert says: %v", o[0])
 	}
 	// Сервер жив: следующее действие идёт по новому соединению.
 	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`); isErr {
@@ -187,7 +168,7 @@ func TestStatementTimeoutWhenTheCancelFails(t *testing.T) {
 }
 
 // Быстрому запросу таймер не мешает, а lock_timeout ставится в начале
-// транзакции — раньше отметки действия и SQL агента.
+// транзакции — раньше номера транзакции и SQL агента.
 func TestTimeoutsLeaveFastActionsAlone(t *testing.T) {
 	db := newSlowDB("pg_sleep")
 	s := serverOn(t, db, filepath.Join(t.TempDir(), "receipts.jsonl"), func(c *Config) {
@@ -198,7 +179,7 @@ func TestTimeoutsLeaveFastActionsAlone(t *testing.T) {
 		t.Fatalf("%v %s", isErr, text)
 	}
 	if db.log[1] != "BEGIN" || !strings.HasSuffix(db.log[2], "; SET LOCAL statement_timeout = 65000; SET LOCAL lock_timeout = 5000") ||
-		!strings.Contains(db.log[3], "mark_action") || db.log[len(db.log)-1] != "COMMIT" {
+		!strings.Contains(db.log[3], "pg_current_xact_id") || db.log[len(db.log)-1] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
 	if cancels, closes := db.counts(); cancels != 0 || closes != 0 {
@@ -239,32 +220,40 @@ func TestActionsPerMinuteAcrossSessions(t *testing.T) {
 	if text, isErr := exec(second); isErr {
 		t.Fatal(text)
 	}
+	// alerted — отказы за частоту, о которых ушла тревога людям: сборщик
+	// поднимает её по квитанции исхода с alerted (pginput, receipts.go).
+	alerted := func() (n int) {
+		for _, o := range outcomes(t, path) {
+			if o["agent"] == "support-bot" && o["cause"] == CauseRate && o["alerted"] == true {
+				n++
+			}
+		}
+		return n
+	}
 	before := len(db.log)
 	text, isErr := exec(second)
 	if !isErr || !strings.Contains(text, "was refused: 3 actions in the last minute, and the limit is 3") || !strings.Contains(text, "do not retry in a loop") {
 		t.Fatalf("the fourth action in a minute: %v %s", isErr, text)
 	}
-	// В базу ушла только отметка для тревоги, с чистого сеанса: ни BEGIN, ни
-	// SQL агента.
-	if got := db.log[before:]; len(got) != 2 || got[0] != "DISCARD ALL" || !strings.Contains(got[1], "SELECT evidence.mark_refused('{") ||
-		!strings.Contains(got[1], `"cause":"rate"`) || !strings.Contains(got[1], `"actions":3`) || !strings.Contains(got[1], `"limit":3`) {
-		t.Fatalf("%q", got)
+	// В базу не ушло ничего; в квитанции исхода — тревога и её подробности.
+	o := outcomes(t, path)
+	if last := o[len(o)-1]; len(db.log) != before || alerted() != 1 || last["actions"] != float64(3) || last["limit"] != float64(3) {
+		t.Fatalf("%q %v", db.log[before:], last)
 	}
-	before = len(db.log)
 	for i := 0; i < 5; i++ { // агент в цикле: отказы есть, новых тревог нет
 		now = now.Add(time.Second)
 		if _, isErr := exec(second); !isErr {
 			t.Fatal("a looping agent got through")
 		}
 	}
-	if len(db.log) != before {
-		t.Fatalf("each refusal raised an alert: %q", db.log[before:])
+	if len(db.log) != before || alerted() != 1 {
+		t.Fatalf("each refusal raised an alert: %d alerts, %q", alerted(), db.log[before:])
 	}
 	// И новый сеанс в ту же минуту тревогу не повторяет: когда она была, видно
 	// по квитанциям. Минута с неё прошла, а агент всё в цикле — тревога снова.
 	third := clock(serverOn(t, db, path, limit))
-	if _, isErr := exec(third); !isErr || len(db.log) != before {
-		t.Fatalf("a new session raised the alert again: %q", db.log[before:])
+	if _, isErr := exec(third); !isErr || alerted() != 1 {
+		t.Fatalf("a new session raised the alert again: %d alerts", alerted())
 	}
 	now = now.Add(56 * time.Second) // с первой тревоги — 62 с; действия первой минуты уже не в счёт
 	for i := 0; i < 3; i++ {
@@ -273,18 +262,16 @@ func TestActionsPerMinuteAcrossSessions(t *testing.T) {
 		}
 		now = now.Add(time.Second)
 	}
-	before = len(db.log)
-	if _, isErr := exec(third); !isErr || len(db.log) != before+2 || !strings.Contains(db.log[before+1], `"cause":"rate"`) {
-		t.Fatalf("a minute after the alert the agent loops again, and nobody is told: %q", db.log[before:])
+	if _, isErr := exec(third); !isErr || alerted() != 2 {
+		t.Fatalf("a minute after the alert the agent loops again, and nobody is told: %d alerts", alerted())
 	}
 	// Счёт минуты — от последней тревоги, а не от первой.
 	now = now.Add(time.Second)
-	before = len(db.log)
-	if _, isErr := exec(third); !isErr || len(db.log) != before {
-		t.Fatalf("an alert a second after the previous one: %q", db.log[before:])
+	if _, isErr := exec(third); !isErr || alerted() != 2 {
+		t.Fatalf("an alert a second after the previous one: %d alerts", alerted())
 	}
-	if _, isErr := exec(clock(serverOn(t, db, path, limit))); !isErr || len(db.log) != before {
-		t.Fatalf("an alert a second after the previous one, from a new session: %q", db.log[before:])
+	if _, isErr := exec(clock(serverOn(t, db, path, limit))); !isErr || alerted() != 2 {
+		t.Fatalf("an alert a second after the previous one, from a new session: %d alerts", alerted())
 	}
 	var refused int
 	for _, rc := range receipts(t, path) {
@@ -334,10 +321,10 @@ func TestWindowRowsStopsAnAgentThatSplitsItsChange(t *testing.T) {
 		!strings.Contains(text, "with its 400 rows the agent would have changed 1200 rows in the last 10m0s, and the limit is 1000") {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	n := len(db.log)
-	if db.log[n-1] != "ROLLBACK" || !strings.Contains(db.log[n-2], `"cause":"window-rows"`) || !strings.Contains(db.log[n-2], `"window_rows":800`) ||
-		!strings.Contains(db.log[n-2], `"rows":400`) || !strings.Contains(db.log[n-2], `"window":"10m0s"`) {
-		t.Fatalf("%q", db.log[n-3:])
+	o := outcomes(t, path)
+	if n := len(db.log); db.log[n-1] != "ROLLBACK" || o[2]["cause"] != CauseWindowRows || o[2]["window_rows"] != float64(800) ||
+		o[2]["rows"] != float64(400) || o[2]["window"] != "10m0s" || o[2]["limit"] != float64(1000) {
+		t.Fatalf("%q %v", db.log[n-3:], o[2])
 	}
 	if rc := receipts(t, path); rc[2].Outcome != "refused" || rc[2].Cause != CauseWindowRows || rc[2].Rows != 400 {
 		t.Fatalf("receipt %+v", rc[2])
@@ -366,10 +353,10 @@ func TestLedgerReadsOnlyWhatTheWindowNeeds(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
 	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
+	signer, _ := gateway.NewSigner(testKey, "esmcp", nil)
 	line := func(at time.Time, agent, outcome, cause string, rows int) {
-		rc, _ := json.Marshal(Receipt{ActionID: "x", Time: at.Format(time.RFC3339Nano), Agent: agent, Tool: "execute",
-			SQL: strings.Repeat("update t set v = 1; ", 20), Outcome: outcome, Cause: cause, Rows: rows})
-		buf.Write(append(rc, '\n'))
+		buf.Write(signedLine(t, signer, Receipt{ActionID: "x", Time: at.Format(time.RFC3339Nano), Agent: agent, Tool: "execute",
+			SQL: strings.Repeat("update t set v = 1; ", 20), Outcome: outcome, Cause: cause, Rows: rows}))
 	}
 	for i := 0; i < 3000; i++ { // больше мегабайта старых квитанций
 		line(now.Add(-48*time.Hour).Add(time.Duration(i)*time.Second), "support-bot", "committed", "", 1000)
@@ -402,6 +389,7 @@ func TestLedgerReadsOnlyWhatTheWindowNeeds(t *testing.T) {
 	}
 	// Файл заменили коротким (ротация).
 	buf.Reset()
+	signer, _ = gateway.NewSigner(testKey, "esmcp", nil)
 	line(now, "support-bot", "committed", "", 7)
 	os.WriteFile(path, buf.Bytes(), 0o600)
 	if actions, rows, _, _ := s.usage(now.Add(time.Second)); actions != 1 || rows != 7 {
@@ -443,10 +431,10 @@ func TestLedgerCountsAReceiptCaughtMidWrite(t *testing.T) {
 	}
 	// Другой сеанс этого агента дописывает квитанцию о действии в 40 строк;
 	// этот читает, когда в файле лишь её начало.
-	line, _ := json.Marshal(Receipt{ActionID: "a-x", Time: now.Add(-time.Second).Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+	signer, _ := gateway.NewSigner(testKey, "esmcp", nil)
+	line := signedLine(t, signer, Receipt{ActionID: "a-x", Time: now.Add(-time.Second).Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
 		SQL: "UPDATE accounts SET note = 'x' WHERE id <= 40", Outcome: "committed", Rows: 40, XID: "900"})
-	line = append(line, '\n')
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}

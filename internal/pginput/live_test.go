@@ -169,8 +169,9 @@ func TestLive(t *testing.T) {
 		}
 	}
 
+	gw := newLiveGateway(t, "esmcp")
 	cfg := Config{DSN: base + " user=pgin_tap", Slot: "pgin_slot", Publication: "pgin_pub", Dir: t.TempDir(),
-		MCPRoles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}, RequireAction: true, SlotAlertMB: 4,
+		MCPRoles: []string{"pgin_agent"}, Tables: []string{"public.pgin_accounts"}, Receipts: liveReceipts(gw), RequireGateway: true, SlotAlertMB: 4,
 		Notify: &Notify{To: []alert.Target{{Type: alert.TypeSlack, URL: hook.URL}}}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -201,16 +202,11 @@ func TestLive(t *testing.T) {
 		}
 		return s
 	}
-	// change — агент меняет строку id; возвращает xid транзакции.
+	// change — шлюз меняет строку id (намерение — до COMMIT); возвращает xid
+	// транзакции.
 	change := func(id int, note string) uint32 {
 		t.Helper()
-		res, err := agent.Query(fmt.Sprintf("BEGIN; UPDATE public.pgin_accounts SET note = %s WHERE id = %d; SELECT pg_current_xact_id()::text; COMMIT", pgwire.Literal(note), id))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var xid uint32
-		fmt.Sscan(*res[2].Rows[0][0], &xid)
-		return xid
+		return gw.act(agent, fmt.Sprintf("UPDATE public.pgin_accounts SET note = %s WHERE id = %d", pgwire.Literal(note), id))
 	}
 	// last — последняя запись буфера с транзакцией (не пачка отпечатков): её
 	// xid и старое значение note.
@@ -253,8 +249,9 @@ func TestLive(t *testing.T) {
 		}
 	}
 
-	// 1. Транзакция агента ложится в буфер целиком; транзакция владельца —
-	// отпечатком в пачке: кто, ключ, хеши, без самих строк (DECISIONS, п. 41).
+	// 1. Транзакция шлюза (его подписанное намерение) ложится в буфер
+	// целиком; транзакция владельца — отпечатком в пачке: ключ, хеши, без
+	// самих строк и без «кто» (DECISIONS, п. 42).
 	s := open()
 	readAll(s, 0) // первое подключение заводит слот: журнал копится с этого места
 	x1 := change(1, "one")
@@ -269,12 +266,12 @@ func TestLive(t *testing.T) {
 		t.Fatalf("got transaction %d with old note %q", xid, old)
 	}
 	pack, err := pgtap.ReadPack(sink.bodies[len(sink.bodies)-1])
-	if err != nil || len(pack) != 1 || uint32(pack[0]["xid"].(float64)) != xo || !strings.Contains(fmt.Sprint(pack[0]["who"]), "postgres") ||
+	if err != nil || len(pack) != 1 || uint32(pack[0]["xid"].(float64)) != xo || pack[0]["action"] != nil ||
 		strings.Contains(string(sink.bodies[len(sink.bodies)-1]), "owner") {
 		t.Fatalf("the owner's transaction %d: %v %v", xo, pack, err)
 	}
 	index := filepath.Join(cfg.Dir, pgtap.IndexFile)
-	if e, found, err := pgtap.Lookup(index, x1); err != nil || !found || e.FirstSeq != 1 || e.LastSeq != 1 || !strings.Contains(string(e.Who), "pgin_agent") {
+	if e, found, err := pgtap.Lookup(index, x1); err != nil || !found || e.FirstSeq != 1 || e.LastSeq != 1 || e.Action == nil || e.Action.ID != "esmcp-1" || e.Action.Gateway != "esmcp" {
 		t.Fatalf("index: %+v %v %v", e, found, err)
 	}
 	if e, found, err := pgtap.Lookup(index, xo); err != nil || !found || e.Kind != pgtap.KindFingerprint || e.FirstSeq != 2 {
@@ -283,27 +280,21 @@ func TestLive(t *testing.T) {
 	if st := s.Stats(); st.Captured != 1 || st.Fingerprinted != 1 {
 		t.Fatalf("stats %+v", st)
 	}
-	// Агент пришёл мимо MCP-сервера (отметки действия нет): тревога дошла до
-	// получателя одним сообщением — с ролью, числом строк, номером записи и
-	// командой, которой смотрят откат.
-	text := message(nil, fmt.Sprintf("agent transaction %d", x1))
-	for _, want := range []string{"evidencestore, database live:", "• no-action:", "who: role pgin_agent", "changed: 1 row — public.pgin_accounts (updated 1)",
-		"store record: 1", fmt.Sprintf("undo preview: esundo check -config undo.json -xid %d", x1)} {
-		if !strings.Contains(text, want) {
+	// Владелец писал в базу, где пишет только шлюз (require_gateway): тревога
+	// дошла до получателя одним сообщением — с числом строк и без команды
+	// отката: откатывать из хранилища нечего.
+	text := message(nil, fmt.Sprintf("transaction %d not through the gateway", xo))
+	for _, want := range []string{"evidencestore, database live:", "• not-via-gateway:", "only its fingerprint is kept", "changed: 1 row — public.pgin_accounts (updated 1)"} {
+		if !strings.Contains(text, want) || strings.Contains(text, "undo preview") {
 			t.Fatalf("the alert lacks %q:\n%s", want, text)
 		}
 	}
-	// MCP-сервер остановил действие пределом строк: отметка об отказе — не
-	// транзакционное сообщение, и откат транзакции её не стирает. Сборщик
-	// узнаёт о том, чего в базе не случилось.
-	// (Откат не сбрасывает журнал базы на диск сразу — это делает её фоновый
-	// процесс за доли секунды, — поэтому сообщение приходит чуть погодя.)
-	exec(agent, `BEGIN; UPDATE public.pgin_accounts SET note = 'too many'; SELECT evidence.mark_refused('{"action_id":"act-9","agent":"bot","rows":20,"limit":5}'::json); ROLLBACK`)
+	// MCP-сервер остановил действие пределом строк: в базе ничего не
+	// случилось, а в квитанции исхода — отказ. Сборщик поднимает тревогу по
+	// ней, пока поток молчит.
+	gw.outcome("act-9", `{"action_id":"act-9","agent":"bot","outcome":"refused","cause":"row-limit","rows":20,"limit":5}`)
 	if text := message(s, "• refused:"); !strings.Contains(text, "would change 20 rows (the limit for one action is 5)") || !strings.Contains(text, "action: act-9, agent bot") {
 		t.Fatalf("refused alert:\n%s", text)
-	}
-	if one("SELECT count(*) FROM public.pgin_accounts WHERE note = 'too many'") != "0" {
-		t.Fatal("the refused action changed rows")
 	}
 
 	// 2. База оборвала соединение: вход не останавливается, подключается
@@ -394,12 +385,7 @@ func TestLive(t *testing.T) {
 	partSize = 64 << 10
 	s = open()
 	readAll(s, 0)
-	res, err = agent.Query("BEGIN; UPDATE public.pgin_accounts SET note = (SELECT string_agg(md5(random()::text || g), '') FROM generate_series(1, 30000) g); SELECT pg_current_xact_id()::text; COMMIT")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var big uint32
-	fmt.Sscan(*res[2].Rows[0][0], &big)
+	big := gw.act(agent, "UPDATE public.pgin_accounts SET note = (SELECT string_agg(md5(random()::text || g), '') FROM generate_series(1, 30000) g)")
 	sink.onEmit = func(records int) {
 		if records == before+3 { // три части в буфере: база рвёт соединение
 			sink.onEmit = nil

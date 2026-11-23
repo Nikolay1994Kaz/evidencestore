@@ -41,23 +41,25 @@ import (
 
 // Поводы тревог.
 const (
-	KindMassChange = "mass-change"    // изменений в транзакции не меньше порога
-	KindCanary     = "canary"         // тронута строка-ловушка
-	KindNoAction   = "no-action"      // транзакция агента без отметки действия: в обход MCP
-	KindTruncate   = "truncate"       // TRUNCATE: строк в записи нет
-	KindIdentity   = "identity"       // таблица без REPLICA IDENTITY FULL
-	KindLateMarker = "late-marker"    // отметка пришла после пропущенных изменений
-	KindNoWho      = "no-who"         // изменения без отметки «кто»: триггер выключен или его нет
-	KindForged     = "forged-marker"  // отметка не от функций evidence: её написали pg_logical_emit_message напрямую
-	KindRefused    = "refused"        // MCP-сервер остановил действие пределом строк
-	KindEscaped    = "escaped"        // SQL агента сам закрыл транзакцию MCP-сервера
-	KindUnknown    = "commit-unknown" // связь MCP-сервера с базой оборвалась на COMMIT: действие могло зафиксироваться
-	KindDBDown     = "db-down"        // нет связи с базой дольше порога
-	KindDBUp       = "db-up"          // связь с базой вернулась
-	KindGap        = "gap"            // записи потеряны: слот удалён или его журнал стёрт
-	KindSlotLag    = "slot-lag"       // база копит журнал для слота: до предела — половина или меньше
-	KindSlotOK     = "slot-ok"        // журнал для слота снова в норме
-	KindDropped    = "dropped"        // тревога слишком длинная для доставки: вместо неё — эта, с местом в файле
+	KindMassChange = "mass-change" // изменений в транзакции не меньше порога
+	KindCanary     = "canary"      // тронута строка-ловушка
+	KindTruncate   = "truncate"    // TRUNCATE: строк в записи нет
+	KindIdentity   = "identity"    // таблица без REPLICA IDENTITY FULL
+	// KindNotViaGateway — транзакция по названным таблицам без намерения
+	// шлюза (require_gateway): в базу писали не через шлюз.
+	KindNotViaGateway = "not-via-gateway"
+	// KindForgedReceipt — строка файла квитанций, подписанная не ключом шлюза:
+	// её дописал тот, у кого ключа нет.
+	KindForgedReceipt = "forged-receipt"
+	KindRefused       = "refused"        // MCP-сервер остановил действие пределом строк
+	KindEscaped       = "escaped"        // SQL агента сам закрыл транзакцию MCP-сервера
+	KindUnknown       = "commit-unknown" // связь MCP-сервера с базой оборвалась на COMMIT: действие могло зафиксироваться
+	KindDBDown        = "db-down"        // нет связи с базой дольше порога
+	KindDBUp          = "db-up"          // связь с базой вернулась
+	KindGap           = "gap"            // записи потеряны: слот удалён или его журнал стёрт
+	KindSlotLag       = "slot-lag"       // база копит журнал для слота: до предела — половина или меньше
+	KindSlotOK        = "slot-ok"        // журнал для слота снова в норме
+	KindDropped       = "dropped"        // тревога слишком длинная для доставки: вместо неё — эта, с местом в файле
 )
 
 // Signal — один повод тревоги.
@@ -79,17 +81,42 @@ type Event struct {
 	XID     uint32   `json:"xid,omitempty"`
 	Signals []Signal `json:"signals"`
 	// О транзакции — то же, что в её строке справочника.
-	Changes  int               `json:"changes,omitempty"`
-	Tables   map[string]Counts `json:"tables,omitempty"`
-	Who      json.RawMessage   `json:"who,omitempty"`
-	Actions  []json.RawMessage `json:"actions,omitempty"`
-	Undo     json.RawMessage   `json:"undo,omitempty"`
-	FirstSeq uint64            `json:"first_seq,omitempty"`
-	LastSeq  uint64            `json:"last_seq,omitempty"`
-	// Fingerprint — от транзакции в хранилище только отпечаток (роль не из
-	// списков сборщика): откатить её нельзя.
+	Changes int               `json:"changes,omitempty"`
+	Tables  map[string]Counts `json:"tables,omitempty"`
+	// Action — действие шлюза, чья это транзакция (по его подписанному
+	// намерению); у служебного события — действие, о котором оно (отказ,
+	// обрыв на COMMIT). Нет — транзакция не через шлюз.
+	Action   *Action `json:"action,omitempty"`
+	FirstSeq uint64  `json:"first_seq,omitempty"`
+	LastSeq  uint64  `json:"last_seq,omitempty"`
+	// Fingerprint — от транзакции в хранилище только отпечаток (намерения
+	// шлюза нет): откатить её нельзя.
 	Fingerprint bool `json:"fingerprint,omitempty"`
 }
+
+// Action — действие шлюза по его квитанции (DECISIONS, п. 42): какой шлюз,
+// какая квитанция цепочки (seq и SHA-256 строки — по ним её находят в
+// хранилище), номер действия и шаг: StepIntent — действие агента, StepUndo —
+// откат.
+type Action struct {
+	ID      string `json:"id"`
+	Gateway string `json:"gateway"`
+	Seq     uint64 `json:"seq"`
+	Hash    string `json:"hash"`
+	Step    string `json:"step"`
+	Time    string `json:"time,omitempty"` // часы шлюза: ничего не доказывают
+	Agent   string `json:"agent,omitempty"`
+	Tool    string `json:"tool,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Undoes  string `json:"undoes,omitempty"` // у отката — какое действие он возвращает
+}
+
+// Шаги квитанций шлюза, которые читает сборщик Postgres.
+const (
+	StepIntent  = "intent"  // перед COMMIT: действие агента в транзакции xid
+	StepUndo    = "undo"    // перед COMMIT: откат действия в транзакции xid
+	StepOutcome = "outcome" // после: чем кончилось
+)
 
 // Add добавляет повод; точный повтор (ловушку тронули дважды одним и тем же
 // оператором) не добавляется.
@@ -279,17 +306,16 @@ func Text(e Event, o TextOptions) string {
 	if title == "" {
 		title = "collector"
 	}
+	undo := e.Action != nil && e.Action.Step == StepUndo
 	switch {
-	case e.XID != 0 && e.Undo != nil:
+	case e.XID != 0 && undo:
 		fmt.Fprintf(&b, "evidencestore, %s: undo transaction %d", title, e.XID)
 	case e.XID != 0 && e.Fingerprint:
-		fmt.Fprintf(&b, "evidencestore, %s: transaction %d of a role outside the collector's lists (only its fingerprint is kept)", title, e.XID)
-	case e.XID != 0 && slices.Contains(e.Kinds(), KindForged):
-		fmt.Fprintf(&b, "evidencestore, %s: transaction %d with forged evidence markers", title, e.XID)
-	case e.XID != 0 && slices.Contains(e.Kinds(), KindNoWho):
-		fmt.Fprintf(&b, "evidencestore, %s: transaction %d without a who marker", title, e.XID)
-	case e.XID != 0:
+		fmt.Fprintf(&b, "evidencestore, %s: transaction %d not through the gateway (only its fingerprint is kept)", title, e.XID)
+	case e.XID != 0 && e.Action != nil:
 		fmt.Fprintf(&b, "evidencestore, %s: agent transaction %d", title, e.XID)
+	case e.XID != 0:
+		fmt.Fprintf(&b, "evidencestore, %s: transaction %d", title, e.XID)
 	default:
 		fmt.Fprintf(&b, "evidencestore, %s", title)
 	}
@@ -300,13 +326,8 @@ func Text(e Event, o TextOptions) string {
 		}
 		fmt.Fprintf(&b, "\n• %s: %s", s.Kind, short(s.Detail))
 	}
-	if who := describeWho(e.Who); who != "" {
-		fmt.Fprintf(&b, "\nwho: %s", who)
-	}
-	for _, a := range e.Actions {
-		if act := describeAction(a); act != "" {
-			fmt.Fprintf(&b, "\naction: %s", act)
-		}
+	if act := describeAction(e.Action); act != "" {
+		fmt.Fprintf(&b, "\naction: %s", act)
 	}
 	if len(e.Tables) > 0 {
 		rows := "rows"
@@ -325,7 +346,7 @@ func Text(e Event, o TextOptions) string {
 			fmt.Fprintf(&tail, "\nstore records: %d–%d", e.FirstSeq, e.LastSeq)
 		}
 		// Откат TRUNCATE esundo не делает: подсказывать его нечего (T-8, заход 2).
-		if o.UndoHint != "" && e.Undo == nil && !e.Fingerprint && !slices.Contains(e.Kinds(), KindTruncate) {
+		if o.UndoHint != "" && !undo && !e.Fingerprint && !slices.Contains(e.Kinds(), KindTruncate) {
 			fmt.Fprintf(&tail, "\nundo preview: %s", short(strings.ReplaceAll(o.UndoHint, "{xid}", strconv.FormatUint(uint64(e.XID), 10))))
 		}
 	}
@@ -344,37 +365,20 @@ func clip(s string, limit int) string {
 	return string(r[:max(limit-utf8.RuneCountInString(cutNote), 0)]) + cutNote
 }
 
-func describeWho(raw json.RawMessage) string {
-	var w struct {
-		Role string `json:"role"`
-		App  string `json:"app"`
-	}
-	if len(raw) == 0 || json.Unmarshal(raw, &w) != nil || w.Role == "" {
+func describeAction(a *Action) string {
+	if a == nil || a.ID == "" {
 		return ""
 	}
-	if w.App != "" {
-		return fmt.Sprintf("role %s, application %s", field(w.Role), field(w.App))
+	s := field(a.ID)
+	if a.Agent != "" {
+		s += ", agent " + field(a.Agent)
 	}
-	return "role " + field(w.Role)
-}
-
-func describeAction(raw json.RawMessage) string {
-	var a struct {
-		Info struct {
-			ActionID string `json:"action_id"`
-			Agent    string `json:"agent"`
-			Reason   string `json:"reason"`
-		} `json:"info"`
+	s += fmt.Sprintf(" (receipt %d of gateway %s)", a.Seq, field(a.Gateway))
+	if a.Undoes != "" {
+		s += ", undoes " + field(a.Undoes)
 	}
-	if json.Unmarshal(raw, &a) != nil || a.Info.ActionID == "" {
-		return ""
-	}
-	s := field(a.Info.ActionID)
-	if a.Info.Agent != "" {
-		s += ", agent " + field(a.Info.Agent)
-	}
-	if a.Info.Reason != "" {
-		s += fmt.Sprintf(" — reason given: %q", short(a.Info.Reason))
+	if a.Reason != "" {
+		s += fmt.Sprintf(" — reason given: %q", short(a.Reason))
 	}
 	return s
 }

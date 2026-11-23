@@ -35,6 +35,7 @@ package mcpserver
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -50,6 +51,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -107,10 +110,22 @@ type Config struct {
 	// (pgwire.Config.Params) — их задаёт сервер (sessionParams), и Dial обязан
 	// их передать. Зовётся при первом запросе и заново после обрыва.
 	Dial func(params map[string]string) (DB, error)
-	// Receipts — журнал квитанций (строки JSON, fsync на строку). ReceiptsPath —
-	// он же для чтения: по нему действие находится и после перезапуска сервера.
-	Receipts     *os.File
+	// ReceiptsPath — файл квитанций шлюза (receipt/v1, DECISIONS, п. 42–43):
+	// на каждое действие — намерение с xid транзакции до её COMMIT и исход
+	// после, подписанные ключом Key (gateway.Append: flock, fsync). По
+	// намерению сборщик берёт транзакцию целиком как действие агента; по
+	// файлу же действие находится после перезапуска и считаются пределы.
+	// Пусто — квитанции только в памяти (тесты): сборщику брать нечего.
 	ReceiptsPath string
+	// Key — ключ шлюза (Ed25519): его открытый ключ — в gateway_keys
+	// сборщика и в gateway_key источника квитанций у хранилища.
+	Key ed25519.PrivateKey
+	// Gateway — имя цепочки квитанций этого сервера (gateway квитанции):
+	// одна на агента, сеансы агента ведут её по очереди, под flock.
+	Gateway string
+	// PGSource — имя источника базы в хранилище: намерение ссылается на
+	// транзакцию как {"source": PGSource, "subject": xid}.
+	PGSource string
 	// Fetch отдаёт тела записей транзакции из хранилища, выписанные esverify из
 	// проверенных пакетов. nil — инструментов отката у агента нет.
 	Fetch func(xid uint32) ([][]byte, error)
@@ -138,7 +153,8 @@ type Receipt struct {
 	// Outcome — committed, failed, refused (остановлено пределом), escaped
 	// (SQL агента сам закрыл транзакцию сервера: что он изменил после этого,
 	// могло зафиксироваться мимо пределов) или unknown (связь оборвалась на
-	// COMMIT: зафиксировано ли, неизвестно).
+	// COMMIT: зафиксировано ли, неизвестно). У намерения — pending: исхода
+	// ещё нет; без квитанции исхода (сервер упал между ними) так и остаётся.
 	Outcome string   `json:"outcome"`
 	Tags    []string `json:"tags,omitempty"`
 	Rows    int      `json:"rows,omitempty"` // изменений строк (считается, когда задан предел)
@@ -152,6 +168,10 @@ type Receipt struct {
 	Error   string          `json:"error,omitempty"`
 	Undoes  string          `json:"undoes,omitempty"` // у отката: какое действие он возвращает
 	Client  json.RawMessage `json:"client,omitempty"`
+	// Info — подробности отказа для тревоги людям (предел, окно, таймаут):
+	// в теле квитанции исхода — рядом с полями выше. По ним сборщик поднимает
+	// тревогу (pginput, receipts.go).
+	Info map[string]any `json:"-"`
 }
 
 // Server — один агент на одном потоке ввода-вывода.
@@ -482,7 +502,8 @@ func (s *Server) call(name string, args json.RawMessage) (string, error) {
 	return "", errUnknownTool(name)
 }
 
-// history — квитанции из журнала (или из памяти, если журнала на чтение нет).
+// history — действия этого агента по файлу квитанций (или из памяти, если
+// файла нет): квитанция исхода дополняет намерение того же действия.
 func (s *Server) history() []Receipt {
 	if s.cfg.ReceiptsPath == "" {
 		return s.recent
@@ -491,31 +512,90 @@ func (s *Server) history() []Receipt {
 	if err != nil {
 		return s.recent
 	}
-	// Файл квитанций может быть общим у нескольких агентов: свои — только
-	// этого (P-247). Чужое действие агент не видит и не откатывает.
+	// Файл квитанций может быть общим у нескольких агентов и шлюзов: свои —
+	// только квитанции этого шлюза, подписанные его ключом, и этого агента
+	// (P-247). Чужое действие агент не видит и не откатывает.
 	var out []Receipt
+	at := map[string]int{}
 	for _, line := range strings.Split(string(data), "\n") {
-		var rc Receipt
-		if line != "" && json.Unmarshal([]byte(line), &rc) == nil && rc.Agent == s.cfg.Agent {
-			out = append(out, rc)
+		rc, _, ok := s.own([]byte(line))
+		if !ok || rc.Agent != s.cfg.Agent {
+			continue
 		}
+		if i, seen := at[rc.ActionID]; seen {
+			out[i] = rc
+			continue
+		}
+		at[rc.ActionID] = len(out)
+		out = append(out, rc)
 	}
 	return out
 }
 
-// marks — несёт ли транзакция плана отметку действия actionID.
-func marks(p *pgundo.Plan, actionID string) bool {
-	for _, a := range p.Actions {
-		var m struct {
-			Info struct {
-				ActionID string `json:"action_id"`
-			} `json:"info"`
-		}
-		if json.Unmarshal(a, &m) == nil && m.Info.ActionID == actionID {
-			return true
+// own — квитанция этого шлюза, подписанная его ключом: тело — Receipt, step —
+// её шаг. Чужие строки, подделки и строки не по формату — не его.
+func (s *Server) own(line []byte) (rc Receipt, step string, ok bool) {
+	if len(line) == 0 || len(s.cfg.Key) == 0 {
+		return rc, "", false
+	}
+	r, err := gateway.ParseReceipt(line)
+	if err != nil || r.Gateway != s.cfg.Gateway || r.Verify(s.cfg.Key.Public().(ed25519.PublicKey)) != nil {
+		return rc, "", false
+	}
+	if json.Unmarshal(r.Body, &rc) != nil || rc.ActionID != r.Action {
+		return rc, "", false
+	}
+	return rc, r.Step, true
+}
+
+// intent пишет квитанцию-намерение действия rc (step alert.StepIntent или
+// alert.StepUndo) со ссылкой на его транзакцию. Без файла квитанций — ничего:
+// сборщику брать нечего, тесты без базы.
+func (s *Server) intent(rc *Receipt, step string) error {
+	if s.cfg.ReceiptsPath == "" {
+		return nil
+	}
+	var refs []gateway.Ref
+	if rc.XID != "" {
+		refs = []gateway.Ref{{Source: s.cfg.PGSource, Subject: rc.XID}}
+	}
+	draft := *rc
+	draft.Outcome = OutcomePending
+	a, err := gateway.Append(s.cfg.ReceiptsPath, s.cfg.Key, s.cfg.Gateway, gateway.Draft{
+		Time: s.now(), Action: rc.ActionID, Step: step, Refs: refs, Body: bodyOf(draft)})
+	s.appended(a)
+	return err
+}
+
+// OutcomePending — исход в теле намерения: действия ещё не было.
+const OutcomePending = "pending"
+
+// appended — в журнал сервера то, что Append сказал о файле квитанций.
+func (s *Server) appended(a gateway.Appended) {
+	if a.Torn {
+		s.log.Warn("the last line of the receipts file was torn (a writer died in the middle of it): it is closed and stays as a broken line", "file", s.cfg.ReceiptsPath)
+	}
+	if a.Skipped > 0 {
+		s.log.Warn("lines of the receipts file are not this gateway's receipts signed with its key: the chain goes on past them", "file", s.cfg.ReceiptsPath, "lines", a.Skipped)
+	}
+}
+
+// bodyOf — тело квитанции: поля Receipt и подробности отказа (Info) рядом с
+// ними, не поверх.
+func bodyOf(rc Receipt) json.RawMessage {
+	data, _ := json.Marshal(rc)
+	if len(rc.Info) == 0 {
+		return data
+	}
+	var m map[string]any
+	json.Unmarshal(data, &m)
+	for k, v := range rc.Info {
+		if _, taken := m[k]; !taken {
+			m[k] = v
 		}
 	}
-	return false
+	data, _ = json.Marshal(m)
+	return data
 }
 
 // undoLimit — откат перешёл предел строк по статистике своей транзакции.
@@ -539,10 +619,10 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	switch {
 	case target == nil:
 		return "", fmt.Errorf("action %s is not in this server's receipts", actionID)
-	case target.Outcome != "committed" && target.Outcome != "unknown":
-		// unknown — COMMIT оборвался, и действие могло зафиксироваться: если
-		// хранилище знает транзакцию с его отметкой (marks ниже), откат есть
-		// (T заход 2).
+	case target.Outcome != "committed" && target.Outcome != "unknown" && target.Outcome != OutcomePending:
+		// unknown — COMMIT оборвался, pending — сервер упал после намерения:
+		// действие могло зафиксироваться. Если сборщик взял его транзакцию
+		// по намерению (plan.Action ниже), откат есть (T заход 2).
 		return "", fmt.Errorf("action %s did not commit (%s): there is nothing to undo", actionID, target.Outcome)
 	case target.Tool == "undo_apply":
 		// Откат отката повторил бы то изменение, которое откат вернул (P-249).
@@ -581,20 +661,13 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 		return "", err
 	}
 	plan.SearchPath = s.cfg.UndoSearchPath
-	// Транзакция с этим номером — та, что несёт отметку действия: номер
-	// бывает занят заново (база восстановлена из копии, счётчик обошёл
-	// 32 бита), и откат чужой транзакции вышел бы откатом этого действия.
-	if !marks(plan, actionID) {
-		for _, f := range plan.Forged {
-			if strings.Contains(string(f), actionID) {
-				// Отметка этого действия — без метки функций evidence (функции
-				// прежней версии или подделка): причина не в номере (T-5, заход 2).
-				return "", fmt.Errorf("the marker of action %s in transaction %d is not marked by the evidence functions (an older escollect -setup-sql, "+
-					"or someone wrote it with pg_logical_emit_message). This action is not undone here: ask a person", actionID, xid)
-			}
-		}
-		return "", fmt.Errorf("transaction %d in the evidence store carries no marker of action %s: the transaction id was taken again "+
-			"(the database was restored from a backup, or the counter wrapped). This action is not undone here: ask a person", xid, actionID)
+	// Транзакция с этим номером — та, что сборщик взял по намерению этого
+	// действия: номер бывает занят заново (база восстановлена из копии,
+	// счётчик обошёл 32 бита), и откат чужой транзакции вышел бы откатом
+	// этого действия.
+	if plan.Action == nil || plan.Action.ID != actionID || plan.Action.Gateway != s.cfg.Gateway {
+		return "", fmt.Errorf("transaction %d in the evidence store is not action %s of this server (the collector took it by another receipt, or by none): "+
+			"the transaction id was taken again (the database was restored from a backup, or the counter wrapped). This action is not undone here: ask a person", xid, actionID)
 	}
 	// Сверка и откат — с чистого сеанса; путь поиска ставит pgundo (Path и
 	// UndoSearchPath), таймауты — параметры входа (sessionParams).
@@ -663,9 +736,12 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 		}
 		return nil
 	})
-	// Откат — тоже действие: его отметка несёт и номер действия, и что он возвращает.
-	applied, err := plan.Apply(s.db, map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": reason,
-		"undoes_action": actionID, "undoes_xid": target.XID, "steps_applied": ok, "conflicts_left": bad})
+	// Откат — тоже действие: его намерение несёт и номер действия, и что он
+	// возвращает, и транзакцию отката — до её изменений.
+	applied, err := plan.Apply(s.db, func(xid, xid8 string) error {
+		rc.XID, rc.FullXID = xid, xid8
+		return s.intent(&rc, alert.StepUndo)
+	})
 	var lim *undoLimit
 	if errors.As(err, &lim) {
 		return refuse(lim.cause, lim.info, lim.why)
@@ -886,6 +962,9 @@ func (s *Server) execute(stmts []string, reason string) (string, error) {
 	if werr := s.keep(rc); werr != nil {
 		// Действие без квитанции — дыра в учёте: о ней должен узнать и агент, и оператор.
 		s.log.Error("receipt not written", "action", rc.ActionID, "outcome", rc.Outcome, "err", werr)
+		if err != nil {
+			return "", fmt.Errorf("action %s is %s (%v), but its receipt could not be written: %v", rc.ActionID, rc.Outcome, err, werr)
+		}
 		return "", fmt.Errorf("action %s is %s, but its receipt could not be written: %v", rc.ActionID, rc.Outcome, werr)
 	}
 	if err != nil && rc.Cause == CauseRate {
@@ -931,7 +1010,7 @@ func (s *Server) throttle(rc *Receipt) error {
 		// С чистого сеанса: отказ раньше базы идёт до транзакции, а сеанс
 		// остался от прошлого вызова (P-243). В квитанции «тревога ушла» —
 		// только если отметка легла.
-		rc.Alerted = s.fresh() == nil && s.markRefused(rc, map[string]any{"actions": actions, "limit": s.cfg.ActionsPerMinute})
+		rc.Alerted = s.markRefused(rc, map[string]any{"actions": actions, "limit": s.cfg.ActionsPerMinute})
 	}
 	return fmt.Errorf("%d actions in the last minute, and the limit is %d. Wait before the next one and do not retry in a loop; if this pace is needed, ask a person to raise the limit",
 		actions, s.cfg.ActionsPerMinute)
@@ -955,11 +1034,6 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	if _, err := s.run(strings.Join(append(slices.Clone(own), s.guards()...), "; ")); err != nil {
 		return fail(err)
 	}
-	mark, _ := json.Marshal(map[string]any{"action_id": rc.ActionID, "agent": rc.Agent, "tool": rc.Tool, "reason": rc.Reason, "client": rc.Client})
-	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
-	if _, err := s.run("SELECT evidence.mark_action(" + pgwire.Literal(string(mark)) + "::json)"); err != nil {
-		return fail(fmt.Errorf("the action marker could not be set%s: %w", setupHint(err), err))
-	}
 	// Номер транзакции, а при пределах строк — и счёт строк до SQL агента
 	// (changed): тем же запросом, без лишнего обмена с базой. Номер — 32
 	// бита, как в журнале базы, справочнике, хранилище и тревогах; полный
@@ -979,6 +1053,12 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) >= 2 && res[0].Rows[0][0] != nil && res[0].Rows[0][1] != nil {
 		rc.XID, rc.FullXID = *res[0].Rows[0][0], *res[0].Rows[0][1]
 	}
+	// Намерение — до SQL агента и тем более до COMMIT: по нему сборщик
+	// берёт транзакцию целиком как действие агента (DECISIONS, п. 42). Не
+	// записалось — действия нет: без квитанции оно легло бы отпечатком.
+	if err := s.intent(rc, alert.StepIntent); err != nil {
+		return fail(fmt.Errorf("the action's receipt could not be written, so the action did not run: %w", err))
+	}
 	before := 0
 	if counting {
 		if before, err = countIn(res, 2); err != nil {
@@ -991,15 +1071,15 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		rc.Tags = append(rc.Tags, r.Tag)
 	}
 	if errors.Is(err, errTimeout) {
-		// Соединение закрыто, транзакция откатилась вместе с ним. Отметка для
-		// тревоги — по новому соединению.
+		// Соединение закрыто, транзакция откатилась вместе с ним. Тревога —
+		// по квитанции исхода.
 		rc.Cause = CauseTimeout
 		s.markRefused(rc, map[string]any{"timeout": s.cfg.StatementTimeout.String()})
 		return err
 	}
 	// Транзакция всё ещё та, что открыл сервер? COMMIT или ROLLBACK в тексте
 	// агента закрывают её, не спрашивая сервера, а всё, что идёт в тексте
-	// после них, база исполняет само по себе: без отметки действия, мимо
+	// после них, база исполняет само по себе: без намерения шлюза, мимо
 	// пределов строк и с фиксацией раньше, чем сервер что-то проверит.
 	if left, lerr := s.left(rc.XID, rc.Tags); lerr != nil {
 		return fail(lerr)
@@ -1018,8 +1098,8 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 			return fail(fmt.Errorf("the rows the action changed could not be counted, so the row limits cannot be checked: %w", err))
 		}
 		rc.Rows = rows
-		// refuse: отметка об отказе — не транзакционное сообщение журнала базы,
-		// откат её не стирает, и сборщик поднимет тревогу для людей.
+		// refuse: отказ — в квитанции исхода, по ней сборщик поднимет тревогу
+		// для людей.
 		refuse := func(cause string, info map[string]any, why error) error {
 			rc.Cause = cause
 			s.markRefused(rc, info)
@@ -1216,41 +1296,13 @@ func (s *Server) keep(rc Receipt) error {
 	if len(s.recent) > 50 {
 		s.recent = s.recent[len(s.recent)-50:]
 	}
-	if s.cfg.Receipts == nil {
+	if s.cfg.ReceiptsPath == "" {
 		return nil
 	}
-	line, err := json.Marshal(rc)
-	if err != nil {
-		return err
-	}
-	line = append(line, '\n')
-	// Прошлая запись оборвалась на полуслове (сбой процесса, нет места):
-	// своя квитанция — с новой строки, иначе она приклеится к обрывку, и её
-	// не разберёт ни счёт пределов, ни actions (R1 заход 2).
-	if s.cfg.ReceiptsPath != "" && !endsLine(s.cfg.ReceiptsPath) {
-		line = append([]byte{'\n'}, line...)
-	}
-	if _, err := s.cfg.Receipts.Write(line); err != nil {
-		return err
-	}
-	return s.cfg.Receipts.Sync()
-}
-
-// endsLine — файл пуст или кончается переводом строки. Не прочесть — да:
-// лишний перевод строки безвреден, а не дописать его — тоже не хуже, чем было.
-func endsLine(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return true
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil || fi.Size() == 0 {
-		return true
-	}
-	var b [1]byte
-	if _, err := f.ReadAt(b[:], fi.Size()-1); err != nil {
-		return true
-	}
-	return b[0] == '\n'
+	// Исход — отдельной квитанцией после действия: что было, видно по
+	// намерению и без неё (оборвался сервер между ними — исхода нет).
+	a, err := gateway.Append(s.cfg.ReceiptsPath, s.cfg.Key, s.cfg.Gateway, gateway.Draft{
+		Time: s.now(), Action: rc.ActionID, Step: alert.StepOutcome, Body: bodyOf(rc)})
+	s.appended(a)
+	return err
 }

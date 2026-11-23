@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
@@ -160,12 +161,9 @@ func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 func newServer(t *testing.T, db *fakeDB) (*Server, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { f.Close() })
-	s := New(Config{Agent: "support-bot", Receipts: f, Version: "test", MaxRows: 1, Dial: func(map[string]string) (DB, error) { return db, nil }}, nil)
+	cfg := Config{Agent: "support-bot", Version: "test", MaxRows: 1, Dial: func(map[string]string) (DB, error) { return db, nil }}
+	gatewayOn(&cfg, path)
+	s := New(cfg, nil)
 	s.newID = func() string { return "a-1" }
 	return s, path
 }
@@ -249,7 +247,7 @@ func TestLegacyHandshake(t *testing.T) {
 	}
 }
 
-func TestExecuteMarksTheActionAndKeepsAReceipt(t *testing.T) {
+func TestExecuteKeepsItsReceipts(t *testing.T) {
 	db := &fakeDB{}
 	s, path := newServer(t, db)
 	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'it''s' WHERE id = 6","reason":"cleanup"}`)
@@ -261,25 +259,22 @@ func TestExecuteMarksTheActionAndKeepsAReceipt(t *testing.T) {
 	if out["action_id"] != "a-1" || out["xid"] != "751" || out["outcome"] != "committed" || out["statements"].([]any)[0] != "UPDATE 3" {
 		t.Fatalf("%v", out)
 	}
-	// Порядок: чистый сеанс, транзакция, свои настройки сеанса, отметка
-	// действия первой, номер транзакции; пачка — путь агента, команда агента
-	// подготовкой и исполнением, отложенное — сразу, свои настройки снова;
-	// фиксация.
-	if len(db.log) != 14 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
-		!strings.HasPrefix(db.log[3], "SELECT evidence.mark_action('{") ||
-		!strings.Contains(db.log[3], `"action_id":"a-1"`) || !strings.Contains(db.log[3], `"agent":"support-bot"`) ||
-		db.log[5] != "SET LOCAL search_path TO DEFAULT" ||
-		db.log[6] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[7] != "EXECUTE es_agent_0" ||
-		db.log[8] != "SET CONSTRAINTS ALL IMMEDIATE" || db.log[9] != "SET LOCAL search_path = pg_catalog, pg_temp" || db.log[12] != ownTimeouts || db.log[13] != "COMMIT" {
+	// Порядок: чистый сеанс, транзакция, свои настройки сеанса, номер
+	// транзакции (и намерение в файл квитанций); пачка — путь агента, команда
+	// агента подготовкой и исполнением, отложенное — сразу, свои настройки
+	// снова; фиксация. В журнал базы сервер от себя ничего не пишет.
+	if len(db.log) != 13 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
+		db.log[3] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text" || db.log[4] != "SET LOCAL search_path TO DEFAULT" ||
+		db.log[5] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[6] != "EXECUTE es_agent_0" ||
+		db.log[7] != "SET CONSTRAINTS ALL IMMEDIATE" || db.log[8] != "SET LOCAL search_path = pg_catalog, pg_temp" || db.log[11] != ownTimeouts || db.log[12] != "COMMIT" {
 		t.Fatalf("%q", db.log)
 	}
-	data, _ := os.ReadFile(path)
-	var rc Receipt
-	if err := json.Unmarshal(bytes.TrimSpace(data), &rc); err != nil {
-		t.Fatal(err)
+	if c := chain(t, path); len(c) != 2 || c[0].Step != "intent" || c[0].Refs[0].Subject != "751" || c[1].Step != "outcome" {
+		t.Fatalf("%+v", c)
 	}
-	if rc.ActionID != "a-1" || rc.XID != "751" || rc.Outcome != "committed" || rc.Reason != "cleanup" || !strings.Contains(string(rc.Client), `"name":"c"`) {
-		t.Fatalf("%+v", rc)
+	rcs := receipts(t, path)
+	if rc := rcs[0]; len(rcs) != 1 || rc.ActionID != "a-1" || rc.XID != "751" || rc.Outcome != "committed" || rc.Reason != "cleanup" || !strings.Contains(string(rc.Client), `"name":"c"`) {
+		t.Fatalf("%+v", rcs)
 	}
 	list, _ := callText(t, s, "actions", `{}`)
 	if !strings.Contains(list, `"action_id":"a-1"`) {
@@ -363,9 +358,10 @@ func TestServeAnswersLineByLine(t *testing.T) {
 	}
 }
 
-// journalLine — транзакция 751 одной записью сборщика: строка 6 была "a", стала "b".
+// journalLine — транзакция 751 одной записью сборщика: строка 6 была "a", стала
+// "b"; сборщик взял её по намерению действия a-1 шлюза esmcp.
 func journalLine() []byte {
-	stream := `{"t":"H","v":1,"xid":751,"actions":[{"role":"support_bot","info":{"action_id":"a-1","agent":"support-bot","tool":"execute"}}]}
+	stream := `{"t":"H","v":2,"xid":751,"action":{"id":"a-1","gateway":"esmcp","seq":1,"hash":"` + strings.Repeat("ab", 32) + `","step":"intent","agent":"support-bot","tool":"execute"}}
 {"t":"R","id":1,"schema":"public","table":"accounts","identity":"f","columns":["id","note"],"types":["integer","text"],"pk":["id"]}
 {"t":"U","r":1,"old":["6","a"],"new":["6","b"]}
 {"t":"U","r":1,"old":["7","a"],"new":["7","b"]}
@@ -435,18 +431,27 @@ func TestUndoPreviewAndApply(t *testing.T) {
 		!strings.Contains(out, `"differs_from_before":[{"table":"public.accounts","column":"note","rows":1}]`) {
 		t.Fatalf("%v %s", isErr, out)
 	}
-	// Откат — отметка с номером своего действия и того, что он возвращает; одна команда на годный шаг.
-	var mark, update string
+	// Откат — намерение шагом undo с номером своего действия, тем, что он
+	// возвращает, и его транзакцией; одна команда на годный шаг.
+	var update string
 	for _, q := range db.log[before:] {
-		if strings.Contains(q, "evidence.mark_undo") {
-			mark = q
-		}
 		if strings.HasPrefix(q, "UPDATE") {
 			update = q
 		}
 	}
-	if !strings.Contains(mark, `"action_id":"u-1"`) || !strings.Contains(mark, `"undoes_action":"a-1"`) || !strings.Contains(update, "(1, '7'::integer") || strings.Contains(update, "'6'") {
-		t.Fatalf("mark %s\nupdate %s", mark, update)
+	var undo *gateway.Receipt
+	for _, r := range chain(t, path) {
+		if r.Step == "undo" {
+			undo = &r
+		}
+	}
+	var ub Receipt
+	if undo != nil {
+		json.Unmarshal(undo.Body, &ub)
+	}
+	if undo == nil || undo.Action != "u-1" || ub.Undoes != "a-1" || ub.Tool != "undo_apply" || len(undo.Refs) != 1 || undo.Refs[0].Subject != "751" ||
+		!strings.Contains(update, "(1, '7'::integer") || strings.Contains(update, "'6'") {
+		t.Fatalf("undo %+v %+v\nupdate %s", undo, ub, update)
 	}
 	// Сверка и откат — с чистого сеанса и pg_catalog первым в пути: функции и
 	// операторы под системными именами из схем роли агента их не подменят.
@@ -514,22 +519,18 @@ func TestRowLimitRefusesBeforeCommit(t *testing.T) {
 			t.Fatalf("the refusal lacks %q: %s", want, text)
 		}
 	}
-	// Порядок: изменения, счёт строк, отметка об отказе, откат. Фиксации нет.
+	// Порядок: изменения, счёт строк, откат. Фиксации нет.
 	n := len(db.log)
-	if db.log[n-4] != ownTimeouts || !strings.Contains(db.log[n-3], "pg_stat_get_xact_tuples") ||
-		!strings.Contains(db.log[n-2], "SELECT evidence.mark_refused('{") || db.log[n-1] != "ROLLBACK" || slices.Contains(db.log, "COMMIT") {
+	if db.log[n-3] != ownTimeouts || !strings.Contains(db.log[n-2], "pg_stat_get_xact_tuples") || db.log[n-1] != "ROLLBACK" || slices.Contains(db.log, "COMMIT") {
 		t.Fatalf("%q", db.log)
 	}
-	for _, want := range []string{`"action_id":"a-1"`, `"agent":"support-bot"`, `"rows":700`, `"limit":500`, `"reason":"close inactive accounts"`} {
-		if !strings.Contains(db.log[n-2], want) {
-			t.Fatalf("the refusal marker lacks %s: %s", want, db.log[n-2])
-		}
+	// Отказ — в квитанции исхода, с тем, что скажет тревога.
+	o := outcomes(t, path)
+	if len(o) != 1 || o[0]["action_id"] != "a-1" || o[0]["agent"] != "support-bot" || o[0]["rows"] != float64(700) || o[0]["limit"] != float64(500) ||
+		o[0]["reason"] != "close inactive accounts" || o[0]["cause"] != CauseRowLimit {
+		t.Fatalf("the refusal: %v", o)
 	}
-	data, _ := os.ReadFile(path)
-	var rc Receipt
-	if err := json.Unmarshal(bytes.TrimSpace(data), &rc); err != nil {
-		t.Fatal(err)
-	}
+	rc := receipts(t, path)[0]
 	if rc.Outcome != "refused" || rc.Rows != 700 || !strings.Contains(rc.Error, "at most 500") || rc.Tags[0] != "UPDATE 3" {
 		t.Fatalf("receipt %+v", rc)
 	}
@@ -546,7 +547,7 @@ func TestRowLimitLetsSmallActionsThrough(t *testing.T) {
 	if isErr || !strings.Contains(text, `"outcome":"committed"`) {
 		t.Fatalf("%v %s", isErr, text)
 	}
-	if db.log[len(db.log)-1] != "COMMIT" || strings.Contains(strings.Join(db.log, "\n"), "mark_refused") {
+	if db.log[len(db.log)-1] != "COMMIT" || receipts(t, path)[0].Cause != "" {
 		t.Fatalf("%q", db.log)
 	}
 	data, _ := os.ReadFile(path)
@@ -602,7 +603,7 @@ func TestRowCountIsTheActionsOwn(t *testing.T) {
 		t.Fatalf("%v %s", isErr, text)
 	}
 	// Счёт «до» — в одном запросе с номером транзакции, лишнего обмена нет.
-	if !strings.Contains(db.log[4], "pg_current_xact_id") || !strings.Contains(db.log[4], "pg_stat_get_xact_tuples") {
+	if !strings.Contains(db.log[3], "pg_current_xact_id") || !strings.Contains(db.log[3], "pg_stat_get_xact_tuples") {
 		t.Fatalf("%q", db.log)
 	}
 	data, _ := os.ReadFile(path)
@@ -673,18 +674,5 @@ func TestCheckRoleOnEveryConnection(t *testing.T) {
 	up = true
 	if text, isErr := callText(t, s, "query", `{"sql":"SELECT 1"}`); !isErr || !strings.Contains(text, "agent_bot can become esmcp_bot") || len(db.log) != 0 {
 		t.Fatalf("after the database is back: %v %s; queries %q", isErr, text, db.log)
-	}
-}
-
-// Подсказка про -setup-sql — только когда дело в настройке базы, а не в
-// оборванном соединении (R2-10, T-7).
-func TestSetupHintOnlyForSetupErrors(t *testing.T) {
-	for code, want := range map[string]bool{"42883": true, "3F000": true, "42501": true, "57P01": false, "40001": false} {
-		if got := setupHint(&pgwire.PgError{Code: code}) != ""; got != want {
-			t.Errorf("%s: hint %v", code, got)
-		}
-	}
-	if setupHint(errors.New("connection reset by peer")) != "" {
-		t.Error("a broken connection is told to run the setup script")
 	}
 }

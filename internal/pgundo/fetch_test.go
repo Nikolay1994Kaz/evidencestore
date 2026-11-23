@@ -69,16 +69,16 @@ func TestFetchTakesTheRecordsNamedByTheIndex(t *testing.T) {
 	}
 }
 
-// Транзакция роли не из списков — в справочнике отпечатком: откатить её из
-// хранилища нечем, и Fetch говорит это, не трогая хранилище (DECISIONS, п. 41).
+// Транзакция без намерения шлюза — в справочнике отпечатком: откатить её из
+// хранилища нечем, и Fetch говорит это, не трогая хранилище (DECISIONS, п. 42).
 func TestFetchRefusesAFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	index := filepath.Join(dir, "index.jsonl")
-	if err := os.WriteFile(index, []byte(`{"xid":77,"kind":"fingerprint","first_seq":5,"last_seq":5,"changes":1,"who":{"role":"app"},"commit_time":"","commit_lsn":"0/1","end_lsn":"0/2"}`+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(index, []byte(`{"xid":77,"kind":"fingerprint","first_seq":5,"last_seq":5,"changes":1}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f := &Fetcher{Index: index, Proof: []string{"false"}, Verify: []string{"false"}}
-	if _, err := f.Fetch(77); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "only its fingerprint") || !strings.Contains(err.Error(), `"role":"app"`) {
+	if _, err := f.Fetch(77); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "did not come through the gateway") || !strings.Contains(err.Error(), "in record 5") {
 		t.Fatalf("%v", err)
 	}
 }

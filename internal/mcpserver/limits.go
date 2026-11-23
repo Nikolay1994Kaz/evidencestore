@@ -17,9 +17,9 @@ package mcpserver
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +29,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgrole"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -98,7 +99,8 @@ func (s *Server) CheckRole() error { return s.connect() }
 // агента идёт этой ролью, поэтому:
 //   - не суперпользователь;
 //   - никакая другая роль со входом, кроме суперпользователей, не может ею
-//     стать: иначе её умолчания, сеансы и отметки — в руках той роли;
+//     стать: иначе её умолчания и сеансы — в руках той роли, и таблицы она
+//     пишет в обход шлюза;
 //   - может только выданное ей самой — то же, что проверяет
 //     escollect -setup-sql (pgrole.Rights, pgrole.Params): ни членств, ни
 //     pg_terminate_backend, ни чужих SECURITY DEFINER, ни того, что initdb или
@@ -127,7 +129,7 @@ func checkRole(db DB) error {
 	case row[1] != nil && *row[1] == "true":
 		return fmt.Errorf("%w: %s is a superuser. Give the MCP server a role of its own (mcp_roles in the collector config; escollect -setup-sql creates it)", ErrSharedRole, *row[0])
 	case row[2] != nil:
-		return fmt.Errorf("%w: %s can become %s. Revoke the membership: whoever can become the role of the server sets its defaults, ends its sessions and puts marks in the log", ErrSharedRole, *row[2], *row[0])
+		return fmt.Errorf("%w: %s can become %s. Revoke the membership: whoever can become the role of the server sets its defaults, ends its sessions and writes the tables past the gateway", ErrSharedRole, *row[2], *row[0])
 	case row[3] != nil:
 		return fmt.Errorf("%w: %s. %s", ErrSharedRole, *row[3], pgrole.Hint)
 	}
@@ -267,11 +269,14 @@ type spent struct {
 // с того места, где остановились в прошлый раз: в него пишут и другие сеансы.
 type ledger struct {
 	path, agent string
-	keep        time.Duration // сколько помнить: самое длинное окно
-	primed      bool
-	off         int64
-	items       []spent
-	alerted     time.Time // последний отказ за частоту, о котором людям ушла тревога
+	// own — квитанция этого шлюза с его подписью (Server.own): в счёт идут
+	// только квитанции исхода — по одной на действие.
+	own     func(line []byte) (Receipt, string, bool)
+	keep    time.Duration // сколько помнить: самое длинное окно
+	primed  bool
+	off     int64
+	items   []spent
+	alerted time.Time // последний отказ за частоту, о котором людям ушла тревога
 }
 
 // refresh дочитывает файл и забывает то, что старше keep.
@@ -351,8 +356,8 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 			return nil, false, start, err
 		}
 		done += int64(len(line))
-		var rc Receipt
-		if json.Unmarshal(line, &rc) != nil {
+		rc, step, ok := l.own(bytes.TrimRight(line, "\n"))
+		if !ok || step != alert.StepOutcome {
 			continue
 		}
 		at, perr := time.Parse(time.RFC3339Nano, rc.Time)
@@ -401,7 +406,7 @@ func (s *Server) usage(now time.Time) (actions, rows int, alerted time.Time, err
 	var items []spent
 	if s.cfg.ReceiptsPath != "" {
 		if s.ledger == nil {
-			s.ledger = &ledger{path: s.cfg.ReceiptsPath, agent: s.cfg.Agent, keep: max(time.Minute, s.cfg.Window)}
+			s.ledger = &ledger{path: s.cfg.ReceiptsPath, agent: s.cfg.Agent, own: s.own, keep: max(time.Minute, s.cfg.Window)}
 		}
 		if err := s.ledger.refresh(now); err != nil {
 			return 0, 0, alerted, err
@@ -432,32 +437,18 @@ func (s *Server) usage(now time.Time) (actions, rows int, alerted time.Time, err
 	return actions, rows, alerted, nil
 }
 
-// markRefused оставляет в журнале базы отметку об отказе: по ней сборщик
-// поднимает тревогу для людей. Сообщение не транзакционное, поэтому годится и
-// внутри транзакции, которая сейчас откатится, и вне транзакции. Внутри —
-// после своих настроек (own), вне — с чистого сеанса (fresh): SQL агента не
-// меняет, как база прочтёт отметку с его причиной (P-243, P-256). false —
-// отметки нет, и тревоги не будет.
+// markRefused кладёт подробности отказа в квитанцию исхода: по ней сборщик
+// поднимает тревогу для людей (pginput, receipts.go). В журнал базы ничего не
+// пишется: «что случилось» говорит подписанная квитанция шлюза, а не база
+// (DECISIONS, п. 42). true — тревога будет.
 func (s *Server) markRefused(rc *Receipt, info map[string]any) bool {
-	info["action_id"], info["agent"], info["reason"], info["cause"] = rc.ActionID, rc.Agent, rc.Reason, rc.Cause
-	mark, _ := json.Marshal(info)
-	if _, err := s.run("SELECT evidence.mark_refused(" + pgwire.Literal(string(mark)) + "::pg_catalog.json)"); err != nil {
-		s.log.Error("the refusal is not marked in the database log, so no alert is raised for it"+setupHint(err),
-			"action", rc.ActionID, "cause", rc.Cause, "err", err)
-		return false
+	if rc.Info == nil {
+		rc.Info = map[string]any{}
 	}
-	return true
-}
-
-// setupHint — подсказка про escollect -setup-sql, когда дело и правда в ней:
-// функции отметки нет, схемы нет или нет права. Оборванное соединение или
-// чужая роль — не о настройке, и подсказка вела бы не туда (R2-10, T-7).
-func setupHint(err error) string {
-	var pg *pgwire.PgError
-	if errors.As(err, &pg) && (pg.Code == "42883" || pg.Code == "3F000" || pg.Code == "42501") {
-		return " (is the database prepared with the current escollect -setup-sql?)"
+	for k, v := range info {
+		rc.Info[k] = v
 	}
-	return ""
+	return s.cfg.ReceiptsPath != ""
 }
 
 // actionLock — замок на действие агента для всех его сеансов: flock на файле

@@ -102,15 +102,13 @@ type Step struct {
 
 // Plan — откат одной транзакции.
 type Plan struct {
-	XID     uint32            `json:"xid"`
-	Who     json.RawMessage   `json:"who,omitempty"`     // отметка роли из журнала
-	Actions []json.RawMessage `json:"actions,omitempty"` // отметки действий MCP
-	// Forged — отметки без метки функций evidence (pgtap.authentic): ни
-	// «кто», ни действием они не считаются; их показывает esundo.
-	Forged  []json.RawMessage       `json:"forged,omitempty"`
-	Undo    json.RawMessage         `json:"undo,omitempty"` // это сама транзакция отката
-	Changes int                     `json:"changes"`        // изменений строк в транзакции
-	Noop    int                     `json:"noop"`           // строк без итогового изменения
+	XID uint32 `json:"xid"`
+	// Action — действие шлюза по его подписанному намерению (DECISIONS,
+	// п. 42): номер, шлюз, квитанция; шаг alert.StepUndo — это сама
+	// транзакция отката. Нет — транзакция записана целиком без шлюза.
+	Action  *pgtap.Intent           `json:"action,omitempty"`
+	Changes int                     `json:"changes"` // изменений строк в транзакции
+	Noop    int                     `json:"noop"`    // строк без итогового изменения
 	Counts  map[string]pgtap.Counts `json:"counts"`
 	Tables  map[string]*Table       `json:"tables"`
 	Steps   []Step                  `json:"steps"` // в порядке применения
@@ -154,23 +152,17 @@ func Build(xid uint32, lines [][]byte) (*Plan, error) {
 		return nil, refuse("the journal stream is of version %v, this build reads %d", head["v"], pgtap.FormatVersion)
 	}
 	if head["fingerprint"] == true {
-		return nil, refuse("transaction %d is of a role outside the collector's lists: the store keeps only its fingerprint — who, the keys of the rows "+
+		return nil, refuse("transaction %d did not come through the gateway: the store keeps only its fingerprint — the keys of the rows "+
 			"and their hashes, not the rows — so it cannot be undone from the store. Restore the rows from a backup", xid)
 	}
 	p := &Plan{XID: xid, Counts: map[string]pgtap.Counts{}, Tables: map[string]*Table{}}
-	p.Who, _ = raw(head["who"])
-	p.Undo, _ = raw(head["undo"])
-	if list, ok := head["actions"].([]any); ok {
-		for _, a := range list {
-			r, _ := raw(a)
-			p.Actions = append(p.Actions, r)
+	if a, ok := head["action"]; ok {
+		data, _ := json.Marshal(a)
+		var in pgtap.Intent
+		if json.Unmarshal(data, &in) != nil || in.ID == "" {
+			return nil, refuse("the gateway action in the journal header is malformed")
 		}
-	}
-	if list, ok := head["forged"].([]any); ok {
-		for _, a := range list {
-			r, _ := raw(a)
-			p.Forged = append(p.Forged, r)
-		}
+		p.Action = &in
 	}
 	rels := map[float64]string{}
 	live, dead := map[string]*row{}, map[string]*row{}
@@ -203,18 +195,6 @@ func Build(xid uint32, lines [][]byte) (*Plan, error) {
 				return nil, refuse("%s was altered inside the transaction (DDL): not handled", name)
 			}
 			rels[id.ID], p.Tables[name] = name, &t
-			continue
-		case "M":
-			if r["forged"] == true {
-				// Поддельная отметка — улика, а не действие (R2-4, заход 2).
-				f, _ := raw(map[string]any{"prefix": r["prefix"], "content": r["content"]})
-				p.Forged = append(p.Forged, f)
-				continue
-			}
-			if r["prefix"] == pgtap.PrefixAction {
-				a, _ := raw(r["content"])
-				p.Actions = append(p.Actions, a)
-			}
 			continue
 		case "T":
 			if list, ok := r["tables"].([]any); ok {
@@ -831,31 +811,34 @@ type Difference struct {
 	Rows   int    `json:"rows"`
 }
 
-// Apply применяет шаги p.OK одной транзакцией. marker — кто и почему
-// откатывает; он уходит в журнал базы отметкой evidence.mark_undo и делает сам
-// откат записью хранилища. Строка, изменённая после Check, отменяет всё:
-// ErrChanged.
+// IntentFunc — намерение отката: шлюз пишет и подписывает свою квитанцию с
+// транзакцией отката (xid — 32 бита, как в журнале базы; xid8 — с эпохой)
+// раньше её COMMIT (DECISIONS, п. 42). По ней сборщик берёт откат целиком.
+// Ошибка — откат не идёт: без квитанции он лёг бы отпечатком, не действием.
+type IntentFunc func(xid, xid8 string) error
+
+// Apply применяет шаги p.OK одной транзакцией. intent пишет квитанцию отката
+// до его изменений. Строка, изменённая после Check, отменяет всё: ErrChanged.
 //
 // Сначала — порядок, обратный журналу: он верен всегда, когда каждое изменение
 // транзакции делал её собственный оператор. Отказ базы по ограничению
 // целостности (SQLSTATE класса 23) значит, что часть изменений сделал каскад
 // внешнего ключа: тогда вторая попытка, по внешним ключам из каталога.
-func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
+func (p *Plan) Apply(db DB, intent IntentFunc) (*Applied, error) {
 	if len(p.OK) == 0 {
 		return nil, errors.New("pgundo: no step to apply: run the check first")
+	}
+	if intent == nil {
+		return nil, errors.New("pgundo: an undo needs the gateway's intent: without its receipt the collector keeps it as a fingerprint")
 	}
 	only := map[int]bool{}
 	for _, n := range p.OK {
 		only[n] = true
 	}
-	mark, err := json.Marshal(marker)
-	if err != nil {
-		return nil, err
-	}
 	if err := p.session(db); err != nil {
 		return nil, err
 	}
-	out, err := p.apply(db, string(mark), p.groups(only), OrderJournal)
+	out, err := p.apply(db, intent, p.groups(only), OrderJournal)
 	var pg *pgwire.PgError
 	// errReferenced в порядке журнала — ещё не приговор: при отложенном внешнем
 	// ключе ребёнок мог быть вставлен раньше родителя, и его шаг стоит позже.
@@ -867,7 +850,7 @@ func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w (and the order by foreign keys could not be built: %v)", first, err)
 	}
-	if out, err = p.apply(db, string(mark), ordered, OrderKeys); err != nil {
+	if out, err = p.apply(db, intent, ordered, OrderKeys); err != nil {
 		if errors.Is(err, errReferenced) && errors.Is(first, errReferenced) {
 			return nil, err // обе попытки упёрлись в одно и то же: дважды не повторяем
 		}
@@ -876,7 +859,7 @@ func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 	return out, nil
 }
 
-func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Applied, err error) {
+func (p *Plan) apply(db DB, intent IntentFunc, groups []group, order string) (_ *Applied, err error) {
 	if _, err := db.Query("BEGIN"); err != nil {
 		return nil, err
 	}
@@ -885,17 +868,22 @@ func (p *Plan) apply(db DB, mark string, groups []group, order string) (_ *Appli
 			db.Query("ROLLBACK")
 		}
 	}()
-	// Отметка — первой: в журнале базы она встанет перед изменениями строк.
-	if _, err := db.Query("SELECT evidence.mark_undo(" + pgwire.Literal(mark) + "::json)"); err != nil {
-		return nil, fmt.Errorf("the undo marker could not be set (is the database prepared with escollect -setup-sql?): %w", err)
-	}
 	out := &Applied{Order: order}
-	res, err := db.Query("SELECT pg_current_xact_id()::xid::text") // 32 бита — как в журнале базы, справочнике и тревогах
+	// 32 бита — как в журнале базы, справочнике и тревогах; с эпохой — для квитанции.
+	res, err := db.Query("SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text")
 	if err != nil {
 		return nil, err
 	}
-	if len(res) == 1 && len(res[0].Rows) == 1 {
-		out.XID = deref(res[0].Rows[0][0])
+	var xid8 string
+	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) == 2 {
+		out.XID, xid8 = deref(res[0].Rows[0][0]), deref(res[0].Rows[0][1])
+	}
+	if out.XID == "" {
+		return nil, errors.New("pgundo: the transaction id of the undo could not be read")
+	}
+	// Квитанция — до изменений: сборщик решает по ней на Begin транзакции.
+	if err := intent(out.XID, xid8); err != nil {
+		return nil, fmt.Errorf("the undo's receipt could not be written, so the undo did not run: %w", err)
 	}
 	// Счёт до шагов: статистика сеанса держит и не сброшенные прошлые
 	// транзакции, строки отката — разность.

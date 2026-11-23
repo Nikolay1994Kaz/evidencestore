@@ -157,6 +157,11 @@ func (c *Config) resolve(base string) {
 	paths := []*string{&c.CA, &c.Cert, &c.Key, &c.SpoolDir, &c.File, &c.Glob}
 	if c.Postgres != nil {
 		paths = append(paths, &c.Postgres.Dir)
+		if r := c.Postgres.Receipts; r != nil {
+			for i := range r.Files {
+				paths = append(paths, &r.Files[i])
+			}
+		}
 	}
 	for _, p := range paths {
 		if *p != "" && !filepath.IsAbs(*p) {

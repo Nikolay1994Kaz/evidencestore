@@ -113,7 +113,8 @@ INSERT INTO pgu.place VALUES (1, '(1.5,2.5)', '{"a": 1,  "b": [1, 2]}', 'one'), 
 INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	version, _ := strconv.Atoi(one("SELECT current_setting('server_version_num')"))
 
-	cfg := Config{DSN: base + " user=pgu_tap", Slot: "pgu_slot", Publication: "pgu_pub", Dir: t.TempDir(),
+	gw, undoGW := newLiveGateway(t, "esmcp"), newLiveGateway(t, "esundo")
+	cfg := Config{DSN: base + " user=pgu_tap", Slot: "pgu_slot", Publication: "pgu_pub", Dir: t.TempDir(), Receipts: liveReceipts(gw, undoGW),
 		MCPRoles: []string{"pgu_agent"}, Roles: []string{"pgu_ai"}, Tables: []string{"pgu.parent", "pgu.child", "pgu.loose", "pgu.part", "pgu.place", "pgu.calc", "pgu.ident", "pgu.tag"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -153,9 +154,10 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 		"FROM pg_class c WHERE c.relname IN ('part', 'part_1', 'part_2') AND c.relnamespace = 'pgu'::regnamespace"); got != "part:true:false part_1:true:false part_2:true:false" {
 		t.Fatalf("the rights of the agent on the partitions after the old setup: %s", got)
 	}
-	// Секциям — то же, что таблице: старая строка целиком, отметка «кто», права агента.
-	if got := one("SELECT string_agg(c.relname || ':' || c.relreplident::text || ':' || (SELECT count(*) FROM pg_trigger g WHERE g.tgrelid = c.oid AND g.tgname = 'evidence_who') " +
-		"|| ':' || has_table_privilege('pgu_agent', c.oid, 'UPDATE'), ' ' ORDER BY c.relname) FROM pg_class c WHERE c.relname IN ('part_1', 'part_2')"); got != "part_1:f:1:true part_2:f:1:true" {
+	// Секциям — то же, что таблице: старая строка целиком, права сервера;
+	// триггеров нет ни на ком (п. 42).
+	if got := one("SELECT string_agg(c.relname || ':' || c.relreplident::text || ':' || (SELECT count(*) FROM pg_trigger g WHERE g.tgrelid = c.oid AND NOT g.tgisinternal) " +
+		"|| ':' || has_table_privilege('pgu_agent', c.oid, 'UPDATE'), ' ' ORDER BY c.relname) FROM pg_class c WHERE c.relname IN ('part_1', 'part_2')"); got != "part_1:f:0:true part_2:f:0:true" {
 		t.Fatalf("partitions after the setup: %s", got)
 	}
 	agent := dial("pgu_agent")
@@ -182,18 +184,11 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	}
 	read() // первое подключение заводит слот: журнал копится с этого места
 
-	// act — действие агента одной транзакцией; отдаёт её номер.
+	// act — действие шлюза одной транзакцией (намерение — до COMMIT); отдаёт
+	// её номер.
 	act := func(sql string) uint32 {
 		t.Helper()
-		res, err := agent.Query("BEGIN; " + sql + "; SELECT pg_current_xact_id()::text; COMMIT")
-		if err != nil {
-			t.Fatalf("%s: %v", sql, err)
-		}
-		xid, err := strconv.ParseUint(*res[len(res)-2].Rows[0][0], 10, 32)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return uint32(xid)
+		return gw.act(agent, sql)
 	}
 	// plan — план отката транзакции по записям, которые вход положил в буфер.
 	plan := func(xid uint32) (*pgundo.Plan, error) {
@@ -219,7 +214,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 		if ok, _, bad := pgundo.Tally(statuses); ok != len(p.Steps) || bad != 0 {
 			t.Fatalf("check: %d of %d steps to apply, %d conflicts", ok, len(p.Steps), bad)
 		}
-		done, err := p.Apply(admin, map[string]any{"by": "test", "undoes_xid": fmt.Sprint(xid)})
+		done, err := p.Apply(admin, undoGW.undo(xid))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -266,6 +261,15 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	p, done := roundTrip("cascade on delete", "DELETE FROM pgu.parent WHERE id = 1", true)
 	if p.Changes != 4 || done.Order != pgundo.OrderKeys || done.Steps != 4 || done.Differ != nil {
 		t.Fatalf("cascade on delete: %d changes, %+v", p.Changes, done)
+	}
+	// Откат — тоже действие: по намерению esundo сборщик взял его транзакцию
+	// целиком (п. 42). Первая попытка в порядке журнала отменена, её намерение
+	// — о транзакции, которой в журнале нет.
+	read()
+	undoXID, _ := strconv.ParseUint(done.XID, 10, 32)
+	if e, found, err := pgtap.Lookup(filepath.Join(cfg.Dir, pgtap.IndexFile), uint32(undoXID)); err != nil || !found || e.Kind != "" ||
+		e.Action == nil || e.Action.Gateway != "esundo" || e.Action.Step != "undo" {
+		t.Fatalf("the undo transaction %s in the index: %+v %v %v", done.XID, e, found, err)
 	}
 
 	// 2. Смена ключа родителя: каскад переписывает ссылки, а агент ещё и правит
@@ -316,7 +320,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	}
 	exec(admin, "UPDATE pgu.loose SET note = 'human' WHERE id = 400")
 	held := state(true)
-	if _, err := raced.Apply(admin, map[string]any{"by": "test"}); !errors.Is(err, pgundo.ErrChanged) || state(true) != held {
+	if _, err := raced.Apply(admin, undoGW.undo(xid)); !errors.Is(err, pgundo.ErrChanged) || state(true) != held {
 		t.Fatalf("a row changed after the check: %v", err)
 	}
 	// То же, когда откат идёт по внешним ключам: порядок журнала база отвергает
@@ -330,7 +334,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	}
 	exec(admin, "UPDATE pgu.child SET note = 'human' WHERE id = 30")
 	held = state(true)
-	if _, err := raced.Apply(admin, map[string]any{"by": "test"}); !errors.Is(err, pgundo.ErrChanged) || !strings.Contains(err.Error(), "in the order of the journal") || state(true) != held {
+	if _, err := raced.Apply(admin, undoGW.undo(xid)); !errors.Is(err, pgundo.ErrChanged) || !strings.Contains(err.Error(), "in the order of the journal") || state(true) != held {
 		t.Fatalf("a row changed after the check, the order of foreign keys: %v", err)
 	}
 
@@ -352,7 +356,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 		t.Fatalf("equality coarser than the value: %d steps to apply, %d conflicts: %+v", ok, bad, statuses)
 	}
 	held = state(true)
-	if _, err := raced.Apply(admin, map[string]any{"by": "test"}); err == nil || state(true) != held ||
+	if _, err := raced.Apply(admin, undoGW.undo(xid)); err == nil || state(true) != held ||
 		one("SELECT name || ' ' || amount FROM pgu.tag WHERE id = 1") != "ALICE 1" || one("SELECT amount::text FROM pgu.tag WHERE id = 2") != "1.00" {
 		t.Fatalf("the undo overwrote the change of a person: %v", err)
 	}
@@ -422,7 +426,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 		statuses[0].Detail != "1 rows of pgu.child refer to it: ON DELETE CASCADE would delete them; 1 rows of pgu.loose refer to it: ON DELETE SET NULL would clear their reference" {
 		t.Fatalf("a row others refer to: %+v", statuses)
 	}
-	if _, err := referred.Apply(admin, map[string]any{"by": "test"}); err == nil || state(true) != held {
+	if _, err := referred.Apply(admin, undoGW.undo(xid)); err == nil || state(true) != held {
 		t.Fatalf("a row others refer to was removed: %v", err)
 	}
 
@@ -437,7 +441,7 @@ INSERT INTO pgu.calc (id, a) VALUES (1, 5), (2, 7)`)
 	}
 	exec(admin, "INSERT INTO pgu.child (id, parent_id, note) VALUES (600, 60, 'human')")
 	held = state(true)
-	if _, err := referred.Apply(admin, map[string]any{"by": "test"}); !errors.Is(err, pgundo.ErrChanged) || !strings.Contains(err.Error(), "have rows of pgu.child referring to them") || state(true) != held {
+	if _, err := referred.Apply(admin, undoGW.undo(xid)); !errors.Is(err, pgundo.ErrChanged) || !strings.Contains(err.Error(), "have rows of pgu.child referring to them") || state(true) != held {
 		t.Fatalf("a row someone referred to after the check: %v", err)
 	}
 

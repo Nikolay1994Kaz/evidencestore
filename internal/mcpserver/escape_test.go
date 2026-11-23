@@ -90,14 +90,8 @@ func TestSQLThatEndsTheTransactionIsNotReportedAsRolledBack(t *testing.T) {
 			if got := strings.Contains(log, "pg_current_xact_id_if_assigned"); got != tc.check {
 				t.Fatalf("asked for the transaction id: %v\n%s", got, log)
 			}
-			var mark string
-			for _, q := range db.log {
-				if strings.Contains(q, "mark_refused") {
-					mark = q
-				}
-			}
-			if !strings.Contains(mark, `"cause":"escaped"`) || !strings.Contains(mark, `"xid":"751"`) || !strings.Contains(mark, `"tool":"execute"`) {
-				t.Fatalf("the marker for the alert: %q", mark)
+			if o := outcomes(t, path); len(o) != 1 || o[0]["cause"] != CauseEscaped || o[0]["xid"] != "751" || o[0]["tool"] != "execute" || o[0]["outcome"] != "escaped" {
+				t.Fatalf("the outcome for the alert: %v", o)
 			}
 			rc := receipts(t, path)
 			if len(rc) != 1 || rc[0].Outcome != "escaped" || rc[0].Cause != CauseEscaped || rc[0].XID != "751" {
@@ -148,10 +142,7 @@ func TestReadThatEndsItsTransactionIsAnAction(t *testing.T) {
 		if !isErr || !strings.Contains(text, "the read a-1 left the server's transaction") {
 			t.Fatalf("%c: %v %s", after, isErr, text)
 		}
-		if !strings.Contains(strings.Join(db.log, "\n"), `"cause":"escaped"`) {
-			t.Fatalf("%c: no marker for the alert: %q", after, db.log)
-		}
-		if rc := receipts(t, path); len(rc) != 1 || rc[0].Tool != "query" || rc[0].Outcome != "escaped" {
+		if rc := receipts(t, path); len(rc) != 1 || rc[0].Tool != "query" || rc[0].Outcome != "escaped" || rc[0].Cause != CauseEscaped {
 			t.Fatalf("%c: receipt %+v", after, rc)
 		}
 	}

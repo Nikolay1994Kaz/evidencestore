@@ -9,11 +9,20 @@
 // запуске он отказывается работать суперпользователем или ролью, которой
 // может стать другая роль со входом. Настройки с паролем агенту читать нельзя:
 // esmcp — под другим пользователем ОС или в контейнере (DECISIONS, п. 39).
-// Базу готовит скрипт escollect -setup-sql (роли, функции отметок).
+// Базу готовит скрипт escollect -setup-sql (роли, права, публикация).
+//
+// На каждое действие сервер пишет в свой файл квитанций (receipt/v1) намерение
+// с номером транзакции до её COMMIT и исход после, подписанные ключом шлюза
+// (key): по намерению сборщик берёт транзакцию целиком как действие агента
+// (DECISIONS, п. 42). Ключ читает только esmcp: агенту — ни его, ни файла.
+//
+//	esmcp -config mcp.json -pubkey    # открытый ключ шлюза: в gateway_keys сборщика и gateway_key хранилища
 package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,6 +34,7 @@ import (
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/mcpserver"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
@@ -36,10 +46,22 @@ type Config struct {
 	// DSN — подключение ролью сервера: "host=db user=esmcp_bot dbname=shop
 	// sslmode=verify-full". Пароль — здесь или в PGPASSWORD.
 	DSN string `json:"dsn"`
-	// Agent — имя агента в отметках действий и квитанциях.
+	// Agent — имя агента в квитанциях.
 	Agent string `json:"agent"`
-	// Receipts — журнал квитанций; его читает escollect как свой источник.
+	// Receipts — файл квитанций шлюза (receipt/v1); его читает escollect:
+	// источник postgres — ради намерений, второй источник — чтобы отдать
+	// квитанции хранилищу.
 	Receipts string `json:"receipts"`
+	// Key — ключ шлюза (PKCS#8 PEM, Ed25519; esreceipt keygen): им подписана
+	// каждая квитанция.
+	Key string `json:"key"`
+	// Gateway — имя цепочки квитанций (1–128 знаков из латиницы, цифр и
+	// . _ : -). По умолчанию "esmcp". У каждого агента в общем файле — своё.
+	Gateway string `json:"gateway"`
+	// PGSource — имя источника базы в хранилище: на него ссылается намерение
+	// ({"source": pg_source, "subject": xid}). По умолчанию "postgres"; то же
+	// имя — в receipts.source у сборщика.
+	PGSource string `json:"pg_source"`
 	// MaxRows — сколько строк отдавать агенту на один запрос чтения; 0 — 200.
 	MaxRows int `json:"max_rows"`
 	// ActionRowLimit — предохранитель: сколько строк может изменить одно
@@ -84,9 +106,23 @@ func loadConfig(path string) (*Config, error) {
 		errs = append(errs, errors.New("agent: name the agent (it goes into every action marker)"))
 	}
 	if c.Receipts == "" {
-		errs = append(errs, errors.New("receipts: name the receipts journal"))
+		errs = append(errs, errors.New("receipts: name the receipts file"))
 	} else if !filepath.IsAbs(c.Receipts) {
 		c.Receipts = filepath.Join(filepath.Dir(path), c.Receipts)
+	}
+	if c.Key == "" {
+		errs = append(errs, errors.New("key: name the gateway key (esreceipt keygen -key FILE writes one): every receipt is signed with it"))
+	} else if !filepath.IsAbs(c.Key) {
+		c.Key = filepath.Join(filepath.Dir(path), c.Key)
+	}
+	if c.Gateway == "" {
+		c.Gateway = "esmcp"
+	}
+	if !gateway.ValidName(c.Gateway) {
+		errs = append(errs, fmt.Errorf("gateway %q: 1 to %d letters, digits and . _ : -", c.Gateway, gateway.MaxGatewayName))
+	}
+	if c.PGSource == "" {
+		c.PGSource = "postgres"
 	}
 	if c.MaxRows < 0 {
 		errs = append(errs, errors.New("max_rows is negative"))
@@ -126,6 +162,7 @@ func loadConfig(path string) (*Config, error) {
 func main() {
 	path := flag.String("config", "mcp.json", "server config")
 	showVersion := flag.Bool("version", false, "print the version and the commit it was built from")
+	showPub := flag.Bool("pubkey", false, "print the gateway's public key (64 hex) and exit: it goes to gateway_keys of the collector and gateway_key of the store")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version.String("esmcp"))
@@ -133,20 +170,23 @@ func main() {
 	}
 	cfg, err := loadConfig(*path)
 	fail(err)
+	key, err := gateway.LoadKey(cfg.Key)
+	fail(err)
+	if *showPub {
+		fmt.Println(hex.EncodeToString(key.Public().(ed25519.PublicKey)))
+		return
+	}
 	dsn, err := pgwire.ParseDSN(cfg.DSN)
 	fail(err)
 	if dsn.AppName == "" {
 		dsn.AppName = "esmcp/" + cfg.Agent
 	}
 	fail(os.MkdirAll(filepath.Dir(cfg.Receipts), 0o700))
-	receipts, err := os.OpenFile(cfg.Receipts, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	fail(err)
-	defer receipts.Close()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	mc := mcpserver.Config{
 		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, ActionsPerMinute: cfg.ActionsPerMinute,
 		WindowRows: cfg.WindowRows, Window: cfg.Window.D(), StatementTimeout: cfg.StatementTimeout.D(), LockTimeout: cfg.LockTimeout.D(),
-		Receipts: receipts, ReceiptsPath: cfg.Receipts, Version: version.String("esmcp"),
+		ReceiptsPath: cfg.Receipts, Key: key, Gateway: cfg.Gateway, PGSource: cfg.PGSource, Version: version.String("esmcp"),
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dsn
 			c.Params = params

@@ -15,9 +15,6 @@ package pgrole
 
 import "strings"
 
-// EvidenceSchema — схема функций отметок: их SECURITY DEFINER — наш.
-const EvidenceSchema = "evidence"
-
 // as — «(as группа)», если право пришло через роль, которой r может стать.
 const as = "CASE WHEN g.oid <> r.oid THEN format(' (as %I)', g.rolname) ELSE '' END"
 
@@ -38,9 +35,11 @@ func initOnly(class, obj, priv string) string {
 //   - суперпользователь, REPLICATION, CREATEROLE — сама или через роль;
 //   - членство в любой роли (кроме неявного pg_database_owner: владение
 //     базой называет проверка владения);
-//   - EXECUTE на pg_logical_emit_message, pg_terminate_backend,
-//     pg_cancel_backend; на функции, которые initdb или расширение оставили
-//     суперпользователям; на чужие функции SECURITY DEFINER;
+//   - EXECUTE на pg_terminate_backend, pg_cancel_backend (обрыв сеанса
+//     сервера посреди действия); на функции, которые initdb или расширение
+//     оставили суперпользователям; на чужие функции SECURITY DEFINER.
+//     Сообщения журнала (pg_logical_emit_message) — не в счёт: «чья
+//     транзакция» из базы больше не берётся (DECISIONS, п. 42);
 //   - SELECT на колонки таблиц, которые initdb оставил суперпользователям
 //     (pg_authid.rolpassword), — кроме колонок, открытых PUBLIC при initdb;
 //   - USAGE на сторонний сервер.
@@ -54,14 +53,14 @@ func Rights(roles string) string {
 		"    UNION ALL SELECT format('%I can call %s', r.rolname, f.oid::regprocedure) || " + as + "\n" +
 		"      FROM " + member + " JOIN pg_proc f ON has_function_privilege(g.oid, f.oid, 'EXECUTE')\n" +
 		"      WHERE r.rolname IN (" + roles + ") AND NOT g.rolsuper AND (\n" +
-		"        f.pronamespace = 'pg_catalog'::regnamespace AND f.proname IN ('pg_logical_emit_message', 'pg_terminate_backend', 'pg_cancel_backend')\n" +
+		"        f.pronamespace = 'pg_catalog'::regnamespace AND f.proname IN ('pg_terminate_backend', 'pg_cancel_backend')\n" +
 		"        OR " + initOnly("pg_proc", "f.oid", "EXECUTE") + ")\n" +
 		"    UNION ALL SELECT format('%I can call %s, a SECURITY DEFINER function of %I', r.rolname, f.oid::regprocedure, pg_get_userbyid(f.proowner)) || " + as + "\n" +
 		// Функцию триггера SQL не позовёт: её зовёт только триггер.
 		"      FROM " + member + " JOIN pg_proc f ON f.prosecdef AND f.proowner <> r.oid AND has_function_privilege(g.oid, f.oid, 'EXECUTE')\n" +
 		"        AND f.prorettype NOT IN ('pg_catalog.trigger'::pg_catalog.regtype, 'pg_catalog.event_trigger'::pg_catalog.regtype)\n" +
 		"      WHERE r.rolname IN (" + roles + ") AND NOT g.rolsuper\n" +
-		"        AND f.pronamespace NOT IN ('pg_catalog'::regnamespace, (SELECT oid FROM pg_namespace WHERE nspname = '" + EvidenceSchema + "'))\n" +
+		"        AND f.pronamespace <> 'pg_catalog'::regnamespace\n" +
 		"    UNION ALL SELECT format('%I can read %s.%I', r.rolname, c.oid::regclass, a.attname) || " + as + "\n" +
 		"      FROM " + member + " JOIN pg_class c ON " + initOnly("pg_class", "c.oid", "SELECT") + "\n" +
 		"      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped\n" +
@@ -85,8 +84,8 @@ func Params(roles string) string {
 }
 
 // Hint — что сказать оператору на любую строку Rights и Params.
-const Hint = "The SQL of the agent runs as the role of the MCP server, so these rights are the agent's: its own marks in the log, ending the sessions " +
-	"that put marks, reading the files of the server (the settings of esmcp with its password) and the password hashes, SQL as another role " +
+const Hint = "The SQL of the agent runs as the role of the MCP server, so these rights are the agent's: ending the sessions of the server " +
+	"in the middle of an action, reading the files of the server (the settings of esmcp with its password) and the password hashes, SQL as another role " +
 	"(a SECURITY DEFINER function, a foreign server of dblink or postgres_fdw), switching off the row count (track_counts). " +
 	"Everything the role needs this script grants to the role itself: revoke the rest, from PUBLIC too, and the memberships."
 

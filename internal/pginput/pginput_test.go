@@ -67,18 +67,34 @@ func TestConfigDefaultsAndRefusals(t *testing.T) {
 	if err := ok.Validate(); err != nil {
 		t.Errorf("a role of 63 bytes: %v", err)
 	}
-	// Роль отката — тоже наблюдаемая: её транзакция без отметки отката — тревога
-	// no-action (её функцию позвал кто-то другой, R2-1).
-	ok.UndoRoles = []string{"undo_op"}
-	if got := strings.Join(ok.watched(), ","); got != strings.Repeat("s", 63)+",agent_bot,undo_op" {
-		t.Errorf("watched: %s", got)
+	// Квитанции шлюзов: файлы и ключи обязательны, require_gateway — только с
+	// ними (DECISIONS, п. 42).
+	key := strings.Repeat("ab", 32)
+	r := good()
+	r.Receipts, r.RequireGateway = &ReceiptsConfig{Files: []string{"/var/lib/esmcp/receipts.jsonl", "/var/lib/esundo/receipts.jsonl"}, GatewayKeys: []string{key}}, true
+	if err := r.Validate(); err != nil || r.Receipts.Source != "postgres" {
+		t.Fatalf("receipts: %v %+v", err, r.Receipts)
+	}
+	for name, spoil := range map[string]func(*Config){
+		"require_gateway without receipts": func(c *Config) { c.Receipts = nil },
+		"no receipts files":                func(c *Config) { c.Receipts.Files = nil },
+		"an empty receipts file":           func(c *Config) { c.Receipts.Files = []string{""} },
+		"one file twice":                   func(c *Config) { c.Receipts.Files = []string{"/a/r.jsonl", "/a/../a/r.jsonl"} },
+		"no gateway keys":                  func(c *Config) { c.Receipts.GatewayKeys = nil },
+		"a key that is not one":            func(c *Config) { c.Receipts.GatewayKeys = []string{"abc"} },
+	} {
+		c := good()
+		c.Receipts, c.RequireGateway = &ReceiptsConfig{Files: []string{"/a/r.jsonl"}, GatewayKeys: []string{key}}, true
+		spoil(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }
 
-// Скрипт настройки базы: права сервера — только строки названных таблиц и
-// отметки, агента — только чтение, отката — строки и отметка отката; отметку
-// «кто» ставит триггер, прямой вызов pg_logical_emit_message закрыт, функции
-// отметок — у роли без входа; имена берутся в кавычки.
+// Скрипт настройки базы: права сервера — только строки названных таблиц,
+// агента — только чтение, отката — строки; ни отметок, ни триггеров, ни
+// ключа в базе (п. 42): прежние снимаются; имена берутся в кавычки.
 func TestSetupSQL(t *testing.T) {
 	c := good()
 	c.MCPRoles = []string{`agent "x"`, "50% off"}
@@ -95,26 +111,24 @@ func TestSetupSQL(t *testing.T) {
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON "public"."accounts", "sales"."orders" TO "agent ""x""";`,
 		`GRANT USAGE ON SCHEMA "sales" TO "agent ""x""";`,
 		`ALTER TABLE "sales"."orders" REPLICA IDENTITY FULL;`,
-		`CREATE TRIGGER evidence_who BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON "public"."accounts"`,
 		`REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC`,
-		`PERFORM pg_logical_emit_message(false, 'evidence/refused',`,
-		`evidence.mark_refused(json) TO "agent ""x""";`,
 		`ALTER ROLE "agent ""x""" SET statement_timeout = '60s';`,
 		`ALTER ROLE "agent ""x""" SET lock_timeout = '10s';`,
 		`ALTER ROLE "agent ""x""" SET idle_in_transaction_session_timeout = '5min';`,
 		// Агент — только чтение; запись и отметки, выданные раньше, отозваны.
 		`GRANT SELECT ON "public"."accounts", "sales"."orders" TO "agent_bot";`,
 		`REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON "public"."accounts", "sales"."orders" FROM "agent_bot";`,
-		`REVOKE EXECUTE ON FUNCTION evidence.mark_action(json), evidence.mark_undo(json), evidence.mark_refused(json) FROM "agent_bot";`,
 		`EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON %s FROM "agent_bot"', leaf);`,
-		// Откат — строки и отметка отката.
-		`GRANT EXECUTE ON FUNCTION evidence.mark_undo(json) TO "undo_op";`,
-		// Владелец отметок — роль без входа; писать в журнал может только она.
-		`CREATE ROLE "evidence_owner" NOLOGIN;`,
-		`ALTER FUNCTION evidence.mark_refused(json) OWNER TO "evidence_owner";`,
-		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', f, 'evidence_owner');`,
+		// Откат — строки.
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON "public"."accounts", "sales"."orders" TO "undo_op";`,
+		// Прежние отметки сняты: схема с функциями, ключом и триггерами, их
+		// владелец; право писать в журнал возвращено, как было.
+		`DROP SCHEMA IF EXISTS evidence CASCADE;`,
+		`AND has_function_privilege('evidence_owner', p.oid, 'EXECUTE') LOOP`,
+		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO PUBLIC', f);`,
+		`EXECUTE format('DROP OWNED BY %I', 'evidence_owner');`,
 		// Роли агента и сервера — разрешённым перечнем: ни членств, ни владения;
-		// ролью сервера и владельцем отметок не может стать никто другой.
+		// ролью сервера не может стать никто другой.
 		`SELECT format('%I is a member of %I', r.rolname, g.rolname)`,
 		`a SECURITY DEFINER function of %I`,
 		`JOIN pg_foreign_server s ON has_server_privilege(g.oid, s.oid, 'USAGE')`,
@@ -124,13 +138,12 @@ func TestSetupSQL(t *testing.T) {
 		`WHERE r.rolname IN ('agent_bot', 'agent "x"', '50% off') AND g.oid <> r.oid`,
 		`SELECT format('%I owns %s', r.rolname, pg_describe_object(s.classid, s.objid, s.objsubid)) AS x`,
 		`SELECT format('%I can become %I', x.rolname, m.rolname) AS x`,
-		`WHERE m.rolname IN ('agent "x"', '50% off', 'evidence_owner')`,
-		`ALTER ROLE "evidence_owner" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD NULL;`,
-		`ALTER SCHEMA evidence OWNER TO "evidence_owner";`,
+		`WHERE m.rolname IN ('agent "x"', '50% off')`,
 		// Обрывать сеансы — только суперпользователям и pg_signal_backend; что initdb
-		// оставил суперпользователям, остаётся им.
+		// оставил суперпользователям, остаётся им. Чужая SECURITY DEFINER — любая вне pg_catalog.
 		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pg_signal_backend', f);`,
-		`f.proname IN ('pg_logical_emit_message', 'pg_terminate_backend', 'pg_cancel_backend')`,
+		`f.proname IN ('pg_terminate_backend', 'pg_cancel_backend')`,
+		`AND f.pronamespace <> 'pg_catalog'::regnamespace`,
 		`AND NOT EXISTS (SELECT FROM aclexplode(i.initprivs) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'))`,
 		// Запись агента — и в колонку, и через вид; умолчания прав.
 		`has_any_column_privilege(r.oid, c.oid, pr.p)`,
@@ -156,11 +169,17 @@ func TestSetupSQL(t *testing.T) {
 	if strings.Contains(sql, "TRUNCATE ON") && strings.Contains(sql, "GRANT TRUNCATE") {
 		t.Error("the agent role is granted TRUNCATE")
 	}
+	// Из базы «кто» не берётся: ни триггеров, ни функций отметок, ни ключа.
+	for _, gone := range []string{"CREATE TRIGGER", "CREATE FUNCTION", "CREATE SCHEMA", "mark_", "marker_key", "CREATE ROLE \"evidence_owner\"", "ROW LEVEL SECURITY"} {
+		if strings.Contains(sql, gone) {
+			t.Errorf("the script still has %s", gone)
+		}
+	}
 	if !strings.HasPrefix(strings.TrimSpace(sql[strings.Index(sql, "BEGIN;"):]), "BEGIN;") || !strings.HasSuffix(strings.TrimSpace(sql), "COMMIT;") {
 		t.Error("the script is not one transaction")
 	}
 	// Проверка — раньше первого изменения базы.
-	if guard, first := strings.Index(sql, "RAISE EXCEPTION"), strings.Index(sql, "CREATE SCHEMA"); guard < 0 || guard > first {
+	if guard, first := strings.Index(sql, "RAISE EXCEPTION"), strings.Index(sql, "DROP SCHEMA"); guard < 0 || guard > first {
 		t.Error("the refusal comes after the script has begun to change the database")
 	}
 }

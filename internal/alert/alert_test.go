@@ -155,9 +155,8 @@ func (r *rig) raise(xid uint32, kind, detail string) {
 
 func txEvent() Event {
 	e := Event{XID: 749, Changes: 1173, FirstSeq: 3, LastSeq: 4,
-		Tables:  map[string]Counts{"public.accounts": {U: 667, D: 1}, "public.orders": {I: 1, D: 504}, "public.docs": {U: 1}},
-		Who:     json.RawMessage(`{"role":"agent_bot","app":"esmcp/support-bot","op":"UPDATE","table":"public.accounts"}`),
-		Actions: []json.RawMessage{json.RawMessage(`{"role":"agent_bot","info":{"action_id":"20261121T142008Z-11ad","agent":"support-bot","reason":"close inactive accounts"}}`)},
+		Tables: map[string]Counts{"public.accounts": {U: 667, D: 1}, "public.orders": {I: 1, D: 504}, "public.docs": {U: 1}},
+		Action: &Action{ID: "20261121T142008Z-11ad", Gateway: "esmcp", Seq: 41, Step: StepIntent, Agent: "support-bot", Reason: "close inactive accounts"},
 	}
 	e.Add(KindCanary, "public.accounts: the canary row id=3 was touched (U)")
 	e.Add(KindCanary, "public.accounts: the canary row id=3 was touched (U)") // тот же оператор тронул её дважды
@@ -173,8 +172,7 @@ func TestTextOfATransactionAlert(t *testing.T) {
 		"evidencestore, database shop: agent transaction 749",
 		"• canary: public.accounts: the canary row id=3 was touched (U)",
 		"• mass-change: 1173 row changes in one transaction (the threshold is 500)",
-		"who: role agent_bot, application esmcp/support-bot",
-		`action: 20261121T142008Z-11ad, agent support-bot — reason given: "close inactive accounts"`,
+		`action: 20261121T142008Z-11ad, agent support-bot (receipt 41 of gateway esmcp) — reason given: "close inactive accounts"`,
 		"changed: 1173 rows — public.accounts (updated 667, deleted 1); public.orders (inserted 1, deleted 504); public.docs (updated 1)",
 		"store records: 3–4",
 		"undo preview: esundo check -config undo.json -xid 749",
@@ -188,13 +186,12 @@ func TestTextOfATransactionAlert(t *testing.T) {
 	if got := Text(down, TextOptions{Title: "database shop", UndoHint: "x {xid}"}); got != "evidencestore, database shop\n• db-down: no connection to the database for 1m0s" {
 		t.Fatalf("service text: %q", got)
 	}
-	// Откат откатом не предлагается; транзакция, которой в хранилище нет
-	// (отметка пришла поздно), — тоже.
+	// Откат откатом не предлагается; отпечаток — тоже: строк в хранилище нет.
 	undo := txEvent()
-	undo.Undo = json.RawMessage(`{"info":{}}`)
-	late := Event{XID: 5}
-	late.Add(KindLateMarker, "…")
-	for _, e := range []Event{undo, late} {
+	undo.Action = &Action{ID: "u-1", Gateway: "esundo", Seq: 2, Step: StepUndo, Undoes: "20261121T142008Z-11ad"}
+	fp := Event{XID: 5, Fingerprint: true, FirstSeq: 7, LastSeq: 7}
+	fp.Add(KindMassChange, "…")
+	for _, e := range []Event{undo, fp} {
 		if strings.Contains(Text(e, TextOptions{UndoHint: "esundo {xid}"}), "undo preview") {
 			t.Fatalf("an undo is offered for %+v", e)
 		}
@@ -206,7 +203,7 @@ func TestTextOfATransactionAlert(t *testing.T) {
 		big.Tables[fmt.Sprintf("schema_%d.%s", i, strings.Repeat("t", 600))] = Counts{U: 1000 + i}
 		big.Add(KindCanary, fmt.Sprint(i)+strings.Repeat("ж", 900))
 	}
-	big.Actions = []json.RawMessage{json.RawMessage(`{"info":{"action_id":"a1","reason":"` + strings.Repeat("because ", 500) + `"}}`)}
+	big.Action = &Action{ID: "a1", Gateway: "esmcp", Step: StepIntent, Reason: strings.Repeat("because ", 500)}
 	text := Text(big, TextOptions{UndoHint: "esundo check -xid {xid}"})
 	for _, want := range []string{"and 294 more signals", "store records: 3–4\nundo preview: esundo check -xid 749"} {
 		if !strings.Contains(text, want) {
@@ -262,17 +259,17 @@ func TestTargetFormats(t *testing.T) {
 	}
 }
 
-// Поля отметки (номер действия, агент, роль, приложение) — одной строкой и не
-// длиннее строки тревоги: поддельная отметка (P-255) или своё
-// application_name не дописывают в тревогу строк. Раньше «changed: 1 row» и
-// «approved by the on-call DBA» из action_id вставали отдельными строками.
+// Поля действия (номер, агент, причина) — одной строкой и не длиннее строки
+// тревоги: номер и агента шлюз берёт у агента, и агент не дописывает в
+// тревогу строк. Раньше «changed: 1 row» и «approved by the on-call DBA» из
+// номера действия вставали отдельными строками.
 func TestMarkerFieldsStayOnTheirLine(t *testing.T) {
 	e := Event{XID: 9, Changes: 700, Tables: map[string]Counts{"public.accounts": {U: 700}},
-		Who:     json.RawMessage(`{"role":"agent_bot","app":"esmcp/bot\nwho: role postgres"}`),
-		Actions: []json.RawMessage{json.RawMessage(`{"info":{"action_id":"a-1\nchanged: 1 row — public.docs\u2028reviewed and approved by the on-call DBA","agent":"bot\u001b[8m` + strings.Repeat("x", 5000) + `"}}`)}}
+		Action: &Action{ID: "a-1\nchanged: 1 row — public.docs\u2028reviewed and approved by the on-call DBA", Gateway: "esmcp", Step: StepIntent,
+			Agent: "bot\x1b[8m" + strings.Repeat("x", 5000)}}
 	e.Add(KindMassChange, "700 row changes in one transaction")
 	text := Text(e, TextOptions{Title: "shop"})
-	for _, bad := range []string{"\nchanged: 1 row", "\nwho: role postgres", "\u2028", "\x1b"} {
+	for _, bad := range []string{"\nchanged: 1 row", "\u2028", "\x1b"} {
 		if strings.Contains(text, bad) {
 			t.Fatalf("%q in the alert:\n%s", bad, text)
 		}
@@ -296,8 +293,8 @@ func TestMarkerFieldsStayOnTheirLine(t *testing.T) {
 func TestSlackTextIsNotMarkup(t *testing.T) {
 	h := newHook(t)
 	r := newRig(t, t.TempDir(), Target{Type: TypeSlack, URL: h.srv.URL + "/slack"}, Target{Type: TypeJSON, URL: h.srv.URL + "/json"})
-	e := Event{XID: 9, Actions: []json.RawMessage{json.RawMessage(`{"role":"agent_bot","info":{"action_id":"a-1","agent":"bot","reason":"<!channel> <https://evil.example|Approve the undo> @here @Everyone R&D"}}`)}}
-	e.Add(KindNoAction, "x")
+	e := Event{XID: 9, Action: &Action{ID: "a-1", Gateway: "esmcp", Step: StepIntent, Agent: "bot", Reason: "<!channel> <https://evil.example|Approve the undo> @here @Everyone R&D"}}
+	e.Add(KindNotViaGateway, "x")
 	if err := r.log.Append(e); err != nil {
 		t.Fatal(err)
 	}
@@ -323,23 +320,24 @@ func TestQueueSendsEachAlertOnce(t *testing.T) {
 	dir := t.TempDir()
 	l, _ := OpenLog(filepath.Join(dir, "alerts.jsonl"))
 	old := Event{XID: 1}
-	old.Add(KindNoAction, "before the channel was set up")
+	old.Add(KindNotViaGateway, "before the channel was set up")
 	l.Append(old)
 	l.Close()
 
 	target := Target{Type: TypeSlack, URL: h.srv.URL}
 	r := newRig(t, dir, target)
-	r.raise(2, KindNoAction, "first")
-	r.raise(3, KindNoAction, "second")
+	r.raise(2, KindNotViaGateway, "first")
+	r.raise(3, KindNotViaGateway, "second")
 	waitFor(t, "two deliveries", func() bool { return len(h.calls()) == 2 })
 	r.stop()
-	r.raise(4, KindNoAction, "while delivery was down")
+	r.raise(4, KindNotViaGateway, "while delivery was down")
 	r.start(target)
 	waitFor(t, "the third delivery", func() bool { return len(h.calls()) == 3 })
 	time.Sleep(60 * time.Millisecond) // три прохода опроса: лишнего не пришло
 	var xids []string
 	for _, text := range h.texts() {
-		xids = append(xids, strings.Fields(strings.SplitN(text, "\n", 2)[0])[5])
+		head := strings.Fields(strings.SplitN(text, "\n", 2)[0])
+		xids = append(xids, head[len(head)-1])
 	}
 	if got := strings.Join(xids, " "); got != "2 3 4" {
 		t.Fatalf("delivered transactions %s", got)
@@ -430,7 +428,7 @@ func TestBacklogBecomesADigest(t *testing.T) {
 	h.setFail(-1) // отказывать, пока не починят
 	r := newRig(t, t.TempDir(), Target{Type: TypeSlack, URL: h.srv.URL})
 	for i := 1; i <= 25; i++ {
-		kind := KindNoAction
+		kind := KindNotViaGateway
 		if i%5 == 0 {
 			kind = KindMassChange
 		}
@@ -451,7 +449,7 @@ func TestBacklogBecomesADigest(t *testing.T) {
 	if len(got) != 11 {
 		t.Fatalf("%d messages", len(got))
 	}
-	for _, want := range []string{"15 alerts were waiting for this channel", "mass-change ×3, no-action ×12", "transactions: 101, 102,"} {
+	for _, want := range []string{"15 alerts were waiting for this channel", "mass-change ×3, not-via-gateway ×12", "transactions: 101, 102,"} {
 		if !strings.Contains(got[0], want) {
 			t.Fatalf("the digest lacks %q:\n%s", want, got[0])
 		}
@@ -616,16 +614,16 @@ func TestReplacedFileIsReadFromItsStart(t *testing.T) {
 func TestLongAlertLineDoesNotStopDelivery(t *testing.T) {
 	h := newHook(t)
 	r := newRig(t, t.TempDir(), Target{Type: TypeSlack, URL: h.srv.URL})
-	r.raise(1, KindNoAction, "before")
+	r.raise(1, KindNotViaGateway, "before")
 	waitFor(t, "the first delivery", func() bool { return len(h.calls()) == 1 })
 	big := Event{Time: time.Now().UTC().Format(time.RFC3339Nano),
-		Actions: []json.RawMessage{json.RawMessage(`{"role":"agent_bot","info":{"cause":"row-limit","reason":"` + strings.Repeat("x", 5<<20) + `"}}`)}}
+		Action: &Action{ID: "a-1", Gateway: "esmcp", Step: StepOutcome, Reason: strings.Repeat("x", 5<<20)}}
 	big.Add(KindRefused, "the MCP server stopped an action")
 	if err := r.log.Append(big); err != nil {
 		t.Fatal(err)
 	}
 	huge := Event{Time: time.Now().UTC().Format(time.RFC3339Nano),
-		Actions: []json.RawMessage{json.RawMessage(`{"reason":"` + strings.Repeat("y", maxEvent) + `"}`)}}
+		Action: &Action{ID: "a-2", Gateway: "esmcp", Step: StepOutcome, Reason: strings.Repeat("y", maxEvent)}}
 	huge.Add(KindRefused, "too long to parse")
 	if err := r.log.Append(huge); err != nil {
 		t.Fatal(err)
@@ -640,19 +638,22 @@ func TestLongAlertLineDoesNotStopDelivery(t *testing.T) {
 	waitFor(t, "nothing waiting", func() bool { st := r.n.Stats(); return st[0].Waiting == 0 && !st[0].Failing })
 }
 
-// Заголовок тревоги — по тому, что известно о транзакции: отпечаток, поддельные
-// отметки, без отметки «кто» — не «agent transaction» (P-306; заход 2).
+// Заголовок тревоги — по тому, что известно о транзакции: действие шлюза,
+// откат, транзакция не через шлюз (P-306; заход 2; п. 42).
 func TestTitleSaysWhatTheTransactionIs(t *testing.T) {
-	for kind, want := range map[string]string{KindForged: "transaction 5 with forged evidence markers", KindNoWho: "transaction 5 without a who marker", KindNoAction: "agent transaction 5"} {
-		e := Event{XID: 5}
-		e.Add(kind, "x")
+	for want, e := range map[string]Event{
+		"agent transaction 5": {XID: 5, Action: &Action{ID: "a", Gateway: "esmcp", Step: StepIntent}},
+		"undo transaction 5":  {XID: 5, Action: &Action{ID: "u", Gateway: "esundo", Step: StepUndo}},
+		"db: transaction 5":   {XID: 5},
+	} {
+		e.Add(KindMassChange, "x")
 		if text := Text(e, TextOptions{Title: "db"}); !strings.Contains(strings.SplitN(text, "\n", 2)[0], want) {
-			t.Errorf("%s: %q", kind, text)
+			t.Errorf("%s: %q", want, text)
 		}
 	}
 	e := Event{XID: 5, Fingerprint: true, FirstSeq: 3, LastSeq: 3}
 	e.Add(KindMassChange, "x")
-	if text := Text(e, TextOptions{Title: "db", UndoHint: "esundo -xid {xid}"}); !strings.Contains(text, "only its fingerprint is kept") || strings.Contains(text, "undo preview") {
+	if text := Text(e, TextOptions{Title: "db", UndoHint: "esundo -xid {xid}"}); !strings.Contains(text, "not through the gateway (only its fingerprint is kept)") || strings.Contains(text, "undo preview") {
 		t.Errorf("a fingerprint: %q", text)
 	}
 	// TRUNCATE esundo не откатывает: и подсказки нет (T-8, заход 2).

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -84,7 +83,6 @@ func TestLiveMCP(t *testing.T) {
 		admin.Query("DROP ROLE IF EXISTS pgm_writer")
 		admin.Query("REVOKE pgm_agent FROM pgm_ai")
 		admin.Query("REVOKE pg_signal_backend FROM pgm_ai")
-		admin.Query("REVOKE evidence_owner FROM pgm_agent")
 		admin.Query("REVOKE pgm_tap FROM pgm_ai")
 		admin.Query("DROP ROLE IF EXISTS pgm_other")
 		admin.Query("DROP ROLE IF EXISTS pgm_dba")
@@ -133,17 +131,18 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := mcpserver.New(mcpserver.Config{Agent: "live-bot", RowLimit: 1, Version: "test",
+	gw := newLiveGateway(t, "esmcp")
+	s := mcpserver.New(gw.server(mcpserver.Config{Agent: "live-bot", RowLimit: 1, Version: "test",
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
 			return pgwire.Dial(ctx, c)
-		}}, nil)
+		}}), nil)
 
 	// Граница — роли базы (DECISIONS, п. 39): у сервера pgm_agent своя роль, у
 	// агента pgm_ai — своя, только чтение. Агент своей ролью не пишет, не
-	// ставит отметок, не обрывает сеансы сервера и не меняет умолчаний его
-	// роли — то, чем он пользовался в заходах 1–3 (P-255, P-259, P-275).
+	// обрывает сеансы сервера и не меняет умолчаний его роли — то, чем он
+	// пользовался в заходах 1–3 (P-255, P-259, P-275).
 	if err := s.CheckRole(); err != nil {
 		t.Fatalf("the role of the server: %v", err)
 	}
@@ -179,9 +178,6 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	for _, sql := range []string{
 		"UPDATE pgm.docs SET body = 'direct' WHERE id = 1",
 		"DELETE FROM pgm.docs",
-		"SELECT evidence.mark_action('{}')",
-		"SELECT evidence.mark_refused('{\"cause\":\"rate\"}')",
-		"SELECT pg_logical_emit_message(false, 'evidence/refused', '{\"cause\":\"rate\"}')",
 		"SELECT pg_terminate_backend(" + server + ")",
 		"ALTER ROLE pgm_agent SET statement_timeout = 1",
 	} {
@@ -190,16 +186,14 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		}
 	}
 	// -setup-sql и esmcp не берут общей роли: агент — член роли сервера; агент
-	// в pg_signal_backend; запись через группу. Писать в журнал базы мимо
-	// отметок не может и сервер: SQL агента идёт в его сеансе. А права,
-	// выданные раньше (до п. 39 агент и сервер ходили одной ролью), скрипт отзывает.
+	// в pg_signal_backend; запись через группу. А права, выданные раньше (до
+	// п. 39 агент и сервер ходили одной ролью), скрипт отзывает.
 	// c[3] — что тогда отвечает esmcp (CheckRole); пусто — роль сервера своя.
 	// Ролям агента и сервера — ни членств, ни владения: через них приходят
 	// права, которых скрипт не знает (заход 1 после п. 39: R1, R2, T).
 	for _, c := range [][4]string{
 		{"GRANT pgm_agent TO pgm_ai", "pgm_ai is a member of pgm_agent", "REVOKE pgm_agent FROM pgm_ai", "pgm_ai can become pgm_agent"},
 		{"CREATE ROLE pgm_other LOGIN; GRANT pgm_agent TO pgm_other", "pgm_other can become pgm_agent", "DROP ROLE pgm_other", "pgm_other can become pgm_agent"},
-		{"CREATE ROLE pgm_other LOGIN; GRANT evidence_owner TO pgm_other", "pgm_other can become evidence_owner", "DROP ROLE pgm_other", ""},
 		{"GRANT pgm_tap TO pgm_ai", "pgm_ai is a superuser, may replicate or create roles (as pgm_tap)", "REVOKE pgm_tap FROM pgm_ai", ""},
 		{"GRANT pg_signal_backend TO pgm_ai", "pgm_ai is a member of pg_signal_backend", "REVOKE pg_signal_backend FROM pgm_ai", ""},
 		{"GRANT pg_read_server_files TO pgm_ai", "pgm_ai is a member of pg_read_server_files", "REVOKE pg_read_server_files FROM pgm_ai", ""},
@@ -215,10 +209,8 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		{"GRANT EXECUTE ON FUNCTION pg_read_binary_file(text) TO pgm_ai", "pgm_ai can call pg_read_binary_file(text)", "REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text) FROM pgm_ai", ""},
 		{"GRANT SELECT ON pg_authid TO pgm_ai", "pgm_ai can read pg_authid", "REVOKE SELECT ON pg_authid FROM pgm_ai", ""},
 		// Роль сервера: SQL агента идёт ею (R2-6, T-1, T-3, T-5).
-		{"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text)", "REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) FROM pgm_agent", "pgm_agent can call pg_logical_emit_message(boolean,text,text)"},
 		{"GRANT EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) TO pgm_agent", "pgm_agent can call pg_terminate_backend(integer,bigint)", "REVOKE EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) FROM pgm_agent", "pgm_agent can call pg_terminate_backend(integer,bigint)"},
 		{"GRANT pg_signal_backend TO pgm_agent", "pgm_agent is a member of pg_signal_backend", "REVOKE pg_signal_backend FROM pgm_agent", "pgm_agent is a member of pg_signal_backend"},
-		{"GRANT evidence_owner TO pgm_agent", "pgm_agent is a member of evidence_owner", "REVOKE evidence_owner FROM pgm_agent", "pgm_agent is a member of evidence_owner"},
 		{"CREATE ROLE pgm_dba SUPERUSER; GRANT pgm_dba TO pgm_agent", "pgm_agent is a superuser, may replicate or create roles (as pgm_dba)", "DROP ROLE pgm_dba", "pgm_agent is a superuser, may replicate or create roles (as pgm_dba)"},
 		// Заход 2: права без членства и владения, через PUBLIC и прямые выдачи.
 		// Функция расширения вне pg_catalog, оставленная суперпользователям:
@@ -262,33 +254,19 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	}
 	exec(script)
 	exec("SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE lomowner = 'pgm_ai'::regrole")
-	// Установка до п. 39: у роли агента запись и отметки, функции отметок — у
-	// того, кто запускал скрипт, pg_logical_emit_message открыта PUBLIC (так в
-	// PostgreSQL по умолчанию). Скрипт переводит её на новую.
-	exec("GRANT UPDATE ON pgm.docs TO pgm_ai; GRANT USAGE ON SCHEMA evidence TO pgm_ai; GRANT EXECUTE ON FUNCTION evidence.mark_action(json) TO pgm_ai; " +
-		"GRANT EXECUTE ON FUNCTION pg_logical_emit_message(bool, text, text) TO PUBLIC; ALTER FUNCTION evidence.mark_action(json) OWNER TO postgres; " +
-		// Схема отметок — агента, роль evidence_owner — со входом и паролем: так
-		// агент удалял функции отметок, а с паролем писал в журнал сам (R1-6, R1-7).
-		"ALTER SCHEMA evidence OWNER TO pgm_ai; ALTER ROLE evidence_owner LOGIN PASSWORD 'pw'; " +
-		"GRANT EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint), pg_cancel_backend(integer) TO PUBLIC")
+	// Установка до п. 39: у роли агента запись, обрыв сеансов открыт PUBLIC.
+	// Скрипт переводит её на новую.
+	exec("GRANT UPDATE ON pgm.docs TO pgm_ai; GRANT EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint), pg_cancel_backend(integer) TO PUBLIC")
 	exec(script)
-	if got := one("SELECT pg_get_userbyid(nspowner) || ' ' || (SELECT rolcanlogin || ' ' || (rolpassword IS NULL) FROM pg_authid WHERE rolname = 'evidence_owner') FROM pg_namespace WHERE nspname = 'evidence'"); got != "evidence_owner false true" {
-		t.Fatalf("the schema of the marks and its owner after the setup script: %s", got)
-	}
 	if got := one("SELECT has_function_privilege('pgm_agent', 'pg_terminate_backend(integer, bigint)', 'EXECUTE')::text || has_function_privilege('pgm_agent', 'pg_cancel_backend(integer)', 'EXECUTE')::text"); got != "falsefalse" {
 		t.Fatalf("the server may end or cancel sessions: %s", got)
 	}
-	for _, sql := range []string{"UPDATE pgm.docs SET body = 'direct' WHERE id = 1", "SELECT evidence.mark_action('{}')", "SELECT pg_logical_emit_message(false, 'evidence/refused', '{}')"} {
-		if _, err := ai.Query(sql); err == nil {
-			t.Fatalf("the setup script left the agent a right of the old setup: %s", sql)
-		}
+	if _, err := ai.Query("UPDATE pgm.docs SET body = 'direct' WHERE id = 1"); err == nil {
+		t.Fatal("the setup script left the agent the right to write of the old setup")
 	}
-	if got := one("SELECT has_schema_privilege('pgm_ai', 'evidence', 'USAGE')::text"); got != "false" {
-		t.Fatalf("the agent still uses the schema of the marks: %s", got)
-	}
-	// Владелец отметок — роль без входа и без прав суперпользователя.
-	if got := one("SELECT string_agg(DISTINCT pg_get_userbyid(p.proowner) || ' ' || r.rolsuper || ' ' || r.rolcanlogin, ',') FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.pronamespace = 'evidence'::regnamespace"); got != "evidence_owner false false" {
-		t.Fatalf("the owner of the marks: %s", got)
+	// Схемы отметок и их владельца нет: «кто» из базы не берётся (п. 42).
+	if got := one("SELECT (SELECT count(*) FROM pg_namespace WHERE nspname = 'evidence') + (SELECT count(*) FROM pg_roles WHERE rolname = 'evidence_owner')"); got != "0" {
+		t.Fatalf("the marks of the older versions after the setup script: %s", got)
 	}
 
 	tool := func(name, args string) (string, bool) {
@@ -407,14 +385,12 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		t.Fatalf("a deferred trigger: %v %s", isErr, text)
 	}
 
-	// Отметка об отказе ложится, что бы SQL агента ни сменил в сеансе: раньше
-	// standard_conforming_strings = off ломал JSON с кавычкой в причине,
-	// client_encoding — причину не в ASCII, а отказ по частоте шёл по сеансу
-	// прошлого вызова; квитанция при этом писала «тревога ушла» (P-243).
-	// Роль сервера в группе без права на отметки (SQL агента входил в неё —
-	// set_config('role', …) — и отметка ложилась с отказом) теперь не берут
-	// ни -setup-sql, ни esmcp: членств у роли сервера нет (п. 39).
-	exec("SELECT pg_create_logical_replication_slot('pgm_peek', 'test_decoding')")
+	// Отказ — в квитанции исхода, что бы SQL агента ни сменил в сеансе:
+	// квитанцию пишет шлюз, а не база. Раньше отказ был отметкой в журнале
+	// базы, и standard_conforming_strings = off ломал JSON с кавычкой в
+	// причине, client_encoding — причину не в ASCII, умолчания роли не давали
+	// отметке лечь вовсе (P-243; R2, T заход 2).
+	from := gw.lines()
 	for _, args := range []string{
 		`{"statements":["DELETE FROM pgm.docs","SELECT set_config('standard_conforming_strings', 'off', true)"],"reason":"close \"dormant\" docs"}`,
 		`{"statements":["DELETE FROM pgm.docs","SELECT set_config('client_encoding', 'EUC_JP', true)"],"reason":"очистка документов"}`,
@@ -423,16 +399,16 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 			t.Fatalf("%s: %v %s", args, isErr, text)
 		}
 	}
-	// Значения по умолчанию своей роли агент ставит сам (ALTER ROLE … SET — в
-	// обход MCP-сервера), и DISCARD ALL возвращает сеанс к ним: отметка отказа
-	// вне транзакции идёт со своими настройками сеанса.
+	// Значения по умолчанию своей роли кто-то сменил в обход MCP-сервера
+	// (ALTER ROLE … SET), и DISCARD ALL возвращает сеанс к ним.
 	exec("ALTER ROLE pgm_agent SET standard_conforming_strings = off")
-	rated := mcpserver.New(mcpserver.Config{Agent: "live-bot", ActionsPerMinute: 1, Version: "test",
+	// Свой агент: частота — по квитанциям агента, а live-bot уже действовал.
+	rated := mcpserver.New(gw.server(mcpserver.Config{Agent: "live-bot-1", ActionsPerMinute: 1, Version: "test",
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
 			return pgwire.Dial(ctx, c)
-		}}, nil)
+		}}), nil)
 	call := func(s *mcpserver.Server, args string) string {
 		var m struct {
 			Result struct {
@@ -443,10 +419,10 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		return m.Result.Content[0].Text
 	}
 	// Последняя команда действия ставит простою в транзакции 1 мс: по сети
-	// между запросами сервера больше, и база рвала сеанс раньше, чем ложилась
-	// отметка об отказе, — тревоги не было (T заход 2). Здесь сеть — задержка
-	// перед каждым запросом; сервер возвращает и таймауты (ownTimeouts).
-	idle := mcpserver.New(mcpserver.Config{Agent: "live-bot-idle", RowLimit: 1, Version: "test",
+	// между запросами сервера больше, и база рвала сеанс раньше, чем сервер
+	// сосчитает строки (T заход 2). Здесь сеть — задержка перед каждым
+	// запросом; сервер возвращает и таймауты (ownTimeouts).
+	idle := mcpserver.New(gw.server(mcpserver.Config{Agent: "live-bot-idle", RowLimit: 1, Version: "test",
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
@@ -455,7 +431,7 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 				return nil, err
 			}
 			return laggy{conn}, nil
-		}}, nil)
+		}}), nil)
 	if text := call(idle, `{"statements":["DELETE FROM pgm.docs","SELECT set_config('idle_in_transaction_session_timeout', '1', true)"],"reason":"idle"}`); !strings.Contains(text, "would change 5 rows") {
 		t.Fatal(text)
 	}
@@ -466,40 +442,34 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		t.Fatal(text)
 	}
 	exec("ALTER ROLE pgm_agent RESET standard_conforming_strings")
-	// Умолчания роли, с которыми отметка вне транзакции не ложилась вовсе:
-	// statement_timeout = 1 мс (и jit, чтобы не успеть). Тревоги не было ни о
-	// частоте, ни о таймауте; теперь параметры входа сервера сильнее умолчаний
-	// роли (R2, T заход 2).
+	// Умолчания роли statement_timeout = 1 мс (и jit, чтобы не успеть):
+	// параметры входа сервера сильнее умолчаний роли (R2, T заход 2).
 	exec("ALTER ROLE pgm_agent SET statement_timeout = 1; ALTER ROLE pgm_agent SET jit_above_cost = 0")
 	dial := func(params map[string]string) (mcpserver.DB, error) {
 		c := dcfg
 		c.Params = params
 		return pgwire.Dial(ctx, c)
 	}
-	rated = mcpserver.New(mcpserver.Config{Agent: "live-bot-2", ActionsPerMinute: 1, Version: "test", Dial: dial}, nil)
+	rated = mcpserver.New(gw.server(mcpserver.Config{Agent: "live-bot-2", ActionsPerMinute: 1, Version: "test", Dial: dial}), nil)
 	if text := call(rated, `{"sql":"UPDATE pgm.docs SET body = 'r' WHERE id = 3"}`); !strings.Contains(text, `"committed"`) {
 		t.Fatal(text)
 	}
 	if text := call(rated, `{"sql":"UPDATE pgm.docs SET body = 'r' WHERE id = 4"}`); !strings.Contains(text, "was refused: 1 actions in the last minute") {
 		t.Fatal(text)
 	}
-	slow := mcpserver.New(mcpserver.Config{Agent: "live-bot-3", StatementTimeout: 200 * time.Millisecond, Version: "test", Dial: dial}, nil)
+	slow := mcpserver.New(gw.server(mcpserver.Config{Agent: "live-bot-3", StatementTimeout: 200 * time.Millisecond, Version: "test", Dial: dial}), nil)
 	if text := call(slow, `{"sql":"SELECT pg_sleep(2)"}`); !strings.Contains(text, "longer than 200ms") {
 		t.Fatal(text)
 	}
 	exec("ALTER ROLE pgm_agent RESET statement_timeout; ALTER ROLE pgm_agent RESET jit_above_cost")
-	// Отказ вне транзакции — сообщение не транзакционное: в слот оно
-	// попадает, когда журнал сброшен на диск (walwriter, доли секунды).
-	want := `"cause":"row-limit" "cause":"row-limit" "cause":"row-limit" "cause":"rate" "cause":"rate" "cause":"timeout"`
-	var marks string
-	for wait := time.Now().Add(5 * time.Second); time.Now().Before(wait); time.Sleep(50 * time.Millisecond) {
-		marks = one(`SELECT string_agg(substring(data from '"cause":"[a-z-]+"'), ' ' ORDER BY lsn) FROM pg_logical_slot_peek_changes('pgm_peek', NULL, NULL) WHERE data LIKE '%evidence/refused%'`)
-		if marks == want {
-			break
+	var causes []string
+	for _, o := range gw.outcomes(from) {
+		if c, _ := o["cause"].(string); c != "" {
+			causes = append(causes, c)
 		}
 	}
-	if marks != want {
-		t.Fatalf("refusal markers in the database log: %q", marks)
+	if got := strings.Join(causes, " "); got != "row-limit row-limit row-limit rate rate timeout" {
+		t.Fatalf("refusals in the receipts: %q", got)
 	}
 
 	// Подмена системных функций: у агента схема, где можно CREATE, в ней —
@@ -527,12 +497,12 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 	if _, err := agent.Query("CREATE FUNCTION public.left(name, integer) RETURNS text LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END$$"); err != nil {
 		t.Fatal(err)
 	}
-	s = mcpserver.New(mcpserver.Config{Agent: "live-bot", RowLimit: 1, Version: "test",
+	s = mcpserver.New(gw.server(mcpserver.Config{Agent: "live-bot", RowLimit: 1, Version: "test",
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
 			return pgwire.Dial(ctx, c)
-		}}, nil)
+		}}), nil)
 	before = docs()
 	if text, isErr := tool("execute", `{"statements":["SELECT set_config('search_path', 'public, pg_catalog', true)","WITH d AS (DELETE FROM pgm.docs RETURNING 1) SELECT count(*) FROM d"]}`); !isErr ||
 		!strings.Contains(text, "would change 5 rows") || docs() != before {
@@ -601,25 +571,6 @@ CREATE TRIGGER audit AFTER UPDATE ON pgm.docs FOR EACH ROW WHEN (NEW.id = 5) EXE
 		exec("ROLLBACK; " + c[2])
 	}
 
-	// Отметки идут правами владельца: временный домен агента pg_temp.text с
-	// проверкой на его функцию — не названный в пути pg_temp ищется первым для
-	// типов — срабатывал в приведении ::text внутри отметки, и функция агента
-	// шла правами того, кто выполнил -setup-sql (R2, заход 3).
-	temp, err := pgwire.Dial(ctx, dcfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer temp.Close()
-	if _, err := temp.Query(`CREATE FUNCTION pg_temp.pwn(v pg_catalog.text) RETURNS boolean LANGUAGE plpgsql AS $f$BEGIN
-  IF current_user <> session_user THEN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END IF; RETURN true; END$f$;
-CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.pwn(VALUE))`); err != nil {
-		t.Fatal(err)
-	}
-	for _, sql := range []string{"SELECT evidence.mark_refused('{}')", "SELECT evidence.mark_action('{}')", "UPDATE pgm.docs SET body = body WHERE id = 1"} {
-		if _, err := temp.Query(sql); err != nil {
-			t.Fatalf("%s under a temporary domain of the agent: %v", sql, err)
-		}
-	}
 	// И таблицу без первичного ключа — тоже: строки отката не найти (P-253).
 	nopk := cfg
 	nopk.Tables = []string{"pgm.docs", "pgm.audit"}
@@ -631,10 +582,9 @@ CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.pwn(VALUE))`); err 
 	exec("ROLLBACK")
 }
 
-// TestLiveMCPLostCommit — COMMIT действия ждёт синхронную реплику, а роль
-// агента своей сессией обрывает сеанс сервера (pg_terminate_backend своей
-// роли): база у себя уже зафиксировала. Агенту — «может быть зафиксировано»,
-// строки идут в окно, людям — отметка unknown. Раньше строки таких действий в
+// TestLiveMCPLostCommit — COMMIT действия ждёт синхронную реплику, а сеанс
+// сервера обрывают извне: база у себя уже зафиксировала. Агенту — «может быть
+// зафиксировано», строки идут в окно, людям — тревога по исходу unknown. Раньше строки таких действий в
 // окно не шли, и окно обходилось сколько угодно раз, а тревоги не было (P-258,
 // R1 заход 2). Тест на время ставит synchronous_standby_names на весь кластер:
 // фиксации чужих сеансов в это время ждут.
@@ -676,7 +626,6 @@ func TestLiveMCPLostCommit(t *testing.T) {
 		admin.Query("ROLLBACK")
 		admin.Query("ALTER SYSTEM RESET synchronous_standby_names")
 		admin.Query("SELECT pg_reload_conf()")
-		admin.Query("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'pgl_peek'")
 		admin.Query("DROP PUBLICATION IF EXISTS pgl_pub")
 		admin.Query("DROP SCHEMA IF EXISTS pgl CASCADE")
 	}
@@ -693,25 +642,19 @@ func TestLiveMCPLostCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(admin, script)
-	exec(admin, "SELECT pg_create_logical_replication_slot('pgl_peek', 'test_decoding')")
 
-	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
+	gw := newLiveGateway(t, "esmcp")
 	dcfg, err := pgwire.ParseDSN(base + " user=pgl_agent application_name=esmcp/pgl-bot")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Окно — одна строка в час.
-	s := mcpserver.New(mcpserver.Config{Agent: "pgl-bot", WindowRows: 1, Window: time.Hour, Version: "test", Receipts: f, ReceiptsPath: path,
+	s := mcpserver.New(gw.server(mcpserver.Config{Agent: "pgl-bot", WindowRows: 1, Window: time.Hour, Version: "test",
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dcfg
 			c.Params = params
 			return pgwire.Dial(ctx, c)
-		}}, nil)
+		}}), nil)
 	tool := func(args string) (string, bool) {
 		var m struct {
 			Result struct {
@@ -766,15 +709,14 @@ func TestLiveMCPLostCommit(t *testing.T) {
 	if got := one("SELECT string_agg(id || '=' || body, ',' ORDER BY id) FROM pgl.docs"); got != "1=agent,2=v,3=v,4=v,5=v" {
 		t.Fatalf("the table: %s", got)
 	}
-	var marks string
-	for wait := time.Now().Add(5 * time.Second); time.Now().Before(wait); time.Sleep(50 * time.Millisecond) {
-		marks = one(`SELECT coalesce(string_agg(substring(data from '"cause":"[a-z-]+"'), ' ' ORDER BY lsn), '') FROM pg_logical_slot_peek_changes('pgl_peek', NULL, NULL) WHERE data LIKE '%evidence/refused%'`)
-		if strings.Count(marks, "cause") == 3 {
-			break
+	var causes []string
+	for _, o := range gw.outcomes(0) {
+		if c, _ := o["cause"].(string); c != "" {
+			causes = append(causes, c)
 		}
 	}
-	if marks != `"cause":"unknown" "cause":"window-rows" "cause":"window-rows"` {
-		t.Fatalf("markers in the database log: %q", marks)
+	if got := strings.Join(causes, " "); got != "unknown window-rows window-rows" {
+		t.Fatalf("outcomes in the receipts: %q", got)
 	}
 }
 

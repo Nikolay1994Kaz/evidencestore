@@ -31,8 +31,8 @@ func undoAnswers(sql string) ([]pgwire.Result, bool) {
 	return nil, false
 }
 
-// Откат через MCP — только своих действий и только той транзакции, что несёт
-// отметку действия. До исправления P-247 агент видел в `actions` и откатывал
+// Откат через MCP — только своих действий и только той транзакции, что
+// сборщик взял по намерению этого действия. До исправления P-247 агент видел в `actions` и откатывал
 // действия другого агента из общего файла квитанций, а транзакцию брал по
 // номеру без сверки: номер, занятый заново (база из копии, оборот счётчика),
 // давал откат чужой транзакции под именем этого действия. Номер с эпохой
@@ -59,18 +59,17 @@ func TestUndoTakesOnlyItsOwnActionsAndTheirTransactions(t *testing.T) {
 	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"b-1"}`); !isErr || !strings.Contains(out, "not in this server's receipts") {
 		t.Fatalf("%v %s", isErr, out)
 	}
-	// Своё действие, а хранилище по его номеру отдаёт транзакцию без его
-	// отметки (в journalLine — отметка a-1).
+	// Своё действие, а хранилище по его номеру отдаёт транзакцию другого
+	// действия (в journalLine — намерение a-1).
 	if out, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'c'"}`); isErr {
 		t.Fatal(out)
 	}
-	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-2"}`); !isErr || !strings.Contains(out, "carries no marker of action a-2") {
+	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-2"}`); !isErr || !strings.Contains(out, "is not action a-2 of this server") {
 		t.Fatalf("%v %s", isErr, out)
 	}
-	// Квитанция до 22.11: номер с эпохой. Хранилище знает младшие 32 бита.
-	rc, _ := json.Marshal(Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+	// Номер с эпохой в квитанции: хранилище знает младшие 32 бита.
+	appendReceipt(t, path, Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
 		SQL: "UPDATE accounts SET note = 'b'", XID: fmt.Sprint(uint64(1)<<32 + 751), Outcome: "committed"})
-	appendLine(t, path, rc)
 	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`); isErr || !strings.Contains(out, `"to_apply":2`) || fetched[len(fetched)-1] != 751 {
 		t.Fatalf("%v %s %v", isErr, out, fetched)
 	}
@@ -102,9 +101,8 @@ func TestUndoIsAnActionUnderTheLimits(t *testing.T) {
 	path = filepath.Join(t.TempDir(), "receipts.jsonl")
 	s = serverOn(t, &fakeDB{answers: undoAnswers}, path, func(c *Config) { c.RowLimit = 1 })
 	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
-	rc, _ := json.Marshal(Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+	appendReceipt(t, path, Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
 		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
-	appendLine(t, path, rc)
 	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-1"}`); !isErr || !strings.Contains(out, "it would change 2 rows, and one action may change at most 1") {
 		t.Fatalf("%v %s", isErr, out)
 	}
@@ -127,13 +125,13 @@ func TestLostCommitIsUnknownNotRolledBack(t *testing.T) {
 	if rc := receipts(t, path); len(rc) != 1 || rc[0].Outcome != "unknown" || rc[0].Cause != CauseUnknown {
 		t.Fatalf("receipt %+v", rc)
 	}
-	// Людям — тревога: отметка с причиной unknown, номером и строками, уже с
-	// нового соединения (P-258).
-	if last := db.log[len(db.log)-1]; !strings.Contains(last, "evidence.mark_refused(") || !strings.Contains(last, `"cause":"unknown"`) || !strings.Contains(last, `"xid":"751"`) {
-		t.Fatalf("no alert about the lost COMMIT: %q", last)
+	// Людям — тревога по квитанции исхода: причина unknown, номер и строки
+	// (P-258).
+	if o := outcomes(t, path); o[0]["cause"] != CauseUnknown || o[0]["xid"] != "751" || o[0]["outcome"] != "unknown" {
+		t.Fatalf("no alert about the lost COMMIT: %v", o[0])
 	}
 	// Такое действие могло зафиксироваться: откат его берёт, если хранилище
-	// знает транзакцию с его отметкой (в journalLine — отметка a-1).
+	// знает транзакцию, взятую по его намерению (в journalLine — a-1).
 	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
 	db.answers = undoAnswers
 	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`); isErr || !strings.Contains(out, `"to_apply":2`) {
@@ -227,7 +225,7 @@ func TestTornReceiptDoesNotHideTheNext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	s.cfg.Receipts, s.cfg.ReceiptsPath = f, path
+	gatewayOn(&s.cfg, path)
 	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 0 {
 		t.Fatal(rows, err)
 	}
@@ -318,9 +316,8 @@ func TestLostCommitOfAnUndoIsUnknown(t *testing.T) {
 	db := &fakeDB{answers: undoAnswers}
 	s := serverOn(t, db, path, func(c *Config) { c.WindowRows, c.Window = 3, time.Hour })
 	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
-	rc, _ := json.Marshal(Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+	appendReceipt(t, path, Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
 		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
-	appendLine(t, path, rc)
 	db.fail = map[string]error{"COMMIT": io.ErrUnexpectedEOF}
 	out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-1"}`)
 	if !isErr || !strings.Contains(out, "the undo may have been committed") {
@@ -330,8 +327,8 @@ func TestLostCommitOfAnUndoIsUnknown(t *testing.T) {
 	if last := got[len(got)-1]; last.Tool != "undo_apply" || last.Outcome != "unknown" || last.Rows != 2 {
 		t.Fatalf("receipt %+v", last)
 	}
-	if last := db.log[len(db.log)-1]; !strings.Contains(last, "evidence.mark_refused(") || !strings.Contains(last, `"cause":"unknown"`) {
-		t.Fatalf("no alert about the lost COMMIT of the undo: %q", last)
+	if o := outcomes(t, path); o[len(o)-1]["cause"] != CauseUnknown || o[len(o)-1]["tool"] != "undo_apply" {
+		t.Fatalf("no alert about the lost COMMIT of the undo: %v", o[len(o)-1])
 	}
 	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 2 {
 		t.Fatalf("the window counts %d rows: %v", rows, err)
@@ -355,16 +352,16 @@ func TestClientInfoIsCut(t *testing.T) {
 	s.Handle([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"sql":"UPDATE accounts SET note = 'x'"}}}`))
 	s.Handle([]byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"` + modernVersion + `","io.modelcontextprotocol/clientInfo":` + huge + `},"name":"execute","arguments":{"sql":"UPDATE accounts SET note = 'y'"}}}`))
 	n := 0
-	for _, q := range db.log {
-		if strings.Contains(q, "evidence.mark_action(") {
+	for _, r := range chain(t, s.cfg.ReceiptsPath) {
+		if r.Step == "intent" {
 			n++
-			if len(q) > 2000 {
-				t.Fatalf("the action marker is %d bytes", len(q))
-			}
+		}
+		if len(r.Body) > 2000 {
+			t.Fatalf("a receipt body of %d bytes", len(r.Body))
 		}
 	}
 	if n != 2 {
-		t.Fatalf("%d action markers", n)
+		t.Fatalf("%d intents", n)
 	}
 }
 
@@ -375,9 +372,8 @@ func TestUndoRowsWithoutStatistics(t *testing.T) {
 	db := &fakeDB{answers: undoAnswers, noStats: true}
 	s := serverOn(t, db, path, func(c *Config) { c.WindowRows, c.Window = 10, time.Hour })
 	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
-	rc, _ := json.Marshal(Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+	appendReceipt(t, path, Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
 		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
-	appendLine(t, path, rc)
 	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-1"}`); isErr {
 		t.Fatal(out)
 	}

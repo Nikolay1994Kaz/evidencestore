@@ -1,14 +1,14 @@
 package pgtap
 
-// ОТПЕЧАТКИ (DECISIONS, п. 41). С Config.All вход берёт все транзакции по
-// названным таблицам, а не только наблюдаемых ролей: запись чужой ролью
-// (петля dblink, чужая функция SECURITY DEFINER, украденный пароль владельца)
-// иначе не попала бы в хранилище вовсе (P-289). Полные строки «до» и «после»
-// нужны только для отката — то есть ролям агента, сервера и отката, и
-// транзакциям без отметки «кто» (триггер выключен, секция без него: такое
-// подозрительно и редко). Транзакция другой роли — людей, приложения — ложится
-// отпечатком: кто, xid, время, таблицы, ключи строк, вид изменения и хеши
-// старой и новой строки. Самих строк в нём нет, и откатить её из хранилища
+// ОТПЕЧАТКИ (DECISIONS, п. 41–42). Вход берёт все транзакции по названным
+// таблицам: запись в обход шлюза — петля dblink, чужая функция SECURITY
+// DEFINER, украденный пароль владельца — иначе не попала бы в хранилище вовсе
+// (P-289). Полные строки «до» и «после» нужны только для отката — то есть
+// действиям шлюза, у которых есть его подписанное намерение. Транзакция без
+// намерения — людей, приложения, кого угодно в обход шлюза — ложится
+// отпечатком: xid, время, таблицы, ключи строк, вид изменения и хеши старой и
+// новой строки. Чья она, отпечаток не говорит: роли в журнале нет, а из базы
+// «кто» больше не берётся. Самих строк в нём нет, и откатить её из хранилища
 // нельзя (pgundo отказывает: Kind = KindFingerprint).
 //
 // Отпечатки складываются пачкой — одна запись хранилища на много транзакций:
@@ -17,25 +17,24 @@ package pgtap
 // PartSize байт, перед первой полной транзакцией после неё и когда ей больше
 // PackWait (Tick, по умолчанию минута; у -once — в конце прохода, Flush). До
 // этого её транзакции базе не подтверждаются (Pending): упадёт сборщик — база
-// пришлёт их заново. Тревоги отпечатка (ловушка, массовое изменение, TRUNCATE)
-// поднимаются сразу, на его фиксации.
+// пришлёт их заново. Тревоги отпечатка (ловушка, массовое изменение, TRUNCATE,
+// not-via-gateway) поднимаются сразу, на его фиксации.
 //
 // Формат записи пачки — строка JSON:
 //
-//	{"xid":"pack","pack":3,"v":1,"gz":"<base64>"}
+//	{"xid":"pack","pack":3,"v":2,"gz":"<base64>"}
 //
 // Поле xid — PackSubject, не номер: хранилище ставит пачкам одну метку
 // субъекта, не совпадающую ни с одним xid. Без метки пачка в пакете по окну
 // времени была бы «записью без субъекта, может быть чьей угодно», и окно
-// перестало бы доказывать, что других записей транзакции агента нет. Пачка
-// транзакций агента не держит никогда: транзакция либо целиком, либо
-// отпечатком, с первой отметки или первого изменения. В gz — строки JSON, по
-// одной на транзакцию (fpEntry).
+// перестало бы доказывать, что других записей транзакции шлюза нет. Пачка
+// транзакций шлюза не держит никогда: транзакция либо целиком, либо
+// отпечатком, решено на её Begin. В gz — строки JSON, по одной на транзакцию
+// (fpEntry).
 //
-// Хеш строки — первые 16 байт SHA-256 от массива значений колонок в JSON, как
-// он стоит в полной записи (значения текстом, как их отдаёт PostgreSQL), в
-// base64 без выравнивания. По строке из базы или бэкапа его можно пересчитать
-// и сверить. Хеш строки с малым разнообразием значений подбирается перебором:
+// Хеш строки — первые 16 байт SHA-256 по колонкам подряд (hashRow), в base64
+// без выравнивания. По строке из базы или бэкапа его можно пересчитать и
+// сверить. Хеш строки с малым разнообразием значений подбирается перебором:
 // тела записей в хранилище зашифрованы, но получатель пакета хеши видит.
 
 import (
@@ -49,6 +48,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -84,14 +84,10 @@ type fpEntry struct {
 	CommitTime string            `json:"commit_time"`
 	CommitLSN  string            `json:"commit_lsn"`
 	EndLSN     string            `json:"end_lsn"`
-	Who        json.RawMessage   `json:"who,omitempty"`
 	Changes    int               `json:"changes"`
 	Tables     map[string]Counts `json:"tables,omitempty"`
 	Truncated  []string          `json:"truncated,omitempty"`
-	Forged     []json.RawMessage `json:"forged,omitempty"` // отметки без метки функций evidence
-	// MarksDropped — отметок сверх maxMarks: их нет нигде, кроме счёта.
-	MarksDropped int               `json:"markers_dropped,omitempty"`
-	Rows         []json.RawMessage `json:"rows,omitempty"` // fpRow и строки T (TRUNCATE) по порядку журнала
+	Rows       []json.RawMessage `json:"rows,omitempty"` // fpRow и строки T (TRUNCATE) по порядку журнала
 
 	end uint64 // EndLSN числом
 }
@@ -173,7 +169,7 @@ func (t *Tap) fpChange(tx *txState, op byte, id uint32, oldKind byte, old, fresh
 	full := oldKind == 'O'
 	row := fpRow{T: string(op), R: rel.Namespace + "." + rel.Name, Partial: op != 'I' && !full}
 	if rel.Identity != 'f' {
-		t.alert(tx, "identity", fmt.Sprintf("%s is not REPLICA IDENTITY FULL: the fingerprint has no hash of the old row, and of the new one only when all its values are in the journal", row.R))
+		t.alert(tx, alert.KindIdentity, fmt.Sprintf("%s is not REPLICA IDENTITY FULL: the fingerprint has no hash of the old row, and of the new one only when all its values are in the journal", row.R))
 	}
 	for _, tuple := range [][]pgoutput.Value{old, fresh} {
 		if tuple != nil && len(tuple) != len(rel.Columns) {
@@ -306,7 +302,7 @@ func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err erro
 	e := fpEntry{
 		XID: tx.begin.XID, CommitTime: tx.begin.CommitTime.UTC().Format(time.RFC3339Nano),
 		CommitLSN: pgwire.LSN(tx.begin.FinalLSN).String(), EndLSN: pgwire.LSN(c.EndLSN).String(),
-		Who: tx.who, Changes: tx.changes, Tables: tx.tables, Truncated: tx.truncated, Forged: tx.forgedMarks, MarksDropped: tx.marksDropped, Rows: tx.rows, end: c.EndLSN,
+		Changes: tx.changes, Tables: tx.tables, Truncated: tx.truncated, Rows: tx.rows, end: c.EndLSN,
 	}
 	line, err := json.Marshal(e)
 	if err != nil {
@@ -338,12 +334,9 @@ func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err erro
 	p.last, p.end = tx.begin.FinalLSN, c.EndLSN
 	t.stats.Fingerprinted++
 	t.stats.FingerprintChanges += uint64(tx.changes)
-	// Тревоги — как у полной транзакции, кроме no-action: роль не из списков.
-	// Номеров записей в тревоге нет (пачка ещё не в буфере), и команды отката
-	// тоже: откатить отпечаток нельзя.
-	if t.cfg.AlertRows > 0 && tx.changes >= t.cfg.AlertRows {
-		t.alert(tx, "mass-change", fmt.Sprintf("%d row changes in one transaction (the threshold is %d) by a role outside the collector's lists: the store keeps only a fingerprint", tx.changes, t.cfg.AlertRows))
-	}
+	// Тревоги — как у полной транзакции. Номеров записей в тревоге нет (пачка
+	// ещё не в буфере), и команды отката тоже: откатить отпечаток нельзя.
+	t.closingAlerts(tx)
 	if err := t.flushAlerts(tx, &IndexEntry{Changes: tx.changes, Tables: tx.tables}); err != nil {
 		return 0, err
 	}
@@ -364,9 +357,9 @@ func (t *Tap) flushPack() (flushed uint64, err error) {
 	seq := t.sink.Next()
 	for _, e := range p.entries {
 		// Строка справочника отпечатка — только чтобы найти пачку и объяснить
-		// отказ отката: кто, когда, таблицы — в самой пачке, в хранилище.
+		// отказ отката: когда и таблицы — в самой пачке, в хранилище.
 		// Полная строка (~290 Б) была бы дороже отпечатка в пачке (замер 23.11).
-		line, err := json.Marshal(IndexEntry{XID: e.XID, Kind: KindFingerprint, FirstSeq: seq, LastSeq: seq, Changes: e.Changes, Who: whoRole(e.Who)})
+		line, err := json.Marshal(IndexEntry{XID: e.XID, Kind: KindFingerprint, FirstSeq: seq, LastSeq: seq, Changes: e.Changes})
 		if err != nil {
 			return 0, err
 		}
@@ -394,18 +387,6 @@ func (t *Tap) flushPack() (flushed uint64, err error) {
 	end := p.end
 	p.entries = p.entries[:0]
 	return end, nil
-}
-
-// whoRole — из отметки «кто» только роль: {"role":"..."}.
-func whoRole(who json.RawMessage) json.RawMessage {
-	var w struct {
-		Role string `json:"role"`
-	}
-	if json.Unmarshal(who, &w) != nil || w.Role == "" {
-		return nil
-	}
-	b, _ := json.Marshal(w)
-	return b
 }
 
 // isPack — тело записи — пачка отпечатков.

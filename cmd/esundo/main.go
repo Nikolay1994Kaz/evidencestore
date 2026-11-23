@@ -20,8 +20,14 @@
 //	esundo apply -config undo.json -plan undo-N.json -by WHO
 //
 // undo.json: {"dsn": "…", "index": "…/index.jsonl", "stamp": […], "proof": […],
-// "verify": […], "wait": "15s", "search_path": ["public"]} — подключение к базе
-// и раздел pgundo.Settings.
+// "verify": […], "wait": "15s", "search_path": ["public"], "receipts": "…",
+// "key": "…", "gateway": "esundo", "pg_source": "postgres"} — подключение к
+// базе, раздел pgundo.Settings и квитанции шлюза.
+//
+// Откат — тоже действие (DECISIONS, п. 42): до своих изменений esundo пишет в
+// файл квитанций намерение отката с номером его транзакции, подписанное
+// ключом key. По нему сборщик берёт откат целиком; без квитанции он лёг бы
+// отпечатком. Поэтому apply без настроек с receipts и key отказывает.
 //
 // Коды выхода: 0 — готово, 1 — ошибка вызова или базы, 2 — откат построить
 // нельзя (TRUNCATE, таблица без REPLICA IDENTITY FULL, транзакция не вся),
@@ -33,6 +39,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -44,7 +51,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/version"
@@ -79,6 +89,14 @@ type Config struct {
 	// "host=db user=owner dbname=shop sslmode=verify-full".
 	DSN string `json:"dsn"`
 	pgundo.Settings
+	// Receipts, Key — файл квитанций шлюза и ключ (PKCS#8 PEM): в него
+	// esundo пишет намерение каждого отката до его изменений. Gateway — имя
+	// цепочки (по умолчанию "esundo"); PGSource — источник базы в хранилище,
+	// как у esmcp (по умолчанию "postgres"). Ключ — в gateway_keys сборщика.
+	Receipts string `json:"receipts"`
+	Key      string `json:"key"`
+	Gateway  string `json:"gateway"`
+	PGSource string `json:"pg_source"`
 }
 
 func loadConfig(path string) *Config {
@@ -92,6 +110,20 @@ func loadConfig(path string) *Config {
 	}
 	if err := c.Validate(filepath.Dir(path)); err != nil {
 		fail(fmt.Errorf("%s: %w", path, err))
+	}
+	for _, f := range []*string{&c.Receipts, &c.Key} {
+		if *f != "" && !filepath.IsAbs(*f) {
+			*f = filepath.Join(filepath.Dir(path), *f)
+		}
+	}
+	if c.Gateway == "" {
+		c.Gateway = "esundo"
+	}
+	if !gateway.ValidName(c.Gateway) {
+		fail(fmt.Errorf("%s: gateway %q: 1 to %d letters, digits and . _ : -", path, c.Gateway, gateway.MaxGatewayName))
+	}
+	if c.PGSource == "" {
+		c.PGSource = "postgres"
 	}
 	return &c
 }
@@ -265,10 +297,15 @@ func apply(args []string) {
 		fmt.Println("nothing to apply: the check found no step to take")
 		return
 	}
+	if cfg == nil || cfg.Receipts == "" || cfg.Key == "" {
+		fail(errors.New("apply writes the undo's receipt before its changes (the collector takes the undo by it): give -config with receipts and key"))
+	}
+	key, err := gateway.LoadKey(cfg.Key)
+	fail(err)
 	db := dial(*dsn)
 	defer db.Close()
-	done, err := p.Apply(db, map[string]any{"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "by": *by, "reason": *reason,
-		"steps_applied": len(p.OK), "steps_total": len(p.Steps)})
+	action := "undo-" + strconv.FormatUint(uint64(p.XID), 10) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	done, err := p.Apply(db, undoIntent(cfg, key, p, action, *by, *reason))
 	fail(err)
 	fmt.Printf("undo applied: %d steps in transaction %s\n", done.Steps, done.XID)
 	if done.Order == pgundo.OrderKeys {
@@ -282,6 +319,28 @@ func apply(args []string) {
 	fmt.Println("  Triggers of these tables rewrote what the undo put back (the undo does not switch triggers off):")
 	for _, d := range done.Differ {
 		fmt.Printf("    %s.%s: %d rows\n", pgundo.Shown(d.Table), pgundo.Shown(d.Column), d.Rows)
+	}
+}
+
+// undoIntent — намерение отката: квитанция шагом undo со ссылкой на
+// транзакцию отката, подписанная ключом esundo, — в его файл квитанций до
+// изменений отката. По ней сборщик берёт откат целиком (п. 42). Если первая
+// попытка отменена и откат идёт в порядке внешних ключей, у второй транзакции
+// — своё намерение того же действия.
+func undoIntent(cfg *Config, key ed25519.PrivateKey, p *pgundo.Plan, action, by, reason string) pgundo.IntentFunc {
+	undoes := ""
+	if p.Action != nil {
+		undoes = p.Action.ID
+	}
+	return func(xid, xid8 string) error {
+		body, err := json.Marshal(map[string]any{"agent": by, "tool": "esundo", "reason": reason, "undoes": undoes,
+			"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "xid8": xid8, "steps": len(p.OK)})
+		if err != nil {
+			return err
+		}
+		_, err = gateway.Append(cfg.Receipts, key, cfg.Gateway, gateway.Draft{Action: action, Step: alert.StepUndo,
+			Refs: []gateway.Ref{{Source: cfg.PGSource, Subject: xid}}, Body: body})
+		return err
 	}
 }
 
@@ -311,49 +370,27 @@ func loadPlan(path string, cfg *Config) (*pgundo.Plan, error) {
 // агент не дописывает в этот вывод своих строк (P-251).
 func describe(w io.Writer, p *pgundo.Plan, records int) {
 	fmt.Fprintf(w, "transaction %d: %d store records, %d row changes\n", p.XID, records, p.Changes)
-	var who struct{ Role, App string }
-	if json.Unmarshal(p.Who, &who) == nil && who.Role != "" {
-		fmt.Fprintf(w, "  who: role %s, session %q\n", pgundo.Shown(who.Role), who.App)
-	}
-	if p.Undo != nil {
-		fmt.Fprintf(w, "  this is an undo transaction: %s\n", pgundo.Shown(string(p.Undo)))
-	}
-	for _, a := range p.Actions {
-		var m struct {
-			Info struct {
-				ActionID string `json:"action_id"`
-				Agent    string `json:"agent"`
-				Tool     string `json:"tool"`
-				Reason   string `json:"reason"`
-			} `json:"info"`
-		}
-		json.Unmarshal(a, &m)
-		// Всё в отметке — от агента: причина, имена, номер действия (P-251).
-		// Причина — в кавычках и не длиннее 300 знаков: пробелами агент
-		// переносил свой текст на отдельные строки терминала (T заход 2).
-		// Номер, агент и инструмент — тоже не длиннее (T заход 3): отметку
-		// кладёт и SQL агента (P-255).
+	if a := p.Action; a != nil {
+		// Всё в квитанции — от шлюза, но причина и имена — от агента (P-251):
+		// в кавычках и не длиннее 300 знаков, иначе пробелами агент переносил
+		// свой текст на отдельные строки терминала (T заход 2).
 		cut := func(s string, n int) string {
 			if r := []rune(s); len(r) > n {
 				return string(r[:n]) + "…"
 			}
 			return s
 		}
-		fmt.Fprintf(w, "  action %s: agent %s, tool %s, reason: %q\n", cut(pgundo.Shown(m.Info.ActionID), 60), cut(pgundo.Shown(m.Info.Agent), 60),
-			cut(pgundo.Shown(m.Info.Tool), 20), cut(m.Info.Reason, 300))
-	}
-	if p.Who != nil && len(p.Actions) == 0 {
-		fmt.Fprintln(w, "  no action marker: the transaction did not come through the MCP server")
-	}
-	// Отметки без метки функций evidence: их написали pg_logical_emit_message
-	// напрямую (или функции прежней версии). Ни «кто», ни действием они не
-	// считаются; здесь — чтобы оператор их видел (R2-4, заход 2).
-	for _, f := range p.Forged {
-		s := pgundo.Shown(string(f))
-		if r := []rune(s); len(r) > 300 {
-			s = string(r[:300]) + "…"
+		what := "action"
+		if a.Step == alert.StepUndo {
+			what = "undo"
 		}
-		fmt.Fprintf(w, "  FORGED marker (not written by the evidence functions, ignored): %s\n", s)
+		fmt.Fprintf(w, "  %s %s: gateway %s (receipt %d), agent %s, tool %s, reason: %q\n", what, cut(pgundo.Shown(a.ID), 60), cut(pgundo.Shown(a.Gateway), 60), a.Seq,
+			cut(pgundo.Shown(a.Agent), 60), cut(pgundo.Shown(a.Tool), 20), cut(a.Reason, 300))
+		if a.Undoes != "" {
+			fmt.Fprintf(w, "  it undoes action %s\n", cut(pgundo.Shown(a.Undoes), 60))
+		}
+	} else {
+		fmt.Fprintln(w, "  no gateway intent: the collector kept the transaction whole without the gateway's receipts")
 	}
 	var names []string
 	for n := range p.Counts {

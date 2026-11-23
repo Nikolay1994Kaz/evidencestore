@@ -155,10 +155,18 @@ func TestSignRefuses(t *testing.T) {
 	}
 	data, _ = os.ReadFile(file)
 
-	// Порванная последняя строка: дальше не подписывается.
+	// Порванная последняя строка (писавший умер посреди неё): она закрыта
+	// переводом строки и осталась поломанной строкой, цепочка — от квитанции
+	// до неё.
 	os.WriteFile(file, append(data, []byte(`{"v":1,"gateway":"gw"`)...), 0o640)
-	if code, _, errOut := call(t, `{"action":"p-1","step":"cart"}`, "sign", "-key", key, "-gateway", "gw", "-file", file); code == exitOK || !strings.Contains(errOut, "torn") {
+	if code, _, errOut := call(t, `{"action":"p-1","step":"cart"}`, "sign", "-key", key, "-gateway", "gw", "-file", file); code != exitOK || !strings.Contains(errOut, "torn") {
 		t.Fatalf("after a torn line: %d %s", code, errOut)
+	}
+	if code, out, _ := call(t, "", "verify", "-gateway-key", keyPub, "-file", file); code != exitInvalid || !strings.Contains(out, "6 receipts of 2 gateways, 3 not intact") || !strings.Contains(out, "line 5:") {
+		t.Fatalf("verify after a torn line: %d\n%s", code, out)
+	}
+	if after, _ := os.ReadFile(file); !bytes.HasPrefix(after, data) || !bytes.Contains(after, []byte(`{"v":1,"gateway":"gw"`+"\n")) {
+		t.Fatalf("the file after a torn line:\n%s", after[len(data):])
 	}
 }
 
