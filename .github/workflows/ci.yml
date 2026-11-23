@@ -48,6 +48,7 @@ jobs:
             dist/escollect-*
             dist/eswitness-*
             dist/esverify-*
+            dist/esreceipt-*
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}

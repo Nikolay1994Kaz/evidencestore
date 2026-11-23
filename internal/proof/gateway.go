@@ -13,7 +13,8 @@ import (
 
 // Улика из журнала гейтвея несёт второй лист — вердикт хранилища при приёме
 // (gateway.Verdict): открытые поля цепочки гейтвея (seq, hash, prev_hash) и
-// что сошлось. Лист ложится в цепь рядом с уликой и, как и она, остаётся
+// что сошлось. Так же — у квитанции шлюза (receipt/v1): у неё подписана
+// каждая строка, и контрольной точки нет. Лист ложится в цепь рядом с уликой и, как и она, остаётся
 // проверяемым после уничтожения ключа месяца.
 //
 // Пакет по такой улике доказывает больше обычного: тело — именно та запись
@@ -85,6 +86,11 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	}
 	add("the entry is intact in the gateway chain (checked by the store at intake)", err, fmt.Sprintf("seq %d, chaining %s", v.Seq, v.Link))
 
+	if sealed.ContentType == gateway.ReceiptContentType {
+		verifyReceipt(v, r, trust, add)
+		return
+	}
+
 	if r.BodyOpened {
 		e, err := gateway.ParseEntry(r.Body)
 		var h string
@@ -136,10 +142,43 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	}
 }
 
+// verifyReceipt — проверки квитанции шлюза сверх вердикта: тело — та самая
+// квитанция, она разбирается и без хранилища, и её подпись проверил кто-то:
+// сам проверяющий ключом шлюза или хранилище при приёме. Контрольной точки у
+// квитанции нет: подписана каждая строка.
+func verifyReceipt(v gateway.Verdict, r *Report, trust Trust, add func(string, error, string) bool) {
+	r.Receipt = true
+	if !r.BodyOpened {
+		return
+	}
+	rc, perr := gateway.ParseReceipt(r.Body)
+	var err error
+	switch {
+	case rc.Hash != v.Hash:
+		err = fmt.Errorf("body hash %s, verdict hash %s", short(rc.Hash), short(v.Hash))
+	case rc.Gateway != v.Writer || rc.Seq != v.Seq || rc.Prev != v.PrevHash:
+		err = fmt.Errorf("the receipt names gateway %q, seq %d, prev %s; the verdict %q, seq %d, prev %s", rc.Gateway, rc.Seq, short(rc.Prev), v.Writer, v.Seq, short(v.PrevHash))
+	}
+	add("the body is that very gateway receipt (hash recomputed)", err, short(v.Hash))
+	add("the gateway receipt is well-formed (parsed offline)", perr, fmt.Sprintf("gateway %s, seq %d", rc.Gateway, rc.Seq))
+	switch {
+	case trust.GatewayKey != nil:
+		r.GatewayKeyChecked = true
+		r.ReceiptSigned = add("the gateway receipt is signed with the pinned gateway key", rc.Verify(trust.GatewayKey), fmt.Sprintf("gateway %s, seq %d", rc.Gateway, rc.Seq))
+	case v.Signature == gateway.SigValid:
+		r.ReceiptSigned = true
+	default:
+		r.GatewayUnsigned = true
+	}
+}
+
 // gatewayNotes — пределы доказательства по улике гейтвея.
 func (r Report) gatewayNotes() []string {
 	if r.Gateway == nil {
 		return nil
+	}
+	if r.Receipt {
+		return r.receiptNotes()
 	}
 	var n []string
 	if r.Gateway.Link == gateway.LinkFirstSeen {
@@ -155,6 +194,29 @@ func (r Report) gatewayNotes() []string {
 	}
 	if r.GatewayCheckpoint != nil {
 		n = append(n, "the store checked at intake that the entry chains to the checkpoint (the hashes of the entries in between); those entries are not in the bundle")
+	}
+	return n
+}
+
+// receiptNotes — пределы доказательства по квитанции шлюза.
+func (r Report) receiptNotes() []string {
+	var n []string
+	switch r.Gateway.Link {
+	case gateway.LinkFirstSeen:
+		n = append(n, "the gateway's chain of receipts began before the first one the store received: the store never saw the receipts before it")
+	case gateway.LinkOK:
+		n = append(n, "the store checked at intake that the gateway receipt chains to the gateway's previous one (prev and seq); that one is not in this bundle, a bundle over the source shows the chain")
+	}
+	switch {
+	case !r.BodyOpened:
+		n = append(n, "the body is not opened, so the gateway receipt's own signature cannot be checked from this bundle: only the store's verdict at intake speaks for it")
+	case r.GatewayUnsigned:
+		n = append(n, "nobody checked the gateway receipt's signature: the store's verdict does not call it valid and you pinned no gateway key (esverify -gateway-key)")
+	case r.ReceiptSigned && !r.GatewayKeyChecked:
+		n = append(n, "the store checked the gateway receipt's signature at intake; pin the gateway key (esverify -gateway-key) to check it yourself")
+	}
+	if r.ReceiptSigned {
+		n = append(n, "the signature shows who wrote the gateway receipt, the holder of the gateway key, and that it is unchanged; it does not show that what the receipt says is true")
 	}
 	return n
 }

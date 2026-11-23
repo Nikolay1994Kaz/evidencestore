@@ -214,9 +214,9 @@ type Store struct {
 	// srcTail — последний лист улики каждого источника в порядке цепи: на него
 	// ссылается следующий лист источника, он же уходит в хвосты (п. 28).
 	srcTail map[string]srcTailRef
-	// gwSources — источники журнала гейтвея: заданы при старте и не
-	// меняются, читаются без замка. Их вид — в хвостах (tailKind).
-	gwSources map[string]bool
+	// gwSources — источники журнала гейтвея и их вид (content_type): заданы
+	// при старте и не меняются, читаются без замка. Вид — в хвостах (tailKind).
+	gwSources map[string]string
 	// preTailsHead — звено хвостов перед запросом, ещё не заверенное: метка,
 	// повторённая без новых листьев (TSA не ответила), берёт его же.
 	preTailsHead uint64
@@ -341,8 +341,9 @@ type sourceState struct {
 
 	pendingGaps []gap // найденные пропуски, ещё не записанные в цепь
 
-	// Журнал гейтвея (gateway.go); gw == nil — источник не гейтвей.
-	gw         *gateway.Tracker
+	// Журнал гейтвея (gateway.go): Pipelock или квитанции; gw == nil —
+	// записи источника при приёме не проверяются.
+	gw         gateway.Checker
 	gwMu       sync.Mutex    // пачки такого источника — по одной
 	gwVerified uint64        // последняя позиция с вердиктом в цепи
 	gwProblems atomic.Uint64 // записи с поломкой с момента запуска
@@ -589,11 +590,13 @@ func Open(cfg *config.Config, opt Options) (*Store, error) {
 			s.mono = func() time.Duration { return time.Since(start) }
 		}
 	}
-	s.gwSources = map[string]bool{}
+	s.gwSources = map[string]string{}
 	for _, src := range cfg.Sources {
 		st := &sourceState{cfg: src, known: true, inflight: map[uint64]bool{}, gw: newTracker(src)}
 		s.sources[src.Name] = st
-		s.gwSources[src.Name] = st.gw != nil
+		if st.gw != nil {
+			s.gwSources[src.Name] = src.ContentType
+		}
 	}
 	lock, err := lockDataDir(cfg.DataDir)
 	if err != nil {

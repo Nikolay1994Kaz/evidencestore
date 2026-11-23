@@ -382,8 +382,14 @@ type Report struct {
 	GatewayKeyChecked bool             // подпись точки проверена ключом проверяющего
 	// GatewayUnsigned — точка после записи в пакете есть, но её подпись не
 	// проверял никто: ключ гейтвея не закреплён ни в хранилище, ни у
-	// проверяющего. Такая точка запись не накрывает.
+	// проверяющего. Такая точка запись не накрывает. У квитанции — подпись
+	// самой квитанции не проверял никто.
 	GatewayUnsigned bool
+	// Receipt — запись — квитанция шлюза (receipt/v1); ReceiptSigned — её
+	// подпись проверена: проверяющим (GatewayKeyChecked) или хранилищем при
+	// приёме.
+	Receipt       bool
+	ReceiptSigned bool
 
 	// WitnessChecked — пакет сверялся с головами свидетеля (Trust.Witness);
 	// WitnessHead — голова свидетеля, которая закрепляет улику: первая
@@ -581,7 +587,7 @@ func Verify(b Bundle, trust Trust) Report {
 	switch {
 	case b.Gateway != nil:
 		verifyGateway(b.Gateway, sealed, &r, trust, linkAt, add)
-	case sealed.ContentType == gateway.ContentType:
+	case gateway.Verified(sealed.ContentType):
 		add("the gateway verdict describes this record", errors.New("the record comes from a gateway journal, but the bundle has no gateway part"), "")
 	}
 

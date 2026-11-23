@@ -209,16 +209,30 @@ type Source struct {
 	ExpectContact Duration `json:"expect_contact"`
 	// Disabled — источник выведен из работы: приём отклоняется.
 	Disabled bool `json:"disabled"`
-	// GatewayKey — открытый ключ гейтвея (Ed25519, 64 hex) для источника с
-	// content_type "pipelock/recorder": им при приёме проверяются подписи
-	// контрольных точек бортового журнала. Пусто — подписи не проверяются,
-	// сцепка и хэши — проверяются.
+	// GatewayKey — открытый ключ гейтвея (Ed25519, 64 hex). У источника с
+	// content_type "pipelock/recorder" им при приёме проверяются подписи
+	// контрольных точек бортового журнала; пусто — подписи не проверяются,
+	// сцепка и хэши — проверяются. У источника "receipt/v1" — подпись каждой
+	// квитанции, и ключ обязателен: квитанция без проверенной подписи ничего
+	// не доказывает.
 	GatewayKey string `json:"gateway_key"`
 }
 
 // GatewayContentType — строки бортового журнала Pipelock: такой источник
 // проверяется при приёме (пакет gateway).
 const GatewayContentType = "pipelock/recorder"
+
+// ReceiptContentType — общая квитанция шлюза (gateway.ReceiptContentType):
+// подпись и сцепка каждой строки проверяются при приёме.
+const ReceiptContentType = "receipt/v1"
+
+// ReceiptSubjectField — поле метки у источника квитанций: номер действия.
+// Других полей верхнего уровня, годных в субъекты, у квитанции нет.
+const ReceiptSubjectField = "action"
+
+// VerifiedContentType — записи этого вида проверяются при приёме, и у каждой
+// в цепи вердикт хранилища.
+func VerifiedContentType(ct string) bool { return ct == GatewayContentType || ct == ReceiptContentType }
 
 // MaxSourceName совпадает с evidence.MaxSourceLen.
 const MaxSourceName = 255
@@ -463,8 +477,16 @@ func (c *Config) Validate() error {
 			if b, err := hex.DecodeString(s.GatewayKey); err != nil || len(b) != 32 {
 				errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_key must be 64 hex characters (Ed25519 public key)", i, s.Name))
 			}
-			if s.ContentType != GatewayContentType {
-				errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_key is used only with content_type %q", i, s.Name, GatewayContentType))
+			if !VerifiedContentType(s.ContentType) {
+				errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_key is used only with content_type %q or %q", i, s.Name, GatewayContentType, ReceiptContentType))
+			}
+		}
+		if s.ContentType == ReceiptContentType {
+			if s.GatewayKey == "" {
+				errs = append(errs, fmt.Errorf("sources[%d] %s: content_type %q needs gateway_key: the store checks the signature of every receipt with it, and a receipt whose signature nobody checked proves nothing", i, s.Name, ReceiptContentType))
+			}
+			if s.SubjectField != "" && s.SubjectField != ReceiptSubjectField {
+				errs = append(errs, fmt.Errorf("sources[%d] %s: subject_field of content_type %q is %q (the receipt's action) or none", i, s.Name, ReceiptContentType, ReceiptSubjectField))
 			}
 		}
 		if s.RetentionMonths < 0 {

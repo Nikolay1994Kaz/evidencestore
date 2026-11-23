@@ -880,7 +880,7 @@ func windowRecords(records []WindowRecord, leaves []auditchain.Leaf, r *WindowRe
 		case l.UnixNano != sealed.ReceivedAt:
 			return fmt.Errorf("attached record %s/%d: the receive time does not match its leaf", sealed.Source, sealed.Seq)
 		}
-		if sealed.ContentType == gateway.ContentType {
+		if gateway.Verified(sealed.ContentType) {
 			r.GatewayRecords++
 		}
 		if len(rec.DEK) == 0 {
@@ -923,7 +923,7 @@ func (r WindowReport) Notes() []string {
 		}
 	}
 	if r.GatewayRecords > 0 {
-		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint signature) are in single-record bundles (evidencestore proof -source S -seq N)")
+		n = append(n, "gateway journal records: the gateway's own checks (entry hash, checkpoint or receipt signature) are in single-record and one-source bundles (evidencestore proof -source S -seq N, or -source S with -from and -to)")
 	}
 	if r.WitnessRefused != 0 {
 		n = append(n, fmt.Sprintf("a collector refused %d heads signed with the store key (in its checkpoints-conflict.jsonl): the store showed it a second history, or lost the end of its chain; ask its operator", r.WitnessRefused))

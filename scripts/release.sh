@@ -18,12 +18,15 @@ build() { # ос арх команда
 }
 
 for arch in amd64 arm64; do
-	for cmd in evidencestore escollect eswitness esverify; do
+	for cmd in evidencestore escollect eswitness esverify esreceipt; do
 		build linux "$arch" "$cmd"
 	done
 done
-build darwin amd64 esverify
-build darwin arm64 esverify
+# esverify — у аудитора, esreceipt — у шлюза: оба бывают не на Linux.
+for cmd in esverify esreceipt; do
+	build darwin amd64 "$cmd"
+	build darwin arm64 "$cmd"
+done
 build windows amd64 esverify
 
 # Бинарник из изменённого дерева помечен +dirty (vcs.modified): релиз

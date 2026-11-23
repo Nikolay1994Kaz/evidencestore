@@ -5,6 +5,9 @@
     python3 scripts/mutate.py keyring          # все мутации пакета
     python3 scripts/mutate.py keyring M1a M6   # только выбранные
 
+В наборе "run" (по желанию) — регулярное выражение go test -run: тогда
+идут только эти тесты пакетов набора.
+
 Мутация — точная замена строки; если строка не нашлась ровно один раз,
 скрипт падает: значит, код поменялся и мутацию надо обновить.
 Компиляционная ошибка мутанта засчитывается как «не собрался», а не как
@@ -31,9 +34,12 @@ def run(pkg, only):
     if left:
         sys.exit("в дереве остался мутант — сначала верни код:\n  " + "\n  ".join(left))
     spec = json.loads((SETS / f"{pkg}.json").read_text(encoding="utf-8"))
+    # "run" — только тесты, которые стерегут набор: пакет хранилища целиком
+    # идёт минуты, а мутанту квитанций нужны его тесты квитанций.
+    only_tests = ["-run", spec["run"]] if spec.get("run") else []
     # Без мутантов тесты обязаны быть зелёными: красный тест «ловит» любого
     # мутанта, и прогон врёт (так было 11.10 со снимком дерева посреди правки).
-    base = subprocess.run(["go", "test", "-race", "-count=1"] + spec["packages"],
+    base = subprocess.run(["go", "test", "-race", "-count=1"] + only_tests + spec["packages"],
                           cwd=ROOT, capture_output=True, text=True, timeout=600)
     if base.returncode != 0:
         fails = [l.strip() for l in (base.stdout + base.stderr).splitlines() if l.startswith("--- FAIL")]
@@ -63,7 +69,7 @@ def run(pkg, only):
                 print(f"НЕ СОБРАЛСЯ {name}")
                 continue
             try:
-                r = subprocess.run(["go", "test", "-race", "-count=1"] + spec["packages"],
+                r = subprocess.run(["go", "test", "-race", "-count=1"] + only_tests + spec["packages"],
                                    cwd=ROOT, capture_output=True, text=True, timeout=600)
             except subprocess.TimeoutExpired:
                 # Тесты не уложились в 10 минут: мутант их подвесил или

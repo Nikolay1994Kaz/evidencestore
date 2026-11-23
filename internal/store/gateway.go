@@ -10,9 +10,10 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
-// Журнал гейтвея (content_type pipelock/recorder). Каждая принятая строка
-// проверяется (gateway.Tracker): хэш записи, сцепка с предыдущей, подпись
-// контрольной точки. Вердикт ложится в цепь листом рядом с уликой, в порядке
+// Журнал гейтвея: бортовой журнал Pipelock (content_type pipelock/recorder)
+// или общая квитанция (receipt/v1). Каждая принятая строка проверяется
+// (gateway.Checker): у Pipelock — хэш записи, сцепка с предыдущей, подпись
+// контрольной точки; у квитанции — разбор, подпись самой строки и сцепка. Вердикт ложится в цепь листом рядом с уликой, в порядке
 // журнала улик, поэтому пачки такого источника принимаются по одной.
 // Проверка ничего не отвергает: битая или подменённая запись принимается
 // как пришла, а вердикт говорит, что с ней не так.
@@ -32,15 +33,17 @@ type gwItem struct {
 	body   []byte
 }
 
-func newTracker(src config.Source) *gateway.Tracker {
-	if src.ContentType != config.GatewayContentType {
+// newTracker — проверка записей источника при приёме; nil — не журнал
+// гейтвея.
+func newTracker(src config.Source) gateway.Checker {
+	if !config.VerifiedContentType(src.ContentType) {
 		return nil
 	}
 	var key ed25519.PublicKey
 	if src.GatewayKey != "" {
 		key, _ = gateway.ParseKey(src.GatewayKey) // проверен config.Validate
 	}
-	return gateway.NewTracker(key)
+	return gateway.NewChecker(src.ContentType, key)
 }
 
 // recordGateway проверяет записи и кладёт вердикты в цепь. Зовётся под
