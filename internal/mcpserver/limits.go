@@ -263,6 +263,11 @@ func (s *Server) guards() []string {
 type spent struct {
 	at   time.Time
 	rows int
+	// action и pending — намерение без исхода: действие было, а чем
+	// кончилось, квитанции нет (сервер убит между COMMIT и исходом, T-8).
+	// Оно в счёте с худшим случаем строк, пока исход его не заменит.
+	action  string
+	pending bool
 }
 
 // ledger — расход агента за последнее время по файлу квитанций. Файл читается
@@ -273,6 +278,7 @@ type ledger struct {
 	// только квитанции исхода — по одной на действие.
 	own     func(line []byte) (Receipt, string, bool)
 	keep    time.Duration // сколько помнить: самое длинное окно
+	worst   int           // строк у намерения без исхода: предел действия, без него — предел окна
 	primed  bool
 	off     int64
 	items   []spent
@@ -357,7 +363,7 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 		}
 		done += int64(len(line))
 		rc, step, ok := l.own(bytes.TrimRight(line, "\n"))
-		if !ok || step != alert.StepOutcome {
+		if !ok || (step != alert.StepOutcome && step != alert.StepIntent && step != alert.StepUndo) {
 			continue
 		}
 		at, perr := time.Parse(time.RFC3339Nano, rc.Time)
@@ -368,11 +374,38 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 			covered = true
 			continue
 		}
+		if step != alert.StepOutcome {
+			// Намерение: действие пошло в базу. Исхода может не быть никогда —
+			// тогда оно в счёте с худшим случаем (T-8, R2-4).
+			if rc.Agent == l.agent && (rc.Tool == "execute" || rc.Tool == "undo_apply") {
+				items = append(items, spent{at: at, rows: l.worst, action: rc.ActionID, pending: true})
+			}
+			continue
+		}
 		l.note(rc, at)
 		if it, ok := l.count(rc, at); ok {
-			items = append(items, it)
+			it.action = rc.ActionID
+			if !l.settle(items, it) && !l.settle(l.items, it) {
+				items = append(items, it)
+			}
+		} else {
+			// Не в счёт (отказ за частоту и подобное): и намерение его — нет.
+			l.settle(items, spent{at: at, action: rc.ActionID})
+			l.settle(l.items, spent{at: at, action: rc.ActionID})
 		}
 	}
+}
+
+// settle — исход it заменяет намерение того же действия в items, если оно
+// там есть.
+func (l *ledger) settle(items []spent, it spent) bool {
+	for i := len(items) - 1; i >= 0; i-- {
+		if items[i].pending && items[i].action == it.action {
+			items[i] = it
+			return true
+		}
+	}
+	return false
 }
 
 // count — идёт ли квитанция в счёт. Считаются действия этого агента — execute
@@ -402,11 +435,18 @@ func (l *ledger) note(rc Receipt, at time.Time) {
 
 // usage — сколько действий агент сделал за последнюю минуту, сколько строк
 // изменил за окно и когда об отказе за частоту последний раз ушла тревога.
-func (s *Server) usage(now time.Time) (actions, rows int, alerted time.Time, err error) {
+//
+// self — действие, которое сейчас идёт: его намерение уже в файле, а строки
+// считает тот, кто спрашивает; пусто — действие ещё не начато.
+func (s *Server) usage(now time.Time, self string) (actions, rows int, alerted time.Time, err error) {
 	var items []spent
 	if s.cfg.ReceiptsPath != "" {
 		if s.ledger == nil {
-			s.ledger = &ledger{path: s.cfg.ReceiptsPath, agent: s.cfg.Agent, own: s.own, keep: max(time.Minute, s.cfg.Window)}
+			worst := s.cfg.RowLimit
+			if worst == 0 {
+				worst = s.cfg.WindowRows
+			}
+			s.ledger = &ledger{path: s.cfg.ReceiptsPath, agent: s.cfg.Agent, own: s.own, keep: max(time.Minute, s.cfg.Window), worst: worst}
 		}
 		if err := s.ledger.refresh(now); err != nil {
 			return 0, 0, alerted, err
@@ -426,6 +466,9 @@ func (s *Server) usage(now time.Time) (actions, rows int, alerted time.Time, err
 		alerted = l.alerted
 	}
 	for _, it := range items {
+		if it.pending && self != "" && it.action == self {
+			continue
+		}
 		age := now.Sub(it.at)
 		if age <= time.Minute {
 			actions++

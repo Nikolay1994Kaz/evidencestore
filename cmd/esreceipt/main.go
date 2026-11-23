@@ -203,10 +203,22 @@ func sign(key ed25519.PrivateKey, name, path string, in io.Reader, warn io.Write
 		if a.Torn {
 			fmt.Fprintf(warn, "warning: the last line of %s was torn (its writer died in the middle of it): it is closed with a newline and stays there as a broken line, which the store names\n", path)
 		}
-		if a.Skipped > 0 {
+		switch {
+		case a.Claimed > 0 && a.Receipt.Seq == 1:
+			// Ни одной своей квитанции, а строки от его имени есть: не тот
+			// ключ или строки, дописанные без ключа. Отказ здесь превращал бы
+			// одну подложенную строку в остановку шлюза (R1-3).
+			fmt.Fprintf(warn, "warning: %d lines of %s claim gateway %q, and none is signed with this key: is it the gateway's key? A new chain is started; if the key is wrong, the store names every receipt it signs\n", a.Claimed, path, name)
+		case a.Skipped > 0:
 			// Чужая строка в файле шлюза — не повод его останавливать:
 			// хранилище назовёт её поломанной, а цепочка идёт мимо неё.
 			fmt.Fprintf(warn, "warning: the last %d lines of %s are not receipts of gateway %q signed with this key; the chain goes on from its last receipt before them\n", a.Skipped, path, name)
+		}
+		if a.Glued {
+			fmt.Fprintf(warn, "warning: the receipt was glued to bytes that someone wrote into %s without its lock: it is written once more on a line of its own\n", path)
+		}
+		if a.Stale > 0 {
+			fmt.Fprintf(warn, "warning: %d lines of %s are copies of earlier receipts of gateway %q or a second branch of its chain: someone who can write the file wrote them, and the chain does not go on from them\n", a.Stale, path, name)
 		}
 		n++
 	}
@@ -217,13 +229,26 @@ func sign(key ed25519.PrivateKey, name, path string, in io.Reader, warn io.Write
 // печатает каждую поломку и итог.
 func verify(key ed25519.PublicKey, in io.Reader, out io.Writer) (bool, error) {
 	tr := gateway.NewReceiptTracker(key)
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 64<<10), gateway.MaxReceiptLen+2)
+	br := bufio.NewReaderSize(in, 64<<10)
 	total, bad := 0, 0
 	gateways := map[string]bool{}
-	for sc.Scan() {
+	for {
+		line, long, err := readLine(br, gateway.MaxReceiptLen+2)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return false, err
+		}
 		total++
-		v := tr.Check(sc.Bytes())
+		if long {
+			// Строка длиннее любой квитанции — поломка, а не конец проверки
+			// (R1-3): её дописал не шлюз.
+			bad++
+			fmt.Fprintf(out, "line %d: longer than a receipt can be (%d bytes): not a receipt\n", total, gateway.MaxReceiptLen)
+			continue
+		}
+		v := tr.Check(line)
 		if v.Writer != "" {
 			gateways[v.Writer] = true
 		}
@@ -232,11 +257,33 @@ func verify(key ed25519.PublicKey, in io.Reader, out io.Writer) (bool, error) {
 			fmt.Fprintf(out, "line %d: gateway %q, seq %d, link %s, signature %s: %s\n", total, v.Writer, v.Seq, dash(v.Link), dash(v.Signature), v.Problem)
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return false, err
-	}
 	fmt.Fprintf(out, "%d receipts of %d gateways, %d not intact\n", total, len(gateways), bad)
 	return bad == 0, nil
+}
+
+// readLine — следующая строка без перевода строки; long — строка длиннее
+// max, её байты пропущены и не копятся. io.EOF — строк больше нет; обрывок
+// в конце без перевода строки — тоже строка.
+func readLine(br *bufio.Reader, max int) (line []byte, long bool, err error) {
+	var buf []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if !long {
+			buf = append(buf, chunk...)
+			if len(buf) > max {
+				buf, long = nil, true
+			}
+		}
+		switch {
+		case err == bufio.ErrBufferFull:
+			continue
+		case err == io.EOF && len(buf) == 0 && !long:
+			return nil, false, io.EOF
+		case err != nil && err != io.EOF:
+			return nil, false, err
+		}
+		return bytes.TrimSuffix(buf, []byte("\n")), long, nil
+	}
 }
 
 func dash(s string) string {

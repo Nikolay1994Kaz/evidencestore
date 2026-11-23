@@ -83,6 +83,13 @@ func fullyOpen(r SourceReport) string {
 		return fmt.Sprintf("%d records are under its label in %s, where no body of it is open: whose they are is not shown", r.SubjectUnbound, QuotedList(r.SubjectUnboundMonths))
 	case r.SubjectNoLabel > 0:
 		return fmt.Sprintf("the bundle names no label for %s, and its records there, if any, are not shown", QuotedList(r.SubjectNoLabelMonths))
+	case len(r.SubjectUnconfirmedMonths) > 0:
+		// Метку месяца связывает с субъектом только открытое тело этого
+		// месяца, а подписи на метках нет (P-75): кто держит пакет до
+		// проверяющего, может назвать для такого месяца любую метку и снять
+		// ключи его записей — и все открытые записи останутся «всеми» (R1-1).
+		return fmt.Sprintf("no body of it is open in %s, and only an open body of a month ties that month's label to it: its records there, if any, are not shown; "+
+			"ask for a window inside the months where the action has records", QuotedList(r.SubjectUnconfirmedMonths))
 	}
 	return ""
 }

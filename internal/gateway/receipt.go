@@ -111,6 +111,9 @@ func ParseReceipt(line []byte) (Receipt, error) {
 	if !utf8.Valid(line) {
 		return r, errors.New("receipt is not valid UTF-8")
 	}
+	if loneSurrogate(line) {
+		return r, errors.New(`receipt: a half of a surrogate pair is escaped alone (\ud800 without its pair): parsers read it differently`)
+	}
 	all, err := strictObject(line)
 	if err != nil {
 		return r, fmt.Errorf("receipt: %w", err)
@@ -200,6 +203,71 @@ func ParseReceipt(line []byte) (Receipt, error) {
 		r.Body = raw
 	}
 	return r, problem
+}
+
+// loneSurrogate — в строке JSON половина суррогатной пары экранирована одна
+// (\ud800 без пары): Go прочтёт её как U+FFFD, Python — как одиночный
+// суррогат, и одно подписанное тело читается двумя способами. Наверху, в refs
+// и approval таких строк нет (имена — ASCII), а body свободно (R1-4).
+func loneSurrogate(b []byte) bool {
+	in := false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if !in {
+			in = c == '"'
+			continue
+		}
+		switch c {
+		case '"':
+			in = false
+		case '\\':
+			if i+1 >= len(b) {
+				return false
+			}
+			if b[i+1] != 'u' {
+				i++
+				continue
+			}
+			v, ok := hex4(b, i+2)
+			switch {
+			case !ok:
+				return false // не JSON: скажет strictObject
+			case v >= 0xD800 && v <= 0xDBFF:
+				if i+11 >= len(b) || b[i+6] != '\\' || b[i+7] != 'u' {
+					return true
+				}
+				if lo, ok := hex4(b, i+8); !ok || lo < 0xDC00 || lo > 0xDFFF {
+					return true
+				}
+				i += 11
+			case v >= 0xDC00 && v <= 0xDFFF:
+				return true
+			default:
+				i += 5
+			}
+		}
+	}
+	return false
+}
+
+func hex4(b []byte, at int) (uint16, bool) {
+	if at+4 > len(b) {
+		return 0, false
+	}
+	var v uint16
+	for _, c := range b[at : at+4] {
+		switch {
+		case c >= '0' && c <= '9':
+			v = v<<4 | uint16(c-'0')
+		case c >= 'a' && c <= 'f':
+			v = v<<4 | uint16(c-'a'+10)
+		case c >= 'A' && c <= 'F':
+			v = v<<4 | uint16(c-'A'+10)
+		default:
+			return 0, false
+		}
+	}
+	return v, true
 }
 
 // Verify проверяет подпись квитанции ключом шлюза.
@@ -350,6 +418,9 @@ func isHash(s string) bool { return len(s) == 2*sha256.Size && isLowerHex(s) }
 type ReceiptTracker struct {
 	key  ed25519.PublicKey
 	last map[string]receiptLink // шлюз → последняя принятая квитанция
+	// genesis — шлюз → хэш начала его нынешней цепочки: копия этого начала —
+	// не новая цепочка, а повтор (LinkStale).
+	genesis map[string]string
 }
 
 type receiptLink struct {
@@ -360,7 +431,7 @@ type receiptLink struct {
 // NewReceiptTracker — key nil: подписи не проверяются (SigNoKey). Хранилище
 // так не делает: у источника квитанций gateway_key обязателен.
 func NewReceiptTracker(key ed25519.PublicKey) *ReceiptTracker {
-	return &ReceiptTracker{key: key, last: map[string]receiptLink{}}
+	return &ReceiptTracker{key: key, last: map[string]receiptLink{}, genesis: map[string]string{}}
 }
 
 // Check проверяет очередную квитанцию и двигает состояние её цепочки.
@@ -392,12 +463,29 @@ func (t *ReceiptTracker) Check(line []byte) Verdict {
 		// Состояние двигается и после поломки сцепки: одна выпавшая квитанция —
 		// одна поломка, а не каскад до конца цепочки. Но не после чужой
 		// подписи: такую строку написал не шлюз, в его цепочке её нет, и
-		// подделка не должна ломать следующую настоящую квитанцию.
-		if v.Signature != SigInvalid {
+		// подделка не должна ломать следующую настоящую квитанцию. И не после
+		// повтора (LinkStale): копию своей же прежней строки дописать может
+		// любой, кто пишет в файл, без ключа.
+		if MovesChain(v) {
 			t.last[r.Gateway] = receiptLink{hash: r.Hash, seq: r.Seq}
+			if r.Prev == Genesis {
+				t.genesis[r.Gateway] = r.Hash
+			}
 		}
 	}()
 	switch {
+	case seen && r.Prev != Genesis && r.Seq <= last.seq, seen && r.Prev == Genesis && r.Hash == t.genesis[r.Gateway]:
+		v.Link = LinkStale
+		if v.Problem == "" {
+			switch {
+			case r.Hash == last.hash:
+				v.Problem = fmt.Sprintf("a copy of the gateway's last receipt (seq %d): the chain goes on from that one", last.seq)
+			case r.Prev == Genesis:
+				v.Problem = fmt.Sprintf("a copy of the start of the gateway's chain, after its seq %d: the chain goes on from seq %d", last.seq, last.seq)
+			default:
+				v.Problem = fmt.Sprintf("seq %d after seq %d: a copy of an earlier receipt of this gateway, or a second branch of its chain; the chain goes on from seq %d", r.Seq, last.seq, last.seq)
+			}
+		}
 	case !seen && r.Prev == Genesis:
 		v.Link = LinkGenesis
 		if r.Seq != 1 && v.Problem == "" {
@@ -432,14 +520,17 @@ func linkProblem(r Receipt, last receiptLink) string {
 func (t *ReceiptTracker) Resume(v Verdict) {
 	if MovesChain(v) {
 		t.last[v.Writer] = receiptLink{hash: v.Hash, seq: v.Seq}
+		if v.PrevHash == Genesis {
+			t.genesis[v.Writer] = v.Hash
+		}
 	}
 }
 
 // MovesChain — квитанция с этим вердиктом стала последней в цепочке своего
-// шлюза: цепочка названа, и подпись не чужая. Так же считает проверка пакета
-// по источнику.
+// шлюза: цепочка названа, подпись не чужая, и это не повтор прежней
+// (LinkStale). Так же считает проверка пакета по источнику.
 func MovesChain(v Verdict) bool {
-	return v.Writer != "" && v.Seq != 0 && v.PrevHash != "" && v.Signature != SigInvalid
+	return v.Writer != "" && v.Seq != 0 && v.PrevHash != "" && v.Signature != SigInvalid && v.Link != LinkStale
 }
 
 // Signer ведёт цепочку квитанций одного шлюза и подписывает их.

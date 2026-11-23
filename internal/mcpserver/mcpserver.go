@@ -39,6 +39,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -147,7 +148,10 @@ type Receipt struct {
 	// одной, когда их больше одной.
 	SQL        string   `json:"sql"`
 	Statements []string `json:"statements,omitempty"`
-	Reason     string   `json:"reason,omitempty"`
+	// SQLSHA256 — у квитанции исхода, в которую текст SQL не поместился:
+	// его SHA-256, а текст — в намерении того же действия (R2-4).
+	SQLSHA256 string `json:"sql_sha256,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 	// XID — номер транзакции, 32 бита, как в журнале базы и хранилище;
 	// FullXID — он же с эпохой (xid8): различает номера, занятые заново.
 	XID     string `json:"xid,omitempty"`
@@ -576,8 +580,17 @@ func (s *Server) appended(a gateway.Appended) {
 	if a.Torn {
 		s.log.Warn("the last line of the receipts file was torn (a writer died in the middle of it): it is closed and stays as a broken line", "file", s.cfg.ReceiptsPath)
 	}
-	if a.Skipped > 0 {
+	switch {
+	case a.Claimed > 0 && a.Receipt.Seq == 1:
+		s.log.Warn("lines of the receipts file claim this gateway, and none is signed with its key: a wrong key, or lines written without it; a new chain is started", "file", s.cfg.ReceiptsPath, "lines", a.Claimed)
+	case a.Skipped > 0:
 		s.log.Warn("lines of the receipts file are not this gateway's receipts signed with its key: the chain goes on past them", "file", s.cfg.ReceiptsPath, "lines", a.Skipped)
+	}
+	if a.Stale > 0 {
+		s.log.Warn("lines of the receipts file are copies of this gateway's earlier receipts or a second branch of its chain: someone who can write the file wrote them; the chain does not go on from them", "file", s.cfg.ReceiptsPath, "lines", a.Stale)
+	}
+	if a.Glued {
+		s.log.Warn("the receipt was glued to bytes that someone wrote into the receipts file without its lock: it is written once more on a line of its own", "file", s.cfg.ReceiptsPath)
 	}
 }
 
@@ -709,7 +722,7 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 			fmt.Errorf("it would change %d rows, and one action may change at most %d: ask a person to undo it", ok, s.cfg.RowLimit))
 	}
 	if s.cfg.WindowRows > 0 {
-		_, before, _, err := s.usage(s.now())
+		_, before, _, err := s.usage(s.now(), rc.ActionID)
 		if err != nil {
 			return "", fmt.Errorf("the receipts journal could not be read, so the limit of %d rows in %s cannot be checked: %w", s.cfg.WindowRows, s.cfg.Window, err)
 		}
@@ -725,7 +738,7 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 				fmt.Errorf("it changed %d rows (with what triggers and cascades changed), and one action may change at most %d: ask a person to undo it", rows, s.cfg.RowLimit)}
 		}
 		if s.cfg.WindowRows > 0 {
-			_, before, _, err := s.usage(s.now())
+			_, before, _, err := s.usage(s.now(), rc.ActionID)
 			if err != nil {
 				return err
 			}
@@ -994,7 +1007,7 @@ func (s *Server) throttle(rc *Receipt) error {
 		return nil
 	}
 	now := s.now()
-	actions, _, alerted, err := s.usage(now)
+	actions, _, alerted, err := s.usage(now, "")
 	if err != nil {
 		// Не сосчитать — не пускать: предел, который молча не работает, хуже
 		// его отсутствия.
@@ -1113,7 +1126,7 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 					rows, s.cfg.RowLimit))
 		}
 		if s.cfg.WindowRows > 0 {
-			_, before, _, err := s.usage(s.now())
+			_, before, _, err := s.usage(s.now(), rc.ActionID)
 			if err != nil {
 				return fail(fmt.Errorf("the receipts journal could not be read, so the limit of %d rows in %s cannot be checked: %w", s.cfg.WindowRows, s.cfg.Window, err))
 			}
@@ -1302,7 +1315,33 @@ func (s *Server) keep(rc Receipt) error {
 	// Исход — отдельной квитанцией после действия: что было, видно по
 	// намерению и без неё (оборвался сервер между ними — исхода нет).
 	a, err := gateway.Append(s.cfg.ReceiptsPath, s.cfg.Key, s.cfg.Gateway, gateway.Draft{
-		Time: s.now(), Action: rc.ActionID, Step: alert.StepOutcome, Body: bodyOf(rc)})
+		Time: s.now(), Action: rc.ActionID, Step: alert.StepOutcome, Body: outcomeBody(rc)})
 	s.appended(a)
 	return err
 }
+
+// outcomeBody — тело квитанции исхода. Длину её задаёт агент (текст SQL,
+// ошибка базы с его значениями), а исход лечь должен: по нему тревога людям
+// и счёт пределов. Раньше агент подбирал длину так, что намерение влезало, а
+// исход — нет, и пределы и тревоги refused его действий не видели (R2-4).
+// Не влезает — текст SQL заменён его SHA-256 (целиком он в намерении), ошибка
+// укорочена.
+func outcomeBody(rc Receipt) json.RawMessage {
+	body := bodyOf(rc)
+	if len(body) <= gateway.MaxReceiptLen-outcomeEnvelope {
+		return body
+	}
+	sum := sha256.Sum256([]byte(rc.SQL))
+	rc.SQL, rc.Statements, rc.SQLSHA256 = "", nil, hex.EncodeToString(sum[:])
+	if r := []rune(rc.Error); len(r) > maxOutcomeError {
+		rc.Error = string(r[:maxOutcomeError]) + "…"
+	}
+	return bodyOf(rc)
+}
+
+// outcomeEnvelope — запас на поля квитанции вокруг тела; maxOutcomeError —
+// сколько знаков ошибки базы остаётся в укороченном исходе.
+const (
+	outcomeEnvelope = 4 << 10
+	maxOutcomeError = 2000
+)

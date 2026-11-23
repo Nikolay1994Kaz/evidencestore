@@ -287,8 +287,17 @@ func TestReceiptForgedInSubjectBundle(t *testing.T) {
 	if !r.Valid() || !slices.Equal(r.GatewayBroken, []uint64{3}) || r.Withheld() != 1 || !slices.Equal(bodySeqs(r.Bodies), []uint64{1, 4}) || r.ReceiptsSigned != 2 {
 		t.Fatalf("поломано %v, не вскрыто %d, тела %v, подписей %d:\n%s", r.GatewayBroken, r.Withheld(), bodySeqs(r.Bodies), r.ReceiptsSigned, r.Text())
 	}
-	if r.SubjectRecords != 3 || r.SubjectOpened != 2 || !strings.Contains(r.Text(), "gateway receipts 3 were found broken by the store at intake") {
+	if r.SubjectRecords != 2 || r.SubjectOpened != 2 || r.SubjectForged != 1 || !strings.Contains(r.Text(), "gateway receipts 3 were found broken by the store at intake") ||
+		!strings.Contains(r.Text(), `records 3 lie under the label of "p-1", and the store found at intake that they are not signed with the gateway key`) {
 		t.Fatalf("поломка не названа:\n%s", r.Text())
+	}
+	// Подделка под меткой действия — не квитанция шлюза: сделку по p-1 она не
+	// держит (R1-6). Раньше «2 of its 3 records in the window are open» —
+	// и действие, обе квитанции которого открыты и подписаны ключом шлюза,
+	// доказать было нельзя: номер действия видно в файле, строку дописать
+	// может любой, кто пишет в файл.
+	if d := proof.LinkDeal(r, nil); !d.Valid() {
+		t.Fatalf("сделка по p-1 не сводится из-за строки с чужой подписью:\n%s", d.Text())
 	}
 }
 

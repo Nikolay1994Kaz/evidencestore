@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,7 +200,7 @@ func TestForeignReceiptsAreNotOwn(t *testing.T) {
 	if list, _ := callText(t, s, "actions", `{}`); strings.Contains(list, "forged-1") {
 		t.Fatalf("a forged receipt is in the actions: %s", list)
 	}
-	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 3 {
+	if _, rows, _, err := s.usage(time.Now(), ""); err != nil || rows != 3 {
 		t.Fatalf("the window counts %d rows (a forged receipt of 49 must not count): %v", rows, err)
 	}
 	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"forged-1"}`); !isErr || !strings.Contains(out, "not in this server's receipts") {
@@ -208,5 +209,119 @@ func TestForeignReceiptsAreNotOwn(t *testing.T) {
 	// Своё действие после подделки — следующим звеном своей цепочки.
 	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'y' WHERE id = 1"}`); isErr {
 		t.Fatal(text)
+	}
+}
+
+// oversizedArgs — вызов execute: 100 команд, первая с длинным литералом.
+// Тело квитанции несёт текст дважды (sql и statements), а исход длиннее
+// намерения на теги ответов.
+func oversizedArgs(pad int) string {
+	stmts := []string{fmt.Sprintf(`"UPDATE accounts SET balance = 0 WHERE id = 0 AND '%s' <> ''"`, strings.Repeat("p", pad))}
+	for i := 1; i < 100; i++ {
+		stmts = append(stmts, fmt.Sprintf(`"UPDATE accounts SET balance = 0 WHERE id = %d"`, i))
+	}
+	return `{"statements":[` + strings.Join(stmts, ",") + `],"reason":"tidy"}`
+}
+
+// Агент подбирал длину текста так, что намерение ещё влезало в квитанцию, а
+// исход — уже нет: действие фиксировалось, исход не писался, и счёт пределов
+// (по исходам) и тревоги refused его действий не видели — 10 действий по 400
+// строк в минуту при пределах 3 в минуту и 1000 строк за 10 минут (R2-4).
+// Теперь исход ложится всегда: текст SQL в нём заменяется его SHA-256.
+func TestOversizedActionKeepsItsOutcome(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	stat := "400"
+	db := &fakeDB{answers: func(sql string) ([]pgwire.Result, bool) {
+		if strings.Contains(sql, "pg_stat_get_xact_tuples") && !strings.Contains(sql, "pg_current_xact_id") {
+			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
+		}
+		return nil, false
+	}}
+	// Подбор, как сделал бы агент: наибольшая длина, при которой действие идёт.
+	scratch := filepath.Join(t.TempDir(), "probe.jsonl")
+	runs := func(pad int) bool {
+		s := serverOn(t, db, scratch, nil)
+		s.now = func() time.Time { return now }
+		text, _ := callText(t, s, "execute", oversizedArgs(pad))
+		return !strings.Contains(text, "did not run")
+	}
+	lo, hi := 0, gateway.MaxReceiptLen
+	for lo < hi {
+		if mid := (lo + hi + 1) / 2; runs(mid) {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	limits := func(c *Config) {
+		c.RowLimit, c.WindowRows, c.Window, c.ActionsPerMinute = 500, 1000, 10*time.Minute, 3
+	}
+	commits := 0
+	for range 10 {
+		s := serverOn(t, db, path, limits)
+		s.now = func() time.Time { return now }
+		before := len(db.log)
+		callText(t, s, "execute", oversizedArgs(lo-50))
+		for _, q := range db.log[before:] {
+			if q == "COMMIT" {
+				commits++
+			}
+		}
+	}
+	if commits > 2 {
+		t.Fatalf("%d actions of 400 rows committed in one minute, past 3 a minute and 1000 rows in 10 minutes", commits)
+	}
+	hashed := 0
+	for _, o := range outcomes(t, path) {
+		if o["sql_sha256"] != nil && o["sql"] == "" {
+			hashed++
+		}
+	}
+	if hashed == 0 {
+		t.Fatal("no outcome carries the hash of the SQL in place of its text")
+	}
+	// Отказ пределом строк при той же длине — с квитанцией исхода: по ней
+	// сборщик поднимает тревогу.
+	stat = "3000"
+	s := serverOn(t, db, path, limits)
+	s.now = func() time.Time { return now.Add(time.Hour) }
+	text, _ := callText(t, s, "execute", oversizedArgs(lo-50))
+	refused := 0
+	for _, o := range outcomes(t, path) {
+		if o["outcome"] == "refused" && o["cause"] == CauseRowLimit {
+			refused++
+		}
+	}
+	if !strings.Contains(text, "refused") || refused != 1 {
+		t.Fatalf("over the row limit: %d refused outcomes; %.200s", refused, text)
+	}
+}
+
+// Сервер убит между COMMIT и квитанцией исхода: намерение в файле есть,
+// исхода нет, и зафиксированное в счёт пределов не шло — при окне 50 строк
+// прошло 80 (T-8). Теперь намерение без исхода — действие с худшим случаем
+// строк (предел действия); пришёл исход — в счёте его строки.
+func TestIntentWithoutOutcomeCountsAtWorst(t *testing.T) {
+	now := time.Now()
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s := serverOn(t, &fakeDB{}, path, func(c *Config) {
+		c.RowLimit, c.WindowRows, c.Window, c.ActionsPerMinute = 40, 50, 10*time.Minute, 30
+	})
+	rc := Receipt{ActionID: "a-1", Time: now.UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute", XID: "751", Outcome: OutcomePending}
+	if _, err := gateway.Append(path, testKey, "esmcp", gateway.Draft{Time: now, Action: "a-1", Step: alert.StepIntent, Body: bodyOf(rc)}); err != nil {
+		t.Fatal(err)
+	}
+	if actions, rows, _, err := s.usage(now, ""); err != nil || actions != 1 || rows != 40 {
+		t.Fatalf("an intent without an outcome: %d actions, %d rows, %v", actions, rows, err)
+	}
+	// Идущее сейчас действие свои строки считает само.
+	if _, rows, _, _ := s.usage(now, "a-1"); rows != 0 {
+		t.Fatalf("the action's own intent is counted: %d rows", rows)
+	}
+	rc.Outcome, rc.Rows = "committed", 7
+	appendReceipt(t, path, rc)
+	if actions, rows, _, err := s.usage(now, ""); err != nil || actions != 1 || rows != 7 {
+		t.Fatalf("after the outcome: %d actions, %d rows, %v", actions, rows, err)
 	}
 }

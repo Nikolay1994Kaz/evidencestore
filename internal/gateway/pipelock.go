@@ -229,6 +229,11 @@ const (
 	LinkOK        = "linked"     // prev_hash = hash предыдущей принятой записи
 	LinkFirstSeen = "first-seen" // цепочка началась не с нас: предыдущих записей мы не получали
 	LinkBroken    = "broken"     // prev_hash не совпал: записи пропали, переставлены или подменены
+	// LinkStale — квитанция с верной подписью, но не новее последней принятой
+	// её шлюза: копия прежней строки или вторая ветвь цепочки. Цепочку она не
+	// двигает (R1-2): иначе копия, дописанная без ключа, ломала бы следующую
+	// настоящую квитанцию.
+	LinkStale = "stale"
 )
 
 // Исходы подписи контрольной точки.
@@ -261,7 +266,7 @@ type Verdict struct {
 // Clean — запись цела: хэш сошёлся, сцепка не разорвана, подпись (если
 // это контрольная точка и ключ закреплён) верна.
 func (v Verdict) Clean() bool {
-	return v.Problem == "" && v.HashOK && v.Link != LinkBroken && v.Signature != SigInvalid
+	return v.Problem == "" && v.HashOK && v.Link != LinkBroken && v.Link != LinkStale && v.Signature != SigInvalid
 }
 
 // Namespace — цепочка, которой принадлежит запись (сессия и писатель).

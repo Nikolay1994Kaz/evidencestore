@@ -121,12 +121,16 @@ func TestSetupSQL(t *testing.T) {
 		`EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON %s FROM "agent_bot"', leaf);`,
 		// Откат — строки.
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON "public"."accounts", "sales"."orders" TO "undo_op";`,
-		// Прежние отметки сняты: схема с функциями, ключом и триггерами, их
-		// владелец; право писать в журнал возвращено, как было.
-		`DROP SCHEMA IF EXISTS evidence CASCADE;`,
-		`AND has_function_privilege('evidence_owner', p.oid, 'EXECUTE') LOOP`,
+		// Прежние отметки сняты: триггеры, функции, ключ и схема — то, чем
+		// владеет evidence_owner, и сама роль, когда на неё не ссылается ни одна
+		// база; право писать в журнал возвращено, как было. Схему целиком
+		// (CASCADE) — нет: в ней могут быть данные приложения (R2-5).
+		`AND has_function_privilege(o, p.oid, 'EXECUTE') LOOP`,
 		`EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO PUBLIC', f);`,
+		`EXECUTE format('DROP TRIGGER %I ON %s', t.tgname, t.rel);`,
+		`it stays, and the owner of the database owns it now`,
 		`EXECUTE format('DROP OWNED BY %I', 'evidence_owner');`,
+		`run this script there as well; the last one drops the role`,
 		// Роли агента и сервера — разрешённым перечнем: ни членств, ни владения;
 		// ролью сервера не может стать никто другой.
 		`SELECT format('%I is a member of %I', r.rolname, g.rolname)`,
@@ -170,7 +174,7 @@ func TestSetupSQL(t *testing.T) {
 		t.Error("the agent role is granted TRUNCATE")
 	}
 	// Из базы «кто» не берётся: ни триггеров, ни функций отметок, ни ключа.
-	for _, gone := range []string{"CREATE TRIGGER", "CREATE FUNCTION", "CREATE SCHEMA", "mark_", "marker_key", "CREATE ROLE \"evidence_owner\"", "ROW LEVEL SECURITY"} {
+	for _, gone := range []string{"CREATE TRIGGER", "CREATE FUNCTION", "CREATE SCHEMA", "mark_", "marker_key", "CREATE ROLE \"evidence_owner\"", "ROW LEVEL SECURITY", "DROP SCHEMA IF EXISTS evidence CASCADE"} {
 		if strings.Contains(sql, gone) {
 			t.Errorf("the script still has %s", gone)
 		}
@@ -179,7 +183,7 @@ func TestSetupSQL(t *testing.T) {
 		t.Error("the script is not one transaction")
 	}
 	// Проверка — раньше первого изменения базы.
-	if guard, first := strings.Index(sql, "RAISE EXCEPTION"), strings.Index(sql, "DROP SCHEMA"); guard < 0 || guard > first {
+	if guard, first := strings.Index(sql, "RAISE EXCEPTION"), strings.Index(sql, "DROP OWNED BY"); guard < 0 || first < 0 || guard > first {
 		t.Error("the refusal comes after the script has begun to change the database")
 	}
 }

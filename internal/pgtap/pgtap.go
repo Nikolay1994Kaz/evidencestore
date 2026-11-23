@@ -87,9 +87,10 @@ type Intent = alert.Action
 // Intents — намерения шлюза о транзакциях: pginput читает их из файла
 // квитанций шлюза и проверяет подпись.
 type Intents interface {
-	// Intent — намерение о транзакции xid, зафиксированной в commit;
-	// found == false — намерения нет: транзакция не через шлюз.
-	Intent(xid uint32, commit time.Time) (in Intent, found bool, err error)
+	// Intent — намерение о транзакции xid, зафиксированной в commit на месте
+	// журнала final; found == false — намерения нет: транзакция не через
+	// шлюз.
+	Intent(xid uint32, commit time.Time, final uint64) (in Intent, found bool, err error)
 }
 
 // Config — настройки.
@@ -278,6 +279,10 @@ func (t *Tap) Stats() Stats { return t.stats }
 // буфере целиком (0 — ещё ни одной).
 func (t *Tap) Cursor() uint64 { return t.lastCommit }
 
+// Rewind — база ушла назад (pginput): её новые транзакции — с позициями не
+// выше прежнего места, и за повторы их больше не считать.
+func (t *Tap) Rewind(cursor uint64) { t.lastCommit = cursor }
+
 // InTransaction — между Begin и Commit: подтверждать серверу позицию дальше
 // последнего Commit сейчас нельзя.
 func (t *Tap) InTransaction() bool { return t.tx != nil }
@@ -311,7 +316,7 @@ func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 			// Чья транзакция — решается здесь, до первого изменения: её
 			// намерение шлюз положил на диск раньше COMMIT, а поток отдаёт её
 			// только после COMMIT.
-			in, found, err := t.cfg.Intents.Intent(m.XID, m.CommitTime)
+			in, found, err := t.cfg.Intents.Intent(m.XID, m.CommitTime, m.FinalLSN)
 			if err != nil {
 				return 0, fmt.Errorf("pgtap: transaction %d: the gateway's intents: %w", m.XID, err)
 			}

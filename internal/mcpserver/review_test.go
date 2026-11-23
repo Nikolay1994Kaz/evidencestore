@@ -226,20 +226,20 @@ func TestTornReceiptDoesNotHideTheNext(t *testing.T) {
 	}
 	defer f.Close()
 	gatewayOn(&s.cfg, path)
-	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 0 {
+	if _, rows, _, err := s.usage(time.Now(), ""); err != nil || rows != 0 {
 		t.Fatal(rows, err)
 	}
 	torn, _ := json.Marshal(Receipt{ActionID: "a-torn", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute", Outcome: "committed", Rows: 5})
 	f.Write(torn[:len(torn)/2])
-	if _, _, _, err := s.usage(time.Now()); err != nil {
+	if _, _, _, err := s.usage(time.Now(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if out, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x'"}`); isErr {
 		t.Fatal(out)
 	}
 	fresh := serverOn(t, &fakeDB{}, path, func(c *Config) { c.WindowRows, c.Window = 50, 10*time.Minute })
-	_, running, _, err1 := s.usage(time.Now())
-	_, again, _, err2 := fresh.usage(time.Now())
+	_, running, _, err1 := s.usage(time.Now(), "")
+	_, again, _, err2 := fresh.usage(time.Now(), "")
 	if err1 != nil || err2 != nil || running != 40 || again != 40 {
 		t.Fatalf("after a torn line: the running session counts %d rows, a new one %d (want 40): %v %v", running, again, err1, err2)
 	}
@@ -330,7 +330,7 @@ func TestLostCommitOfAnUndoIsUnknown(t *testing.T) {
 	if o := outcomes(t, path); o[len(o)-1]["cause"] != CauseUnknown || o[len(o)-1]["tool"] != "undo_apply" {
 		t.Fatalf("no alert about the lost COMMIT of the undo: %v", o[len(o)-1])
 	}
-	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 2 {
+	if _, rows, _, err := s.usage(time.Now(), ""); err != nil || rows != 2 {
 		t.Fatalf("the window counts %d rows: %v", rows, err)
 	}
 }

@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
 // Пакет по сделке (DECISIONS, п. 42): квитанции действия a-1 называют
@@ -98,5 +100,92 @@ func TestDealBundle(t *testing.T) {
 	single := w.file(t, "one.json", []byte(`{"v":3,"evidence":""}`))
 	if code, _, errOut := w.run(t, single, "-linked", tx); code != exitUsage || !strings.Contains(errOut, "-linked are for a bundle over a window") {
 		t.Fatalf("код %d: %s", code, errOut)
+	}
+}
+
+// Сделка через границу месяцев (R1-1): действие a-1 идёт 23:55 31.10 → 00:05
+// 01.11 — намерение и часть 1 транзакции 754 в октябре, часть 2 и исход в
+// ноябре. Кто держит пакеты до проверяющего, заменяет в обоих метку ноября
+// выдуманной и снимает ключи записей ноября: подписи на метках нет (P-75), и
+// открытые записи октября оставались «всеми записями» — сделка проходила со
+// спрятанными исходом и частью транзакции. Теперь месяц окна, где не открыто
+// ни одно тело субъекта, — отказ.
+func TestDealRefusesAMonthWithoutAnOpenBody(t *testing.T) {
+	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{41}, ed25519.SeedSize))
+	pub := hex.EncodeToString(key.Public().(ed25519.PublicKey))
+	w := openWorldAt(t, []config.Source{
+		{Name: "agent-mcp", ContentType: config.ReceiptContentType, GatewayKey: pub, SubjectField: config.ReceiptSubjectField},
+		{Name: "pg-agent", ContentType: "pg/before-images-v1", SubjectField: "xid"},
+	}, time.Date(2026, 10, 31, 23, 50, 0, 0, time.UTC))
+	gw, _ := gateway.NewSigner(key, "esmcp", nil)
+	receipt := func(action, step string, refs ...gateway.Ref) string {
+		line, err := gw.Sign(gateway.Draft{Time: time.Date(2026, 10, 31, 23, 55, 0, 0, time.UTC), Action: action, Step: step, Refs: refs,
+			Body: json.RawMessage(`{"agent":"bot","outcome":"` + step + `"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(line)
+	}
+	w.line(t, "agent-mcp", 1, receipt("a-0", "intent", gateway.Ref{Source: "pg-agent", Subject: "700"}))
+	w.stamp(t)
+	w.advance(5 * time.Minute) // 23:55, октябрь
+	w.line(t, "agent-mcp", 2, receipt("a-1", "intent", gateway.Ref{Source: "pg-agent", Subject: "754"}))
+	w.line(t, "pg-agent", 1, `{"xid":754,"part":1,"last":false,"gz":""}`)
+	w.advance(10 * time.Minute) // 00:05, ноябрь
+	w.line(t, "pg-agent", 2, `{"xid":754,"part":2,"last":true,"gz":""}`)
+	w.line(t, "agent-mcp", 3, receipt("a-1", "outcome"))
+	w.advance(5 * time.Minute)
+	w.closeUp(t)
+	from, to := time.Date(2026, 10, 31, 23, 54, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 6, 0, 0, time.UTC)
+	receipts, err := w.s.ProofSubject("agent-mcp", "a-1", from, to, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := w.s.ProofSubject("pg-agent", "754", from, to, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := w.run(t, w.file(t, "receipts.json", receipts), "-linked", w.file(t, "tx.json", tx), "-gateway-key", pub)
+	if code != exitValid || !strings.Contains(out, "2 receipts open") || !strings.Contains(out, "linked bundle 1: 2 records, 2 open") {
+		t.Fatalf("the honest deal across midnight: exit %d\n%s\n%s", code, out, errOut)
+	}
+	hide := func(b proof.SourceBundle, scope string) proof.SourceBundle {
+		data, _ := json.Marshal(b)
+		var f proof.SourceBundle
+		if err := json.Unmarshal(data, &f); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for i, l := range f.Subject.Labels {
+			if l.Scope == scope {
+				f.Subject.Labels[i].Tag, found = []byte("0123456789abcdef"), true
+			}
+		}
+		if !found {
+			t.Fatalf("no label of %s in the bundle: %+v", scope, f.Subject.Labels)
+		}
+		for i := range f.Records {
+			if sealed, err := evidence.Unmarshal(f.Records[i].Evidence); len(f.Records[i].Evidence) > 0 && err == nil && sealed.Scope() == scope {
+				f.Records[i].DEK = nil
+			}
+		}
+		return f
+	}
+	for _, c := range []struct {
+		name         string
+		receipts, tx proof.SourceBundle
+		why          string
+	}{
+		{"the outcome receipt hidden", hide(receipts, "agent-mcp/2026-11"), tx, `the receipts of action "a-1": no body of it is open in "agent-mcp/2026-11"`},
+		{"part 2 of the transaction hidden", receipts, hide(tx, "pg-agent/2026-11"), `pg-agent "754" (linked bundle 1): no body of it is open in "pg-agent/2026-11"`},
+	} {
+		bodies := filepath.Join(w.dir, "bodies-"+strings.ReplaceAll(c.name, " ", "-"))
+		code, out, errOut := w.run(t, w.file(t, "r.json", c.receipts), "-linked", w.file(t, "t.json", c.tx), "-gateway-key", pub, "-bodies", bodies)
+		if code == exitValid || !strings.Contains(out, c.why) || !strings.Contains(out, "ask for a window inside the months where the action has records") {
+			t.Errorf("%s: exit %d, want a refusal naming %q\n%s\n%s", c.name, code, c.why, out, errOut)
+		}
+		if files, _ := os.ReadDir(bodies); len(files) != 0 {
+			t.Errorf("%s: the bodies of a deal that does not verify are written: %d files", c.name, len(files))
+		}
 	}
 }

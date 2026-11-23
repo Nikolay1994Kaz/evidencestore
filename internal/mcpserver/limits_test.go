@@ -370,7 +370,7 @@ func TestLedgerReadsOnlyWhatTheWindowNeeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := serverOn(t, &fakeDB{}, path, func(c *Config) { c.ActionsPerMinute, c.WindowRows, c.Window = 10, 1000, 10*time.Minute })
-	actions, rows, _, err := s.usage(now)
+	actions, rows, _, err := s.usage(now, "")
 	if err != nil || actions != 1 || rows != 100 {
 		t.Fatalf("usage: %d actions, %d rows, %v", actions, rows, err)
 	}
@@ -384,7 +384,7 @@ func TestLedgerReadsOnlyWhatTheWindowNeeds(t *testing.T) {
 	f.Write(buf.Bytes())
 	f.WriteString(`{"action_id":"torn","time":"` + now.Format(time.RFC3339Nano) + `","agent":"support-bot","tool":"exe`)
 	f.Close()
-	if actions, rows, _, _ := s.usage(now); actions != 2 || rows != 105 {
+	if actions, rows, _, _ := s.usage(now, ""); actions != 2 || rows != 105 {
 		t.Fatalf("after an append: %d actions, %d rows", actions, rows)
 	}
 	// Файл заменили коротким (ротация).
@@ -392,7 +392,7 @@ func TestLedgerReadsOnlyWhatTheWindowNeeds(t *testing.T) {
 	signer, _ = gateway.NewSigner(testKey, "esmcp", nil)
 	line(now, "support-bot", "committed", "", 7)
 	os.WriteFile(path, buf.Bytes(), 0o600)
-	if actions, rows, _, _ := s.usage(now.Add(time.Second)); actions != 1 || rows != 7 {
+	if actions, rows, _, _ := s.usage(now.Add(time.Second), ""); actions != 1 || rows != 7 {
 		t.Fatalf("after the file was replaced: %d actions, %d rows", actions, rows)
 	}
 }
@@ -426,7 +426,7 @@ func TestLedgerCountsAReceiptCaughtMidWrite(t *testing.T) {
 	}}
 	b := serverOn(t, db, path, func(c *Config) { c.WindowRows, c.Window = 50, 10*time.Minute })
 	b.now = func() time.Time { return now }
-	if _, rows, _, err := b.usage(now); err != nil || rows != 0 {
+	if _, rows, _, err := b.usage(now, ""); err != nil || rows != 0 {
 		t.Fatal(rows, err)
 	}
 	// Другой сеанс этого агента дописывает квитанцию о действии в 40 строк;
@@ -440,11 +440,11 @@ func TestLedgerCountsAReceiptCaughtMidWrite(t *testing.T) {
 	}
 	defer f.Close()
 	f.Write(line[:len(line)/2])
-	if _, rows, _, err := b.usage(now); err != nil || rows != 0 {
+	if _, rows, _, err := b.usage(now, ""); err != nil || rows != 0 {
 		t.Fatalf("half a receipt counted: %d rows, %v", rows, err)
 	}
 	f.Write(line[len(line)/2:])
-	if _, rows, _, err := b.usage(now); err != nil || rows != 40 {
+	if _, rows, _, err := b.usage(now, ""); err != nil || rows != 40 {
 		t.Fatalf("the receipt completed after a read: %d rows counted, want 40 (%v)", rows, err)
 	}
 	// И предел за окно держит: ещё 40 строк при пределе 50 — отказ.

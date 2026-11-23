@@ -206,11 +206,17 @@ type SourceReport struct {
 	// назвавший для такого месяца чужую или выдуманную метку, выглядит так же,
 	// как честный пакет без записей субъекта в этом месяце (P-75).
 	SubjectUnconfirmedMonths []string
+	// SubjectForged — записей под меткой субъекта, чью подпись хранилище при
+	// приёме признало не ключом шлюза (квитанции receipt/v1): их написал тот,
+	// у кого ключа нет, квитанциями действия они не считаются (R1-6).
+	SubjectForged     int
+	SubjectForgedSeqs []uint64
 	// GatewayRecords — записей журнала гейтвея (с вердиктом хранилища);
 	// GatewayBroken — номера тех, что хранилище при приёме признало
-	// поломанными.
+	// поломанными; GatewayForged — из них тех, чья подпись не шлюза.
 	GatewayRecords int
 	GatewayBroken  []uint64
+	GatewayForged  []uint64
 	// Receipts — источник квитанций шлюза (receipt/v1). ReceiptLinks —
 	// пар соседних квитанций одного шлюза, чью сцепку пакет проверил сам;
 	// ReceiptsOpened — открытых квитанций, сверенных с вердиктом;
@@ -617,6 +623,9 @@ func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Rec
 		if !verdict.Clean() {
 			seq, _ := strconv.ParseUint(l.Subject, 10, 64)
 			r.GatewayBroken = append(r.GatewayBroken, seq)
+			if verdict.Signature == gateway.SigInvalid {
+				r.GatewayForged = append(r.GatewayForged, seq)
+			}
 		}
 	}
 	return nil
@@ -648,12 +657,20 @@ func sourceReceipts(b SourceBundle, trust Trust, r *SourceReport) error {
 			continue // цепочку не назвать: хранилище её состояние не двигало
 		}
 		prev, seen := last[v.Writer]
-		// Как приём (gateway.MovesChain): строка с чужой подписью в цепочку
-		// шлюза не входит.
+		// Как приём (gateway.MovesChain): строка с чужой подписью и повтор
+		// прежней квитанции в цепочку шлюза не входят.
 		if gateway.MovesChain(v) {
 			last[v.Writer] = link{v.Hash, v.Seq}
 		}
 		if !seen {
+			continue
+		}
+		if v.Link == gateway.LinkStale {
+			// Повтор правдоподобен, только если он не новее последней
+			// квитанции шлюза в пакете; копию начала цепочки пакет не видит.
+			if v.PrevHash != gateway.Genesis && v.Seq > prev.seq {
+				return fmt.Errorf("record %s/%d: the store's verdict calls the receipt of gateway %s with seq %d a repeat of an earlier one, and it is newer than its seq %d in the bundle: the verdict is false", b.Source, seq, v.Writer, v.Seq, prev.seq)
+			}
 			continue
 		}
 		want := gateway.LinkBroken
@@ -884,6 +901,12 @@ func sourceSubject(b SourceBundle, r *SourceReport) error {
 		}
 		m := month(sealed.Scope())
 		switch {
+		case mine && r.Receipts && slices.Contains(r.GatewayForged, sealed.Seq):
+			// Строка с чужой подписью под меткой действия: метку хранилище
+			// ставит по телу, а тело пишет кто угодно. Квитанцией шлюза она не
+			// стала (P-329) и сделку не держит, но в отчёте названа.
+			r.SubjectForged++
+			r.SubjectForgedSeqs = append(r.SubjectForgedSeqs, sealed.Seq)
 		case mine:
 			m.records++
 			if len(rec.DEK) == 0 {
@@ -1049,6 +1072,13 @@ func (r SourceReport) Notes() []string {
 		}
 		if r.SubjectUnlabeled > 0 {
 			n = append(n, fmt.Sprintf("%d records received in the window carry no subject label: their lines named no subject, or they came before the source had subject_field, and they could be anyone's", r.SubjectUnlabeled))
+		}
+		if r.SubjectForged > 0 {
+			var seqs []string
+			for _, q := range r.SubjectForgedSeqs {
+				seqs = append(seqs, strconv.FormatUint(q, 10))
+			}
+			n = append(n, fmt.Sprintf("records %s lie under the label of %q, and the store found at intake that they are not signed with the gateway key: someone without the key wrote them; they are not counted as receipts of %q", strings.Join(seqs, ", "), r.Subject, r.Subject))
 		}
 		if r.SubjectOpened > 0 && len(r.SubjectUnconfirmedMonths) > 0 {
 			k1 := fmt.Sprintf("no body of %q is open in %s, and only an open body of a month ties that month's label to the subject: a bundle can name any label for such a month, so the subject's records there, if it has any, can be among the closed records, and nothing here shows that it has none there", r.Subject, QuotedList(r.SubjectUnconfirmedMonths))

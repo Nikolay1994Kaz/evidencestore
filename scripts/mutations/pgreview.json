@@ -1,0 +1,207 @@
+{
+ "packages": [
+  "./internal/proof/",
+  "./cmd/esverify/",
+  "./internal/gateway/",
+  "./cmd/esreceipt/",
+  "./internal/store/",
+  "./internal/pginput/",
+  "./internal/pgtap/",
+  "./internal/mcpserver/"
+ ],
+ "run": "^Test(Deal|LinkDeal|Receipt|Append|Sign|Intent|Stale|Voided|Truncated|Forged|Outcomes|LiveRestored|ReviewSlotMoved|LiveSetupSQL|LiveMigration|ReviewUpgrade|SetupSQL|Oversized|WindowRows|Ledger|ActionsPerMinute|LostCommit|TornReceipt|UndoIs|Execute)",
+ "mutations": [
+  {
+   "name": "V1 сделка не смотрит на месяцы без открытого тела",
+   "file": "internal/proof/deal.go",
+   "old": "\tcase len(r.SubjectUnconfirmedMonths) > 0:",
+   "new": "\tcase len(r.SubjectUnconfirmedMonths) > 99:"
+  },
+  {
+   "name": "V2 подделка под меткой действия в счёт",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase mine && r.Receipts && slices.Contains(r.GatewayForged, sealed.Seq):",
+   "new": "\t\tcase mine && r.Receipts && slices.Contains(r.GatewayForged, sealed.Seq) && false:"
+  },
+  {
+   "name": "V3 повтор квитанции не stale",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tcase seen && r.Prev != Genesis && r.Seq <= last.seq, seen && r.Prev == Genesis && r.Hash == t.genesis[r.Gateway]:",
+   "new": "\tcase seen && r.Prev != Genesis && r.Seq < 0, seen && r.Prev == Genesis && r.Hash == t.genesis[r.Gateway]:"
+  },
+  {
+   "name": "V4 копия начала цепочки не stale",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tcase seen && r.Prev != Genesis && r.Seq <= last.seq, seen && r.Prev == Genesis && r.Hash == t.genesis[r.Gateway]:",
+   "new": "\tcase seen && r.Prev != Genesis && r.Seq <= last.seq, seen && r.Prev == Genesis && r.Hash == \"\":"
+  },
+  {
+   "name": "V5 stale двигает цепочку",
+   "file": "internal/gateway/receipt.go",
+   "old": "v.Signature != SigInvalid && v.Link != LinkStale",
+   "new": "v.Signature != SigInvalid"
+  },
+  {
+   "name": "V6 пакет не сверяет stale с seq",
+   "file": "internal/proof/source.go",
+   "old": "\t\t\tif v.PrevHash != gateway.Genesis && v.Seq > prev.seq {",
+   "new": "\t\t\tif v.PrevHash != gateway.Genesis && v.Seq > prev.seq+1000 {"
+  },
+  {
+   "name": "V7 Append берёт копию прежней строки",
+   "file": "internal/gateway/journal.go",
+   "old": "\t\tcase c.cur == nil || (r.Seq == c.cur.seq+1 && r.Prev == c.cur.hash):",
+   "new": "\t\tcase c.cur == nil || r.Seq > 0:"
+  },
+  {
+   "name": "V8 без метки — последняя своя строка, не большая",
+   "file": "internal/gateway/journal.go",
+   "old": "\t\tcase r.Seq > c.cur.seq:",
+   "new": "\t\tcase r.Seq > c.cur.seq+1000000:"
+  },
+  {
+   "name": "V9 длинная строка останавливает Append",
+   "file": "internal/gateway/journal.go",
+   "old": "\t\t\tskipping, b.buf = true, nil",
+   "new": "\t\t\treturn nil, false, fmt.Errorf(\"gateway: a line is longer than a receipt can be\")"
+  },
+  {
+   "name": "V10 склеенная квитанция не пишется ещё раз",
+   "file": "internal/gateway/journal.go",
+   "old": "\t\tif glued {\n\t\t\tif _, err := f.Write(append([]byte{'\\n'}, out...)); err != nil {",
+   "new": "\t\tif glued && false {\n\t\t\tif _, err := f.Write(append([]byte{'\\n'}, out...)); err != nil {"
+  },
+  {
+   "name": "V11 после ротации — новая цепочка",
+   "file": "internal/gateway/journal.go",
+   "old": "\t\tif c.cur == nil && marked && h.Seq > 0 && h.Seq < MaxSeq-1 && isHash(h.Hash) {",
+   "new": "\t\tif c.cur == nil && marked && h.Seq > 0 && h.Seq < MaxSeq-1 && isHash(h.Hash) && false {"
+  },
+  {
+   "name": "V12 сборщик не идёт за путём",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif ino, ok := pathInode(rf.path); ok && ino != rf.inode {",
+   "new": "\tif ino, ok := pathInode(rf.path); ok && ino != rf.inode && false {"
+  },
+  {
+   "name": "V13 ушедший файл не дочитывается",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif rf.inode != 0 {\n\t\t\tif err := r.drainRotated(rf); err != nil {",
+   "new": "\t\tif rf.inode == 1 {\n\t\t\tif err := r.drainRotated(rf); err != nil {"
+  },
+  {
+   "name": "V14 строка без перевода — в память целиком",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\t\t\t\tif len(rf.partial) > 2*gateway.MaxReceiptLen {",
+   "new": "\t\t\t\t\tif len(rf.partial) > 1<<40 {"
+  },
+  {
+   "name": "V15 тревога на каждую строку без подписи",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif u.n == 0 {\n\t\treturn nil\n\t}\n\twhere := fmt.Sprintf(\"the line ending at byte %d\", u.first)",
+   "new": "\tif u.n == 0 {\n\t\treturn nil\n\t}\n\tfor i := 1; i < u.n; i++ {\n\t\tr.raise(alert.Event{})\n\t}\n\twhere := fmt.Sprintf(\"the line ending at byte %d\", u.first)"
+  },
+  {
+   "name": "V16 тревоги исходов по месту, не по seq",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tcase rc.Seq <= c.Alerted:\n",
+   "new": "\t\tcase rc.Seq <= c.Alerted && false:\n"
+  },
+  {
+   "name": "V17 снятые намерения снова в счёте",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif rc.Seq <= c.Void {",
+   "new": "\t\tif rc.Seq <= c.Void && false {"
+  },
+  {
+   "name": "V18 намерение решает много транзакций",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif final != 0 && at.spent != 0 && at.spent != final {",
+   "new": "\tif final != 0 && at.spent != 0 && at.spent != final && false {"
+  },
+  {
+   "name": "V19 потраченное не переживает перезапуск",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tin.spent = r.spent[in.in.Hash]",
+   "new": "\tin.spent = 0"
+  },
+  {
+   "name": "V20 эпоха номера не сверяется",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif at.xid8 != 0 && r.ref8 != 0 && at.xid8 != fullXID(r.ref8, xid) {",
+   "new": "\tif at.xid8 != 0 && r.ref8 != 0 && at.xid8 != fullXID(r.ref8, xid) && false {"
+  },
+  {
+   "name": "V21 давнее намерение затеняет свежее",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif !ok || !r.fits(at, xid, commit, final) {\n\t\tif err := r.poll(); err != nil {",
+   "new": "\tif !ok {\n\t\tif err := r.poll(); err != nil {"
+  },
+  {
+   "name": "V22 файл переписан на месте — не замечено",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif fi.Size() < rf.off || !r.sameTail(rf) {",
+   "new": "\tif fi.Size() < rf.off {"
+  },
+  {
+   "name": "V23 сдвинутый слот не замечен",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tcase exists && known.Slot == s.cfg.Slot && confirmed != 0 && at > confirmed:",
+   "new": "\tcase exists && known.Slot == s.cfg.Slot && confirmed != 0 && at > confirmed+1<<40:"
+  },
+  {
+   "name": "V24 позиция не пишется до подтверждения",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tif s.flushed > s.persisted {",
+   "new": "\tif s.flushed > s.persisted+1<<40 {"
+  },
+  {
+   "name": "V25 база ушла назад — не замечено",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tcase cursor != 0 && end < cursor:",
+   "new": "\tcase cursor != 0 && end+1<<40 < cursor:"
+  },
+  {
+   "name": "V26 после отката журнала — чтение с прежнего места",
+   "file": "internal/pginput/pginput.go",
+   "old": "\t\ts.tap.Rewind(uint64(slotAt))\n\t\tfrom = slotAt",
+   "new": "\t\tfrom = cursor + 1"
+  },
+  {
+   "name": "V27 исход без места не ложится",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\tif len(body) <= gateway.MaxReceiptLen-outcomeEnvelope {",
+   "new": "\tif len(body) <= gateway.MaxReceiptLen*1000 {"
+  },
+  {
+   "name": "V28 намерение без исхода не в счёте",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\t\tif rc.Agent == l.agent && (rc.Tool == \"execute\" || rc.Tool == \"undo_apply\") {",
+   "new": "\t\t\tif rc.Agent == l.agent && rc.Tool == \"none\" {"
+  },
+  {
+   "name": "V29 своё намерение в своём счёте",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\tif it.pending && self != \"\" && it.action == self {",
+   "new": "\t\tif it.pending && self == \"x\" && it.action == self {"
+  },
+  {
+   "name": "V30 -setup-sql снимает чужую схему",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tp(\"  EXECUTE format('DROP OWNED BY %%I', %s);\", lit(EvidenceOwner))",
+   "new": "\tp(\"  EXECUTE 'DROP SCHEMA IF EXISTS evidence CASCADE';\")\n\tp(\"  EXECUTE format('DROP OWNED BY %%I', %s);\", lit(EvidenceOwner))"
+  },
+  {
+   "name": "V31 роль снимается в первой же базе",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tp(\"      AND d.dbid <> 0 AND d.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database())) THEN\")",
+   "new": "\tp(\"      AND false) THEN\")"
+  },
+  {
+   "name": "V32 одиночная половина суррогата в body проходит",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tif loneSurrogate(line) {",
+   "new": "\tif loneSurrogate(line) && false {"
+  }
+ ]
+}

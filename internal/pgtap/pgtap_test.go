@@ -45,7 +45,7 @@ func undo(id string) testAction         { return testAction{"agent", id, alert.S
 // fakeIntents — намерения шлюза в памяти: xid → действие.
 type fakeIntents map[uint32]Intent
 
-func (f fakeIntents) Intent(xid uint32, _ time.Time) (Intent, bool, error) {
+func (f fakeIntents) Intent(xid uint32, _ time.Time, _ uint64) (Intent, bool, error) {
 	in, ok := f[xid]
 	return in, ok, nil
 }
@@ -325,7 +325,7 @@ func TestIntentsErrorStopsTheTransaction(t *testing.T) {
 
 type brokenIntents struct{}
 
-func (brokenIntents) Intent(uint32, time.Time) (Intent, bool, error) {
+func (brokenIntents) Intent(uint32, time.Time, uint64) (Intent, bool, error) {
 	return Intent{}, false, errors.New("receipts file unreadable")
 }
 

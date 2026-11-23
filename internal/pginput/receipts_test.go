@@ -1,6 +1,7 @@
 package pginput
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -101,23 +103,23 @@ func TestIntentsByXID(t *testing.T) {
 	now := time.Now()
 	rc := g.sign("esmcp.jsonl", intent("a-1", now, "751"))
 	g.sign("esmcp.jsonl", gateway.Draft{Time: now, Action: "a-2", Step: alert.StepIntent, Refs: []gateway.Ref{{Source: "billing", Subject: "752"}}})
-	in, ok, err := g.r.Intent(751, now)
+	in, ok, err := g.r.Intent(751, now, 0)
 	if err != nil || !ok || in.ID != "a-1" || in.Gateway != "esmcp" || in.Seq != 1 || in.Hash != rc.Hash || in.Agent != "bot" || in.Reason != "tidy" {
 		t.Fatalf("%+v %v %v", in, ok, err)
 	}
 	for _, xid := range []uint32{752, 753} {
-		if _, ok, err := g.r.Intent(xid, now); ok || err != nil {
+		if _, ok, err := g.r.Intent(xid, now, 0); ok || err != nil {
 			t.Fatalf("xid %d: found %v, %v", xid, ok, err)
 		}
 	}
 	g.sign("esmcp.jsonl", intent("a-3", now, "753"))
-	if in, ok, _ := g.r.Intent(753, now); !ok || in.ID != "a-3" {
+	if in, ok, _ := g.r.Intent(753, now, 0); !ok || in.ID != "a-3" {
 		t.Fatalf("an intent written after the open: %+v %v", in, ok)
 	}
 	// Откат — тоже намерение, шагом undo; что он возвращает — из тела.
 	g.sign("esmcp.jsonl", gateway.Draft{Time: now, Action: "u-1", Step: alert.StepUndo, Refs: []gateway.Ref{{Source: "postgres", Subject: "754"}},
 		Body: json.RawMessage(`{"undoes":"a-1"}`)})
-	if in, ok, _ := g.r.Intent(754, now); !ok || in.Step != alert.StepUndo || in.Undoes != "a-1" {
+	if in, ok, _ := g.r.Intent(754, now, 0); !ok || in.Step != alert.StepUndo || in.Undoes != "a-1" {
 		t.Fatalf("an undo: %+v %v", in, ok)
 	}
 	if g.kinds() != "" {
@@ -131,10 +133,10 @@ func TestIntentOfAnOldTransactionIsNotTaken(t *testing.T) {
 	g := newRig(t, "esmcp.jsonl")
 	at := time.Now().Add(-48 * time.Hour)
 	g.sign("esmcp.jsonl", intent("a-1", at, "751"))
-	if _, ok, _ := g.r.Intent(751, time.Now()); ok {
+	if _, ok, _ := g.r.Intent(751, time.Now(), 0); ok {
 		t.Fatal("an intent of two days ago decided a transaction committed now")
 	}
-	if _, ok, _ := g.r.Intent(751, at.Add(time.Minute)); !ok {
+	if _, ok, _ := g.r.Intent(751, at.Add(time.Minute), 0); !ok {
 		t.Fatal("the intent of its own transaction is not taken")
 	}
 }
@@ -156,7 +158,7 @@ func TestForgedReceiptDecidesNothing(t *testing.T) {
 	f, _ := os.OpenFile(g.cfg.Files[0], os.O_APPEND|os.O_WRONLY, 0)
 	f.Write(append(line, '\n'))
 	f.Close()
-	if _, ok, _ := g.r.Intent(999, now); ok {
+	if _, ok, _ := g.r.Intent(999, now, 0); ok {
 		t.Fatal("a forged intent decided a transaction")
 	}
 	if g.kinds() != alert.KindForgedReceipt || !strings.Contains(g.alerts[0].Signals[0].Detail, "esmcp.jsonl") {
@@ -169,7 +171,7 @@ func TestForgedReceiptDecidesNothing(t *testing.T) {
 	}
 	// Цепочка шлюза идёт мимо подделки: следующее намерение — его.
 	g.sign("esmcp.jsonl", intent("a-2", now, "752"))
-	if in, ok, _ := g.r.Intent(752, now); !ok || in.ID != "a-2" {
+	if in, ok, _ := g.r.Intent(752, now, 0); !ok || in.ID != "a-2" {
 		t.Fatalf("after a forgery: %+v %v", in, ok)
 	}
 }
@@ -235,10 +237,10 @@ func TestReceiptsOfSeveralGateways(t *testing.T) {
 	now := time.Now()
 	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
 	g.sign("esundo.jsonl", gateway.Draft{Time: now, Action: "undo-751", Step: alert.StepUndo, Refs: []gateway.Ref{{Source: "postgres", Subject: "760"}}})
-	if in, ok, _ := g.r.Intent(760, now); !ok || in.Gateway != "esundo" || in.Step != alert.StepUndo {
+	if in, ok, _ := g.r.Intent(760, now, 0); !ok || in.Gateway != "esundo" || in.Step != alert.StepUndo {
 		t.Fatalf("the undo: %+v %v", in, ok)
 	}
-	if in, ok, _ := g.r.Intent(751, now); !ok || in.Gateway != "esmcp" {
+	if in, ok, _ := g.r.Intent(751, now, 0); !ok || in.Gateway != "esmcp" {
 		t.Fatalf("the action: %+v %v", in, ok)
 	}
 	// Исходы обоих — тревоги, каждая один раз; место — у каждого файла своё.
@@ -271,12 +273,12 @@ func TestIntentsAreBounded(t *testing.T) {
 	if len(g.r.byXID) != 3 || len(g.r.order) != 3 {
 		t.Fatalf("%d intents in memory", len(g.r.byXID))
 	}
-	if _, ok, _ := g.r.Intent(5, now); !ok {
+	if _, ok, _ := g.r.Intent(5, now, 0); !ok {
 		t.Fatal("the last intent is gone")
 	}
 	g.sign("esmcp.jsonl", gateway.Draft{Time: now, Action: "a-long", Step: alert.StepIntent, Refs: []gateway.Ref{{Source: "postgres", Subject: "9"}},
 		Body: json.RawMessage(`{"reason":"` + strings.Repeat("я", 50000) + `"}`)})
-	if in, ok, _ := g.r.Intent(9, now); !ok || len([]rune(in.Reason)) > maxReason+1 {
+	if in, ok, _ := g.r.Intent(9, now, 0); !ok || len([]rune(in.Reason)) > maxReason+1 {
 		t.Fatalf("a reason of %d characters in memory", len([]rune(in.Reason)))
 	}
 }
@@ -285,11 +287,285 @@ func TestIntentsAreBounded(t *testing.T) {
 // читается.
 func TestReceiptsFileThatIsNotThereYet(t *testing.T) {
 	g := newRig(t, "esmcp.jsonl")
-	if _, ok, err := g.r.Intent(1, time.Now()); ok || err != nil {
+	if _, ok, err := g.r.Intent(1, time.Now(), 0); ok || err != nil {
 		t.Fatalf("%v %v", ok, err)
 	}
 	g.sign("esmcp.jsonl", intent("a-1", time.Now(), "1"))
-	if _, ok, err := g.r.Intent(1, time.Now()); !ok || err != nil {
+	if _, ok, err := g.r.Intent(1, time.Now(), 0); !ok || err != nil {
 		t.Fatalf("%v %v", ok, err)
+	}
+}
+
+func (g *rig) raw(file string, data []byte) {
+	g.t.Helper()
+	f, err := os.OpenFile(filepath.Join(g.dir, file), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o640)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		g.t.Fatal(err)
+	}
+}
+
+func (g *rig) count(kind string) int {
+	n := 0
+	for _, e := range g.alerts {
+		for _, k := range e.Kinds() {
+			if k == kind {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// intent8 — намерение с номером транзакции и его эпохой (xid8), как пишут
+// esmcp и esundo.
+func intent8(action string, at time.Time, xid8 uint64) gateway.Draft {
+	d := intent(action, at, fmt.Sprint(uint32(xid8)))
+	d.Body = json.RawMessage(fmt.Sprintf(`{"agent":"bot","tool":"execute","reason":"tidy","xid8":"%d"}`, xid8))
+	return d
+}
+
+// Файл квитанций заменили на ходу — logrotate (create) или mv поверх:
+// шлюз пишет по пути в новый файл, а сборщик читал старый до перезапуска,
+// и каждое действие шлюза шло отпечатком, исходы — без тревог (R2-3, T-1).
+func TestReceiptsFileReplacedWhileRunning(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
+	if _, ok, _ := g.r.Intent(751, now, 0); !ok {
+		t.Fatal("the first intent")
+	}
+	// Ротация: старый файл — под другим именем, шлюз пишет в новый.
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	g.sign("esmcp.jsonl", intent("a-2", now, "752"))
+	g.sign("esmcp.jsonl", outcome("a-2", `{"outcome":"refused","cause":"row-limit","rows":9,"limit":1}`))
+	if in, ok, _ := g.r.Intent(752, now, 0); !ok || in.ID != "a-2" {
+		t.Fatalf("after a rotation: %+v %v", in, ok)
+	}
+	if g.count(alert.KindRefused) != 1 {
+		t.Fatalf("the refusal after a rotation: alerts %s", g.kinds())
+	}
+	// mv поверх: новый файл собран рядом и переименован на место.
+	tmp := path + ".new"
+	data, _ := os.ReadFile(path)
+	os.WriteFile(tmp, data, 0o640)
+	a, err := gateway.Append(tmp, g.keys[path], "esmcp", intent("a-3", now, "753"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	if in, ok, _ := g.r.Intent(753, now, 0); !ok || in.Hash != a.Receipt.Hash {
+		t.Fatalf("after a file was moved over: %+v %v", in, ok)
+	}
+	if g.count(alert.KindRefused) != 1 {
+		t.Fatalf("the refusal was raised again: alerts %s", g.kinds())
+	}
+}
+
+// Файл ротировали, пока сборщик стоял, а в старом остались непрочитанные
+// намерения: он дочитывается из того же каталога по inode.
+func TestReceiptsFileRotatedWhileDown(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
+	g.r.poll()
+	g.r.close()
+	g.sign("esmcp.jsonl", intent("a-2", now, "752")) // сборщик стоит
+	os.Rename(path, path+".1")
+	g.sign("esmcp.jsonl", intent("a-3", now, "753"))
+	g.open()
+	for xid, id := range map[uint32]string{751: "a-1", 752: "a-2", 753: "a-3"} {
+		if in, ok, _ := g.r.Intent(xid, now, 0); !ok || in.ID != id {
+			t.Errorf("xid %d: %+v %v", xid, in, ok)
+		}
+	}
+}
+
+// Кто пишет в файл без ключа, дописывает мусор: сборщик читал весь прирост
+// одним куском (дважды: буфер и копия) и падал на нехватке памяти, по кругу
+// при каждом перезапуске; на каждую строку мусора — своя тревога с fsync
+// (R2-6, T-2). Теперь — кусками, длинная строка пропускается, тревога одна.
+func TestReceiptsReadInBoundedMemory(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	g.raw("esmcp.jsonl", append(bytes.Repeat([]byte("x"), 48<<20), '\n'))
+	g.raw("esmcp.jsonl", []byte(strings.Repeat("{\"v\":1}\n", 2000)))
+	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if in, ok, err := g.r.Intent(751, now, 0); !ok || err != nil || in.ID != "a-1" {
+		t.Fatalf("the intent after the garbage: %+v %v %v", in, ok, err)
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 16<<20 {
+		t.Fatalf("the reader allocated %d MiB for 48 MiB of garbage", got>>20)
+	}
+	if g.count(alert.KindForgedReceipt) != 1 || !strings.Contains(g.alerts[0].Signals[0].Detail, "2001 lines ending at bytes") ||
+		!strings.Contains(g.alerts[0].Signals[0].Detail, "(1 of them longer than any receipt)") ||
+		!strings.Contains(g.alerts[0].Signals[0].Detail, "a gateway died in the middle of writing it, or someone without the key wrote it") {
+		t.Fatalf("alerts %s: %+v", g.kinds(), g.alerts)
+	}
+}
+
+// В памяти — давнее намерение о том же 32-битном xid: оно затеняло свежее,
+// уже лежащее на диске, и транзакция шлюза шла отпечатком (R2-9).
+func TestStaleIntentDoesNotShadowTheFreshOne(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	g.sign("esmcp.jsonl", intent("a-old", now.Add(-48*time.Hour), "751"))
+	g.r.poll()
+	g.sign("esmcp.jsonl", intent("a-new", now, "751"))
+	if in, ok, _ := g.r.Intent(751, now, 0); !ok || in.ID != "a-new" {
+		t.Fatalf("%+v %v", in, ok)
+	}
+}
+
+// Намерение с номером с эпохой (xid8) — только о своей транзакции: тот же
+// 32-битный номер другой эпохи (после оборота) — не его, и окно в сутки
+// этого не ловило (R2-1).
+func TestIntentsByFullXID(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	epoch1 := uint64(1) << 32
+	g.sign("esmcp.jsonl", intent8("a-1", now, epoch1+751))
+	g.r.setRef(epoch1 + 900) // база выдаст следующим номер эпохи 1
+	if in, ok, _ := g.r.Intent(751, now, 0); !ok || in.ID != "a-1" {
+		t.Fatalf("the intent of its own transaction: %+v %v", in, ok)
+	}
+	g.sign("esmcp.jsonl", intent8("a-2", now, epoch1+1000))
+	g.r.poll()
+	g.r.setRef(2*epoch1 + 2000) // оборот: номер 1000 занят заново в эпохе 2
+	if _, ok, _ := g.r.Intent(1000, now, 0); ok {
+		t.Fatal("the intent of epoch 1 was taken for a transaction of epoch 2")
+	}
+	if got := fullXID(2*epoch1+5, 4294967290); got != epoch1+4294967290 {
+		t.Fatalf("fullXID across an epoch: %d", got)
+	}
+}
+
+// База ушла назад (поднята из копии): намерения, дописанные до того, не в
+// счёт — их номера она выдаст снова чужим транзакциям (R2-1, T-7). Так же
+// после перезапуска сборщика и после того, как файл переписали на месте.
+func TestVoidedIntentsStayVoid(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
+	if err := g.r.void(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := g.r.Intent(751, now, 0); ok {
+		t.Fatal("a voided intent decided a transaction")
+	}
+	g.sign("esmcp.jsonl", intent("a-2", now, "752"))
+	check := func(when string) {
+		t.Helper()
+		if _, ok, _ := g.r.Intent(751, now, 0); ok {
+			t.Fatalf("%s: a voided intent decided a transaction", when)
+		}
+		if in, ok, _ := g.r.Intent(752, now, 0); !ok || in.ID != "a-2" {
+			t.Fatalf("%s: the intent after the void: %+v %v", when, in, ok)
+		}
+	}
+	check("now")
+	g.open()
+	check("after a restart")
+	data, _ := os.ReadFile(g.cfg.Files[0])
+	f, _ := os.OpenFile(g.cfg.Files[0], os.O_WRONLY|os.O_TRUNC, 0)
+	f.Write(data)
+	f.Close()
+	g.r.poll()
+	check("after the file was rewritten in place")
+}
+
+// Обрезка хвоста файла квитанций: читатель перечитывал файл с начала с
+// местом тревог 0 — каждый прежний отказ поднимал тревогу снова (T-6а);
+// намерение, дописанное шлюзом до того, как сборщик заметил обрезку,
+// читалось с середины, и транзакция шла отпечатком (T-6б).
+func TestTruncatedReceiptsFile(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	for i := range 3 {
+		g.sign("esmcp.jsonl", outcome(fmt.Sprintf("a-%d", i), `{"outcome":"refused","cause":"row-limit","rows":9,"limit":1}`))
+	}
+	g.r.poll()
+	if g.count(alert.KindRefused) != 3 {
+		t.Fatalf("alerts %s", g.kinds())
+	}
+	fi, _ := os.Stat(path)
+	os.Truncate(path, fi.Size()-20)
+	g.sign("esmcp.jsonl", intent("a-d", now, "760")) // раньше, чем сборщик перечитал
+	if in, ok, _ := g.r.Intent(760, now, 0); !ok || in.ID != "a-d" {
+		t.Fatalf("the intent after the truncation: %+v %v", in, ok)
+	}
+	if g.count(alert.KindRefused) != 3 {
+		t.Fatalf("the old refusals were raised again: alerts %s", g.kinds())
+	}
+	// Состояние прежней версии (тревоги — по месту в файле): после
+	// обновления старые тревоги не повторяются.
+	os.WriteFile(filepath.Join(g.dir, ReceiptsState), []byte(fmt.Sprintf(`{"files":[{"file":%q,"inode":%d,"alerted":%d}]}`, path, inodeOfPath(t, path), fileSize(t, path))), 0o600)
+	g.alerts = nil
+	g.open()
+	os.Truncate(path, fileSize(t, path)-5)
+	g.sign("esmcp.jsonl", outcome("a-e", `{"outcome":"refused","cause":"row-limit","rows":9,"limit":1}`))
+	g.r.poll()
+	if g.count(alert.KindRefused) != 1 {
+		t.Fatalf("after an upgrade and a truncation: alerts %s", g.kinds())
+	}
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
+func inodeOfPath(t *testing.T, path string) uint64 {
+	ino, ok := pathInode(path)
+	if !ok {
+		t.Fatal("no file")
+	}
+	return ino
+}
+
+// Намерение решает одну транзакцию: другая с тем же номером и другим местом
+// фиксации — не его (база поднята из копии и выдала номер снова, R2-1);
+// повтор той же транзакции (сервер шлёт её снова после обрыва) — его. И после
+// перезапуска сборщика.
+func TestIntentDecidesOneTransaction(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
+	if _, ok, _ := g.r.Intent(751, now, 0x1000); !ok {
+		t.Fatal("the transaction of the intent")
+	}
+	if _, ok, _ := g.r.Intent(751, now, 0x1000); !ok {
+		t.Fatal("the same transaction sent again")
+	}
+	if _, ok, _ := g.r.Intent(751, now, 0x2000); ok {
+		t.Fatal("another transaction with the same number took the intent")
+	}
+	g.open()
+	if _, ok, _ := g.r.Intent(751, now, 0x2000); ok {
+		t.Fatal("after a restart, another transaction with the same number took the intent")
+	}
+	if _, ok, _ := g.r.Intent(751, now, 0x1000); !ok {
+		t.Fatal("after a restart, the same transaction sent again")
+	}
+	// Свежее намерение о том же номере — для своей транзакции.
+	g.sign("esmcp.jsonl", intent("a-2", now, "751"))
+	if in, ok, _ := g.r.Intent(751, now, 0x2000); !ok || in.ID != "a-2" {
+		t.Fatalf("a fresh intent for the number: %+v %v", in, ok)
 	}
 }

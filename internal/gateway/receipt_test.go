@@ -113,6 +113,8 @@ func TestReceiptRejectsMalformed(t *testing.T) {
 		"gateway with a space": strings.Replace(ok, `"gateway":"g"`, `"gateway":"g w"`, 1),
 		"gateway too long":     strings.Replace(ok, `"gateway":"g"`, `"gateway":"`+strings.Repeat("g", MaxGatewayName+1)+`"`, 1),
 		"lone surrogate":       strings.Replace(ok, `"gateway":"g"`, `"gateway":"\ud800"`, 1),
+		"lone half in body":    strings.Replace(ok, `"step":"s"`, `"step":"s","body":{"reason":"\ud800 x"}`, 1),
+		"lone low half":        strings.Replace(ok, `"step":"s"`, `"step":"s","body":{"reason":"\udfff"}`, 1),
 		"seq 0":                strings.Replace(ok, `"seq":1`, `"seq":0`, 1),
 		"seq 01":               strings.Replace(ok, `"seq":1`, `"seq":01`, 1),
 		"seq 1.0":              strings.Replace(ok, `"seq":1`, `"seq":1.0`, 1),
@@ -230,12 +232,20 @@ func TestReceiptTrackerLinks(t *testing.T) {
 	if v := tr.Check(lines[5]); v.Link != LinkOK || !v.Clean() {
 		t.Fatalf("after the break: %+v", v)
 	}
-	// Повтор уже принятой — поломка.
-	if v := tr.Check(lines[5]); v.Link != LinkBroken {
-		t.Fatalf("a replayed receipt: %+v", v)
+	// Повтор уже принятой — поломка, но цепочку он не двигает (R1-2): копию
+	// своей прежней строки дописать может любой, кто пишет в файл, без ключа,
+	// и раньше следующая настоящая квитанция выходила поломанной.
+	for i, want := range map[int]string{5: "a copy of the gateway's last receipt (seq 6)", 2: "seq 3 after seq 6", 0: "a copy of the start of the gateway's chain"} {
+		if v := tr.Check(lines[i]); v.Link != LinkStale || v.Clean() || v.Signature != SigValid || !strings.Contains(v.Problem, want) {
+			t.Fatalf("a replayed receipt %d: %+v", i+1, v)
+		}
+	}
+	seven := mustSign(t, s, Draft{Time: at.Add(7 * time.Second), Action: "act-c", Step: "intent"})
+	if v := tr.Check(seven); v.Link != LinkOK || !v.Clean() {
+		t.Fatalf("the next real receipt after the replays: %+v", v)
 	}
 	// prev верный, а seq перескочил: шлюз нумерует не по порядку — поломка.
-	last, _ := ParseReceipt(lines[5])
+	last, _ := ParseReceipt(seven)
 	jump := signRaw(key, `{"v":1,"gateway":"gw","seq":`+strconv.FormatUint(last.Seq+2, 10)+`,"prev":"`+last.Hash+`","time":"2026-11-23T12:00:00Z","action":"a","step":"s"}`)
 	if v := tr.Check(jump); v.Link != LinkBroken || v.Signature != SigValid || !strings.Contains(v.Problem, "follows seq") {
 		t.Fatalf("a seq that jumps: %+v", v)
@@ -403,5 +413,14 @@ func TestReceiptMutationsDoNotPanic(t *testing.T) {
 			// Тот же смысл в других байтах подписи не сохраняет: подпись — над B.
 			t.Fatalf("a changed line passes: %q (parsed %+v)", m, r)
 		}
+	}
+}
+
+// Пара суррогатов в body — один знак, как его ни экранируй: квитанция цела.
+func TestReceiptAcceptsASurrogatePairInBody(t *testing.T) {
+	key := receiptKey(t, 4)
+	line := signRaw(key, `{"v":1,"gateway":"g","seq":1,"prev":"genesis","time":"2026-11-23T12:00:00Z","action":"a-1","step":"s","body":{"reason":"😀 \\ud800 \"\\\""}}`)
+	if r, err := ParseReceipt(line); err != nil || r.Verify(key.Public().(ed25519.PublicKey)) != nil {
+		t.Fatalf("%v", err)
 	}
 }

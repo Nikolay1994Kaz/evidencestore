@@ -415,3 +415,50 @@ GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text
 		t.Fatalf("the owner's transaction after the upgrade: %+v", e)
 	}
 }
+
+// Роль с REPLICATION двигает слот, пока сборщик не подключён
+// (pg_replication_slot_advance): сервер не пришлёт транзакций между прежним
+// местом и новым, а сборщик просил поток с места слота — правки человека и
+// действие шлюза пропадали без следа, без пропуска и тревоги (T-3). Теперь
+// сборщик пишет на диск каждую позицию до того, как подтвердить её серверу,
+// и слот дальше записанного — пропуск и тревога gap.
+func TestReviewSlotMovedWhileAway(t *testing.T) {
+	r := newReviewRig(t)
+	r.exec(r.admin, "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rv_repl') THEN CREATE ROLE rv_repl LOGIN REPLICATION; END IF; END $$")
+	repl := r.dial("rv_repl")
+	owner, mcp := r.dial("rv_owner"), r.dial("rv_mcp")
+	s := r.open()
+	r.xact(owner, "UPDATE public.rv_acc SET note = 'before' WHERE id = 1")
+	if _, err := s.ReadAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	r.gw.act(mcp, "UPDATE public.rv_acc SET note = 'by the agent while the collector is away' WHERE id = 2")
+	r.xact(owner, "UPDATE public.rv_acc SET note = 'by a person while the collector is away' WHERE id = 3")
+	r.exec(repl, "SELECT pg_replication_slot_advance('rv_slot', pg_current_wal_lsn())")
+	s = r.open()
+	if _, err := s.ReadAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	gap := false
+	for _, ev := range r.alerts() {
+		for _, sig := range ev.Signals {
+			if sig.Kind == alert.KindGap && strings.Contains(sig.Detail, "was moved past where the collector had confirmed it") {
+				gap = true
+			}
+		}
+	}
+	if len(r.sink.gaps) != 1 || !strings.Contains(r.sink.gaps[0], "a role with REPLICATION advanced or re-created it") || !gap {
+		t.Fatalf("gaps %q, alerts %+v", r.sink.gaps, r.alerts())
+	}
+	// Дальше — как обычно: ни нового пропуска, ни тревоги.
+	s.Close()
+	r.xact(owner, "UPDATE public.rv_acc SET note = 'after' WHERE id = 4")
+	s = r.open()
+	if _, err := s.ReadAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.sink.gaps) != 1 {
+		t.Fatalf("a second gap: %q", r.sink.gaps)
+	}
+}

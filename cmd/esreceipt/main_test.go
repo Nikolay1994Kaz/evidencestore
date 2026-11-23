@@ -113,11 +113,10 @@ func TestSignRefuses(t *testing.T) {
 		args  []string
 		want  string
 	}{
-		"another key on the same chain": {`{"action":"p-1","step":"cart"}`, []string{"-key", other, "-gateway", "gw"}, "none is signed with this key"},
-		"unknown field":                 {`{"action":"p-1","step":"cart","purchase_id":"p-1"}`, []string{"-key", key, "-gateway", "gw"}, "unknown field"},
-		"no action":                     {`{"step":"cart"}`, []string{"-key", key, "-gateway", "gw"}, `"action"`},
-		"bad time":                      {`{"action":"p-1","step":"cart","time":"yesterday"}`, []string{"-key", key, "-gateway", "gw"}, "time"},
-		"two objects in a line":         {`{"action":"p-1","step":"cart"} {"action":"p-1","step":"pay"}`, []string{"-key", key, "-gateway", "gw"}, "one JSON object"},
+		"unknown field":         {`{"action":"p-1","step":"cart","purchase_id":"p-1"}`, []string{"-key", key, "-gateway", "gw"}, "unknown field"},
+		"no action":             {`{"step":"cart"}`, []string{"-key", key, "-gateway", "gw"}, `"action"`},
+		"bad time":              {`{"action":"p-1","step":"cart","time":"yesterday"}`, []string{"-key", key, "-gateway", "gw"}, "time"},
+		"two objects in a line": {`{"action":"p-1","step":"cart"} {"action":"p-1","step":"pay"}`, []string{"-key", key, "-gateway", "gw"}, "one JSON object"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code, _, errOut := call(t, c.stdin, append([]string{"sign", "-file", file}, c.args...)...)
@@ -167,6 +166,25 @@ func TestSignRefuses(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(file); !bytes.HasPrefix(after, data) || !bytes.Contains(after, []byte(`{"v":1,"gateway":"gw"`+"\n")) {
 		t.Fatalf("the file after a torn line:\n%s", after[len(data):])
+	}
+
+	// Другой ключ на той же цепочке — не отказ, а новая цепочка с
+	// предупреждением: отказ здесь давал любому, кто пишет в файл, остановить
+	// шлюз одной строкой от его имени (R1-3). Не тот ключ называют проверка и
+	// хранилище: подпись не та.
+	code, _, errOut = call(t, `{"action":"p-1","step":"cart"}`, "sign", "-key", other, "-gateway", "gw", "-file", file)
+	if code != exitOK || !strings.Contains(errOut, `claim gateway "gw", and none is signed with this key`) {
+		t.Fatalf("another key on the same chain: %d %s", code, errOut)
+	}
+	if code, out, _ := call(t, "", "verify", "-gateway-key", keyPub, "-file", file); code != exitInvalid || !strings.Contains(out, "7 receipts of 2 gateways, 4 not intact") || !strings.Contains(out, "line 7:") {
+		t.Fatalf("verify after another key: %d\n%s", code, out)
+	}
+	// Строка длиннее любой квитанции — поломка, а не конец проверки.
+	f, _ := os.OpenFile(file, os.O_APPEND|os.O_WRONLY, 0o640)
+	f.Write(append(bytes.Repeat([]byte("x"), 3<<20), '\n'))
+	f.Close()
+	if code, out, _ := call(t, "", "verify", "-gateway-key", keyPub, "-file", file); code != exitInvalid || !strings.Contains(out, "line 8: longer than a receipt can be") || !strings.Contains(out, "8 receipts of 2 gateways, 5 not intact") {
+		t.Fatalf("verify after a long line: %d\n%s", code, out)
 	}
 }
 
