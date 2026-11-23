@@ -212,23 +212,31 @@ func TestLive(t *testing.T) {
 		fmt.Sscan(*res[2].Rows[0][0], &xid)
 		return xid
 	}
-	// last — последняя запись буфера как транзакция: её xid и старое значение note.
+	// last — последняя запись буфера с транзакцией (не пачка отпечатков): её
+	// xid и старое значение note.
 	last := func() (uint32, string) {
 		t.Helper()
-		body := sink.bodies[len(sink.bodies)-1]
+		var body []byte
 		var head struct {
-			XID uint32 `json:"xid"`
+			XID any `json:"xid"`
 		}
-		if err := json.Unmarshal(body, &head); err != nil {
-			t.Fatal(err)
+		for i := len(sink.bodies) - 1; i >= 0; i-- {
+			body = sink.bodies[i]
+			if err := json.Unmarshal(body, &head); err != nil {
+				t.Fatal(err)
+			}
+			if head.XID != pgtap.PackSubject {
+				break
+			}
 		}
-		recs, err := pgtap.ReadTransaction(head.XID, [][]byte{body})
+		xid := uint32(head.XID.(float64))
+		recs, err := pgtap.ReadTransaction(xid, [][]byte{body})
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, r := range recs {
 			if r["t"] == "U" {
-				return head.XID, r["old"].([]any)[1].(string)
+				return xid, r["old"].([]any)[1].(string)
 			}
 		}
 		t.Fatalf("no update in %v", recs)
@@ -245,19 +253,34 @@ func TestLive(t *testing.T) {
 		}
 	}
 
-	// 1. Транзакция агента ложится в буфер; транзакция владельца — нет.
+	// 1. Транзакция агента ложится в буфер целиком; транзакция владельца —
+	// отпечатком в пачке: кто, ключ, хеши, без самих строк (DECISIONS, п. 41).
 	s := open()
 	readAll(s, 0) // первое подключение заводит слот: журнал копится с этого места
 	x1 := change(1, "one")
-	exec(admin, "UPDATE public.pgin_accounts SET note = 'owner' WHERE id = 2")
-	readAll(s, 1)
+	res, err := admin.Query("BEGIN; UPDATE public.pgin_accounts SET note = 'owner' WHERE id = 2; SELECT pg_current_xact_id()::text; COMMIT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var xo uint32
+	fmt.Sscan(*res[2].Rows[0][0], &xo)
+	readAll(s, 2)
 	if xid, old := last(); xid != x1 || old != "note 1" {
 		t.Fatalf("got transaction %d with old note %q", xid, old)
 	}
-	if e, found, err := pgtap.Lookup(filepath.Join(cfg.Dir, pgtap.IndexFile), x1); err != nil || !found || e.FirstSeq != 1 || e.LastSeq != 1 || !strings.Contains(string(e.Who), "pgin_agent") {
+	pack, err := pgtap.ReadPack(sink.bodies[len(sink.bodies)-1])
+	if err != nil || len(pack) != 1 || uint32(pack[0]["xid"].(float64)) != xo || !strings.Contains(fmt.Sprint(pack[0]["who"]), "postgres") ||
+		strings.Contains(string(sink.bodies[len(sink.bodies)-1]), "owner") {
+		t.Fatalf("the owner's transaction %d: %v %v", xo, pack, err)
+	}
+	index := filepath.Join(cfg.Dir, pgtap.IndexFile)
+	if e, found, err := pgtap.Lookup(index, x1); err != nil || !found || e.FirstSeq != 1 || e.LastSeq != 1 || !strings.Contains(string(e.Who), "pgin_agent") {
 		t.Fatalf("index: %+v %v %v", e, found, err)
 	}
-	if st := s.Stats(); st.Captured != 1 || st.Skipped < 1 {
+	if e, found, err := pgtap.Lookup(index, xo); err != nil || !found || e.Kind != pgtap.KindFingerprint || e.FirstSeq != 2 {
+		t.Fatalf("index of the owner's transaction: %+v %v %v", e, found, err)
+	}
+	if st := s.Stats(); st.Captured != 1 || st.Fingerprinted != 1 {
 		t.Fatalf("stats %+v", st)
 	}
 	// Агент пришёл мимо MCP-сервера (отметки действия нет): тревога дошла до
@@ -288,7 +311,7 @@ func TestLive(t *testing.T) {
 	exec(admin, "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'pgin_slot'")
 	x2 := change(1, "two")
 	deadline := time.Now().Add(15 * time.Second)
-	for len(sink.bodies) < 2 {
+	for len(sink.bodies) < 3 { // часть x1, пачка владельца, часть x2
 		if _, err := s.Read(); err != nil {
 			t.Fatal(err)
 		}
@@ -311,7 +334,7 @@ func TestLive(t *testing.T) {
 	x3 := change(1, "three")
 	s = open()
 	readAll(s, 1)
-	if xid, old := last(); xid != x3 || old != "two" || len(sink.bodies) != 3 {
+	if xid, old := last(); xid != x3 || old != "two" || len(sink.bodies) != 4 {
 		t.Fatalf("after the restart: transaction %d, old note %q, %d records", xid, old, len(sink.bodies))
 	}
 
@@ -371,7 +394,7 @@ func TestLive(t *testing.T) {
 	partSize = 64 << 10
 	s = open()
 	readAll(s, 0)
-	res, err := agent.Query("BEGIN; UPDATE public.pgin_accounts SET note = (SELECT string_agg(md5(random()::text || g), '') FROM generate_series(1, 30000) g); SELECT pg_current_xact_id()::text; COMMIT")
+	res, err = agent.Query("BEGIN; UPDATE public.pgin_accounts SET note = (SELECT string_agg(md5(random()::text || g), '') FROM generate_series(1, 30000) g); SELECT pg_current_xact_id()::text; COMMIT")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,16 +500,56 @@ func TestLive(t *testing.T) {
 	}
 	s.Close()
 
-	// Итог в буфере: 1, 2, 3, пропуск, 5, пропуск, 7.
+	// Итог в буфере: 1, пачка с транзакцией владельца, 2, 3, пропуск, 5, пропуск, 7.
 	var shape []string
 	for _, b := range sink.bodies {
-		if b == nil {
+		switch {
+		case b == nil:
 			shape = append(shape, "gap")
-		} else {
+		case bytes.HasPrefix(b, []byte(`{"xid":"pack",`)):
+			shape = append(shape, "pack")
+		default:
 			shape = append(shape, "tx")
 		}
 	}
-	if got := strings.Join(shape, " "); got != "tx tx tx gap tx gap tx" {
+	if got := strings.Join(shape, " "); got != "tx pack tx tx gap tx gap tx" {
 		t.Fatalf("spool: %s", got)
 	}
+
+	// 9. Постоянный сборщик держит пачку отпечатков в памяти, пока ей не станет
+	// PackWait (минута): при редких правках иначе каждая шла бы своей записью.
+	// Место базе за это время не подтверждается — ни концом прохода, ни по
+	// сообщению сервера «жив» (keepalive: оно приходит, пока база видит, что
+	// посланное ещё не подтверждено). Сборщик упал — база присылает
+	// транзакцию снова, отпечаток не потерян.
+	s = open()
+	readAll(s, 0)
+	n0 := len(sink.bodies)
+	walBefore := one("SELECT pg_current_wal_lsn()")
+	res, err = admin.Query("BEGIN; UPDATE public.pgin_accounts SET note = 'owner again' WHERE id = 2; SELECT pg_current_xact_id()::text; COMMIT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var xo2 uint32
+	fmt.Sscan(*res[2].Rows[0][0], &xo2)
+	for until := time.Now().Add(2 * time.Second); time.Now().Before(until); {
+		if _, err := s.Read(); err != nil {
+			t.Fatal(err)
+		}
+		s.Wait(ctx, 100*time.Millisecond)
+	}
+	if len(sink.bodies) != n0 || !s.tap.Pending() {
+		t.Fatalf("the pack went to the spool before PackWait: %d records (were %d)", len(sink.bodies), n0)
+	}
+	if one("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pgin_slot' AND confirmed_flush_lsn > '"+walBefore+"'") != "0" {
+		t.Fatal("the database was told the position past a fingerprint that is not in the spool")
+	}
+	s.Close() // «упал»: пачка в памяти пропала
+	s = open()
+	readAll(s, 1)
+	pack, err = pgtap.ReadPack(sink.bodies[len(sink.bodies)-1])
+	if err != nil || len(pack) != 1 || uint32(pack[0]["xid"].(float64)) != xo2 {
+		t.Fatalf("after the crash, the owner's transaction %d: %v %v", xo2, pack, err)
+	}
+	s.Close()
 }

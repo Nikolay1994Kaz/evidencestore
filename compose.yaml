@@ -1,0 +1,103 @@
+# Проба на одной машине: база PostgreSQL, хранилище, сборщик и MCP-сервер.
+#
+#   docker compose up -d                        всё, при первом запуске — сертификаты и пароли в ./state
+#   docker compose run --rm -T --no-deps esmcp  MCP-сервер для агента (stdio): эту команду даёт клиенту MCP
+#   docker compose exec store esundo check -config /state/store/undo.json -xid N
+#   docker compose exec store evidencestore status -config /state/store/store.json
+#
+# Начать заново: docker compose down -v && rm -rf ./state. Другая версия базы
+# (PG_VERSION=14 … 18) — тоже с начала: слот и справочник сборщика — от прежней.
+# Своя база вместо demo: DSN и "tables" в ./state/collector/collector.json,
+# ./state/mcp/mcp.json и ./state/store/undo.json, SQL настройки —
+# docker compose run --rm init escollect -config /state/collector/collector.json -setup-sql.
+name: evidencestore
+
+x-es: &es
+  image: evidencestore:local
+  build: .
+  pull_policy: build
+
+services:
+  # Первый запуск: сертификаты, ключ хранилища, настройки, пароли (deploy/docker/init.sh).
+  init:
+    <<: *es
+    user: "0"
+    command: ["es-init"]
+    volumes:
+      - ./state:/state
+
+  db:
+    image: postgres:${PG_VERSION:-17}
+    depends_on:
+      init: {condition: service_completed_successfully}
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_PASSWORD_FILE: /run/es/postgres-password
+      # Каталог базы — свой у каждой версии: у образа 18 он сменился, и
+      # кластер одной версии другая не откроет.
+      PGDATA: /var/lib/postgresql/pgdata-${PG_VERSION:-17}
+    # Логическая репликация — вход сборщика; предел журнала для слота: стоящий
+    # сборщик не заполнит диск базы (тревога slot-lag раньше).
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_slot_wal_keep_size=2GB"]
+    volumes:
+      - db:/var/lib/postgresql
+      - ./state/db:/run/es:ro
+      - ./deploy/docker/demo.sql:/docker-entrypoint-initdb.d/demo.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "shop"]
+      interval: 2s
+      retries: 30
+
+  # SQL настройки базы (escollect -setup-sql) — при каждом запуске: он повторяем.
+  db-setup:
+    image: postgres:${PG_VERSION:-17}
+    depends_on:
+      db: {condition: service_healthy}
+    entrypoint: ["sh", "-c", "PGPASSWORD=$$(cat /setup/postgres-password) PGOPTIONS='-c client_min_messages=warning' psql -q -v ON_ERROR_STOP=1 -h db -U postgres -d shop -f /setup/setup.sql"]
+    volumes:
+      - ./state/setup:/setup:ro
+
+  store:
+    <<: *es
+    depends_on:
+      init: {condition: service_completed_successfully}
+    command: ["es-store"]
+    # esundo check пишет план (undo-N.json) в текущий каталог: он — здесь.
+    working_dir: /state/store
+    restart: unless-stopped
+    volumes:
+      - ./state/store:/state/store
+      - ./state/pg-index:/state/pg-index:ro
+    healthcheck:
+      test: ["CMD", "evidencestore", "status", "-config", "/state/store/store.json"]
+      interval: 2s
+      retries: 30
+
+  collector:
+    <<: *es
+    depends_on:
+      store: {condition: service_healthy}
+      db-setup: {condition: service_completed_successfully}
+    command: ["escollect", "-config", "/state/collector/collector.json"]
+    restart: unless-stopped
+    volumes:
+      - ./state/collector:/state/collector
+      - ./state/pg-index:/state/pg-index
+      - ./state/receipts:/state/receipts:ro
+
+  # MCP-сервер запускает клиент MCP, по одному на сеанс:
+  # docker compose run --rm -T --no-deps esmcp (база и db-setup уже подняты up).
+  # Пароль роли сервера — в ./state/mcp: агенту он недоступен, только если
+  # агент не читает ./state (README опыта, «Как база узнаёт агента»).
+  esmcp:
+    <<: *es
+    profiles: ["mcp"]
+    pull_policy: never # образ собран при up: клиент MCP не ждёт сборки
+    command: ["esmcp", "-config", "/state/mcp/mcp.json"]
+    stdin_open: true
+    volumes:
+      - ./state/mcp:/state/mcp:ro
+      - ./state/receipts:/state/receipts
+
+volumes:
+  db:

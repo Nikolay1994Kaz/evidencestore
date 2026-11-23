@@ -99,6 +99,14 @@ type Config struct {
 	RequireAction bool
 	Canaries      []Canary
 	PartSize      int // 0 — 700 000
+	// All — брать все транзакции по таблицам публикации, а не только ролей
+	// Roles: транзакция другой роли ложится отпечатком в пачке (fingerprint.go),
+	// транзакция без отметки «кто» — целиком и с тревогой no-who.
+	All bool
+	// PackTx и PackWait — пачка отпечатков уходит в буфер, когда в ней
+	// столько транзакций или когда поток молчит столько (Tick); 0 — умолчания.
+	PackTx   int
+	PackWait time.Duration
 }
 
 // RelInfo — то, чего нет в сообщении Relation: имена типов и первичный ключ.
@@ -127,18 +135,22 @@ type Sink interface {
 // IndexEntry — строка index.jsonl: одна взятая транзакция и номера её записей
 // у источника в хранилище (части лежат подряд).
 type IndexEntry struct {
-	XID        uint32            `json:"xid"`
-	FirstSeq   uint64            `json:"first_seq"`
-	LastSeq    uint64            `json:"last_seq"`
-	Changes    int               `json:"changes"`
-	Tables     map[string]Counts `json:"tables,omitempty"`
-	Truncated  []string          `json:"truncated,omitempty"`
-	Who        json.RawMessage   `json:"who,omitempty"`
-	Actions    []json.RawMessage `json:"actions,omitempty"`
-	Undo       json.RawMessage   `json:"undo,omitempty"`
-	CommitTime string            `json:"commit_time"`
-	CommitLSN  string            `json:"commit_lsn"`
-	EndLSN     string            `json:"end_lsn"`
+	XID uint32 `json:"xid"`
+	// Kind — KindFingerprint: от транзакции в хранилище только отпечаток в
+	// пачке (FirstSeq = LastSeq — запись пачки), откатить её нельзя.
+	Kind      string            `json:"kind,omitempty"`
+	FirstSeq  uint64            `json:"first_seq"`
+	LastSeq   uint64            `json:"last_seq"`
+	Changes   int               `json:"changes"`
+	Tables    map[string]Counts `json:"tables,omitempty"`
+	Truncated []string          `json:"truncated,omitempty"`
+	Who       json.RawMessage   `json:"who,omitempty"`
+	Actions   []json.RawMessage `json:"actions,omitempty"`
+	Undo      json.RawMessage   `json:"undo,omitempty"`
+	// У отпечатка (Kind) времени и места в журнале здесь нет: они в пачке.
+	CommitTime string `json:"commit_time,omitempty"`
+	CommitLSN  string `json:"commit_lsn,omitempty"`
+	EndLSN     string `json:"end_lsn,omitempty"`
 }
 
 // Stats — счётчики с запуска.
@@ -146,6 +158,8 @@ type Stats struct {
 	Captured, Skipped         uint64 // транзакции
 	Changes, SkippedChanges   uint64 // изменения строк
 	Parts, Alerts, Duplicates uint64
+	// Отпечатки (Config.All): транзакции, их изменения, пачки.
+	Fingerprinted, FingerprintChanges, Packs uint64
 }
 
 // Tap — поток pgoutput → записи до-образов.
@@ -170,6 +184,7 @@ type Tap struct {
 	info       map[uint32]RelInfo
 	tx         *txState
 	stats      Stats
+	pack       pack
 }
 
 type txState struct {
@@ -178,6 +193,10 @@ type txState struct {
 	capture bool
 	skipped int // изменения, пропущенные до решения «не наша»
 	late    bool
+	// fp — транзакция другой роли (Config.All): отпечаток в пачку, а не поток.
+	// unknown — изменения пришли раньше отметки «кто»: берётся целиком.
+	fp, unknown bool
+	rows        []fpRow
 
 	who, undo json.RawMessage
 	actions   []json.RawMessage
@@ -206,6 +225,12 @@ func Open(cfg Config, cat Catalog, sink Sink, cursor uint64, log *slog.Logger) (
 	}
 	if len(cfg.Roles) == 0 {
 		return nil, errors.New("pgtap: name at least one role to watch")
+	}
+	if cfg.PackTx <= 0 {
+		cfg.PackTx = DefaultPackTx
+	}
+	if cfg.PackWait <= 0 {
+		cfg.PackWait = DefaultPackWait
 	}
 	if sink == nil {
 		return nil, errors.New("pgtap: no sink")
@@ -279,6 +304,8 @@ func (t *Tap) Reset() {
 	t.tx = nil
 	clear(t.rels)
 	clear(t.info)
+	// Отпечатки пачки серверу не подтверждены: он пришлёт их транзакции снова.
+	t.pack.entries = t.pack.entries[:0]
 }
 
 // Handle принимает очередное сообщение pgoutput. flushed != 0 — транзакция
@@ -321,7 +348,14 @@ func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 		if !tx.capture {
 			t.stats.Skipped++
 			t.stats.SkippedChanges += uint64(tx.skipped)
+			if t.Pending() {
+				// Подтвердить её конец — значит подтвердить и пачку перед ней.
+				return 0, nil
+			}
 			return m.EndLSN, nil
+		}
+		if tx.fp {
+			return t.fpCommit(tx, m)
 		}
 		return m.EndLSN, t.finish(tx, m)
 	case pgoutput.Insert:
@@ -345,6 +379,11 @@ func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 				return 0, fmt.Errorf("pgtap: truncate of relation %d that was never described", id)
 			}
 			names = append(names, rel.Namespace+"."+rel.Name)
+		}
+		if tx.fp {
+			tx.truncated = append(tx.truncated, names...)
+			t.alert(tx, "truncate", fmt.Sprintf("TRUNCATE %v by a role outside the collector's lists: the rows are not in the journal, and the store keeps only a fingerprint", names))
+			return 0, nil
 		}
 		if !tx.header {
 			if err := t.start(tx); err != nil {
@@ -389,6 +428,22 @@ func (t *Tap) mark(m pgoutput.Message) error {
 			tx.undo = content
 		}
 	default:
+		return nil
+	}
+	if !ours && t.cfg.All && m.Prefix == PrefixWho {
+		switch {
+		case !tx.capture:
+			// Другая роль (Config.All): отпечаток. Решение — до первого изменения.
+			tx.capture, tx.fp, tx.who = true, true, content
+		case tx.unknown && tx.who == nil:
+			// Изменения шли без отметки, потом она пришла: кто — в потоке.
+			tx.who = content
+			return t.write(tx, struct {
+				T       string          `json:"t"`
+				Prefix  string          `json:"prefix"`
+				Content json.RawMessage `json:"content"`
+			}{"M", m.Prefix, content})
+		}
 		return nil
 	}
 	if !ours {
@@ -521,6 +576,12 @@ func (t *Tap) flushAlerts(tx *txState, entry *IndexEntry) error {
 
 // start пишет заголовок потока: к первому изменению отметки уже прочитаны.
 func (t *Tap) start(tx *txState) error {
+	if t.Pending() {
+		// Пачка — раньше: место входа в буфере идёт только вперёд.
+		if _, err := t.flushPack(); err != nil {
+			return err
+		}
+	}
 	tx.header = true
 	tx.gz = gzip.NewWriter(&tx.buf)
 	tx.tables = map[string]Counts{}
@@ -625,9 +686,17 @@ func (t *Tap) change(tx *txState, op byte, id uint32, oldKind byte, old, fresh [
 	if tx.dup {
 		return nil
 	}
+	if !tx.capture && t.cfg.All {
+		// Изменение раньше отметки «кто»: триггер выключен или у таблицы его
+		// нет (секция после -setup-sql). Такую транзакцию — целиком.
+		tx.capture, tx.unknown = true, true
+	}
 	if !tx.capture {
 		tx.skipped++
 		return nil
+	}
+	if tx.fp {
+		return t.fpChange(tx, op, id, oldKind, old, fresh)
 	}
 	if !tx.header {
 		if err := t.start(tx); err != nil {
@@ -683,6 +752,15 @@ func (t *Tap) change(tx *txState, op byte, id uint32, oldKind byte, old, fresh [
 	}
 	tx.tables[key] = c
 	tx.changes++
+	t.canaries(tx, rel, op, line.Old, line.New)
+	return t.write(tx, line)
+}
+
+// canaries — тревога, если изменение тронуло строку-ловушку: старым или новым
+// значением колонки. Ловушку не трогает никто, поэтому — у любой роли, и у
+// отпечатка тоже.
+func (t *Tap) canaries(tx *txState, rel pgoutput.Relation, op byte, old, fresh []any) {
+	key := rel.Namespace + "." + rel.Name
 	for _, cn := range t.cfg.Canaries {
 		if cn.Table != key {
 			continue
@@ -691,14 +769,13 @@ func (t *Tap) change(tx *txState, op byte, id uint32, oldKind byte, old, fresh [
 		if i < 0 {
 			continue
 		}
-		for _, vals := range [][]any{line.Old, line.New} {
+		for _, vals := range [][]any{old, fresh} {
 			if vals != nil && vals[i] == any(cn.Value) {
 				t.alert(tx, "canary", fmt.Sprintf("%s: the canary row %s=%s was touched (%c)", key, cn.Column, cn.Value, op))
 				break
 			}
 		}
 	}
-	return t.write(tx, line)
 }
 
 // value — значение колонки для потока: строка, null или пометка.
@@ -780,7 +857,10 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 	if t.cfg.AlertRows > 0 && tx.changes >= t.cfg.AlertRows {
 		t.alert(tx, "mass-change", fmt.Sprintf("%d row changes in one transaction (the threshold is %d)", tx.changes, t.cfg.AlertRows))
 	}
-	if t.cfg.RequireAction && tx.who != nil && len(tx.actions) == 0 && tx.undo == nil {
+	if tx.unknown {
+		t.alert(tx, alert.KindNoWho, "changes of the transaction came without a who marker: the trigger is off or the table has none (a partition made after escollect -setup-sql); the transaction is kept whole")
+	}
+	if t.cfg.RequireAction && tx.who != nil && !tx.unknown && len(tx.actions) == 0 && tx.undo == nil {
 		t.alert(tx, "no-action", "a transaction of a watched role carries no action or undo marker: it did not come through the MCP server or esundo")
 	}
 	return t.flushAlerts(tx, &entry)
@@ -804,6 +884,9 @@ func ReadTransaction(xid uint32, lines [][]byte) ([]Record, error) {
 	for i, l := range lines {
 		var p part
 		if err := json.Unmarshal(l, &p); err != nil {
+			if isPack(l) {
+				return nil, fmt.Errorf("pgtap: line %d is a pack of fingerprints, not a part of transaction %d: transactions in a pack cannot be undone", i+1, xid)
+			}
 			return nil, fmt.Errorf("pgtap: line %d: %w", i+1, err)
 		}
 		if p.XID != xid {

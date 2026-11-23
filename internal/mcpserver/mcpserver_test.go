@@ -383,6 +383,7 @@ func TestUndoPreviewAndApply(t *testing.T) {
 	db := &fakeDB{}
 	s, path := newServer(t, db)
 	s.cfg.ReceiptsPath = path
+	s.cfg.UndoSearchPath = []string{"app"} // путь отката — из настроек (pgundo.Settings)
 	fetched := 0
 	s.cfg.Fetch = func(xid uint32) ([][]byte, error) {
 		fetched++
@@ -449,12 +450,13 @@ func TestUndoPreviewAndApply(t *testing.T) {
 	}
 	// Сверка и откат — с чистого сеанса и pg_catalog первым в пути: функции и
 	// операторы под системными именами из схем роли агента их не подменят.
+	// Схемы после него — из настроек сервера.
 	var path0, catalog int = -1, -1
 	for i, q := range db.log[before:] {
 		if q == "DISCARD ALL" && path0 < 0 {
 			path0 = i
 		}
-		if q == "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" && catalog < 0 {
+		if q == `SELECT pg_catalog.set_config('search_path', 'pg_catalog, "app", pg_temp', false)` && catalog < 0 {
 			catalog = i
 		}
 	}

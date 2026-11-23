@@ -113,6 +113,9 @@ type Plan struct {
 	Steps   []Step                  `json:"steps"` // в порядке применения
 	// OK — номера шагов, которые Check счёл годными: их применит Apply.
 	OK []int `json:"apply,omitempty"`
+	// SearchPath — схемы пути поиска сверки и отката после pg_catalog
+	// (Settings.SearchPath): с ними план сверен, с ними Apply и применит.
+	SearchPath []string `json:"search_path,omitempty"`
 
 	limit func(rows int) error
 }
@@ -590,14 +593,39 @@ func (g group) keyChanged() string {
 // pg_temp последним (не названный pg_temp ищется первым для типов).
 const Path = "pg_catalog, pg_temp"
 
+// ValidSearchPath проверяет схемы пути отката: имена схем как есть, без
+// кавычек. pg_catalog в пути всегда первой, pg_temp — последней, их и другие
+// pg_* не называют; "$user" — тоже: схема по имени роли сеанса — та, что
+// завести может и агент с CREATE на базе (R1-4, заход 2).
+func ValidSearchPath(schemas []string) error {
+	seen := map[string]bool{}
+	for _, n := range schemas {
+		switch {
+		case n == "" || len(n) > 63:
+			return fmt.Errorf("search_path: %q is not a schema name (1 to 63 bytes)", n)
+		case strings.HasPrefix(n, "pg_"):
+			return fmt.Errorf("search_path: %q: pg_catalog is always first and pg_temp last, schemas pg_* are not named", n)
+		case n == "$user":
+			return errors.New(`search_path: "$user" is not allowed: name the schema itself`)
+		case seen[n]:
+			return fmt.Errorf("search_path: %q is named twice", n)
+		}
+		seen[n] = true
+	}
+	return nil
+}
+
 // session готовит сеанс сверки и отката. Функция или оператор с точным
 // совпадением типов выигрывает у системных при любом порядке пути (класс
 // CVE-2018-1058): `=(varchar, varchar)` агента в public перехватывал сверку
 // ключа, а esundo запускает человек правами владельца (R2 заход 2). Но и путь
-// только из pg_catalog нельзя: триггеры таблиц владельца в откате идут с путём
-// сеанса, и аудит с именем таблицы без схемы падал (R2 заход 3). Поэтому путь
-// — pg_catalog, путь сеанса, pg_temp последним, — и откат отказывает, если в
-// какой-либо схеме этого пути CREATE есть у кого-то, кроме её владельца (и
+// только из pg_catalog годится не всем: триггеры таблиц владельца в откате идут
+// с путём сеанса, и аудит с именем таблицы без схемы падал (R2 заход 3).
+// Поэтому путь — pg_catalog, схемы SearchPath из настроек, pg_temp последним.
+// Путь роли и базы (ALTER ROLE/DATABASE … SET search_path) не берётся: его
+// может поменять и сама роль, а путь отката — то, что оператор назвал явно
+// (DECISIONS, п. 41). Откат отказывает, если названной схемы нет или если в
+// какой-либо из них CREATE есть у кого-то, кроме её владельца (и
 // суперпользователей): «добавить схему в путь — значит доверять всем, у кого
 // там CREATE» (документация PostgreSQL после CVE-2018-1058). Проверять одну
 // роль транзакции мало: она — роль MCP-сервера, а у агента своя (DECISIONS,
@@ -605,29 +633,28 @@ const Path = "pg_catalog, pg_temp"
 // следующий запрос человека в esundo — тоже наш, MCP-сервер начинает вызов с
 // DISCARD ALL.
 func (p *Plan) session(db DB) error {
-	res, err := db.Query("SELECT pg_catalog.array_to_string(pg_catalog.current_schemas(false), ',')")
-	if err != nil {
-		return err
-	}
-	var schemas []string
-	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil && *res[0].Rows[0][0] != "" {
-		schemas = strings.Split(*res[0].Rows[0][0], ",")
+	if err := ValidSearchPath(p.SearchPath); err != nil {
+		return refuse("%v", err)
 	}
 	if _, err := db.Query("SELECT pg_catalog.set_config('search_path', '" + Path + "', false)"); err != nil {
 		return err
 	}
-	path := []string{"pg_catalog"}
-	for _, n := range schemas {
-		if n != "pg_catalog" {
-			path = append(path, pgwire.Ident(n))
-		}
-	}
-	if len(path) == 1 {
+	if len(p.SearchPath) == 0 {
 		return nil // путь — только Path
 	}
-	lits := make([]string, 0, len(schemas))
-	for _, n := range schemas {
+	lits := make([]string, 0, len(p.SearchPath))
+	for _, n := range p.SearchPath {
 		lits = append(lits, pgwire.Literal(n))
+	}
+	// Схемы, которой нет, в пути нет: опечатка в настройках дала бы откат
+	// без неё, а завести её позже может тот, у кого CREATE на базе.
+	res, err := db.Query("SELECT string_agg(format('%I', s), ', ') FROM unnest(ARRAY[" + strings.Join(lits, ", ") + "]::text[]) AS s " +
+		"WHERE NOT EXISTS (SELECT FROM pg_namespace WHERE nspname = s)")
+	if err != nil {
+		return err
+	}
+	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
+		return refuse("no schema %s in the database, and it is named in search_path of the undo settings", *res[0].Rows[0][0])
 	}
 	// Кто может CREATE в схеме пути — сам или через роль, которой может
 	// стать (SET ROLE); владелец схемы может всегда (право у себя он вернёт
@@ -659,14 +686,35 @@ func (p *Plan) session(db DB) error {
 		return err
 	}
 	if len(res) == 1 && len(res[0].Rows) == 1 && res[0].Rows[0][0] != nil {
-		return refuse("%s, and that schema is on the search_path of this session: a function or operator created there would run in the check "+
-			"and the undo with the rights of this session. Take the schema off the search_path of this role (ALTER ROLE … SET search_path) "+
-			"or let only its owner create there. If such a role could create there before, look at what it made: its functions and operators "+
-			"stay, whoever owns them now", *res[0].Rows[0][0])
+		return refuse("%s, and that schema is in search_path of the undo settings: a function or operator created there would run in the check "+
+			"and the undo with the rights of this session. Take the schema off search_path (then triggers of the tables must name their "+
+			"tables and functions with the schema) or let only its owner create there. If such a role could create there before, look at "+
+			"what it made: its functions and operators stay, whoever owns them now", *res[0].Rows[0][0])
 	}
-	path = append(path, "pg_temp")
-	_, err = db.Query("SELECT pg_catalog.set_config('search_path', " + pgwire.Literal(strings.Join(path, ", ")) + ", false)")
+	_, err = db.Query("SELECT pg_catalog.set_config('search_path', " + pgwire.Literal(p.Path()) + ", false)")
 	return err
+}
+
+// Path — путь поиска сверки и отката, как его ставит сеанс: pg_catalog,
+// SearchPath, pg_temp.
+func (p *Plan) Path() string {
+	path := "pg_catalog"
+	for _, n := range p.SearchPath {
+		path += ", " + pgwire.Ident(n)
+	}
+	return path + ", pg_temp"
+}
+
+// pathHint дополняет отказ базы «нет такой таблицы или функции»: команды
+// отката называют таблицы со схемой, так что имя без схемы — из триггера
+// таблицы, а путь отката — только то, что названо в настройках.
+func (p *Plan) pathHint(err error) error {
+	var pg *pgwire.PgError
+	if !errors.As(err, &pg) || pg.Code != "42P01" && pg.Code != "42883" {
+		return err
+	}
+	return fmt.Errorf("%w (the undo runs with search_path %s: if a trigger of the table names a table or a function without "+
+		"its schema, add that schema to search_path in the undo settings)", err, p.Path())
 }
 
 // Check спрашивает базу про каждый шаг и запоминает годные в p.OK.
@@ -793,7 +841,7 @@ func (p *Plan) Apply(db DB, marker any) (*Applied, error) {
 	// errReferenced в порядке журнала — ещё не приговор: при отложенном внешнем
 	// ключе ребёнок мог быть вставлен раньше родителя, и его шаг стоит позже.
 	if !(errors.As(err, &pg) && strings.HasPrefix(pg.Code, "23")) && !errors.Is(err, errReferenced) {
-		return out, err
+		return out, p.pathHint(err)
 	}
 	first := err
 	ordered, err := p.byKeys(db, only)

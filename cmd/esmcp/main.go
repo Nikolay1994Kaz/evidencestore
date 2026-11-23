@@ -62,7 +62,7 @@ type Config struct {
 	// Undo — откуда брать до-образы для инструментов отката (тот же раздел,
 	// что у esundo -config). Нет секции — инструментов undo_preview и
 	// undo_apply у агента нет.
-	Undo *pgundo.Fetcher `json:"undo"`
+	Undo *pgundo.Settings `json:"undo"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -155,6 +155,7 @@ func main() {
 	}
 	if cfg.Undo != nil {
 		mc.Fetch = cfg.Undo.Fetch
+		mc.UndoSearchPath = cfg.Undo.SearchPath
 	}
 	srv := mcpserver.New(mc, log)
 	// Роль сервера — только его (DECISIONS, п. 39): иначе не начинать. База

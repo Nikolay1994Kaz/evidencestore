@@ -79,6 +79,8 @@ The demo runs these steps:
 
 `scripts/demo-intruder.sh` plays an intrusion on a web server: an intruder logs in as root and removes every line with their address from a practice `auth.log` (inside the demo directory; nothing on the host is touched). The script pulls the records of that source out of the store and verifies each one offline: the four deleted lines come back byte for byte, and the time-stamps show they were in the store before the file was rewritten. Last, it asks for the whole session of web-1 as one bundle, which would not verify with any line left out (this waits two minutes for the time-stamps that close the window).
 
+PostgreSQL with an MCP server for an AI agent, the store and the collector in Docker (branch `pg-undo-experiment`): `docker compose up -d` in the clone sets everything up on the first start, certificates and passwords included ([experiments/pg-undo](experiments/pg-undo/README.md#docker)).
+
 ## Run it yourself
 
 The first three steps of the demo, by hand and on a log of your own, on one Linux machine. You need `evidencestore`, `escollect` and `esverify` on your `PATH`: from a release ([Install](#install)), or `go install ./cmd/...` in the clone.

@@ -113,8 +113,11 @@ type Config struct {
 	ReceiptsPath string
 	// Fetch отдаёт тела записей транзакции из хранилища, выписанные esverify из
 	// проверенных пакетов. nil — инструментов отката у агента нет.
-	Fetch   func(xid uint32) ([][]byte, error)
-	Version string // версия программы для serverInfo
+	Fetch func(xid uint32) ([][]byte, error)
+	// UndoSearchPath — схемы пути поиска сверки и отката после pg_catalog
+	// (pgundo.Settings.SearchPath).
+	UndoSearchPath []string
+	Version        string // версия программы для serverInfo
 }
 
 // Receipt — квитанция одного действия.
@@ -577,6 +580,7 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	plan.SearchPath = s.cfg.UndoSearchPath
 	// Транзакция с этим номером — та, что несёт отметку действия: номер
 	// бывает занят заново (база восстановлена из копии, счётчик обошёл
 	// 32 бита), и откат чужой транзакции вышел бы откатом этого действия.
@@ -584,8 +588,8 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 		return "", fmt.Errorf("transaction %d in the evidence store carries no marker of action %s: the transaction id was taken again "+
 			"(the database was restored from a backup, or the counter wrapped). This action is not undone here: ask a person", xid, actionID)
 	}
-	// Сверка и откат — с чистого сеанса; путь поиска ставит pgundo (Path),
-	// таймауты — параметры входа (sessionParams).
+	// Сверка и откат — с чистого сеанса; путь поиска ставит pgundo (Path и
+	// UndoSearchPath), таймауты — параметры входа (sessionParams).
 	if err := s.fresh(); err != nil {
 		return "", err
 	}

@@ -20,7 +20,8 @@
 //	esundo apply -config undo.json -plan undo-N.json -by WHO
 //
 // undo.json: {"dsn": "…", "index": "…/index.jsonl", "stamp": […], "proof": […],
-// "verify": […], "wait": "15s"} — подключение к базе и раздел pgundo.Fetcher.
+// "verify": […], "wait": "15s", "search_path": ["public"]} — подключение к базе
+// и раздел pgundo.Settings.
 //
 // Коды выхода: 0 — готово, 1 — ошибка вызова или базы, 2 — откат построить
 // нельзя (TRUNCATE, таблица без REPLICA IDENTITY FULL, транзакция не вся),
@@ -76,7 +77,7 @@ type Config struct {
 	// DSN — подключение ролью, которой можно менять таблицы (владелец):
 	// "host=db user=owner dbname=shop sslmode=verify-full".
 	DSN string `json:"dsn"`
-	pgundo.Fetcher
+	pgundo.Settings
 }
 
 func loadConfig(path string) *Config {
@@ -161,12 +162,17 @@ func check(args []string) {
 	dsn := fs.String("dsn", "", "database to check the plan against; without it the plan is only printed")
 	out := fs.String("out", "", "write the checked plan here, for esundo apply (with -config: undo-<xid>.json)")
 	show := fs.Int("show", 10, "how many conflicts to print")
+	searchPath := fs.String("search-path", "", "schemas after pg_catalog on the search_path of the check and the undo, comma-separated (with -config: search_path there)")
 	fs.Parse(args)
 	if (*dir == "") == (*cfgPath == "") || *xid == 0 {
 		usage()
 	}
 	var lines [][]byte
 	var err error
+	var schemas []string
+	if *searchPath != "" {
+		schemas = strings.Split(*searchPath, ",")
+	}
 	if *cfgPath != "" {
 		// Записи — из хранилища: пакет на каждую, проверка — командой из настроек.
 		cfg := loadConfig(*cfgPath)
@@ -175,6 +181,9 @@ func check(args []string) {
 		}
 		if *out == "" && *dsn != "" {
 			*out = fmt.Sprintf("undo-%d.json", *xid)
+		}
+		if *searchPath == "" {
+			schemas = cfg.SearchPath
 		}
 		lines, err = cfg.Fetch(uint32(*xid))
 		fail(err)
@@ -185,6 +194,8 @@ func check(args []string) {
 	}
 	p, err := pgundo.Build(uint32(*xid), lines)
 	fail(err)
+	fail(pgundo.ValidSearchPath(schemas))
+	p.SearchPath = schemas
 
 	describe(os.Stdout, p, len(lines))
 	if len(p.Steps) == 0 {
@@ -200,6 +211,7 @@ func check(args []string) {
 	fail(err)
 	ok, done, bad := pgundo.Tally(statuses)
 	fmt.Printf("checked against the database: to apply %d, already as before %d, conflicts %d\n", ok, done, bad)
+	fmt.Printf("  search_path of the check and the undo: %s\n", p.Path())
 	for i, c := range p.Conflicts(statuses) {
 		if i == *show {
 			fmt.Printf("  … and %d more\n", bad-i)

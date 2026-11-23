@@ -46,6 +46,7 @@ const (
 	KindTruncate   = "truncate"       // TRUNCATE: строк в записи нет
 	KindIdentity   = "identity"       // таблица без REPLICA IDENTITY FULL
 	KindLateMarker = "late-marker"    // отметка пришла после пропущенных изменений
+	KindNoWho      = "no-who"         // изменения без отметки «кто»: триггер выключен или его нет
 	KindRefused    = "refused"        // MCP-сервер остановил действие пределом строк
 	KindEscaped    = "escaped"        // SQL агента сам закрыл транзакцию MCP-сервера
 	KindUnknown    = "commit-unknown" // связь MCP-сервера с базой оборвалась на COMMIT: действие могло зафиксироваться

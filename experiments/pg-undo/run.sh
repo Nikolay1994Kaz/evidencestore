@@ -268,7 +268,8 @@ cat >"$WORK/undo.json" <<EOF
   "index": "pg-index/index.jsonl",
   "stamp": ["$BIN/evidencestore", "stamp", "-config", "$CFG"],
   "proof": ["$BIN/evidencestore", "proof", "-config", "$CFG", "-source", "$SRC", "-dek"],
-  "verify": ["$BIN/esverify", "-store-key", "$STORE_KEY", "-tsa-trust", "$WORK/tsa-root.crt"]
+  "verify": ["$BIN/esverify", "-store-key", "$STORE_KEY", "-tsa-trust", "$WORK/tsa-root.crt"],
+  "search_path": ["public"]
 }
 EOF
 # Настройки с паролями ролей сервера и отката — только владельцу файла: агент (и пользователь ОС
@@ -441,16 +442,27 @@ E1=$(size "$WORK/data/evidence"); C1=$(size "$WORK/data/chain")
 TO=$(date -u +%FT%T.%NZ)
 
 step "человек после агента: правит счёт 6, заново заводит удалённый заказ 1, удаляет заказ-возврат, правит счёт 1"
-LINES_BEFORE=$(wc -l <"$INDEX")
-owner_tx >/dev/null <<SQL
+HUMAN=$(owner_tx <<SQL
 update accounts set balance = 777.00, note = 'fixed by a human' where id = 6;
 insert into orders values (1, 8, 're-entered by a human', false);
 delete from orders where id = $((ROWS + 3));
 update accounts set note = 'called the client' where id = 1;
 SQL
-sleep 1.5
-[ "$(wc -l <"$INDEX")" = "$LINES_BEFORE" ] || die "транзакция владельца попала в записи до-образов"
-echo "транзакции владельца в хранилище не идут: транзакций в справочнике по-прежнему $LINES_BEFORE"
+)
+# Роль владельца не в списках сборщика: её транзакция ложится отпечатком —
+# кто, ключи, хеши строк, без самих строк (DECISIONS, п. 41). Пачка уходит,
+# когда ей минута (или перед полной транзакцией): ждём; до этого сборщик
+# не подтверждает базе место.
+wait_tx "$HUMAN"
+HE=$(entry "$HUMAN")
+[ "$(field "$HE" kind)" = fingerprint ] || die "транзакция владельца $HUMAN должна лечь отпечатком: $HE"
+[ "$(field "$HE" who)" = '{"role": "postgres"}' ] || die "в справочнике у отпечатка нет роли: $HE"
+[ -z "$(alerts "$HUMAN")" ] || die "правка владельца подняла тревогу: $(alerts "$HUMAN")"
+ship
+"$BIN/esundo" check -config "$WORK/undo.json" -xid "$HUMAN" >"$WORK/human-undo.txt" 2>&1 && die "esundo взялся откатывать отпечаток"
+grep -q "the store keeps only its fingerprint" "$WORK/human-undo.txt" || die "esundo не объяснил отказ: $(cat "$WORK/human-undo.txt")"
+echo "транзакция владельца $HUMAN в хранилище — отпечатком в пачке (запись $(field "$HE" first_seq)): $(field "$HE" changes) изменения, роль $(field "$HE" who)"
+echo "esundo: $(head -1 "$WORK/human-undo.txt" | cut -c1-160)…"
 
 # ---------------------------------------------------------------- до-образы и откат
 
@@ -471,6 +483,8 @@ $UNDO_CMD -out "$U/plan.json" >"$U/check.txt"
 T_CHECK=$(since "$T")
 cat "$U/check.txt"
 grep -q "^fetched from the store and verified: $N records" "$U/check.txt" || die "esundo не достал записи из хранилища сам"
+# Путь поиска сверки и отката — из undo.json, не путь роли (DECISIONS, п. 41).
+grep -q '^  search_path of the check and the undo: pg_catalog, "public", pg_temp$' "$U/check.txt" || die "esundo сверял не с путём из undo.json: $(grep search_path "$U/check.txt")"
 grep -q "^to apply it: $BIN/esundo apply -config $WORK/undo.json -plan $U/plan.json" "$U/check.txt" || die "esundo не подсказал команду применения"
 grep -q "action $BAD_ACTION: agent support-bot" "$U/check.txt" || die "в до-образах нет отметки действия $BAD_ACTION"
 grep -q 'already as before 1, conflicts 2$' "$U/check.txt" || die "ждали два конфликта (счёт 6 и заказ 1) и один шаг «уже сделано» (заказ-возврат человек удалил сам)"

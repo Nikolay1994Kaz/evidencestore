@@ -1,0 +1,5 @@
+.git
+state
+dist
+bin
+*.test

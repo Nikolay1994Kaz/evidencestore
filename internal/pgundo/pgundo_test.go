@@ -191,9 +191,6 @@ type fakeDB struct {
 
 func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
 	d.log = append(d.log, sql)
-	if strings.Contains(sql, "current_schemas(false)") {
-		return rows([]string{""}), nil // путь сеанса пуст: остаётся Path
-	}
 	return d.answer(sql)
 }
 
@@ -265,12 +262,11 @@ func TestCheckAndApply(t *testing.T) {
 	// Транзакция, отметка первой, шаг 2 (вернуть удалённую — со своим прежним номером, даже если колонка
 	// GENERATED ALWAYS AS IDENTITY), шаг 4 (вернуть значения: пишется только колонка, которую транзакция
 	// меняла), сверка обеих команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
-	// Перед всем — путь поиска (session): путь сеанса, затем Path; схем в
-	// пути у заглушки нет — Path и остаётся.
-	if len(db.log) != 10 || !strings.Contains(db.log[0], "current_schemas(false)") || db.log[1] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" {
+	// Перед всем — путь поиска (session): схем в настройках нет — только Path.
+	if len(db.log) != 9 || db.log[0] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" {
 		t.Fatalf("%q", db.log)
 	}
-	db.log = db.log[2:]
+	db.log = db.log[1:]
 	if len(db.log) != 8 || db.log[0] != "BEGIN" || !strings.HasPrefix(db.log[1], `SELECT evidence.mark_undo('{"by":"nikolay"}'`) ||
 		!strings.HasPrefix(db.log[3], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[4], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
 		!strings.Contains(db.log[4], `WHERE t."id" = w.n0 AND t."id"::text IS NOT DISTINCT FROM w.n0::text AND t."v"::text IS NOT DISTINCT FROM w.n1::text`) ||
@@ -656,5 +652,48 @@ func TestApplyRefusesToRemoveARowThatOthersReferTo(t *testing.T) {
 		strings.Count(err.Error(), "referring to them") != 1 ||
 		strings.Contains(all, "DELETE FROM") || strings.Count(all, "BEGIN") != 2 || db.log[len(db.log)-1] != "ROLLBACK" {
 		t.Fatalf("%v\n%s", err, all)
+	}
+}
+
+// Путь отката — из настроек: схемы названы явно, путь роли не берётся
+// (DECISIONS, п. 41). Названной схемы нет — отказ; в ней CREATE у чужого —
+// отказ; иначе путь — pg_catalog, схемы, pg_temp.
+func TestSessionSearchPath(t *testing.T) {
+	for _, bad := range [][]string{{""}, {"pg_temp"}, {"pg_catalog"}, {"$user"}, {"a", "a"}, {strings.Repeat("x", 64)}} {
+		if err := ValidSearchPath(bad); err == nil {
+			t.Errorf("%q passed", bad)
+		}
+	}
+	if err := ValidSearchPath([]string{"public", "My Schema"}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(missing, creators *string) ([]string, error) {
+		db := &fakeDB{answer: func(sql string) ([]pgwire.Result, error) {
+			switch {
+			case strings.Contains(sql, "unnest(ARRAY["):
+				return []pgwire.Result{{Rows: [][]*string{{missing}}}}, nil
+			case strings.Contains(sql, "can CREATE in schema"):
+				return []pgwire.Result{{Rows: [][]*string{{creators}}}}, nil
+			}
+			return nil, nil
+		}}
+		p := &Plan{SearchPath: []string{"public", "My Schema"}, Tables: map[string]*Table{}}
+		err := p.session(db)
+		return db.log, err
+	}
+	str := func(s string) *string { return &s }
+	log, err := run(nil, nil)
+	if err != nil || len(log) != 4 || !strings.Contains(log[1], `ARRAY['public', 'My Schema']`) ||
+		log[3] != `SELECT pg_catalog.set_config('search_path', 'pg_catalog, "public", "My Schema", pg_temp', false)` {
+		t.Fatalf("%v %q", err, log)
+	}
+	if _, err := run(str(`"My Schema"`), nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), `no schema "My Schema"`) {
+		t.Fatalf("a missing schema: %v", err)
+	}
+	if log, err := run(nil, str("agent can CREATE in schema public")); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "agent can CREATE in schema public") || len(log) != 3 {
+		t.Fatalf("a schema others can create in: %v %q", err, log)
+	}
+	if err := (&Plan{SearchPath: []string{"$user"}}).session(&fakeDB{}); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a bad path in a plan file: %v", err)
 	}
 }

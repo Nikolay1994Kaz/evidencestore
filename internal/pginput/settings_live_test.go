@@ -276,19 +276,29 @@ CREATE TRIGGER fan AFTER INSERT ON pgs.vals FOR EACH ROW EXECUTE FUNCTION pgs.fa
 	if p, err = pgundo.Build(uint32(xid), lines); err != nil {
 		t.Fatal(err)
 	}
+	// Путь отката — только из настроек: без них — pg_catalog, и аудит
+	// владельца с именем таблицы без схемы падает, с подсказкой, что делать.
+	human = dial("postgres", "esundo")
+	if _, err = p.Check(human); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = p.Apply(human, map[string]any{"by": "test"}); err == nil || !strings.Contains(err.Error(), `"pgs_tick_audit" does not exist`) ||
+		!strings.Contains(err.Error(), "the undo runs with search_path pg_catalog, pg_temp: if a trigger") {
+		t.Fatalf("the undo with a trigger that names its table without the schema, and no search_path: %v", err)
+	}
+	p.SearchPath = []string{"public"}
 	exec(admin, "GRANT CREATE ON SCHEMA public TO pgs_agent")
 	exec(agent, `CREATE FUNCTION public.pgs_eq(varchar, varchar) RETURNS bool LANGUAGE plpgsql AS $f$BEGIN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END$f$;
 CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = public.pgs_eq)`)
-	// pgs_agent может CREATE в public, а public — в пути сеанса: сверка
+	// pgs_agent может CREATE в public, а public — в пути отката: сверка
 	// отказана и ничего чужого не позвала.
 	human = dial("postgres", "esundo")
 	if _, err = p.Check(human); !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema public") {
 		t.Fatalf("the check by a person with a schema of the agent on the path: %v", err)
 	}
 	// Свой запрос — тоже после того, как оператора не стало: он перехватил бы
-	// и его. Без права CREATE откат идёт с путём сеанса: аудит владельца с
-	// именем таблицы без схемы работает (при пути только из pg_catalog он
-	// падал — R2 заход 3).
+	// и его. Без права CREATE откат идёт с путём из настроек: аудит владельца
+	// с именем таблицы без схемы работает (R2 заход 3).
 	exec(admin, "DROP OPERATOR public.= (varchar, varchar); DROP FUNCTION public.pgs_eq(varchar, varchar); REVOKE CREATE ON SCHEMA public FROM pgs_agent")
 	// Член роли-владельца схемы может в ней всё, что владелец: такого не
 	// пропускает и сверка (R2-1; раньше член владельца считался доверенным).
@@ -301,16 +311,17 @@ CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = publ
 	if !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema public (as pgs_owner)") {
 		t.Fatalf("the check by a person with a schema the agent can become the owner of: %v", err)
 	}
-	// Владелец схемы — не доверенный сам по себе: с правом CREATE на базе
-	// агент заводит схему с именем роли сеанса ("$user" в пути), и его
-	// оператор шёл бы правами человека (R1-4, заход 2).
+	// С правом CREATE на базе агент заводит схему с именем роли сеанса
+	// ("$user" в пути по умолчанию), и его оператор шёл бы правами человека
+	// (R1-4, заход 2). Путь роли откат не берёт: такой схемы в нём нет.
 	dbName := pgwire.Ident(one(admin, "SELECT current_database()"))
 	exec(admin, "GRANT CREATE ON DATABASE "+dbName+" TO pgs_agent")
-	exec(agent, "CREATE SCHEMA postgres")
+	exec(agent, `CREATE SCHEMA postgres; CREATE FUNCTION postgres.pgs_eq(varchar, varchar) RETURNS bool LANGUAGE plpgsql AS $f$BEGIN RAISE EXCEPTION 'the function of the agent ran as %', current_user; END$f$;
+CREATE OPERATOR postgres.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = postgres.pgs_eq)`)
 	human = dial("postgres", "esundo")
 	_, err = p.Check(human)
-	exec(admin, "DROP SCHEMA postgres; REVOKE CREATE ON DATABASE "+dbName+" FROM pgs_agent")
-	if !errors.Is(err, pgundo.ErrRefused) || !strings.Contains(err.Error(), "pgs_agent can CREATE in schema postgres") {
+	exec(admin, "DROP SCHEMA postgres CASCADE; REVOKE CREATE ON DATABASE "+dbName+" FROM pgs_agent")
+	if err != nil {
 		t.Fatalf("the check by a person with a schema of the agent named after the person: %v", err)
 	}
 	human = dial("postgres", "esundo")

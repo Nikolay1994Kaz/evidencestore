@@ -91,6 +91,15 @@ type Config struct {
 	// действия, то есть в обход MCP-сервера.
 	RequireAction bool           `json:"require_action"`
 	Canaries      []pgtap.Canary `json:"canaries"`
+	// Capture — какие транзакции по Tables брать (DECISIONS, п. 41):
+	//   - "all" (по умолчанию) — все. Роли из списков — целиком, с до-образами
+	//     для отката; другие роли (люди, приложение) — отпечатком в пачке: кто,
+	//     ключи строк, хеши; транзакция без отметки «кто» — целиком и с
+	//     тревогой no-who. Запись мимо сервера, какой бы ролью ни шла, видна.
+	//   - "roles" — только роли из списков. Меньше места, но запись чужой
+	//     ролью (петля dblink, украденный пароль владельца) в хранилище не
+	//     попадёт вовсе.
+	Capture string `json:"capture"`
 	// StatusEvery — как часто сообщать базе подтверждённую позицию, когда
 	// изменений нет. По умолчанию 5s; должно быть меньше wal_sender_timeout (60 с).
 	StatusEvery config.Duration `json:"status_every"`
@@ -134,6 +143,9 @@ func (c *Config) Validate() error {
 	if c.StatusEvery == 0 {
 		c.StatusEvery = config.Duration(5 * time.Second)
 	}
+	if c.Capture == "" {
+		c.Capture = CaptureAll
+	}
 	var errs []error
 	if c.DSN == "" {
 		errs = append(errs, errors.New("postgres.dsn is required"))
@@ -165,6 +177,9 @@ func (c *Config) Validate() error {
 		if _, ok := seen[dsn.User]; ok {
 			errs = append(errs, fmt.Errorf("postgres.dsn: the collector's role %q is also a role of the agent, the server or the undo", dsn.User))
 		}
+	}
+	if c.Capture != CaptureAll && c.Capture != CaptureRoles {
+		errs = append(errs, fmt.Errorf("postgres.capture %q: %q or %q", c.Capture, CaptureAll, CaptureRoles))
 	}
 	if len(c.Tables) == 0 {
 		errs = append(errs, errors.New("postgres.tables: name at least one table"))
@@ -222,6 +237,12 @@ func splitTable(t string) (schema, table string, err error) {
 // EvidenceOwner — роль-владелец функций отметок: без входа, без прав
 // суперпользователя, с одним правом — писать сообщения в журнал базы.
 const EvidenceOwner = "evidence_owner"
+
+// Значения Config.Capture.
+const (
+	CaptureAll   = "all"
+	CaptureRoles = "roles"
+)
 
 // maxIdent — длина имени в PostgreSQL (NAMEDATALEN − 1).
 const maxIdent = 63
@@ -695,7 +716,7 @@ func New(cfg Config, log *slog.Logger) (*Source, error) {
 func (s *Source) Open(cursor uint64, sink input.Sink) (err error) {
 	s.sink = sink
 	s.tap, err = pgtap.Open(pgtap.Config{Dir: s.cfg.Dir, Roles: s.cfg.watched(), AlertRows: s.cfg.AlertRows,
-		RequireAction: s.cfg.RequireAction, Canaries: s.cfg.Canaries, PartSize: s.partSize}, catalog{s}, counted{s}, cursor, s.log)
+		RequireAction: s.cfg.RequireAction, Canaries: s.cfg.Canaries, PartSize: s.partSize, All: s.cfg.Capture == CaptureAll}, catalog{s}, counted{s}, cursor, s.log)
 	return err
 }
 
@@ -997,7 +1018,7 @@ func (s *Source) step(wait time.Duration) (idle bool, err error) {
 	}
 	if m.Keepalive {
 		// Между транзакциями всё до конца журнала сервера нам уже отдано.
-		if !s.tap.InTransaction() && m.WALEnd > s.flushed {
+		if !s.tap.InTransaction() && !s.tap.Pending() && m.WALEnd > s.flushed {
 			s.flushed = m.WALEnd
 		}
 		return false, s.report(m.ReplyRequested)
@@ -1022,7 +1043,11 @@ func (s *Source) step(wait time.Duration) (idle bool, err error) {
 // транзакции. Внутри транзакции вход ждёт следующее сообщение дольше: отдай он
 // ход отправке посреди транзакции, база за время отправки могла бы оборвать
 // молчащее соединение, и транзакция пошла бы заново.
-func (s *Source) pump(stop func(idle, inTx bool) bool) error {
+//
+// final — разовый проход (-once): в его конце в буфер идёт и неполная пачка
+// отпечатков. У постоянного сборщика пачка ждёт, пока ей не станет PackWait
+// (Tick), — иначе при редких правках каждая шла бы своей записью.
+func (s *Source) pump(stop func(idle, inTx bool) bool, final bool) error {
 	for {
 		wait := drainIdle
 		if s.tap.InTransaction() {
@@ -1033,6 +1058,21 @@ func (s *Source) pump(stop func(idle, inTx bool) bool) error {
 			return err
 		}
 		inTx := s.tap.InTransaction()
+		if idle && !inTx {
+			// Поток молчит: пачка отпечатков, которая ждёт дольше PackWait, — в
+			// буфер. У -once — любая: проход ждёт её позиции, чтобы закончиться.
+			flush := s.tap.Tick
+			if final {
+				flush = s.tap.Flush
+			}
+			done, err := flush()
+			if err != nil {
+				return err
+			}
+			if done != 0 {
+				s.flushed = max(s.flushed, pgwire.LSN(done))
+			}
+		}
 		if idle && inTx {
 			// Сервер молчит посреди транзакции: сказать ему, что мы живы.
 			if err := s.report(true); err != nil {
@@ -1040,6 +1080,20 @@ func (s *Source) pump(stop func(idle, inTx bool) bool) error {
 			}
 		}
 		if stop(idle, inTx) {
+			if !inTx {
+				// Конец прохода: пачка, которой пора, — в буфер; у -once — любая.
+				flush := s.tap.Tick
+				if final {
+					flush = s.tap.Flush
+				}
+				done, err := flush()
+				if err != nil {
+					return err
+				}
+				if done != 0 {
+					s.flushed = max(s.flushed, pgwire.LSN(done))
+				}
+			}
 			// Конец прохода: сдвинувшуюся позицию база узнаёт сразу, а не
 			// через status_every, — её журнал до этой позиции больше не нужен.
 			return s.report(s.flushed != s.reported || time.Since(s.lastReport) >= s.cfg.StatusEvery.D())
@@ -1182,6 +1236,8 @@ func (s *Source) Metrics() []metrics.Family {
 			metrics.One("escollect_postgres_transactions_captured_total", "transactions of the watched roles put into the spool since the collector started", metrics.Counter, float64(st.Captured)),
 			metrics.One("escollect_postgres_transactions_skipped_total", "transactions of other roles passed by since the collector started", metrics.Counter, float64(st.Skipped)),
 			metrics.One("escollect_postgres_row_changes_total", "row changes put into the spool since the collector started", metrics.Counter, float64(st.Changes)),
+			metrics.One("escollect_postgres_transactions_fingerprinted_total", "transactions of other roles kept as fingerprints since the collector started", metrics.Counter, float64(st.Fingerprinted)),
+			metrics.One("escollect_postgres_fingerprint_packs_total", "records of fingerprint packs put into the spool since the collector started", metrics.Counter, float64(st.Packs)),
 			metrics.One("escollect_postgres_alerts_total", "alert signals raised since the collector started", metrics.Counter, float64(st.Alerts)))
 	}
 	if !s.slot.At.IsZero() {
@@ -1267,7 +1323,7 @@ func (s *Source) Read() (int, error) {
 	// Поток пуст — ход отправке. Посреди транзакции ход отдаётся, только когда
 	// сервер замолчал надолго (step ждал status_every); между транзакциями —
 	// ещё и по времени: накопленное надо слать, а хранилищу — слышать пульс.
-	if err := s.pump(func(idle, inTx bool) bool { return idle || !inTx && time.Since(start) >= passBudget }); err != nil {
+	if err := s.pump(func(idle, inTx bool) bool { return idle || !inTx && time.Since(start) >= passBudget }, false); err != nil {
 		return s.emitted, s.fail(err)
 	}
 	if err := s.watchSlot(); err != nil {
@@ -1313,7 +1369,7 @@ func (s *Source) ReadAll(ctx context.Context) (int, error) {
 		}
 		time.Sleep(20 * time.Millisecond)
 		return s.flushed >= target || time.Since(quiet) >= onceIdle
-	})
+	}, true)
 	if err != nil {
 		if s.sinkErr == nil {
 			s.drop(err)
@@ -1378,7 +1434,7 @@ func (s *Source) Close() error {
 		return nil
 	}
 	st := s.tap.Stats()
-	s.log.Info("database input closed", "captured", st.Captured, "skipped", st.Skipped, "changes", st.Changes, "parts", st.Parts, "alerts", st.Alerts)
+	s.log.Info("database input closed", "captured", st.Captured, "fingerprinted", st.Fingerprinted, "packs", st.Packs, "skipped", st.Skipped, "changes", st.Changes, "parts", st.Parts, "alerts", st.Alerts)
 	return s.tap.Close()
 }
 

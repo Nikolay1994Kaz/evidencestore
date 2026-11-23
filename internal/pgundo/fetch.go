@@ -38,6 +38,28 @@ type Fetcher struct {
 	Wait config.Duration `json:"wait"`
 }
 
+// Settings — раздел отката в настройках: undo.json у esundo и раздел "undo"
+// у esmcp. Откуда брать записи (Fetcher) и с каким путём поиска сверять и
+// откатывать.
+type Settings struct {
+	Fetcher
+	// SearchPath — схемы пути поиска сверки и отката после pg_catalog, по
+	// порядку: ["public"]. По умолчанию — только pg_catalog (и pg_temp
+	// последним). Нужны, если триггеры таблиц называют свои таблицы или
+	// функции без схемы. Путь роли и базы откат не берёт; в каждой названной
+	// схеме CREATE должен быть только у её владельца, иначе откат отказывает
+	// (Plan.SearchPath).
+	SearchPath []string `json:"search_path"`
+}
+
+// Validate проверяет раздел; относительный путь справочника — от base.
+func (s *Settings) Validate(base string) error {
+	if err := s.Fetcher.Validate(base); err != nil {
+		return err
+	}
+	return ValidSearchPath(s.SearchPath)
+}
+
 // Validate проверяет раздел и ставит умолчания; относительный путь
 // справочника — от base.
 func (f *Fetcher) Validate(base string) error {
@@ -78,6 +100,13 @@ func (f *Fetcher) Fetch(xid uint32) ([][]byte, error) {
 			return nil, fmt.Errorf("transaction %d is not in the collector's index: it changed no watched table, or the collector has not read it yet", xid)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if entry.Kind == pgtap.KindFingerprint {
+		// Транзакция роли не из списков: в хранилище только её отпечаток —
+		// кто, ключи строк и их хеши (DECISIONS, п. 41). Строк «до» нет.
+		return nil, refuse("transaction %d is of a role outside the collector's lists (%s): the store keeps only its fingerprint, in record %d — "+
+			"who, the keys of the rows and their hashes, not the rows — so it cannot be undone from the store. Restore the rows from a backup; "+
+			"the hashes tell whether a backup row is the one it changed", xid, entry.Who, entry.FirstSeq)
 	}
 	dir, err := os.MkdirTemp("", "esundo-fetch-")
 	if err != nil {
