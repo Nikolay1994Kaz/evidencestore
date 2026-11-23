@@ -175,3 +175,38 @@ func TestPendingActionCanBeUndone(t *testing.T) {
 		t.Fatalf("%v %s", isErr, out)
 	}
 }
+
+// Строка от имени шлюза и агента, подписанная не ключом шлюза, — не его: ни в
+// списке действий, ни в счёте пределов, ни в откате. Её дописал тот, у кого
+// ключа нет (сборщик о ней поднимет forged-receipt).
+func TestForeignReceiptsAreNotOwn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s := serverOn(t, &fakeDB{}, path, func(c *Config) { c.WindowRows, c.Window = 50, time.Hour })
+	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`); isErr {
+		t.Fatal(text)
+	}
+	_, other, _ := ed25519.GenerateKey(rand.Reader)
+	forger, _ := gateway.NewSigner(other, "esmcp", nil)
+	line := signedLine(t, forger, Receipt{ActionID: "forged-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+		SQL: "UPDATE accounts SET balance = 0", XID: "751", Outcome: "committed", Rows: 49})
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write(line)
+	f.Close()
+	if list, _ := callText(t, s, "actions", `{}`); strings.Contains(list, "forged-1") {
+		t.Fatalf("a forged receipt is in the actions: %s", list)
+	}
+	if _, rows, _, err := s.usage(time.Now()); err != nil || rows != 3 {
+		t.Fatalf("the window counts %d rows (a forged receipt of 49 must not count): %v", rows, err)
+	}
+	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"forged-1"}`); !isErr || !strings.Contains(out, "not in this server's receipts") {
+		t.Fatalf("%v %s", isErr, out)
+	}
+	// Своё действие после подделки — следующим звеном своей цепочки.
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'y' WHERE id = 1"}`); isErr {
+		t.Fatal(text)
+	}
+}

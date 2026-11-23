@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Сценарий «аудит + откат» на живом Postgres, на частях этой ветки:
 #
-#   ИИ-агент → esmcp (MCP-сервер): запрос идёт ролью агента, в транзакции — отметка действия
-#   Postgres: триггер пишет в журнал роль сессии; права роли — то, что агенту можно
-#     → escollect, источник "postgres": логическая репликация (pgoutput), только транзакции
-#                агента и отката, сжатые части прямо в буфер сборщика, тревоги
-#     → evidencestore: источник с "subject_field": "xid"   (хранилище не изменено)
+#   ИИ-агент → esmcp (MCP-сервер, шлюз): запрос идёт ролью сервера; до COMMIT сервер пишет
+#                подписанное намерение — квитанцию receipt/v1 с номером транзакции, после — исход
+#   Postgres: ничего своего — ни триггеров, ни отметок; права ролей — то, что агенту можно
+#     → escollect, источник "postgres": логическая репликация (pgoutput); транзакция, названная
+#                в подписанном намерении шлюза, — целиком, остальные — отпечатком; тревоги
+#     → evidencestore: источник с "subject_field": "xid"
 #     → пакеты записей транзакции → esverify → esundo: обратные операции, сверка с базой,
-#                одна транзакция отката; сам откат тоже ложится в хранилище
-#   Сборщик один: тот же процесс escollect вторым источником читает файл квитанций MCP.
+#                одна транзакция отката со своим намерением; сам откат тоже ложится в хранилище
+#   Сборщик один: тот же процесс escollect читает и файлы квитанций шлюзов (esmcp, esundo) —
+#   источники receipt/v1, подпись каждой квитанции хранилище проверяет при приёме (п. 43).
 #   Тревоги сборщик несёт людям сам: Telegram, Slack-совместимый веб-хук, свой адрес в JSON
 #   (здесь все три — местный приёмник hook_server.py). В тревоге — готовая команда отката.
 #   У MCP-сервера — предел строк на действие: больше — откат до фиксации и тревога.
@@ -20,14 +22,14 @@
 # удаляет заказы, удаляет счёт, портит документ в 1,5 МБ). Человек после него
 # правит несколько строк руками, одну — между сверкой и откатом. Откат плохого
 # действия возвращает всё, кроме тронутого человеком. По дороге: агенту отказано
-# в TRUNCATE, DROP и подделке отметки; транзакция в обход MCP поднимает тревогу.
+# в TRUNCATE, DROP и записи своей ролью; правка человека ложится отпечатком.
 # В конце сборщик убивают (kill -9) и перезапускают базу: записи не теряются и
 # не двоятся, сборщик подключается к базе сам.
 # Каждый шаг сверяется с ожидаемым: расхождение — ненулевой код выхода.
 #
 #   WORK=/tmp/pg-undo experiments/pg-undo/run.sh   # каталог стенда (по умолчанию mktemp)
 #   ES_BIN=/path/to/bin …                          # готовые бинарники этой ветки вместо сборки
-#   WINDOW=1 …                                     # ещё и пакет по окну времени: +2,5 минуты
+#   WINDOW=1 …                                     # ещё пакет по окну времени и пакет по сделке: +2,5 минуты
 #   ROWS=450000 …                                  # замер объёма: счетов ROWS
 #   PGBIN=/usr/lib/postgresql/16/bin …             # где initdb, pg_ctl, psql
 #
@@ -59,7 +61,7 @@ field() { python3 -I -c 'import json,sys; v=json.loads(sys.argv[1])[sys.argv[2]]
 
 step "сборка"
 if [ -n "${ES_BIN:-}" ]; then "$BIN/evidencestore" version; else go build -o "$BIN/" ./cmd/...; fi
-for b in evidencestore escollect esverify esmcp esundo; do [ -x "$BIN/$b" ] || die "нет $BIN/$b"; done
+for b in evidencestore escollect esverify esmcp esundo esreceipt; do [ -x "$BIN/$b" ] || die "нет $BIN/$b"; done
 
 if [ -z "${PGBIN:-}" ]; then
   PGBIN=$(pg_config --bindir 2>/dev/null || true)
@@ -130,8 +132,15 @@ sql_arg() { python3 -I -c 'import json,sys; print(json.dumps({"sql": sys.stdin.r
 # stmts_arg ПРИЧИНА: команды со стандартного ввода, по одной на строку («;» в конце строки — не часть команды) → {"statements": […]}.
 stmts_arg() { python3 -I -c 'import json,sys; print(json.dumps({"statements": [l.strip().rstrip(";").rstrip() for l in sys.stdin if l.strip()], "reason": sys.argv[1]}))' "$1"; }
 
-step "хранилище: источники $SRC (метка субъекта — xid) и agent-mcp (квитанции, метка — action_id)"
-"$BIN/evidencestore" dev-pki -out "$WORK/pki" -source "$SRC" -source agent-mcp >/dev/null
+step "ключи шлюзов: esmcp и esundo подписывают каждый свои квитанции (DECISIONS, п. 42)"
+mkdir -p "$WORK/mcp" "$WORK/undo"
+MCPPUB=$("$BIN/esreceipt" keygen -key "$WORK/mcp/esmcp.key")
+UNDOPUB=$("$BIN/esreceipt" keygen -key "$WORK/undo/esundo.key")
+echo "esmcp $MCPPUB"
+echo "esundo $UNDOPUB"
+
+step "хранилище: источники $SRC (метка субъекта — xid), agent-mcp и undo-op (квитанции receipt/v1, метка — action)"
+"$BIN/evidencestore" dev-pki -out "$WORK/pki" -source "$SRC" -source agent-mcp -source undo-op >/dev/null
 cat >"$WORK/evidencestore.json" <<EOF
 {
   "data_dir": "data",
@@ -144,7 +153,8 @@ cat >"$WORK/evidencestore.json" <<EOF
   "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},
   "sources": [
     {"name": "$SRC", "content_type": "pg/before-images-v1", "subject_field": "xid", "retention_months": 1, "expect_every": "1h"},
-    {"name": "agent-mcp", "content_type": "mcp/receipt-v1", "subject_field": "action_id", "retention_months": 12, "expect_every": "1h"}
+    {"name": "agent-mcp", "content_type": "receipt/v1", "gateway_key": "$MCPPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"},
+    {"name": "undo-op", "content_type": "receipt/v1", "gateway_key": "$UNDOPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"}
   ]
 }
 EOF
@@ -156,10 +166,10 @@ STORE_KEY=$(tail -1 "$WORK/init.txt")
 SERVER=$!
 for _ in $(seq 50); do [ -S "$WORK/data/admin.sock" ] && break; sleep 0.1; done
 
-step "сборщик: один escollect, два источника — журнал базы и файл квитанций MCP"
+step "сборщик: один escollect, три источника — журнал базы и файлы квитанций esmcp и esundo"
 # Общее (сервер, УЦ, ключ хранилища) — наверху; у источника свои сертификат,
-# буфер и вход. Раздел "postgres" — он же вход для -setup-sql.
-mkdir -p "$WORK/mcp"
+# буфер и вход. Раздел "postgres" — он же вход для -setup-sql. Его receipts —
+# чьи квитанции решают, какая транзакция — действие шлюза.
 cat >"$WORK/collector.json" <<EOF
 {
   "server": "https://127.0.0.1:$PORT",
@@ -176,8 +186,8 @@ cat >"$WORK/collector.json" <<EOF
        "roles": ["agent_bot"],
        "undo_roles": ["undo_op"],
        "tables": ["public.accounts", "public.orders", "public.docs"],
+       "receipts": {"files": ["mcp/receipts.jsonl", "undo/receipts.jsonl"], "gateway_keys": ["$MCPPUB", "$UNDOPUB"], "source": "$SRC"},
        "alert_rows": 500,
-       "require_action": true,
        "canaries": [{"table": "public.accounts", "column": "id", "value": "3"}],
        "status_every": "1s",
        "down_after": "1s",
@@ -189,14 +199,16 @@ cat >"$WORK/collector.json" <<EOF
            {"type": "json", "url": "http://127.0.0.1:$HOOKPORT/alerts"}
          ]}}},
     {"cert": "pki/agent-mcp.crt", "key": "pki/agent-mcp.key", "spool_dir": "spool-agent-mcp",
-     "file": "mcp/receipts.jsonl", "from_start": true}
+     "file": "mcp/receipts.jsonl", "from_start": true},
+    {"cert": "pki/undo-op.crt", "key": "pki/undo-op.key", "spool_dir": "spool-undo-op",
+     "file": "undo/receipts.jsonl", "from_start": true}
   ]
 }
 EOF
 "$BIN/escollect" -config "$WORK/collector.json" -setup-sql >"$WORK/setup.sql"
 PGOPTIONS='-c client_min_messages=warning' "${OWNER[@]}" -q -f "$WORK/setup.sql"
-grep -c . "$WORK/setup.sql" | sed 's/$/ строк SQL (escollect -setup-sql): роли сервера esmcp_bot (запись), агента agent_bot (чтение) и отката undo_op, триггер отметки на трёх таблицах, публикация, роль сборщика/'
-touch "$WORK/mcp/receipts.jsonl"
+grep -c . "$WORK/setup.sql" | sed 's/$/ строк SQL (escollect -setup-sql): роли сервера esmcp_bot (запись), агента agent_bot (чтение) и отката undo_op, REPLICA IDENTITY FULL трёх таблиц, публикация, роль сборщика; ни триггеров, ни функций/'
+touch "$WORK/mcp/receipts.jsonl" "$WORK/undo/receipts.jsonl"
 # Получатель тревог: местный приёмник вместо Telegram, Slack и своего адреса.
 HOOKS=$WORK/hooks.jsonl
 : >"$HOOKS"
@@ -235,6 +247,8 @@ cat >"$WORK/mcp.json" <<EOF
   "dsn": "host=$WORK/sock port=$PGPORT user=esmcp_bot dbname=shop",
   "agent": "support-bot",
   "receipts": "mcp/receipts.jsonl",
+  "key": "mcp/esmcp.key",
+  "pg_source": "$SRC",
   "action_row_limit": $ROWS,
   "undo": {
     "index": "pg-index/index.jsonl",
@@ -246,12 +260,14 @@ cat >"$WORK/mcp.json" <<EOF
 EOF
 "$BIN/evidencestore" tsa-root -config "$CFG" -out "$WORK/tsa-root.crt" >/dev/null 2>&1
 # Второй агент — со строгими пределами: секунда на запрос, четыре действия в
-# минуту, 50 строк за десять минут. Квитанции — в тот же файл.
+# минуту, 50 строк за десять минут. Шлюз тот же: тот же файл квитанций, ключ и цепочка.
 cat >"$WORK/mcp-strict.json" <<EOF
 {
   "dsn": "host=$WORK/sock port=$PGPORT user=esmcp_bot dbname=shop",
   "agent": "batch-bot",
   "receipts": "mcp/receipts.jsonl",
+  "key": "mcp/esmcp.key",
+  "pg_source": "$SRC",
   "statement_timeout": "1s",
   "actions_per_minute": 4,
   "window_rows": 50,
@@ -259,8 +275,9 @@ cat >"$WORK/mcp-strict.json" <<EOF
 }
 EOF
 mcp_strict() { python3 -I "$HERE/mcp_call.py" "$BIN/esmcp" "$WORK/mcp-strict.json" "$1" "$2" 2>>"$WORK/mcp.log"; }
-# Настройки оператора для esundo: база и то, как достать записи из хранилища.
-# Оператор откатывает ролью отката: не владелец и не суперпользователь (DECISIONS, п. 39).
+# Настройки оператора для esundo: база, то, как достать записи из хранилища, и
+# квитанции отката — свой файл и свой ключ. Оператор откатывает ролью отката:
+# не владелец и не суперпользователь (DECISIONS, п. 39).
 OPDSN="host=$WORK/sock port=$PGPORT user=undo_op dbname=shop"
 cat >"$WORK/undo.json" <<EOF
 {
@@ -269,7 +286,10 @@ cat >"$WORK/undo.json" <<EOF
   "stamp": ["$BIN/evidencestore", "stamp", "-config", "$CFG"],
   "proof": ["$BIN/evidencestore", "proof", "-config", "$CFG", "-source", "$SRC", "-dek"],
   "verify": ["$BIN/esverify", "-store-key", "$STORE_KEY", "-tsa-trust", "$WORK/tsa-root.crt"],
-  "search_path": ["public"]
+  "search_path": ["public"],
+  "receipts": "undo/receipts.jsonl",
+  "key": "undo/esundo.key",
+  "pg_source": "$SRC"
 }
 EOF
 # Настройки с паролями ролей сервера и отката — только владельцу файла: агент (и пользователь ОС
@@ -347,14 +367,14 @@ wait_tx "$GOOD"
 echo "чтение через MCP: $(mcp query '{"sql": "select id, balance from accounts where id in (1, 2) order by id"}')"
 
 step "что агенту нельзя: в базу идут только SELECT, INSERT, UPDATE, DELETE, MERGE (решает грамматика базы), остальное — права роли"
-for q in "truncate accounts" "drop table orders" "alter table accounts disable trigger evidence_who" \
-  "select pg_logical_emit_message(true, 'evidence/who', '{\"role\":\"postgres\"}')" \
+for q in "truncate accounts" "drop table orders" "alter table accounts replica identity default" \
+  "select pg_read_file('postgresql.conf')" \
   "select pg_terminate_backend(pid) from pg_stat_activity where usename = 'esmcp_bot'"; do
   if out=$(mcp execute "$(sql_arg "" <<<"$q")"); then die "агенту удалось: $q"; fi
   echo "$q → $(grep -o 'postgres: [^(]*' <<<"$out" | head -1)"
 done
 [ "$(grep -c '"outcome":"failed"' "$WORK/mcp/receipts.jsonl")" = 5 ] || die "ждали пять квитанций с исходом failed"
-echo "все пять попыток остались в квитанциях с исходом failed; три первые база отвергла при разборе, подделку отметки и обрыв сеансов сервера — правами роли"
+echo "все пять попыток остались в квитанциях с исходом failed; три первые база отвергла при разборе, чтение файлов сервера и обрыв его сеансов — правами роли"
 
 step "агент сам закрывает транзакцию сервера: BEGIN … COMMIT, COMMIT в списке команд, чтение с COMMIT"
 DOCS=$("${OWNER[@]}" -Atc "select md5(string_agg(id || coalesce(body, ''), ',' order by id)) from docs")
@@ -381,7 +401,7 @@ for _ in $(seq 50); do
 done
 [ -n "$SERVER_PID" ] || die "сеанс esmcp в базе не появился"
 for a in "update accounts set note = 'direct write' where id = 12" \
-         "select evidence.mark_action('{\"action_id\": \"forged\"}')" \
+         "delete from orders where id = 1" \
          "select pg_terminate_backend($SERVER_PID)" \
          "alter role esmcp_bot set statement_timeout = 1"; do
   if out=$("${AGENT[@]}" -c "$a" 2>&1); then die "агенту удалось: $a"; fi
@@ -389,7 +409,7 @@ for a in "update accounts set note = 'direct write' where id = 12" \
 done
 wait "$HOLD"
 [ "$("${OWNER[@]}" -Atc "select note from accounts where id = 12")" != "direct write" ] || die "агент записал мимо сервера"
-echo "ни записи, ни отметки, ни обрыва сеансов сервера, ни его настроек: граница — роли базы (п. 39)"
+echo "ни записи, ни обрыва сеансов сервера, ни его настроек: граница — роли базы (п. 39)"
 
 # Снимок «как было до плохого действия» — только чтобы в конце сверить итог.
 "${OWNER[@]}" -q -c "create table snap.accounts as table accounts" -c "create table snap.orders as table orders" -c "create table snap.docs as table docs"
@@ -474,7 +494,7 @@ grep -q "^fetched from the store and verified: $N records" "$U/check.txt" || die
 # Путь поиска сверки и отката — из undo.json, не путь роли (DECISIONS, п. 41).
 grep -q '^  search_path of the check and the undo: pg_catalog, "public", pg_temp$' "$U/check.txt" || die "esundo сверял не с путём из undo.json: $(grep search_path "$U/check.txt")"
 grep -q "^to apply it: $BIN/esundo apply -config $WORK/undo.json -plan $U/plan.json" "$U/check.txt" || die "esundo не подсказал команду применения"
-grep -q "action $BAD_ACTION: agent support-bot" "$U/check.txt" || die "в до-образах нет отметки действия $BAD_ACTION"
+grep -q "action $BAD_ACTION: gateway esmcp (receipt [0-9]*), agent support-bot" "$U/check.txt" || die "в до-образах нет действия $BAD_ACTION по намерению шлюза"
 grep -q 'already as before 1, conflicts 2$' "$U/check.txt" || die "ждали два конфликта (счёт 6 и заказ 1) и один шаг «уже сделано» (заказ-возврат человек удалил сам)"
 
 step "гонка: между сверкой и откатом человек правит ещё одну строку (счёт 9)"
@@ -517,41 +537,54 @@ step "повторная сверка: применять нечего"
 grep -q 'to apply 0,' "$U/check2.txt" || die "вторая сверка нашла, что применять"
 
 step "сам откат — тоже запись в хранилище: кто, что и почему откатил"
+# По намерению esundo сборщик взял транзакцию отката целиком (п. 42).
 wait_tx "$UNDO"
 ship
 stamp
 mkdir -p "$WORK/undo-tx"
 fetch "$UNDO" "$WORK/undo-tx" >/dev/null
 "$BIN/esundo" check -bodies "$WORK/undo-tx/bodies" -xid "$UNDO" >"$WORK/undo-tx/plan.txt"
-head -2 "$WORK/undo-tx/plan.txt" | cut -c1-230
-grep -q "\"undoes_xid\":\"$BAD\"" "$WORK/undo-tx/plan.txt" || die "в записи отката нет ссылки на транзакцию $BAD"
+head -3 "$WORK/undo-tx/plan.txt" | cut -c1-230
+grep -q "^  undo undo-$BAD-[0-9a-z]*: gateway esundo (receipt [0-9]*), agent nikolay, tool esundo" "$WORK/undo-tx/plan.txt" || die "в записи отката нет его намерения"
+grep -q "^  it undoes action $BAD_ACTION$" "$WORK/undo-tx/plan.txt" || die "в записи отката нет ссылки на действие $BAD_ACTION"
 
-step "правка человека в хранилище — отпечатком: кто, ключи, хеши строк, без самих строк"
-# Роль владельца не в списках сборщика: её транзакция ложится отпечатком —
-# кто, ключи, хеши строк, без самих строк (DECISIONS, п. 41). Пачка ушла перед
+step "правка человека в хранилище — отпечатком: ключи, хеши строк, без самих строк"
+# Намерения шлюза у неё нет: её транзакция ложится отпечатком — ключи, хеши
+# строк, без самих строк и без «кто» (DECISIONS, п. 42). Пачка ушла перед
 # полной транзакцией — откатом; до этого сборщик не подтверждал базе место.
+# require_gateway здесь не задан: в эту базу пишут и люди, тревоги нет.
 wait_tx "$HUMAN"
 HE=$(entry "$HUMAN")
 [ "$(field "$HE" kind)" = fingerprint ] || die "транзакция владельца $HUMAN должна лечь отпечатком: $HE"
-[ "$(field "$HE" who)" = '{"role": "postgres"}' ] || die "в справочнике у отпечатка нет роли: $HE"
 [ -z "$(alerts "$HUMAN")" ] || die "правка владельца подняла тревогу: $(alerts "$HUMAN")"
 ship
 "$BIN/esundo" check -config "$WORK/undo.json" -xid "$HUMAN" >"$WORK/human-undo.txt" 2>&1 && die "esundo взялся откатывать отпечаток"
 grep -q "the store keeps only its fingerprint" "$WORK/human-undo.txt" || die "esundo не объяснил отказ: $(cat "$WORK/human-undo.txt")"
-echo "транзакция владельца $HUMAN в хранилище — отпечатком в пачке (запись $(field "$HE" first_seq)): $(field "$HE" changes) изменения, роль $(field "$HE" who)"
+echo "транзакция владельца $HUMAN в хранилище — отпечатком в пачке (запись $(field "$HE" first_seq)): $(field "$HE" changes) изменения"
 echo "esundo: $(head -1 "$WORK/human-undo.txt" | cut -c1-160)…"
 
-step "квитанция действия из источника agent-mcp: что агент просил"
+step "квитанции действия из источника agent-mcp: намерение и исход, подписанные шлюзом"
 ship_receipts
 stamp
-RSEQ=$(grep -n "\"action_id\":\"$BAD_ACTION\"" "$WORK/mcp/receipts.jsonl" | cut -d: -f1)
-"$BIN/evidencestore" proof -config "$CFG" -source agent-mcp -seq "$RSEQ" -dek -out "$WORK/receipt.json" >/dev/null 2>&1 || die "пакет квитанции не выдан"
-"$BIN/esverify" -proof "$WORK/receipt.json" -store-key "$STORE_KEY" -tsa-trust "$WORK/tsa-root.crt" -body "$WORK/receipt.txt" >/dev/null 2>&1 || die "квитанция не прошла проверку"
-python3 -I - "$WORK/receipt.txt" "$BAD_ACTION" "$BAD" <<'PY'
+# Номер записи — номер строки файла: намерение действия и его исход.
+for STEPNAME in intent outcome; do
+  RSEQ=$(grep -n "\"action\":\"$BAD_ACTION\",\"step\":\"$STEPNAME\"" "$WORK/mcp/receipts.jsonl" | cut -d: -f1)
+  [ -n "$RSEQ" ] || die "нет квитанции $STEPNAME действия $BAD_ACTION"
+  "$BIN/evidencestore" proof -config "$CFG" -source agent-mcp -seq "$RSEQ" -dek -out "$WORK/receipt-$STEPNAME.json" >/dev/null 2>&1 || die "пакет квитанции не выдан"
+  "$BIN/esverify" -proof "$WORK/receipt-$STEPNAME.json" -store-key "$STORE_KEY" -tsa-trust "$WORK/tsa-root.crt" -gateway-key "$MCPPUB" -body "$WORK/receipt-$STEPNAME.txt" >"$WORK/receipt-$STEPNAME.out" 2>&1 ||
+    die "квитанция не прошла проверку: $(cat "$WORK/receipt-$STEPNAME.out")"
+  grep -q "the gateway receipt is signed with the pinned gateway key" "$WORK/receipt-$STEPNAME.out" || die "esverify не проверил подпись шлюза: $(cat "$WORK/receipt-$STEPNAME.out")"
+done
+python3 -I - "$WORK/receipt-intent.txt" "$WORK/receipt-outcome.txt" "$BAD_ACTION" "$BAD" "$SRC" <<'PY'
 import json, sys
-r = json.load(open(sys.argv[1]))
-assert r["action_id"] == sys.argv[2] and r["xid"] == sys.argv[3] and r["outcome"] == "committed", r
-print(f"VERIFIED: действие {r['action_id']}, агент {r['agent']}, транзакция {r['xid']}, причина «{r['reason']}», запрос на {len(r['sql'])} байт")
+i, o = (json.load(open(p)) for p in sys.argv[1:3])
+action, xid, src = sys.argv[3:6]
+assert i["action"] == o["action"] == action and i["step"] == "intent" and o["step"] == "outcome", (i, o)
+assert i["refs"] == [{"source": src, "subject": xid}], i["refs"]
+assert o["prev"] != "genesis" and i["body"]["outcome"] == "pending" and o["body"]["outcome"] == "committed", (i, o)
+b = o["body"]
+print(f"VERIFIED: намерение (квитанция {i['seq']}, ссылка на транзакцию {xid} источника {src}) и исход (квитанция {o['seq']}): "
+      f"агент {b['agent']}, причина «{b['reason']}», запрос на {len(b['sql'])} байт; подпись — ключом шлюза")
 PY
 
 # ---------------------------------------------------------------- откат через MCP
@@ -572,7 +605,7 @@ echo "undo_apply: возвращено $(field "$A" applied) строк тран
 wait_tx "$UNDO2"
 E=$(entry "$UNDO2")
 [ "$(alerts "$UNDO2")" = "" ] || die "откат через MCP поднял тревогу: $(alerts "$UNDO2")"
-echo "в справочнике сборщика откат — транзакция роли $(python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); print(e["who"]["role"], "с отметкой отката действия", e["undo"]["info"]["undoes_action"])' "$E")"
+echo "в справочнике сборщика откат — $(python3 -I -c 'import json,sys; e=json.loads(sys.argv[1])["action"]; assert e["step"] == "undo", e; print("действие", e["id"], "шлюза", e["gateway"], "шагом undo: откат действия", e["undoes"])' "$E")"
 grep -q "\"tool\":\"undo_apply\".*\"undoes\":\"$ACT2\"" "$WORK/mcp/receipts.jsonl" || die "нет квитанции отката"
 
 # ---------------------------------------------------------------- окно времени
@@ -601,6 +634,14 @@ assert s["unlabeled"] == 0 and s["opened"] == s["records"], s
 print(f"VERIFIED: в окне записей источника {rep['records_in_window']}, этой транзакции {s['records']} (открыто {s['opened']}), чужих закрытых {s['others_closed']}, без метки {s['unlabeled']}")
 print(f"план из пакета по окну совпал с планом из пакетов записей: {len(a['steps'])} шагов; пакет — {int(sys.argv[4]) // 1024} КБ")
 PY
+  step "пакет по сделке: квитанции действия $BAD_ACTION и транзакция $BAD, которую они называют (п. 42)"
+  "$BIN/evidencestore" proof -config "$CFG" -source agent-mcp -subject "$BAD_ACTION" -from "$FROM" -to "$TO" -out "$W/receipts.json" >/dev/null 2>&1 || die "пакет квитанций действия не выдан"
+  "$BIN/esverify" -proof "$W/receipts.json" -linked "$W/bundle.json" -store-key "$STORE_KEY" -tsa-trust "$WORK/tsa-root.crt" -gateway-key "$MCPPUB" \
+    -bodies "$W/deal-bodies" >"$W/deal.txt" 2>"$W/deal.err" || die "сделка не сведена: $(head -30 "$W/deal.txt") $(cat "$W/deal.err")"
+  sed -n '3,4p' "$W/deal.txt"
+  grep -q "^  named by receipts \[[0-9]*\]: \"$SRC\" \"$BAD\" — linked bundle 1: $PARTS records, $PARTS open$" "$W/deal.txt" || die "в сделке нет транзакции $BAD целиком"
+  [ "$(ls "$W/deal-bodies" | grep -c "^agent-mcp-")" = 2 ] || die "тела сделки: ждали намерение и исход действия"
+  echo "VERIFIED: обе квитанции действия открыты и подписаны ключом шлюза, транзакция названа в намерении и вся в пакете базы"
 fi
 
 # ---------------------------------------------------------------- предохранитель

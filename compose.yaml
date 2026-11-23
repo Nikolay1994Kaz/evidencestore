@@ -73,6 +73,8 @@ services:
     volumes:
       - ./state/store:/state/store
       - ./state/pg-index:/state/pg-index:ro
+      # esundo пишет сюда намерения откатов (п. 42).
+      - ./state/undo-receipts:/state/undo-receipts
     healthcheck:
       test: ["CMD", "evidencestore", "status", "-config", "/state/store/store.json"]
       interval: 2s
@@ -89,11 +91,12 @@ services:
       - ./state/collector:/state/collector
       - ./state/pg-index:/state/pg-index
       - ./state/receipts:/state/receipts:ro
+      - ./state/undo-receipts:/state/undo-receipts:ro
 
   # MCP-сервер запускает клиент MCP, по одному на сеанс:
   # docker compose run --rm -T --no-deps esmcp (база и db-setup уже подняты up).
-  # Пароль роли сервера — в ./state/mcp: агенту он недоступен, только если
-  # агент не читает ./state (README опыта, «Как база узнаёт агента»).
+  # Пароль роли сервера и ключ шлюза — в ./state/mcp: агенту они недоступны,
+  # только если агент не читает ./state (README опыта, «Чья транзакция»).
   esmcp:
     <<: *es
     profiles: ["mcp"]

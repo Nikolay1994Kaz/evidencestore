@@ -25,6 +25,8 @@ type windowArgs struct {
 	bodies   string
 	asJSON   bool
 	single   []string
+	// linked — пакеты сделки (-linked): -proof — пакет квитанций действия.
+	linked []string
 }
 
 // windowResult — итог проверки пакета за окно любого вида: отчёт текстом и
@@ -144,13 +146,21 @@ func leafOnlyNoBodies(months []string) string {
 
 // verifySource — пакет по одному источнику.
 func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResult {
-	var src proof.SourceReport
+	return sourceResult(sourceReport(data, trust, from, to))
+}
+
+// sourceReport — отчёт пакета по источнику. Пакет, который не разбирается, —
+// провал проверки.
+func sourceReport(data []byte, trust proof.Trust, from, to time.Time) proof.SourceReport {
 	b, err := proof.ParseSource(data)
 	if err != nil {
-		src.Checks = []proof.Check{{Name: "the source bundle parses", Detail: err.Error()}}
-	} else {
-		src = proof.VerifySource(b, trust, from, to)
+		return proof.SourceReport{Checks: []proof.Check{{Name: "the source bundle parses", Detail: err.Error()}}}
 	}
+	return proof.VerifySource(b, trust, from, to)
+}
+
+// sourceResult — отчёт пакета по источнику текстом и JSON, тела для -bodies.
+func sourceResult(src proof.SourceReport) windowResult {
 	out := map[string]any{"valid": src.Valid(), "kind": proof.SourceKind, "checks": src.Checks, "notes": src.Notes(),
 		"source": src.Source, "source_named": src.SourceNamed, "from": src.From, "to": src.To, "window_from_bundle": src.FromBundle,
 		"lower": src.Lower, "upper": src.Upper, "from_start": src.FromStart,
@@ -247,6 +257,15 @@ func runWindow(data []byte, kind string, a windowArgs, stdout, stderr io.Writer)
 	if kind == proof.SourceKind {
 		verify = verifySource
 	}
+	if len(a.linked) > 0 {
+		if kind != proof.SourceKind {
+			return usageErr(errors.New("-linked: a deal starts at a bundle by subject of a receipts source (evidencestore proof -source S -subject ACTION -from -to), and -proof is a bundle over a window of every source"))
+		}
+		var err error
+		if verify, err = deal(a.linked); err != nil {
+			return usageErr(err)
+		}
+	}
 	res := verify(data, a.trust, from, to)
 	valid := res.valid
 
@@ -314,4 +333,47 @@ func safeName(s string) string {
 		}
 		return '_'
 	}, s)
+}
+
+// deal — проверка пакета по сделке (DECISIONS, п. 42): -proof — пакет по
+// субъекту источника квитанций (метка — номер действия), linked — пакеты
+// источников, которые квитанции называют. Каждый проверяется своими
+// правилами, связь — по открытым квитанциям (proof.LinkDeal). Файлы
+// читаются до проверки: неверный путь — неверный вызов.
+func deal(paths []string) (func([]byte, proof.Trust, time.Time, time.Time) windowResult, error) {
+	var data [][]byte
+	for _, p := range paths {
+		d, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("-linked: %w", err)
+		}
+		if kind, _ := proof.BundleKind(d); kind != proof.SourceKind {
+			return nil, fmt.Errorf("-linked %s: a bundle by subject of one source (evidencestore proof -source S -subject X -from -to), not %q", p, kind)
+		}
+		data = append(data, d)
+	}
+	return func(main []byte, trust proof.Trust, from, to time.Time) windowResult {
+		rs := sourceReport(main, trust, from, to)
+		var linked []proof.SourceReport
+		for _, d := range data {
+			linked = append(linked, sourceReport(d, trust, from, to))
+		}
+		dr := proof.LinkDeal(rs, linked)
+		first := sourceResult(rs)
+		res := windowResult{valid: dr.Valid(), bodies: first.bodies, warn: first.warn}
+		text := dr.Text() + "\n=== the receipts bundle (-proof) ===\n\n" + first.text
+		bundles := []map[string]any{first.json}
+		for i, l := range linked {
+			lr := sourceResult(l)
+			text += fmt.Sprintf("\n=== linked bundle %d (%s) ===\n\n", i+1, paths[i]) + lr.text
+			bundles = append(bundles, lr.json)
+			res.bodies = append(res.bodies, lr.bodies...)
+			res.warn = append(res.warn, lr.warn...)
+		}
+		res.text = text
+		res.json = map[string]any{"valid": dr.Valid(), "kind": "deal", "action": dr.Action, "gateway": dr.Gateway, "receipts_open": dr.Receipts,
+			"signatures_checked": dr.Signed, "gateway_key_checked": dr.KeyChecked, "links": dr.Links, "checks": dr.Checks, "notes": dr.Notes(), "bundles": bundles}
+		res.noBodies = "the deal's bundles open no bodies"
+		return res
+	}, nil
 }

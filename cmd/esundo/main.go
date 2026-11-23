@@ -366,7 +366,7 @@ func loadPlan(path string, cfg *Config) (*pgundo.Plan, error) {
 }
 
 // describe — что сделала транзакция и что сделает откат. Всё, что пришло из
-// журнала (отметки агента, имена, значения), печатается через pgundo.Shown:
+// журнала (действие шлюза с причиной агента, имена, значения), печатается через pgundo.Shown:
 // агент не дописывает в этот вывод своих строк (P-251).
 func describe(w io.Writer, p *pgundo.Plan, records int) {
 	fmt.Fprintf(w, "transaction %d: %d store records, %d row changes\n", p.XID, records, p.Changes)

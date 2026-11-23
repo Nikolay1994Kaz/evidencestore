@@ -55,6 +55,8 @@ Keep the key readable only by the gateway's own system user. Whoever can read it
 
 `gateway_key` is required for this content type: a receipt whose signature nobody checked proves nothing. `subject_field` is `action` or none; with it, `evidencestore proof -subject` opens the receipts of one action and no others ([One subject](bundles.md)). Point the collector at the file the gateway writes.
 
+The collector's PostgreSQL input reads the same files (`postgres.receipts`: `files`, `gateway_keys`, `source`): a transaction whose id a signed intent names is the gateway's action and is kept whole, with its row images for an undo; any other is kept as a fingerprint. `esmcp` and `esundo` write such intents before their `COMMIT`.
+
 ## What the store checks at intake
 
 Every line: the format above, the signature with the pinned key, and the link to the receipt of the same gateway the store received before it. Nothing is rejected. The line is stored as received, and a verdict goes into the chain next to it: the gateway, `seq`, the hash of the line and its `prev`, the link (`genesis`, `linked`, `first-seen` when the chain began before the store's first receipt of it, `broken`), the signature (`valid` or `invalid`) and what is wrong. The action, the step and the body are not in the verdict, so a bundle for one action keeps the others closed. A line whose signature is not the gateway's does not enter the gateway's chain: the next real receipt links past it. Every line that is not intact counts in `evidencestore_gateway_problems_total` and goes to the store's log.
@@ -63,13 +65,23 @@ Every line: the format above, the signature with the pinned key, and the link to
 
 A single-record bundle (`evidencestore proof -source S -seq N`) shows that its body is the very line the verdict describes (the hash is recomputed) and that it parses offline; with `esverify -gateway-key`, that the gateway signed it. A bundle for one action (`evidencestore proof -source S -subject ACTION -from FROM -to TO`) opens that action's receipts and keeps the others closed. With `esverify -gateway-key` it checks the signature of every open receipt, and it checks the chain across the whole window from the verdicts: two neighbouring receipts of a gateway link by hash exactly as their verdicts say. So a closed receipt between two open ones is named by the signed `prev` of the next: it was neither left out nor swapped, whatever it says. Receipts the store found broken at intake are not opened, and the report names them.
 
+**A deal** is an action known in several sources: its receipts name, in `refs`, the subjects it has there (a database's transaction id). Ask for the bundle of the action's receipts and for a bundle of every subject they name, over one window, and check them together:
+
+```sh
+evidencestore proof -config C -source agent-mcp -subject ACTION -from FROM -to TO -out receipts.json
+evidencestore proof -config C -source pg-agent -subject XID -from FROM -to TO -out tx.json
+esverify -proof receipts.json -linked tx.json -store-key KEY -tsa-trust ROOT -gateway-key <64 hex> [-bodies DIR]
+```
+
+Each bundle is checked by its own rules, and the deal verifies when every one does, every receipt of the action in the window is open, every subject the receipts name is in a linked bundle over the same window with all its records open, and every linked bundle is named. The labels of different sources never match, by design; the open receipt is the link. `-bodies` writes the bodies of all the bundles.
+
 Not proven:
 
 - **That a receipt is true.** The signature shows who wrote it, the holder of the gateway key, and that it is unchanged since; a false step the gateway signed is recorded faithfully.
 - **That every step was written.** A step the gateway never wrote is not in the store, and nothing in a bundle shows that it is missing.
 - **Whose key it is.** Establish that yourself: a key the gateway's operator hands you proves nothing against that operator.
 - **Which receipts are the action's.** That rests on the label the store set at intake from `action`, as for any subject ([Bundles](bundles.md)).
-- **The other sources a receipt names.** `refs` are the gateway's word. This release does not build one bundle across sources: ask each named source for its own bundle of that subject.
+- **The other sources a receipt names**, on its own. `refs` are the gateway's word; a deal (below) checks that the records they name are there and all open, not that the gateway named the right ones.
 
 Limits to plan for:
 

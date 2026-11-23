@@ -1,4 +1,4 @@
-# Образ всех программ: evidencestore, escollect, esverify, esmcp, esundo, eswitness.
+# Образ всех программ: evidencestore, escollect, esverify, esmcp, esundo, esreceipt, eswitness.
 # Сборка — статическая (CGO_ENABLED=0), образ — alpine: оболочка нужна первому
 # запуску compose (deploy/docker/init.sh), больше ничего.
 #

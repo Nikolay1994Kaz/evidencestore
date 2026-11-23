@@ -19,7 +19,9 @@
 //
 // Пакет за окно времени (evidencestore proof -from -to) распознаётся по
 // полю "kind" и проверяется своими правилами (window.go): -from и -to —
-// окно аудитора, -bodies DIR — тела в файлы.
+// окно аудитора, -bodies DIR — тела в файлы. С -linked — пакет по сделке:
+// пакет квитанций действия и пакеты записей, которые они называют в других
+// источниках (DECISIONS, п. 42).
 //
 // Код выхода: 0 — пакет проходит; 1 — не проходит (в том числе пакет не
 // разбирается или обещание нарушено); 2 — неверный вызов, не читается
@@ -106,10 +108,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	windowFrom := fs.String("from", "", "bundle over a window of time: the start of your window (RFC 3339); without -from and -to the window named in the bundle is used")
 	windowTo := fs.String("to", "", "bundle over a window of time: the end of your window (RFC 3339)")
 	bodiesDir := fs.String("bodies", "", "bundle over a window of time: once it verifies, write every opened body to DIR/<source>-<seq> exactly as the source sent it")
+	var linked []string
+	fs.Func("linked", "a deal (an action known in several sources): -proof is the bundle by subject of the action's receipts (evidencestore proof -source RECEIPTS -subject ACTION -from -to -dek), and each -linked is the bundle by subject of a record its receipts name in another source (-source pg-agent -subject XID, the same window); repeat for more: every one must verify, every record the receipts name must be in one, all of it open, and every one must be named", func(v string) error {
+		linked = append(linked, v)
+		return nil
+	})
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: esverify -proof FILE (-store-key KEY | -seal-trust CERT[,CERT] -seal-subject ATTR=VALUE…) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
 		fmt.Fprintln(stderr, "       esverify -proof WINDOW (-store-key KEY | -seal-trust CERT[,CERT] -seal-subject ATTR=VALUE…) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
 		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
+		fmt.Fprintln(stderr, "       esverify -proof RECEIPTS -linked BUNDLE [-linked BUNDLE]… (-store-key KEY | …) -tsa-trust CERT[,CERT] [-gateway-key KEY] [-from T -to T] [-json] [-bodies DIR]")
+		fmt.Fprintln(stderr, "       (a deal: the bundle by subject of an action's receipts and the bundles of the records they name in other sources)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
 		fmt.Fprintln(stderr, "exit code: 0 the bundle verifies; 1 it does not (also an unparsable bundle or a broken promise); 2 bad usage, an unreadable key, certificate, CRL, revocation list or promise file or heads directory, -body for a bundle without the record key, or -bodies for a bundle that opens no body though the window holds the records asked for (when it holds none — no records, none under the subject's label, or only months the bundle names no label for — it says so, and the code is 0)")
@@ -259,10 +268,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 				single = append(single, name)
 			}
 		}
-		return runWindow(data, kind, windowArgs{trust: pt, from: *windowFrom, to: *windowTo, bodies: *bodiesDir, asJSON: *asJSON, single: single}, stdout, stderr)
+		return runWindow(data, kind, windowArgs{trust: pt, from: *windowFrom, to: *windowTo, bodies: *bodiesDir, asJSON: *asJSON, single: single, linked: linked}, stdout, stderr)
 	}
-	if *windowFrom != "" || *windowTo != "" || *bodiesDir != "" {
-		return usageErr(errors.New("-from, -to and -bodies are for a bundle over a window of time (evidencestore proof -from -to)"))
+	if *windowFrom != "" || *windowTo != "" || *bodiesDir != "" || len(linked) > 0 {
+		return usageErr(errors.New("-from, -to, -bodies and -linked are for a bundle over a window of time (evidencestore proof -from -to)"))
 	}
 
 	// Пакет, который не разбирается, — не неверный вызов, а провал проверки:

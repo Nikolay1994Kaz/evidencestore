@@ -80,7 +80,7 @@ The demo runs these steps:
 
 `scripts/demo-intruder.sh` plays an intrusion on a web server: an intruder logs in as root and removes every line with their address from a practice `auth.log` (inside the demo directory; nothing on the host is touched). The script pulls the records of that source out of the store and verifies each one offline: the four deleted lines come back byte for byte, and the time-stamps show they were in the store before the file was rewritten. Last, it asks for the whole session of web-1 as one bundle, which would not verify with any line left out (this waits two minutes for the time-stamps that close the window).
 
-PostgreSQL with an MCP server for an AI agent, the store and the collector in Docker (branch `pg-undo-experiment`): `docker compose up -d` in the clone sets everything up on the first start, certificates and passwords included ([experiments/pg-undo](experiments/pg-undo/README.md#docker)). The branch is frozen: its markers of who made a change do not hold against a role with REPLICATION, and the input is moving to signed gateway receipts ([experiments/pg-undo](experiments/pg-undo/README.md)).
+PostgreSQL with an MCP server for an AI agent, the store and the collector in Docker (branch `pg-receipts`): `docker compose up -d` in the clone sets everything up on the first start, certificates, passwords and gateway keys included ([experiments/pg-undo](experiments/pg-undo/README.md#docker)). Who made a change comes from the gateway's signed receipts, not from the database: a transaction named in an intent of `esmcp` or `esundo` is kept whole and can be undone, any other is kept as a fingerprint ([experiments/pg-undo](experiments/pg-undo/README.md)).
 
 ## Run it yourself
 

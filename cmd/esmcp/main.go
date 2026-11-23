@@ -103,7 +103,7 @@ func loadConfig(path string) (*Config, error) {
 		errs = append(errs, errors.New("dsn is required"))
 	}
 	if c.Agent == "" {
-		errs = append(errs, errors.New("agent: name the agent (it goes into every action marker)"))
+		errs = append(errs, errors.New("agent: name the agent (it goes into every receipt)"))
 	}
 	if c.Receipts == "" {
 		errs = append(errs, errors.New("receipts: name the receipts file"))

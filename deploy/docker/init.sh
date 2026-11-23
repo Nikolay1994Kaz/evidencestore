@@ -1,20 +1,21 @@
 #!/bin/sh
 # Запуск docker compose. Первый: сертификаты, ключ хранилища, настройки всех
-# программ и пароли ролей базы — в ./state, пароль суперпользователя базы — в
-# томе dbsecret. Каждый: SQL настройки базы этой версии (escollect -setup-sql)
-# — db-setup применяет его, и после обновления образа база получает функции
-# отметок той же версии, что сборщик (заход 2, R1-5).
+# программ, ключи шлюзов и пароли ролей базы — в ./state, пароль
+# суперпользователя базы — в томе dbsecret. Каждый: SQL настройки базы этой
+# версии (escollect -setup-sql) — db-setup применяет его, и после обновления
+# образа права ролей в базе — той же версии, что сборщик (заход 2, R1-5).
 #
 # Это проба на одной машине, как evidencestore dev-setup: демонстрационный УЦ,
 # метки времени от встроенной службы хранилища. Настоящая установка —
 # docs/install.md: свой УЦ, настоящая служба меток, хранилище на другой машине.
 #
 # Кому что (каталог — только тому контейнеру, которому он нужен):
-#   store/      хранилище: серверный сертификат, ключи, данные; undo.json для esundo
+#   store/      хранилище: серверный сертификат, ключи, данные; undo.json и ключ esundo
 #   collector/  сборщик: сертификаты источников, буфер, пароль роли сборщика
-#   mcp/        MCP-сервер: пароль роли сервера
+#   mcp/        MCP-сервер: пароль роли сервера, ключ шлюза esmcp
 #   pg-index/   справочник и тревоги сборщика (сборщик пишет, esundo читает)
 #   receipts/   квитанции MCP (сервер пишет, сборщик читает)
+#   undo-receipts/ квитанции откатов (esundo пишет, сборщик читает)
 #   setup/      SQL настройки базы и пароли ролей для него (только root)
 #   agent.txt   подключение для агента напрямую: только чтение
 # Пароль суперпользователя базы — не в ./state, а в томе dbsecret: каталог
@@ -45,15 +46,20 @@ if [ -n "$(ls -A "$S" 2>/dev/null)" ]; then
 	exit 1
 fi
 umask 077
-for d in pki store collector mcp pg-index receipts setup; do mkdir -p "$S/$d"; done
+for d in pki store collector mcp pg-index receipts undo-receipts setup; do mkdir -p "$S/$d"; done
 
 # Пароль: 32 шестнадцатеричных знака — без кавычек в строке подключения.
 pw() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 PW_PG=$(pw); PW_TAP=$(pw); PW_MCP=$(pw); PW_UNDO=$(pw); PW_AGENT=$(pw)
 
-evidencestore dev-pki -out "$S/pki" -host store -host localhost -source pg-agent -source agent-mcp >/dev/null
+evidencestore dev-pki -out "$S/pki" -host store -host localhost -source pg-agent -source agent-mcp -source undo-op >/dev/null
 cp "$S/pki/ca.crt" "$S/pki/server.crt" "$S/pki/server.key" "$S/store/"
-cp "$S/pki/ca.crt" "$S/pki/pg-agent.crt" "$S/pki/pg-agent.key" "$S/pki/agent-mcp.crt" "$S/pki/agent-mcp.key" "$S/collector/"
+cp "$S/pki/ca.crt" "$S/pki/pg-agent.crt" "$S/pki/pg-agent.key" "$S/pki/agent-mcp.crt" "$S/pki/agent-mcp.key" "$S/pki/undo-op.crt" "$S/pki/undo-op.key" "$S/collector/"
+
+# Ключи шлюзов: esmcp и esundo подписывают каждый свои квитанции; «чья
+# транзакция» сборщик берёт из них, а не из базы (DECISIONS, п. 42).
+MCPPUB=$(esreceipt keygen -key "$S/mcp/esmcp.key")
+UNDOPUB=$(esreceipt keygen -key "$S/store/esundo.key")
 
 cat >"$S/store/store.json" <<EOF
 {
@@ -64,7 +70,8 @@ cat >"$S/store/store.json" <<EOF
   "tsa": {"url": "local"},
   "sources": [
     {"name": "pg-agent", "content_type": "pg/before-images-v1", "subject_field": "xid", "retention_months": 1, "expect_every": "1h"},
-    {"name": "agent-mcp", "content_type": "mcp/receipt-v1", "subject_field": "action_id", "retention_months": 12, "expect_every": "1h"}
+    {"name": "agent-mcp", "content_type": "receipt/v1", "gateway_key": "$MCPPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"},
+    {"name": "undo-op", "content_type": "receipt/v1", "gateway_key": "$UNDOPUB", "subject_field": "action", "retention_months": 12}
   ]
 }
 EOF
@@ -85,14 +92,17 @@ cat >"$S/collector/collector.json" <<EOF
        "roles": ["agent_bot"],
        "undo_roles": ["undo_op"],
        "tables": ["public.accounts", "public.orders"],
-       "alert_rows": 500,
-       "require_action": true}},
+       "receipts": {"files": ["/state/receipts/receipts.jsonl", "/state/undo-receipts/receipts.jsonl"],
+                    "gateway_keys": ["$MCPPUB", "$UNDOPUB"], "source": "pg-agent"},
+       "alert_rows": 500}},
     {"cert": "agent-mcp.crt", "key": "agent-mcp.key", "spool_dir": "spool-agent-mcp",
-     "file": "/state/receipts/receipts.jsonl", "from_start": true}
+     "file": "/state/receipts/receipts.jsonl", "from_start": true},
+    {"cert": "undo-op.crt", "key": "undo-op.key", "spool_dir": "spool-undo-op",
+     "file": "/state/undo-receipts/receipts.jsonl", "from_start": true}
   ]
 }
 EOF
-touch "$S/receipts/receipts.jsonl"
+touch "$S/receipts/receipts.jsonl" "$S/undo-receipts/receipts.jsonl"
 
 # Тревоги — в /state/pg-index/alerts.jsonl и в журнал сборщика. Людям — раздел
 # "notify" у входа "postgres" (Telegram, Slack, свой адрес), с командой отката
@@ -117,7 +127,9 @@ cat >"$S/mcp/mcp.json" <<EOF
 {
   "dsn": "host=db user=esmcp_bot dbname=shop password=$PW_MCP",
   "agent": "agent",
-  "receipts": "/state/receipts/receipts.jsonl"
+  "receipts": "/state/receipts/receipts.jsonl",
+  "key": "/state/mcp/esmcp.key",
+  "pg_source": "pg-agent"
 }
 EOF
 
@@ -129,13 +141,16 @@ cat >"$S/store/undo.json" <<EOF
   "index": "/state/pg-index/index.jsonl",
   "stamp": ["evidencestore", "stamp", "-config", "/state/store/store.json"],
   "proof": ["evidencestore", "proof", "-config", "/state/store/store.json", "-source", "pg-agent", "-dek"],
-  "verify": ["esverify", "-store-key", "$KEY", "-tsa-trust", "/state/store/tsa-root.crt"]
+  "verify": ["esverify", "-store-key", "$KEY", "-tsa-trust", "/state/store/tsa-root.crt"],
+  "receipts": "/state/undo-receipts/receipts.jsonl",
+  "key": "/state/store/esundo.key",
+  "pg_source": "pg-agent"
 }
 EOF
 
 printf 'host=db user=agent_bot dbname=shop password=%s\n' "$PW_AGENT" >"$S/agent.txt"
 
-chown -R "$UID_ES:$UID_ES" "$S/store" "$S/collector" "$S/mcp" "$S/pg-index" "$S/receipts" "$S/agent.txt"
+chown -R "$UID_ES:$UID_ES" "$S/store" "$S/collector" "$S/mcp" "$S/pg-index" "$S/receipts" "$S/undo-receipts" "$S/agent.txt"
 chmod 711 "$S"
 setup_sql
 touch "$S/.done"

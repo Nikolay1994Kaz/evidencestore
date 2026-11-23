@@ -379,7 +379,7 @@
   {
    "name": "C66 снимок реестра не пишется перед освобождением буфера",
    "file": "internal/collector/collector.go",
-   "old": "\t\tif err := c.saveFiles(); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif err := c.spool.Release(c.sentPos); err != nil {",
+   "old": "\t\tif err := c.savePositions(); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif err := c.spool.Release(c.sentPos); err != nil {",
    "new": "\t\tif err := c.spool.Release(c.sentPos); err != nil {"
   },
   {
