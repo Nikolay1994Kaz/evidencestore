@@ -2,6 +2,8 @@
 
 [← README](../README.md)
 
+Any other gateway can write [gateway receipts](receipts.md): one signed line per step, checked at intake by the same machinery.
+
 A source with `"content_type": "pipelock/recorder"` carries the flight recorder of a [Pipelock](https://github.com/luckyPipewrench/pipelock) gateway: JSONL where every entry is hash-chained to the previous one and checkpoints are signed with the gateway's Ed25519 key. Pin that key in the source as `gateway_key` (64 hex, `pipelock signing pubkey`). Point the collector at the shards with a glob, since Pipelock writes every shard to a new file (full example: [`configs/collector.pipelock.example.json`](../configs/collector.pipelock.example.json)):
 
 ```json

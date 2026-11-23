@@ -158,6 +158,10 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		"records": src.Records, "records_in_window": src.InWindow, "first_seq": src.FirstSeq, "last_seq": src.LastSeq,
 		"holes": src.Holes, "records_attached": src.Attached, "bodies_opened": len(src.Bodies),
 		"gateway_records": src.GatewayRecords, "gateway_broken": src.GatewayBroken}
+	if src.Receipts {
+		out["gateway_receipts"] = map[string]any{"links_checked": src.ReceiptLinks, "opened": src.ReceiptsOpened,
+			"signatures_checked": src.ReceiptsSigned, "gateway_key_checked": src.ReceiptKeyChecked}
+	}
 	noBodies := "the bundle opens no bodies in the window: it carries no record keys (request them with evidencestore proof -source S -dek), or " + proof.KeylessReasons + ": there are no bodies to write"
 	var warn []string
 	if src.LeafOnly > 0 && src.Subject == "" {
@@ -195,7 +199,7 @@ func verifySource(data []byte, trust proof.Trust, from, to time.Time) windowResu
 		}
 		// Одна разбивка с отчётом: records + unbound + others_closed = records_in_window.
 		out["subject"] = map[string]any{"field": src.SubjectField, "value": src.Subject, "label": src.SubjectLabel,
-			"records": src.SubjectRecords, "opened": src.SubjectOpened, "keyless": src.SubjectKeyless,
+			"records": src.SubjectRecords, "opened": src.SubjectOpened, "keyless": src.SubjectKeyless, "withheld": src.Withheld(),
 			"unbound": src.SubjectUnbound, "unbound_months": src.SubjectUnboundMonths,
 			"others_closed": src.ClosedOthers(), "others": src.SubjectOthers, "unlabeled": src.SubjectUnlabeled,
 			"no_label": src.SubjectNoLabel, "no_label_months": src.SubjectNoLabelMonths,

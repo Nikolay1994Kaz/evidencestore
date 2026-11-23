@@ -54,7 +54,7 @@ Body:
 2026-11-09T02:11:34+05:00 user=alice action=export table=clients rows=1200
 ```
 
-It takes any line-based log: system logs, application and core banking audit logs, a copy of the SIEM stream, the flight recorder of an AI agent gateway such as [Pipelock](https://github.com/luckyPipewrench/pipelock), whose own hash chain and signatures the store also checks at intake. Time-stamps come from any RFC 3161 service, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). What a bundle proves and what it does not, exactly: [What is proven, and what is not](#what-is-proven-and-what-is-not).
+It takes any line-based log: system logs, application and core banking audit logs, a copy of the SIEM stream, the flight recorder of an AI agent gateway such as [Pipelock](https://github.com/luckyPipewrench/pipelock), whose own hash chain and signatures the store also checks at intake, and the [signed receipts](docs/receipts.md) any gateway can write of what its agent did, checked the same way. Time-stamps come from any RFC 3161 service, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). What a bundle proves and what it does not, exactly: [What is proven, and what is not](#what-is-proven-and-what-is-not).
 
 ## Try it
 
@@ -67,7 +67,7 @@ DEMO_TSA=digicert scripts/demo.sh  # same, time-stamps from the public DigiCert 
 DEMO_TSA=nca scripts/demo.sh       # same, time-stamps from the NCA of Kazakhstan
 scripts/demo-intruder.sh           # an intruder cleans auth.log; every deleted line comes back from the store
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # a real Pipelock gateway, see below
-scripts/demo-purchase.sh           # an AI agent makes three purchases; one of them comes out as a bundle, the others stay closed
+scripts/demo-purchase.sh           # an AI agent makes three purchases, signed by its platform; one comes out as a bundle, the others stay closed
 ```
 
 The demo runs these steps:
@@ -166,8 +166,9 @@ esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt
 | `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
 | `eswitness` | a witness that cosigns the store's chain heads (C2SP tlog-witness), run by someone other than the store's administrator: `init`, `serve`, `vkey` (the key auditors pass to `esverify -witness-key`) |
 | `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; exit code 0 means verified, 1 not verified, 2 a bad call or an unreadable file ([exit codes in full](docs/what-is-proven.md#exit-codes-of-esverify)) |
+| `esreceipt` | for a gateway that writes [signed receipts](docs/receipts.md) of its agent's actions: `keygen`, `sign` (steps on stdin into the receipts file), `verify` (a receipts file, by the store's rules) |
 
-`evidencestore version`, `escollect -version`, `eswitness version` and `esverify -version` print the version and the commit a binary was built from.
+`evidencestore version`, `escollect -version`, `eswitness version`, `esverify -version` and `esreceipt version` print the version and the commit a binary was built from.
 
 ## Install
 
@@ -178,11 +179,11 @@ The store, the collector and the witness run on Linux (amd64, arm64). `esverify`
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify evidencestore-linux-amd64 --repo Nikolay1994Kaz/evidencestore
-sudo install -m 0755 evidencestore-linux-amd64 /usr/local/bin/evidencestore   # likewise escollect, eswitness, esverify
+sudo install -m 0755 evidencestore-linux-amd64 /usr/local/bin/evidencestore   # likewise escollect, eswitness, esverify, esreceipt
 evidencestore version
 ```
 
-**With Go** 1.25.4 or newer: `go install github.com/Nikolay1994Kaz/evidencestore/cmd/esverify@latest`, likewise `cmd/evidencestore`, `cmd/escollect` and `cmd/eswitness`.
+**With Go** 1.25.4 or newer: `go install github.com/Nikolay1994Kaz/evidencestore/cmd/esverify@latest`, likewise `cmd/evidencestore`, `cmd/escollect`, `cmd/eswitness` and `cmd/esreceipt`.
 
 **From source.** With Go 1.25.4 or newer: `git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore && go build -o /usr/local/bin/ ./cmd/...`.
 
@@ -198,8 +199,9 @@ There is no container image yet.
 - [Keys and retention](docs/keys.md): month keys, their backup and the roots mirror, destruction, a seal of your organization on the store key.
 - [Copy, restore and the witness](docs/copy-and-witness.md): the remote copy, `restore`, the witness of the chain heads, witnesses that cosign them (`eswitness`).
 - [Bundles over a window of time](docs/bundles.md): everything received in a window, for one source or for all, for one subject inside a source, and the collector's promise.
+- [Gateway receipts](docs/receipts.md): one signed line per step of an agent's action, from any gateway; the store checks the signature and the chain at intake, and a bundle over one action shows them to anyone with the gateway's key.
 - [Gateway journals (Pipelock)](docs/pipelock.md): the flight recorder of an AI agent gateway, checked at intake.
-- [Evidence for purchases made by AI agents](docs/purchases.md): what an agent writes about a purchase, one purchase as a bundle, and a report of it for a dispute.
+- [Evidence for purchases made by AI agents](docs/purchases.md): the receipts a platform signs for every step of a purchase, one purchase as a bundle, and a report of it for a dispute.
 - [Monitoring](docs/monitoring.md): what to alert on.
 - [Known limitations](docs/limitations.md), [How it was tested](docs/testing.md), [release notes](docs/releases/).
 

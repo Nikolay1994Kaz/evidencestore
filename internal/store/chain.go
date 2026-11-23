@@ -13,7 +13,6 @@ import (
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
-	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/tsa"
 )
@@ -216,13 +215,11 @@ func (s *Store) tailsLocked(at int64) auditchain.Leaf {
 	return proof.TailsLeaf(tails, at)
 }
 
-// tailKind — вид источника в хвостах: журнал гейтвея — gateway.ContentType
-// (у каждой его записи в цепи вердикт хранилища), прочие — пусто.
+// tailKind — вид источника в хвостах: у журнала гейтвея — его content_type
+// (gateway.ContentType или gateway.ReceiptContentType: у каждой записи в цепи
+// вердикт хранилища), у прочих — пусто.
 func (s *Store) tailKind(source string) string {
-	if s.gwSources[source] {
-		return gateway.ContentType
-	}
-	return ""
+	return s.gwSources[source]
 }
 
 // tailSalt — соль хвоста источника в листе хвостов с номером leaf: хэш

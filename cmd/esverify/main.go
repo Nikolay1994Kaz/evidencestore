@@ -72,7 +72,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return nil
 	})
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
-	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway checkpoint signature yourself")
+	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway's signatures yourself (a Pipelock checkpoint, every open gateway receipt)")
 	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them; with the S3 versions list next to them (aws s3api list-object-versions > DIR/versions.json) or a collector's head journal, each witness fixes the record with the head it received first (give each collector a subdirectory of its own)")
 	var witnessKeys []string
 	fs.Func("witness-key", "verifier key of a C2SP witness (as eswitness vkey prints it) or a file containing it, taken from the witness's operator; repeat the flag for more witnesses: each must have cosigned a head at or after the record (for a bundle over a window, at or after its end), and the chain in the bundle must agree with it", func(v string) error {
@@ -252,7 +252,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// подходят, и наоборот.
 	if kind, _ := proof.BundleKind(data); kind == proof.WindowKind || kind == proof.SourceKind {
 		var single []string
-		for name, set := range map[string]bool{"-promise": *promisePath != "", "-gateway-key": *gatewayKey != "", "-allow-no-tsa": *allowNoTSA, "-body": *bodyPath != ""} {
+		// -gateway-key годится и пакету по источнику: им проверяется подпись
+		// каждой открытой квитанции шлюза (receipt/v1).
+		for name, set := range map[string]bool{"-promise": *promisePath != "", "-gateway-key": *gatewayKey != "" && kind == proof.WindowKind, "-allow-no-tsa": *allowNoTSA, "-body": *bodyPath != ""} {
 			if set {
 				single = append(single, name)
 			}
@@ -293,6 +295,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if report.Gateway != nil {
 			out["gateway"] = report.Gateway
 			out["gateway_checkpoint"] = report.GatewayCheckpoint
+		}
+		if report.Receipt {
+			out["gateway_receipt_signed"] = report.ReceiptSigned
+			out["gateway_key_checked"] = report.GatewayKeyChecked
 		}
 		if report.WitnessChecked {
 			out["witness_head"] = report.WitnessHead

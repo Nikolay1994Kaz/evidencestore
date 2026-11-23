@@ -2,22 +2,26 @@
 # Отчёт по одной покупке ИИ-агента из пакета по субъекту (docs/purchases.md).
 #
 # Скрипт сам ничего не доказывает: он зовёт esverify и печатает отчёт, только
-# если пакет прошёл проверку. Строки покупки берутся из тел, которые esverify
-# записал байт в байт (-bodies), время приёма — из заголовков улик пакета (их
-# esverify сверил с листьями цепи). Дальше — пересказ строк по шагам покупки и
-# сверки строк между собой: что в них написано — слово того, кто их писал.
+# если пакет прошёл проверку. Шаги покупки — квитанции шлюза платформы
+# (receipt/v1, docs/receipts.md) из тел, которые esverify записал байт в байт
+# (-bodies); время приёма — из заголовков улик пакета (их esverify сверил с
+# листьями цепи). С -gateway-key esverify сам проверяет подпись платформы у
+# каждой открытой квитанции; без него её проверило только хранилище при
+# приёме. Подпись говорит, кто написал квитанцию, а не что написанное правда:
+# дальше — пересказ шагов и сверки их между собой.
 #
-# Исключение — мандат. С -mandate-key (открытый ключ подписавшего, PEM) скрипт
-# проверяет подпись мандата, если это компактный JWS с ES256 (RFC 7515, 7518),
-# через openssl, и тогда корзина сверяется с подписанными условиями, а не с
-# тем, что написано в строке рядом. Чей это ключ — устанавливает проверяющий.
-# SD-JWT с раскрытиями и привязкой ключа (так несёт мандаты AP2) не разбирается.
+# Мандат внутри квитанции — отдельная подпись. С -mandate-key (открытый ключ
+# подписавшего, PEM) скрипт проверяет её, если это компактный JWS с ES256
+# (RFC 7515, 7518), через openssl, и тогда корзина сверяется с подписанными
+# условиями, а не с тем, что написано в квитанции. Чьи это ключи —
+# устанавливает проверяющий. SD-JWT с раскрытиями и привязкой ключа (так несёт
+# мандаты AP2) не разбирается.
 #
 #   python3 scripts/purchase-report.py -proof p-1002.json -store-key store.pub \
-#       -tsa-trust tsa-root.crt -purchase p-1002 [-mandate-key customer.pub] \
-#       [-esverify PATH] [-- флаги esverify]
+#       -tsa-trust tsa-root.crt -purchase p-1002 [-gateway-key platform.pub] \
+#       [-mandate-key customer.pub] [-esverify PATH] [-- флаги esverify]
 #
-# Код выхода: 0 — пакет проверен, отчёт напечатан (расхождения строк — в отчёте);
+# Код выхода: 0 — пакет проверен, отчёт напечатан (расхождения шагов — в отчёте);
 # 1 — пакет не проверен или он о другой покупке; 2 — неверный вызов, это не
 # пакет по субъекту или тела не открылись.
 import argparse
@@ -152,10 +156,25 @@ SIGNED_FIELDS = ("purchase_id", "customer", "instruction", "scope")
 
 
 def signed_against_line(claims, line):
-    """Чем строка мандата расходится с подписанным: (расходятся, не подписаны)."""
+    """Чем квитанция мандата расходится с подписанным: (расходятся, не подписаны).
+    line — поля шага с номером покупки: purchase_id — это action квитанции."""
     differ = [k for k in SIGNED_FIELDS if k in claims and claims[k] != line.get(k)]
     unsigned = [k for k in SIGNED_FIELDS if k not in claims]
     return differ, unsigned
+
+
+def receipt_of(raw):
+    """Квитанция шлюза из тела: (шаг, поля шага, одобрение, ссылки) или None."""
+    try:
+        r = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(r, dict) or r.get("v") != 1 or not isinstance(r.get("step"), str):
+        return None
+    body = r.get("body") if isinstance(r.get("body"), dict) else {}
+    approval = r.get("approval") if isinstance(r.get("approval"), dict) else None
+    refs = [x for x in r.get("refs") or [] if isinstance(x, dict)]
+    return r["step"], dict(body, purchase_id=r.get("action")), approval, refs
 
 
 def main():
@@ -164,6 +183,7 @@ def main():
     ap.add_argument("-store-key", required=True, dest="store_key", help="pinned store public key, as for esverify")
     ap.add_argument("-tsa-trust", required=True, dest="tsa_trust", help="TSA certificates, as for esverify")
     ap.add_argument("-purchase", help="the purchase you asked about: a bundle about another one is refused")
+    ap.add_argument("-gateway-key", dest="gateway_key", help="the platform's gateway public key (64 hex or a file): esverify checks the signature of every open receipt with it")
     ap.add_argument("-mandate-key", dest="mandate_key", help="public key (PEM) of whoever signed the mandate: its signature is checked (a compact JWS with ES256, through openssl), and the cart is compared with what was signed")
     ap.add_argument("-esverify", default="esverify", help="path to esverify (default: from PATH)")
     ap.add_argument("extra", nargs="*", help="after --: more esverify flags, e.g. -from, -to, -witness-key, -tsa-crl")
@@ -171,7 +191,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         cmd = [a.esverify, "-proof", a.proof, "-store-key", a.store_key, "-tsa-trust", a.tsa_trust,
-               "-json", "-bodies", os.path.join(tmp, "bodies")] + a.extra
+               "-json", "-bodies", os.path.join(tmp, "bodies")] + (["-gateway-key", a.gateway_key] if a.gateway_key else []) + a.extra
         try:
             run = subprocess.run(cmd, capture_output=True)
         except OSError as e:
@@ -209,16 +229,12 @@ def main():
                 seq, ns = struct.unpack(">QQ", raw[1:17])
                 received[seq] = ns
 
-        lines = []  # (номер, тело-объект или None, сырые байты)
+        lines = []  # (номер, квитанция или None, сырые байты)
         bdir = os.path.join(tmp, "bodies")
         for name in os.listdir(bdir) if os.path.isdir(bdir) else []:
             seq = int(name.rsplit("-", 1)[1])
             raw = open(os.path.join(bdir, name), "rb").read()
-            try:
-                obj = json.loads(raw)
-            except ValueError:
-                obj = None
-            lines.append((seq, obj if isinstance(obj, dict) else None, raw))
+            lines.append((seq, receipt_of(raw), raw))
         lines.sort(key=lambda x: x[0])
 
     pid = subj.get("value")
@@ -231,12 +247,20 @@ def main():
           + (" (as named in the bundle: pass your own after --, with -from and -to)" if rep.get("window_from_bundle") else ""))
     print(f"  Lines of this purchase: {subj.get('records')}, open: {subj.get('opened')}. "
           f"Other lines of the source in the window: {subj.get('others')}, closed: {subj.get('others_closed')}.")
-    print("  What a line says is the word of whoever wrote it. Of the signatures inside the lines only the mandate's is")
-    print("  checked, and only with -mandate-key.")
+    rc = rep.get("gateway_receipts") or {}
+    if not rc:
+        print("  The source is not a gateway receipt source: no signature of the platform covers the lines.")
+    elif rc.get("gateway_key_checked"):
+        print(f"  Every line is a receipt the platform signed: esverify checked {rc.get('signatures_checked')} of {rc.get('opened')} with the gateway key you gave.")
+    else:
+        print("  Every line is a receipt the platform signed: the store checked the signatures at intake (give -gateway-key to check them yourself).")
+    print("  A signature shows who wrote a line, not that it is true. The mandate inside carries a signature of its own,")
+    print("  checked only with -mandate-key.")
 
+    withheld = subj.get("withheld") or 0
     incomplete = []
-    if subj.get("records") != subj.get("opened"):
-        incomplete.append(f"{(subj.get('records') or 0) - (subj.get('opened') or 0)} line(s) of this purchase did not open: their keys are not in the bundle")
+    if (subj.get("records") or 0) - withheld != subj.get("opened"):
+        incomplete.append(f"{(subj.get('records') or 0) - withheld - (subj.get('opened') or 0)} line(s) of this purchase did not open: their keys are not in the bundle")
     for key, what in (("no_label_months", "the bundle names no label"), ("unbound_months", "no body of this purchase opens"),
                       ("unconfirmed_months", "the label is not confirmed by an open body"), ("leaf_only_months", "records come without evidence")):
         if rep.get(key) or subj.get(key):
@@ -248,10 +272,20 @@ def main():
         print("INCOMPLETE — this report may miss lines of the purchase:")
         for s in incomplete:
             print(f"  ✘ {s}")
+    if withheld:
+        broken = ", ".join(str(x) for x in rep.get("gateway_broken") or [])
+        print()
+        print(f"NOT THE PLATFORM'S — {withheld} line(s) under this purchase's label the store found broken at intake")
+        print(f"  (broken records of the source: {broken}): a signature that is not the platform's, a gap in its chain, or a line")
+        print("  out of format. Their bodies are not opened, and nothing below relies on them; a single-record bundle shows what is wrong.")
 
     by = {}
-    for seq, obj, raw in lines:
-        by.setdefault(obj.get("event") if obj and isinstance(obj.get("event"), str) else None, []).append((seq, obj, raw))
+    approvals = {}
+    for seq, r, raw in lines:
+        step = r[0] if r else None
+        by.setdefault(step, []).append((seq, r[1] if r else None, raw))
+        if r:
+            approvals[seq] = (r[2], r[3])
 
     signed = {}  # номер строки мандата → итог проверки его подписи
 
@@ -267,18 +301,21 @@ def main():
         head("Mandate: what the customer allowed", seq)
         print(f"  customer {q(o.get('customer'))} asked for: {q(o.get('instruction'))}")
         print(f"  allowed: up to {money(sc.get('price_cap'))} {q(sc.get('currency'))} at {q(', '.join(map(str, sc.get('merchants') or [])) or '—')}, until {stamp(sc.get('expires'))}")
-        cred = o.get("credential")
-        if not cred:
-            print("  signed mandate: not in the line")
+        appr = approvals.get(seq, (None, None))[0] or {}
+        cred = appr.get("credential") if appr.get("format") == "jws" else None
+        if appr and not cred:
+            print(f"  signed mandate: carried as {q(appr.get('format'))}, which this script does not check")
+        elif not cred:
+            print("  signed mandate: not in the receipt")
         elif not a.mandate_key:
-            print(f"  signed mandate: carried in the line, {len(str(cred))} characters; its signature is not checked (give the signer's public key with -mandate-key)")
+            print(f"  signed mandate: carried in the receipt, {len(str(cred))} characters; its signature is not checked (give the signer's public key with -mandate-key)")
         else:
             ok, kid, claims, why = signed.setdefault(seq, mandate_jws(cred, a.mandate_key))
             verdict = "the signature verifies under the key you gave" if ok else "the signature does NOT verify under the key you gave" if ok is False else "not checked: " + why
-            print(f"  signed mandate: carried in the line, {len(str(cred))} characters" + (f', key id "{q(kid)}"' if kid else "") + f"; {verdict}")
+            print(f"  signed mandate: carried in the receipt, {len(str(cred))} characters" + (f', key id "{q(kid)}"' if kid else "") + f"; {verdict}")
             ssc = claims.get("scope") if ok and isinstance(claims.get("scope"), dict) else None
             if ssc is not None and ssc != sc:
-                print(f"  SIGNED, and the line differs from it: up to {money(ssc.get('price_cap'))} {q(ssc.get('currency'))} at {q(', '.join(map(str, ssc.get('merchants') or [])) or '—')}, until {stamp(ssc.get('expires'))}")
+                print(f"  SIGNED, and the receipt differs from it: up to {money(ssc.get('price_cap'))} {q(ssc.get('currency'))} at {q(', '.join(map(str, ssc.get('merchants') or [])) or '—')}, until {stamp(ssc.get('expires'))}")
     for seq, o, _ in by.get("agent_verified", []):
         head("Agent: who acted", seq)
         print(f"  {q(o.get('agent_id'))}, key {q(o.get('key_id'))}, checked by {q(o.get('checked_by'))}: {q(o.get('result'))}")
@@ -297,6 +334,8 @@ def main():
     for seq, o, _ in by.get("payment", []):
         head("Payment", seq)
         print(f"  {money(o.get('amount'))} {q(o.get('currency'))}, {q(o.get('method'))} {q(o.get('token_ref'))}, {q(o.get('authentication'))}, reference {q(o.get('network_ref'))}")
+        for ref in approvals.get(seq, (None, []))[1]:
+            print(f"  the receipt names it as {q(ref.get('subject'))} in source {q(ref.get('source'))}: a bundle of that source shows the other side's records")
     for seq, o, _ in by.get("delivery", []):
         head("Delivery", seq)
         print(f"  {q(o.get('carrier'))} {q(o.get('tracking'))}: {q(o.get('status'))}")
@@ -305,7 +344,7 @@ def main():
         if event in known:
             continue
         for seq, o, raw in items:
-            head("Another line" if o else "A line that is not a JSON object", seq)
+            head("Another step" if o else "A line that is not a gateway receipt", seq)
             print("  " + q(raw.decode(errors="replace").rstrip("\n"), 300))
 
     # Сверки строк между собой. True — сходится, False — расходится, None — сказать нельзя.
@@ -314,18 +353,19 @@ def main():
     if by.get("cart"):
         cart = ([c for c in by["cart"] if not pay or c[0] < pay[0]] or by["cart"])[-1]  # корзина, по которой платили
     sc = m[1].get("scope") if m and isinstance(m[1].get("scope"), dict) else {}
-    checks.append((bool(m), "a mandate line is recorded" if m else "no mandate line: nothing here shows what the customer allowed"))
-    the_mandate = "the mandate"  # с чем сверяется корзина: со строкой или с подписанным
+    checks.append((bool(m), "a mandate is recorded" if m else "no mandate receipt: nothing here shows what the customer allowed"))
+    the_mandate = "the mandate"  # с чем сверяется корзина: с квитанцией или с подписанным
+    m_appr = (approvals.get(m[0], (None, None))[0] or {}) if m else {}
     if m and not a.mandate_key:
-        checks.append((None, "the mandate's signature was not checked (no -mandate-key): what the customer allowed is the line's word"))
-    elif m and not m[1].get("credential"):
-        checks.append((False, "the mandate line carries no signed mandate to check"))
+        checks.append((None, "the mandate's signature was not checked (no -mandate-key): what the customer allowed is the platform's word"))
+    elif m and m_appr.get("format") != "jws":
+        checks.append((False, "the mandate receipt carries no signed mandate this script can check (a compact JWS)"))
     elif m:
         ok, _, claims, why = signed[m[0]]
         if ok is None:
             checks.append((None, "the mandate's signature was not checked: " + why))
         elif not ok:
-            checks.append((False, "the mandate's signature does NOT verify under the key you gave" + (f" ({why})" if why else "") + ": what the customer allowed is only the line's word"))
+            checks.append((False, "the mandate's signature does NOT verify under the key you gave" + (f" ({why})" if why else "") + ": what the customer allowed is only the platform's word"))
         else:
             checks.append((True, "the mandate's signature verifies under the key you gave"))
             if "purchase_id" not in claims:
@@ -334,19 +374,19 @@ def main():
                 checks.append((False, f'the signed mandate is for another purchase: "{q(claims["purchase_id"])}"'))
             differ, unsigned = signed_against_line(claims, m[1])
             if differ:
-                checks.append((False, f"the mandate line differs from what was signed in: {', '.join(differ)}"))
+                checks.append((False, f"the mandate receipt differs from what was signed in: {', '.join(differ)}"))
             else:
-                checks.append((True, "the mandate line says what was signed" + (f" (not covered by the signature: {', '.join(unsigned)})" if unsigned else "")))
+                checks.append((True, "the mandate receipt says what was signed" + (f" (not covered by the signature: {', '.join(unsigned)})" if unsigned else "")))
             if isinstance(claims.get("scope"), dict):
                 sc, the_mandate = claims["scope"], "the signed mandate"
                 if differ:
-                    checks.append((None, "the cart is compared below with the signed mandate, not with the line"))
+                    checks.append((None, "the cart is compared below with the signed mandate, not with the receipt"))
     for event in ("mandate", "cart", "payment"):
         if len(by.get(event, [])) > 1:
-            checks.append((None, f"{len(by[event])} {event} lines: the report compares the " + ("first mandate" if event == "mandate" else "last cart before the payment" if event == "cart" else "first payment")))
+            checks.append((None, f"{len(by[event])} {event} receipts: the report compares the " + ("first mandate" if event == "mandate" else "last cart before the payment" if event == "cart" else "first payment")))
     ag = by.get("agent_verified", [])
     if not ag:
-        checks.append((None, "no line says the agent's identity was checked"))
+        checks.append((None, "no receipt says the agent's identity was checked"))
     else:
         bad = [s for s, o, _ in ag if o.get("result") != "ok"]
         checks.append((not bad, "the agent's identity check is recorded as ok" if not bad else f"the agent's identity check did not pass (record {bad[0]})"))
@@ -379,32 +419,32 @@ def main():
     cancels = by.get("cancel", [])
     if pay:
         note = [n for n in by.get("notification", []) if n[0] < pay[0]]
-        checks.append((bool(note), "the customer was notified before the payment" if note else "no notification line lies before the payment"))
+        checks.append((bool(note), "the customer was notified before the payment" if note else "no notification receipt lies before the payment"))
         early = [c for c in cancels if c[0] < pay[0]]
         if early:
             checks.append((False, f"a cancellation is recorded (record {early[0][0]}) BEFORE the payment (record {pay[0]})"))
         elif cancels:
             checks.append((None, f"a cancellation is recorded (record {cancels[0][0]}) after the payment (record {pay[0]})"))
         else:
-            checks.append((True, "no cancellation is recorded among the lines of this purchase"))
+            checks.append((True, "no cancellation is recorded among the receipts of this purchase"))
         if cart:
             a1, t1 = num(pay[1].get("amount")), num(cart[1].get("total"))
             ok = a1 is not None and a1 == t1 and pay[1].get("currency") == cart[1].get("currency")
             checks.append((ok, f"the amount paid {'equals' if ok else 'differs from'} the cart total ({money(pay[1].get('amount'))} {q(pay[1].get('currency'))} against {money(cart[1].get('total'))} {q(cart[1].get('currency'))})"))
         else:
-            checks.append((False, "a payment is recorded without a cart line before it"))
-        checks.append((bool(by.get("delivery")), "a delivery is recorded" if by.get("delivery") else "no delivery line is recorded"))
+            checks.append((False, "a payment is recorded without a cart receipt before it"))
+        checks.append((bool(by.get("delivery")), "a delivery is recorded" if by.get("delivery") else "no delivery receipt is recorded"))
     elif cancels:
         checks.append((True, f"the purchase was cancelled (record {cancels[0][0]}), and no payment is recorded"))
     else:
-        checks.append((None, "no payment line is recorded"))
+        checks.append((None, "no payment receipt is recorded"))
 
-    print("\nThe lines compared with each other (record numbers give the order the lines were written in):")
+    print("\nThe steps compared with each other (record numbers give the order the receipts were written in):")
     for ok, text in checks:
         print(f"  {'✔' if ok else '✘' if ok is False else '?'} {text}")
     bad = sum(1 for ok, _ in checks if ok is False)
     print()
-    print(f"{bad} of these comparisons disagree{'s' if bad == 1 else ''}." if bad else "The lines agree with each other.")
+    print(f"{bad} of these comparisons disagree{'s' if bad == 1 else ''}." if bad else "The steps agree with each other.")
     print(f"esverify's notes on what this bundle does not prove: {len(rep.get('notes') or [])} (run esverify on the bundle to read them).")
     sys.exit(0)
 

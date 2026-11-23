@@ -20,6 +20,6 @@
     "roots_mirror_dir": "/mnt/roots-mirror/evidencestore"
   },
   "sources": [
-    {"name": "shop-agent", "content_type": "purchase-events", "subject_field": "purchase_id", "retention_months": 24, "expect_contact": "2m"}
+    {"name": "shop-agent", "content_type": "receipt/v1", "gateway_key": "PIN-THE-PLATFORM-GATEWAY-KEY-PRINTED-BY-esreceipt-keygen", "subject_field": "action", "retention_months": 24, "expect_contact": "2m"}
   ]
 }

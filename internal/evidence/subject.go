@@ -122,6 +122,18 @@ func SubjectOf(body []byte, field string) (string, bool) {
 // проверяет субъекта, о котором просят пакет (T-01).
 func ValidSubject(v string) bool { return utf8.ValidString(v) }
 
+// JSONString — строка JSON (raw с кавычками), если её разберёт любой
+// разборщик одинаково: UTF-8 и суррогаты \u только парами. Иначе encoding/json
+// подставил бы U+FFFD, и разные байты дали бы одну строку (T-01). Им же
+// проверяются поля квитанции шлюза (gateway.ParseReceipt).
+func JSONString(raw []byte) (string, bool) {
+	var s string
+	if len(raw) == 0 || raw[0] != '"' || !validRawString(raw) || json.Unmarshal(raw, &s) != nil {
+		return "", false
+	}
+	return s, true
+}
+
 // validRawString — строка JSON (с кавычками) в UTF-8, и каждая \u-половина
 // суррогата — в паре. Разбор json заменяет и то и другое на U+FFFD.
 func validRawString(raw []byte) bool {
