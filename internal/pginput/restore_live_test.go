@@ -6,7 +6,8 @@ package pginput
 // сборщика (R2-1, R2-2, T-7; проверка R2 цикла 23.11).
 //
 // Запуск — на отдельном кластере, который тест останавливает и
-// восстанавливает из копии каталога (общий не трогается); порт — 55452:
+// восстанавливает из копии каталога (общий не трогается); сокет — каталог
+// sock рядом с data, порт — из PGINPUT_RESTORE_DSN:
 //
 //	PGINPUT_RESTORE_DSN="host=/path/sock port=55452 dbname=live" PGINPUT_RESTORE_DATA=/path/data \
 //	go test ./internal/pginput -run TestLiveRestored -v
@@ -31,7 +32,7 @@ func pgctl(t *testing.T, data string, args ...string) {
 	base := []string{"-u", "postgres", "--", "/usr/lib/postgresql/16/bin/pg_ctl", "-D", data, "-w"}
 	if args[0] == "start" {
 		base = append(base, "-l", strings.TrimSuffix(data, "/data")+"/log", "-o",
-			"-c wal_level=logical -c port=55452 -c unix_socket_directories="+sock+" -c listen_addresses='' -c max_replication_slots=10 -c max_wal_senders=10 -c autovacuum=off")
+			"-c wal_level=logical -c port="+restorePort()+" -c unix_socket_directories="+sock+" -c listen_addresses='' -c max_replication_slots=10 -c max_wal_senders=10 -c autovacuum=off")
 	}
 	if args[0] == "stop" {
 		base = append(base, "-m", "fast")
@@ -39,6 +40,16 @@ func pgctl(t *testing.T, data string, args ...string) {
 	if out, err := exec.Command("runuser", append(base, args...)...).CombinedOutput(); err != nil {
 		t.Fatalf("pg_ctl %v: %v\n%s", args, err, out)
 	}
+}
+
+// restorePort — порт кластера для подъёма из копии: из PGINPUT_RESTORE_DSN.
+func restorePort() string {
+	for _, f := range strings.Fields(os.Getenv("PGINPUT_RESTORE_DSN")) {
+		if p, ok := strings.CutPrefix(f, "port="); ok {
+			return p
+		}
+	}
+	return "5432"
 }
 
 func shell(t *testing.T, script string) {
