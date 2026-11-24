@@ -55,7 +55,7 @@ Keep the key readable only by the gateway's own system user. Whoever can read it
 
 `gateway_key` is required for this content type: a receipt whose signature nobody checked proves nothing. `subject_field` is `action` or none; with it, `evidencestore proof -subject` opens the receipts of one action and no others ([One subject](bundles.md)). Point the collector at the file the gateway writes.
 
-The collector's PostgreSQL input reads the same files (`postgres.receipts`: `files`, `gateway_keys`, `source`): a transaction whose id a signed intent names is the gateway's action and is kept whole, with its row images for an undo; any other is kept as a fingerprint. `esmcp` and `esundo` write such intents before their `COMMIT`.
+The collector's PostgreSQL input reads the same files (`postgres.receipts`: `files`, `gateway_keys`, `source`): a transaction whose id a signed intent names is the gateway's action and is kept whole, with its row images for an undo; any other is kept as a fingerprint. `esmcp` and `esundo` write such intents before their `COMMIT` ([PostgreSQL and an MCP server](postgres.md)).
 
 ## What the store checks at intake
 

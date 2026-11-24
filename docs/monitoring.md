@@ -36,3 +36,18 @@ Set `metrics_listen` (for example `127.0.0.1:9464`) to expose `/metrics` in the 
 Also exported: records, duplicates and conflicts per source, evidence-log batches and their fsync time, the chain head.
 
 Not in the metrics, worth an alert on the logs. In the store's log: `tree of links: writing tree.hashes failed` (bundles are refused until a restart rebuilds that file) and `head for the collector` (collectors get no head or no proof; once a minute at most). In a collector's log: `the store's chain does not extend the head this collector holds` (the store signed a second history or lost the end of its chain), `the store has not shown a head of its chain that extends the one this collector holds` (the collector does not witness the chain meanwhile) and `was not written to spool_dir` (a head file cannot be written; records are still delivered). See [Collectors as witnesses](copy-and-witness.md#collectors-as-witnesses).
+
+## The collector
+
+`escollect` has a page of its own: `metrics_listen` at the top of its config (for example `127.0.0.1:9465`), one page for all its sources, and every value carries a `source` label. Worth an alert:
+
+| Condition | Meaning |
+|---|---|
+| `time() - escollect_loop_timestamp_seconds > 60` | the collector's loop stopped going round: it hangs |
+| `time() - escollect_store_last_contact_timestamp_seconds > 300` | the store has not answered for five minutes; records wait in the spool (`escollect_spool_pending_records`) |
+| `escollect_postgres_connected == 0` for 5 minutes | the stream from the database is down; the alert `db-down` tells people the same |
+| `escollect_postgres_slot_retained_bytes > 0.5 * escollect_postgres_slot_limit_bytes` | the database keeps more and more log for the slot (the alert `slot-lag` fires at half of `max_slot_wal_keep_size` and at 80 %); a long open transaction in the database holds it too. At the limit the database drops the slot's log, and records are lost |
+| `escollect_postgres_slot_lost == 1` | the database reports the slot as lost |
+| `escollect_alerts_target_failing == 1` | a target of the alerts refuses them or cannot be reached; they wait in its queue (`escollect_alerts_waiting`) |
+
+Also exported: the last record number issued and the last one the store acknowledged, the transactions kept whole and as fingerprints, their row changes and the alerts raised since start, and the slot's lag behind the end of the database's log and its safe size. A collector that is down shows no page at all: the store tells that its source went quiet or lost contact (above).

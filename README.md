@@ -30,6 +30,7 @@ flowchart LR
 - **Nothing left out.** A bundle over a window of time, for one source, for every source or for one subject inside a source, proves that it holds every record the store put into its chain in that window.
 - **The store's administrator is checked too.** Signed chain heads go to witnesses out of that administrator's reach: an `eswitness` that cosigns only heads that extend the last one it cosigned, an S3 bucket with Object Lock, the collectors themselves. A history rewritten after they saw it contradicts what they hold.
 - **Retention by destroying keys.** The records of a source for a month share that month's key. Destroying it, after a waiting period and two named approvals, makes those bodies unreadable in every copy, while the proofs that the records existed and never changed stay valid.
+- **An AI agent's actions, signed and undoable.** A gateway signs a receipt for every step of what its agent does, and the store checks it at intake. On PostgreSQL the collector reads the database's log itself: the agent's transactions are kept whole, with the rows before and after, every other change as a fingerprint, and an operator undoes an agent's transaction in two commands ([PostgreSQL and an MCP server](docs/postgres.md)).
 
 What the auditor sees (`esverify` on a bundle from a store with a witness, abridged):
 
@@ -58,7 +59,7 @@ It takes any line-based log: system logs, application and core banking audit log
 
 ## Try it
 
-The demos run on Linux with bash, python3 and Go 1.25.4 or newer (the Pipelock one also needs curl, the purchase one openssl). With binaries from a release, `ES_BIN=/usr/local/bin` runs them without Go ([Install](#install)).
+The demos run on Linux with bash, python3 and Go 1.25.4 or newer (the Pipelock one also needs curl, the purchase one openssl, the PostgreSQL one PostgreSQL 14 or newer). With binaries from a release, `ES_BIN=/usr/local/bin` runs them without Go ([Install](#install)).
 
 ```sh
 git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore
@@ -68,6 +69,7 @@ DEMO_TSA=nca scripts/demo.sh       # same, time-stamps from the NCA of Kazakhsta
 scripts/demo-intruder.sh           # an intruder cleans auth.log; every deleted line comes back from the store
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # a real Pipelock gateway, see below
 scripts/demo-purchase.sh           # an AI agent makes three purchases, signed by its platform; one comes out as a bundle, the others stay closed
+experiments/pg-undo/run.sh         # an AI agent on PostgreSQL through the MCP server, a person's edit, alerts, limits and an undo
 ```
 
 The demo runs these steps:
@@ -152,7 +154,7 @@ esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt
 
 ## How it works
 
-1. **Collect.** `escollect` tails the log, numbers every line and keeps it in a spool on disk until the store has signed for it.
+1. **Collect.** `escollect` tails the log, or reads a PostgreSQL database's log by logical replication, numbers every record and keeps it in a spool on disk until the store has signed for it.
 2. **Accept.** The store takes each line over mutual TLS, encrypts it as a record with its own key, writes it to disk and answers only after `fsync`, with a signed promise the collector keeps.
 3. **Chain.** Records are chained by hash. A chain head is a signed checkpoint: the number of links and the root of a Merkle tree over all of them.
 4. **Time-stamp.** An external RFC 3161 authority time-stamps the head; a second one, of another operator, can vouch for the first should its key ever be compromised ([Revoked TSA certificates](docs/bundles.md#revoked-tsa-certificates)).
@@ -234,11 +236,11 @@ Every claim in full, with its conditions: [docs/what-is-proven.md](docs/what-is-
 
 ## How it was tested
 
-The test gate with the race detector runs on every push. On the code of v0.4.0, 650 bugs were injected one at a time, and every one of them made a test fail; the set has since grown to 1157, and those have not all been run together since. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each on the code of v0.4.0, with shorter runs on the code after it, and none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on MinIO with Object Lock, not yet on AWS. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
+The test gate with the race detector runs on every push. On the code of v0.4.0, 650 bugs were injected one at a time, and every one of them made a test fail; the set has since grown to 1,301, and those have not all been run together since. The PostgreSQL path ran its live tests against PostgreSQL 16, restores from a copy included, and an end-to-end scenario with an agent, a person and an undo. Randomized simulations of crashes, clocks, the collector and a dishonest store owner ran thousands of scenarios each on the code of v0.4.0, with shorter runs on the code after it, and none failed. The store ran a night on real logs and a live Pipelock, and the witness and the copy were tried on MinIO with Object Lock, not yet on AWS. Numbers, dates and commands: [docs/testing.md](docs/testing.md). Every finding of the code review, how it was reproduced and how it was fixed: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
 
 ## Known limitations
 
-About thirty, each with its cause: [docs/limitations.md](docs/limitations.md). The ones to read before a pilot: the collector reads files and PostgreSQL only; the two approvals of a key destruction are recorded but not enforced; indexes are kept in memory; a record changed on disk stops the next start until `data_dir` is restored from a copy; the seal on the store key does not support ГОСТ; the cryptography is not certified. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
+About thirty-five, each with its cause: [docs/limitations.md](docs/limitations.md), and those of the PostgreSQL path in [docs/postgres.md](docs/postgres.md#limits). The ones to read before a pilot: what the PostgreSQL path promises rests on a [trust boundary](docs/postgres.md#the-trust-boundary); the collector reads files and PostgreSQL only; the two approvals of a key destruction are recorded but not enforced; indexes are kept in memory; a record changed on disk stops the next start until `data_dir` is restored from a copy; the seal on the store key does not support ГОСТ; the cryptography is not certified. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
 
 ## Development
 
@@ -249,7 +251,11 @@ go build ./... && go vet ./... && go test -race ./...
 scripts/release.sh dist               # release binaries and SHA256SUMS
 ES_BIN=/usr/local/bin scripts/demo.sh # the demo on installed binaries instead of a fresh build
 python3 scripts/mutate.py keyring     # mutation testing: every injected bug must fail a test
-                                      # sets: keyring, evlog, tsa, store, edge, auditchain, gateway, config, ship, cosign
+                                      # sets: keyring, evlog, tsa, store, edge, auditchain, gateway, config, ship, cosign,
+                                      # and the rest in scripts/mutations/
+PGINPUT_TEST_DSN="host=… port=… dbname=…" go test ./internal/pginput -run Live -v  # the PostgreSQL input on a live database:
+                                      # PostgreSQL 14+ with wal_level=logical, a throwaway cluster where the test
+                                      # makes roles, a table and a slot; no user in the DSN, roles log in by trust
 ```
 
 The simulations and how to replay a failing scenario: [docs/testing.md](docs/testing.md#simulations).

@@ -13,10 +13,12 @@ What the store and `esverify` promise, and what they do not, is in [What is prov
 - a forged, rewritten or truncated chain, or a bundle that leaves something out, that `esverify` reports as VERIFIED;
 - a time-stamp of a TSA key revoked for compromise that counts without a proof that it existed earlier;
 - confirmed evidence lost or changed without the store or `esverify` showing it;
+- a receipt not signed with the gateway's key that the store or `esverify` takes as signed;
+- within the trust boundary of [PostgreSQL and an MCP server](docs/postgres.md#the-trust-boundary): a transaction on the named tables that gets past the store, kept neither whole nor as a fingerprint, another transaction taken as the gateway's action, or an action of `esmcp` committed over its limits;
 - a destroyed month key, or a body sealed under it, recovered without a copy of the old root key;
-- input that crashes or stalls the store, a collector, a witness or `esverify`.
+- input that crashes or stalls the store, a collector, a witness, `esverify`, `esmcp` or `esundo`.
 
-A limit already described in [docs/limitations.md](docs/limitations.md) is not a vulnerability, unless the report shows it reaches further than described there.
+A limit already described in [docs/limitations.md](docs/limitations.md) or in [docs/postgres.md](docs/postgres.md#limits) is not a vulnerability, unless the report shows it reaches further than described there.
 
 ## Supported versions
 
