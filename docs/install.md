@@ -29,7 +29,7 @@ The store on one host and a collector on each host whose log it keeps, from the 
 On the store's host:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/Nikolay1994Kaz/evidencestore/v0.7.1/deploy/docker/store/compose.yaml
+curl -fsSLO https://raw.githubusercontent.com/Nikolay1994Kaz/evidencestore/v0.7.2/deploy/docker/store/compose.yaml
 ES_HOST=logs.example.com docker compose up -d
 docker compose exec -T store add-collector web1 > web1.tgz
 ```

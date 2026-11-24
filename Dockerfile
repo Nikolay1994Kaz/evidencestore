@@ -20,5 +20,8 @@ COPY deploy/docker/store.sh /usr/local/bin/es-store
 COPY configs/tsa /usr/local/share/evidencestore/tsa
 COPY deploy/docker/store/entry.sh /usr/local/bin/es-docker-store
 COPY deploy/docker/store/add-collector.sh /usr/local/bin/add-collector
+COPY deploy/docker/try.sh /usr/local/bin/try
 USER es
 WORKDIR /state
+# Без команды — проба (deploy/docker/try.sh).
+CMD ["try"]

@@ -16,6 +16,9 @@ COPY dist/esundo-linux-${TARGETARCH} /usr/local/bin/esundo
 COPY configs/tsa /usr/local/share/evidencestore/tsa
 COPY deploy/docker/store/entry.sh /usr/local/bin/es-docker-store
 COPY deploy/docker/store/add-collector.sh /usr/local/bin/add-collector
+COPY deploy/docker/try.sh /usr/local/bin/try
 LABEL org.opencontainers.image.source="https://github.com/Nikolay1994Kaz/evidencestore" \
       org.opencontainers.image.description="evidencestore: an independent witness for logs" \
       org.opencontainers.image.licenses="Apache-2.0"
+# Без команды — проба: docker run --rm ghcr.io/nikolay1994kaz/evidencestore
+CMD ["try"]

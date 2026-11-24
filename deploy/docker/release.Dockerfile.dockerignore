@@ -4,3 +4,4 @@
 !configs/tsa
 !deploy/docker/store/entry.sh
 !deploy/docker/store/add-collector.sh
+!deploy/docker/try.sh

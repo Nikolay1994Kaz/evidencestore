@@ -3,7 +3,7 @@
 # на одном хосте Docker: хранилище (deploy/docker/store/compose.yaml) и
 # сборщик из архива add-source — отдельным проектом compose, к хранилищу —
 # через адрес хоста, как с другой машины. Строка лога доходит, пакет по ней
-# проходит esverify (VERIFIED).
+# проходит esverify (VERIFIED). Сначала — проба образа без команды (try.sh).
 #
 #   scripts/docker-check.sh                  образ из исходников (корневой Dockerfile)
 #   scripts/docker-check.sh IMAGE            готовый образ, например выпуска
@@ -19,6 +19,11 @@ if [ -z "$image" ]; then
 	docker build -q -t "$image" . >/dev/null
 fi
 export ES_IMAGE=$image
+
+echo "== the try: docker run --rm IMAGE"
+try=$(docker run --rm "$image") || { echo "$try" >&2; echo "docker-check: the try failed" >&2; exit 1; }
+echo "$try" | grep -q '^Nov 24 09:14:37 web-1 sshd\[840\]: Accepted password for root from 203.0.113.7' || { echo "$try" >&2; echo "docker-check: the try did not bring the deleted line back" >&2; exit 1; }
+echo "$try" | grep -q '^NOT VERIFIED$' || { echo "$try" >&2; echo "docker-check: the try did not catch the forgery" >&2; exit 1; }
 
 # Адрес хоста из сети контейнеров: по нему сборщик идёт к хранилищу, как к
 # хосту хранилища с другой машины.
