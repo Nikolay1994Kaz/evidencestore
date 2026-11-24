@@ -54,11 +54,11 @@ Body:
 2026-11-09T02:11:34+05:00 user=alice action=export table=clients rows=1200
 ```
 
-It takes any line-based log: system logs, application and core banking audit logs, a copy of the SIEM stream, the flight recorder of an AI agent gateway such as [Pipelock](https://github.com/luckyPipewrench/pipelock), whose own hash chain and signatures the store also checks at intake. Time-stamps come from any RFC 3161 service, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). What a bundle proves and what it does not, exactly: [What is proven, and what is not](#what-is-proven-and-what-is-not).
+It takes any line-based log: system logs, application and core banking audit logs, a copy of the SIEM stream, the flight recorder of an AI agent gateway such as [Pipelock](https://github.com/luckyPipewrench/pipelock), whose own hash chain and signatures the store also checks at intake, and the [signed receipts](docs/receipts.md) any gateway can write of what its agent did, checked the same way. Time-stamps come from any RFC 3161 service, e.g. the National Certification Authority of Kazakhstan (`tsp.pki.gov.kz`). What a bundle proves and what it does not, exactly: [What is proven, and what is not](#what-is-proven-and-what-is-not).
 
 ## Try it
 
-The demos run on Linux with bash, python3 and Go 1.25.4 or newer (the Pipelock one also needs curl). With binaries from a release, `ES_BIN=/usr/local/bin` runs them without Go ([Install](#install)).
+The demos run on Linux with bash, python3 and Go 1.25.4 or newer (the Pipelock one also needs curl, the purchase one openssl). With binaries from a release, `ES_BIN=/usr/local/bin` runs them without Go ([Install](#install)).
 
 ```sh
 git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore
@@ -67,6 +67,7 @@ DEMO_TSA=digicert scripts/demo.sh  # same, time-stamps from the public DigiCert 
 DEMO_TSA=nca scripts/demo.sh       # same, time-stamps from the NCA of Kazakhstan
 scripts/demo-intruder.sh           # an intruder cleans auth.log; every deleted line comes back from the store
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # a real Pipelock gateway, see below
+scripts/demo-purchase.sh           # an AI agent makes three purchases, signed by its platform; one comes out as a bundle, the others stay closed
 ```
 
 The demo runs these steps:
@@ -78,6 +79,8 @@ The demo runs these steps:
 5. Destroys the month key (a single approval is refused) and shows that the proof still verifies while the body is gone.
 
 `scripts/demo-intruder.sh` plays an intrusion on a web server: an intruder logs in as root and removes every line with their address from a practice `auth.log` (inside the demo directory; nothing on the host is touched). The script pulls the records of that source out of the store and verifies each one offline: the four deleted lines come back byte for byte, and the time-stamps show they were in the store before the file was rewritten. Last, it asks for the whole session of web-1 as one bundle, which would not verify with any line left out (this waits two minutes for the time-stamps that close the window).
+
+PostgreSQL with an MCP server for an AI agent, the store and the collector in Docker: `docker compose up -d` in the clone sets everything up on the first start, certificates, passwords and gateway keys included. Who made a change comes from the gateway's signed receipts, not from the database: a transaction named in an intent of `esmcp` or `esundo` is kept whole and can be undone, any other is kept as a fingerprint, and people get alerts ([PostgreSQL and an MCP server](docs/postgres.md)).
 
 ## Run it yourself
 
@@ -162,11 +165,14 @@ esverify -proof proof.json -store-key store.pub -tsa-trust tsa-root.crt
 | Binary | Role |
 |---|---|
 | `evidencestore` | the store: `init`, `serve`, `restore`, `dev-pki` (demo certificates), `dev-setup` (a demo store in one directory: certificates, both configs, `init`), plus operator commands over a local admin socket (`status`, `statement`, `stamp`, `proof`, `tsa-root`, `keys …`, `sources bind`) |
-| `escollect` | collector next to the source: tails a log file (or a set of files by glob), numbers lines, spools them on disk, delivers them over mTLS, keeps the store's signed promises |
+| `escollect` | collector next to the source: tails a log file (or a set of files by glob) or reads PostgreSQL's log by logical replication, numbers the records, spools them on disk, delivers them over mTLS, keeps the store's signed promises; one process can run several sources |
 | `eswitness` | a witness that cosigns the store's chain heads (C2SP tlog-witness), run by someone other than the store's administrator: `init`, `serve`, `vkey` (the key auditors pass to `esverify -witness-key`) |
 | `esverify` | auditor's tool: verifies a proof bundle offline and prints what is and is not proven; exit code 0 means verified, 1 not verified, 2 a bad call or an unreadable file ([exit codes in full](docs/what-is-proven.md#exit-codes-of-esverify)) |
+| `esreceipt` | for a gateway that writes [signed receipts](docs/receipts.md) of its agent's actions: `keygen`, `sign` (steps on stdin into the receipts file), `verify` (a receipts file, by the store's rules) |
+| `esmcp` | an MCP server for an AI agent on PostgreSQL: runs the agent's SQL in its own transaction, under limits, and writes a signed intent before it and the outcome after ([PostgreSQL and an MCP server](docs/postgres.md)) |
+| `esundo` | the operator's undo of an agent's transaction from the rows the store holds: `check` (the plan, compared with the database) and `apply` |
 
-`evidencestore version`, `escollect -version`, `eswitness version` and `esverify -version` print the version and the commit a binary was built from.
+`evidencestore version`, `escollect -version`, `eswitness version`, `esverify -version`, `esreceipt version`, `esmcp -version` and `esundo version` print the version and the commit a binary was built from.
 
 ## Install
 
@@ -177,17 +183,17 @@ The store, the collector and the witness run on Linux (amd64, arm64). `esverify`
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify evidencestore-linux-amd64 --repo Nikolay1994Kaz/evidencestore
-sudo install -m 0755 evidencestore-linux-amd64 /usr/local/bin/evidencestore   # likewise escollect, eswitness, esverify
+sudo install -m 0755 evidencestore-linux-amd64 /usr/local/bin/evidencestore   # likewise escollect, eswitness, esverify, esreceipt, esmcp, esundo
 evidencestore version
 ```
 
-**With Go** 1.25.4 or newer: `go install github.com/Nikolay1994Kaz/evidencestore/cmd/esverify@latest`, likewise `cmd/evidencestore`, `cmd/escollect` and `cmd/eswitness`.
+**With Go** 1.25.4 or newer: `go install github.com/Nikolay1994Kaz/evidencestore/cmd/esverify@latest`, likewise `cmd/evidencestore`, `cmd/escollect`, `cmd/eswitness`, `cmd/esreceipt`, `cmd/esmcp` and `cmd/esundo`.
 
 **From source.** With Go 1.25.4 or newer: `git clone https://github.com/Nikolay1994Kaz/evidencestore && cd evidencestore && go build -o /usr/local/bin/ ./cmd/...`.
 
 **On hosts.** The store, a collector for each source and a witness as systemd services, with the unit files from [`configs/systemd/`](configs/systemd): [Installing on hosts](docs/install.md). The store runs under its own user, with `keys.backup_dir` and `keys.roots_mirror_dir` on other disks; the witness is run by someone other than the store's administrator.
 
-There is no container image yet.
+**In Docker.** [`compose.yaml`](compose.yaml) and the [`Dockerfile`](Dockerfile) build one image with every binary and run PostgreSQL, the store and the collector on one machine as a trial ([Try it in Docker](docs/postgres.md#try-it-in-docker)). No image is published yet.
 
 ## Documentation
 
@@ -197,7 +203,10 @@ There is no container image yet.
 - [Keys and retention](docs/keys.md): month keys, their backup and the roots mirror, destruction, a seal of your organization on the store key.
 - [Copy, restore and the witness](docs/copy-and-witness.md): the remote copy, `restore`, the witness of the chain heads, witnesses that cosign them (`eswitness`).
 - [Bundles over a window of time](docs/bundles.md): everything received in a window, for one source or for all, for one subject inside a source, and the collector's promise.
+- [Gateway receipts](docs/receipts.md): one signed line per step of an agent's action, from any gateway; the store checks the signature and the chain at intake, and a bundle over one action shows them to anyone with the gateway's key.
 - [Gateway journals (Pipelock)](docs/pipelock.md): the flight recorder of an AI agent gateway, checked at intake.
+- [Evidence for purchases made by AI agents](docs/purchases.md): the receipts a platform signs for every step of a purchase, one purchase as a bundle, and a report of it for a dispute.
+- [PostgreSQL and an MCP server for an AI agent](docs/postgres.md): every change to the named tables, the agent's actions whole and undoable, alerts, `esmcp` and `esundo`.
 - [Monitoring](docs/monitoring.md): what to alert on.
 - [Known limitations](docs/limitations.md), [How it was tested](docs/testing.md), [release notes](docs/releases/).
 
@@ -229,7 +238,7 @@ The test gate with the race detector runs on every push. On the code of v0.4.0, 
 
 ## Known limitations
 
-About thirty, each with its cause: [docs/limitations.md](docs/limitations.md). The ones to read before a pilot: the collector reads files only; the two approvals of a key destruction are recorded but not enforced; indexes are kept in memory; a record changed on disk stops the next start until `data_dir` is restored from a copy; the seal on the store key does not support ГОСТ; the cryptography is not certified. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
+About thirty, each with its cause: [docs/limitations.md](docs/limitations.md). The ones to read before a pilot: the collector reads files and PostgreSQL only; the two approvals of a key destruction are recorded but not enforced; indexes are kept in memory; a record changed on disk stops the next start until `data_dir` is restored from a copy; the seal on the store key does not support ГОСТ; the cryptography is not certified. What a bundle for one subject does not show is in [docs/bundles.md](docs/bundles.md).
 
 ## Development
 

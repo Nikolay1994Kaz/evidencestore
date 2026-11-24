@@ -1342,7 +1342,7 @@ func TestSourceProofGatewayKindLie(t *testing.T) {
 	key := pipelockKey(t)
 	c := newClock()
 	s := openStore(t, testConfig(t, withGateway(key)), c)
-	s.gwSources["agent-gw"] = false
+	delete(s.gwSources, "agent-gw")
 	ingest(t, s, "abs-core", 1, 1)
 	mustStamp(t, s) // 10:00
 	c.add(time.Minute)

@@ -1,0 +1,179 @@
+{
+ "packages": [
+  "./internal/gateway/",
+  "./internal/config/",
+  "./internal/store/",
+  "./cmd/esreceipt/"
+ ],
+ "run": "^Test(Receipt|SignerResumesTheChain|SignAndVerify|SignRefuses|SignConcurrent|Usage|Validate)",
+ "mutations": [
+  {
+   "name": "Q1 подпись квитанции не проверяется",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tif len(key) != ed25519.PublicKeySize || !ed25519.Verify(key, r.message(), r.Sig) {",
+   "new": "\tif len(key) != ed25519.PublicKeySize {"
+  },
+  {
+   "name": "Q2 подпись без домена",
+   "file": "internal/gateway/receipt.go",
+   "old": "\treturn append([]byte(receiptDomain), r.signed...)",
+   "new": "\treturn r.signed"
+  },
+  {
+   "name": "Q5 лишние поля верхнего уровня принимаются",
+   "file": "internal/gateway/receipt.go",
+   "old": "\t\tif !slices.Contains(receiptFields, k) {",
+   "new": "\t\tif false && !slices.Contains(receiptFields, k) {"
+  },
+  {
+   "name": "Q6 seq не сверяется со сцепкой",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tcase r.Prev == last.hash && r.Seq == last.seq+1:",
+   "new": "\tcase r.Prev == last.hash:"
+  },
+  {
+   "name": "Q7 подделка двигает цепочку шлюза",
+   "file": "internal/gateway/receipt.go",
+   "old": "\t\tif v.Signature != SigInvalid {\n\t\t\tt.last[r.Gateway] = receiptLink{hash: r.Hash, seq: r.Seq}",
+   "new": "\t\tif true {\n\t\t\tt.last[r.Gateway] = receiptLink{hash: r.Hash, seq: r.Seq}"
+  },
+  {
+   "name": "Q8 восстановление после рестарта берёт и подделки",
+   "file": "internal/gateway/receipt.go",
+   "old": "\treturn v.Writer != \"\" && v.Seq != 0 && v.PrevHash != \"\" && v.Signature != SigInvalid",
+   "new": "\treturn v.Writer != \"\" && v.Seq != 0 && v.PrevHash != \"\""
+  },
+  {
+   "name": "Q9 новая цепочка после принятых — не поломка",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tcase !seen && r.Prev == Genesis:",
+   "new": "\tcase r.Prev == Genesis:"
+  },
+  {
+   "name": "Q10 seq больше 2^53 принимается",
+   "file": "internal/gateway/receipt.go",
+   "old": "\treturn n, err == nil && n <= MaxSeq",
+   "new": "\treturn n, err == nil"
+  },
+  {
+   "name": "Q11 версия не проверяется",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tif string(all[\"v\"]) != \"1\" {",
+   "new": "\tif string(all[\"v\"]) == \"\" {"
+  },
+  {
+   "name": "Q12 источник ссылки с «/»",
+   "file": "internal/gateway/receipt.go",
+   "old": "\t\tif !ok1 || !ok2 || src == \"\" || len(src) > MaxRefSource || strings.ContainsAny(src, \"/\\x00\") ||",
+   "new": "\t\tif !ok1 || !ok2 || src == \"\" || len(src) > MaxRefSource ||"
+  },
+  {
+   "name": "Q13 квитанция длиннее записи подписывается",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tif len(line) > MaxReceiptLen {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "Q14 номер действия — обычным разбором (суррогат проходит)",
+   "file": "internal/gateway/receipt.go",
+   "old": "\t\tif a, ok := evidence.SubjectOf(line, \"action\"); ok {\n\t\t\tr.Action = a\n\t\t}",
+   "new": "\t\tif json.Unmarshal(raw, &r.Action) != nil {\n\t\t\tr.Action = \"\"\n\t\t}"
+  },
+  {
+   "name": "Q15 Signer продолжает чужую цепочку",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tif err := r.Verify(key.Public().(ed25519.PublicKey)); err != nil {\n\t\treturn nil, fmt.Errorf(\"gateway: the last receipt: %w\", err)\n\t}",
+   "new": ""
+  },
+  {
+   "name": "Q16 пакет одной записи не проверяет подпись квитанции",
+   "file": "internal/proof/gateway.go",
+   "old": "\t\tr.ReceiptSigned = add(\"the gateway receipt is signed with the pinned gateway key\", rc.Verify(trust.GatewayKey), fmt.Sprintf(\"gateway %s, seq %d\", rc.Gateway, rc.Seq))",
+   "new": "\t\tr.ReceiptSigned = add(\"the gateway receipt is signed with the pinned gateway key\", nil, fmt.Sprintf(\"gateway %s, seq %d\", rc.Gateway, rc.Seq))"
+  },
+  {
+   "name": "Q17 пакет одной записи не сверяет хэш тела с вердиктом",
+   "file": "internal/proof/gateway.go",
+   "old": "\tcase rc.Hash != v.Hash:\n\t\terr = fmt.Errorf(\"body hash %s, verdict hash %s\", short(rc.Hash), short(v.Hash))\n\tcase rc.Gateway",
+   "new": "\tcase false:\n\tcase rc.Gateway"
+  },
+  {
+   "name": "Q18 пакет по источнику не сверяет сцепку вердиктов",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif v.Link != want {\n\t\t\t// Причин две",
+   "new": "\t\tif false {\n\t\t\t// Причин две"
+  },
+  {
+   "name": "Q19 пакет по источнику не проверяет подписи открытых квитанций",
+   "file": "internal/proof/source.go",
+   "old": "\t\t\tif err := rc.Verify(trust.GatewayKey); err != nil {\n\t\t\t\treturn fmt.Errorf(\"record %s/%d (gateway %s, seq %d): %w\"",
+   "new": "\t\t\tif err := error(nil); err != nil {\n\t\t\t\treturn fmt.Errorf(\"record %s/%d (gateway %s, seq %d): %w\""
+  },
+  {
+   "name": "Q20 пакет по источнику двигает цепочку подделкой",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif gateway.MovesChain(v) {\n\t\t\tlast[v.Writer] = link{v.Hash, v.Seq}",
+   "new": "\t\tif true {\n\t\t\tlast[v.Writer] = link{v.Hash, v.Seq}"
+  },
+  {
+   "name": "Q21 проверка квитанций в пакете по источнику не идёт",
+   "file": "internal/proof/source.go",
+   "old": "\tif kindErr == nil && b.Upper.Open != nil && b.Upper.Open.Kind == gateway.ReceiptContentType {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "Q22 пакет по источнику не сверяет тело с вердиктом",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase rc.Hash != v.Hash:\n\t\t\treturn fmt.Errorf(\"record %s/%d: the body is not the receipt the verdict names",
+   "new": "\t\tcase false:\n\t\t\treturn fmt.Errorf(\"record %s/%d: the body is not the receipt the verdict names"
+  },
+  {
+   "name": "Q23 квитанция без части gateway проходит",
+   "file": "internal/proof/proof.go",
+   "old": "\tcase gateway.Verified(sealed.ContentType):\n\t\tadd(\"the gateway verdict describes this record\"",
+   "new": "\tcase sealed.ContentType == gateway.ContentType:\n\t\tadd(\"the gateway verdict describes this record\""
+  },
+  {
+   "name": "Q24 хранилище не проверяет квитанции",
+   "file": "internal/store/gateway.go",
+   "old": "\tif !config.VerifiedContentType(src.ContentType) {",
+   "new": "\tif src.ContentType != config.GatewayContentType {"
+  },
+  {
+   "name": "Q25 квитанции без ключа шлюза",
+   "file": "internal/config/config.go",
+   "old": "\t\t\tif s.GatewayKey == \"\" {\n\t\t\t\terrs = append(errs, fmt.Errorf(\"sources[%d] %s: content_type %q needs gateway_key",
+   "new": "\t\t\tif false {\n\t\t\t\terrs = append(errs, fmt.Errorf(\"sources[%d] %s: content_type %q needs gateway_key"
+  },
+  {
+   "name": "Q26 метка квитанций по любому полю",
+   "file": "internal/config/config.go",
+   "old": "\t\t\tif s.SubjectField != \"\" && s.SubjectField != ReceiptSubjectField {",
+   "new": "\t\t\tif false {"
+  },
+  {
+   "name": "Q27 esreceipt без замка файла",
+   "file": "cmd/esreceipt/main.go",
+   "old": "\tif err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {\n\t\treturn 0, fmt.Errorf(\"lock %s: %w\", path, err)\n\t}",
+   "new": "\t_ = unix.LOCK_EX"
+  },
+  {
+   "name": "Q28 esreceipt пишет после порванной строки",
+   "file": "cmd/esreceipt/main.go",
+   "old": "\tif one[0] != '\\n' {\n\t\treturn nil, 0, 0, fmt.Errorf(",
+   "new": "\tif false {\n\t\treturn nil, 0, 0, fmt.Errorf("
+  },
+  {
+   "name": "Q29 esreceipt начинает вторую цепочку при чужом ключе",
+   "file": "cmd/esreceipt/main.go",
+   "old": "\tif last == nil && claimed > 0 {",
+   "new": "\tif false {"
+  },
+  {
+   "name": "Q30 esreceipt берёт своей строку без своей подписи",
+   "file": "cmd/esreceipt/main.go",
+   "old": "\t\tif r.Gateway == name && r.Seq > 0 && r.Prev != \"\" && r.Verify(pub) == nil {",
+   "new": "\t\tif r.Gateway == name && r.Seq > 0 && r.Prev != \"\" {"
+  }
+ ]
+}

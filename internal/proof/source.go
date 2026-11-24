@@ -206,11 +206,33 @@ type SourceReport struct {
 	// назвавший для такого месяца чужую или выдуманную метку, выглядит так же,
 	// как честный пакет без записей субъекта в этом месяце (P-75).
 	SubjectUnconfirmedMonths []string
+	// SubjectForged — записей под меткой субъекта, чью подпись хранилище при
+	// приёме признало не ключом шлюза (квитанции receipt/v1): их написал тот,
+	// у кого ключа нет, квитанциями действия они не считаются (R1-6).
+	SubjectForged     int
+	SubjectForgedSeqs []uint64
 	// GatewayRecords — записей журнала гейтвея (с вердиктом хранилища);
 	// GatewayBroken — номера тех, что хранилище при приёме признало
-	// поломанными.
+	// поломанными; GatewayForged — из них тех, чья подпись не шлюза.
 	GatewayRecords int
 	GatewayBroken  []uint64
+	GatewayForged  []uint64
+	// GatewayRepeats — номера квитанций с верной подписью, которые хранилище
+	// назвало повтором (stale): копия прежней квитанции шлюза или вторая
+	// ветвь его цепочки. Их тела открываются: копию дописывает любой, кто
+	// пишет в файл, без ключа, и закрытое тело держало бы пакет по субъекту
+	// неполным — сделку честного действия не свести (R1-5 второго захода).
+	GatewayRepeats []uint64
+	// Receipts — источник квитанций шлюза (receipt/v1). ReceiptLinks —
+	// пар соседних квитанций одного шлюза, чью сцепку пакет проверил сам;
+	// ReceiptsOpened — открытых квитанций, сверенных с вердиктом;
+	// ReceiptsSigned — из них с подписью, проверенной ключом проверяющего
+	// (ReceiptKeyChecked — ключ задан).
+	Receipts          bool
+	ReceiptLinks      int
+	ReceiptsOpened    int
+	ReceiptsSigned    int
+	ReceiptKeyChecked bool
 	// withheld — тел поломанных записей гейтвея, не вскрытых нарочно: ключ
 	// у них есть, и «нет ключа записи» о них неверно.
 	withheld int
@@ -348,7 +370,7 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	// 8. Вердикты хранилища по записям журнала гейтвея. Вид источника —
 	// из раскрытия верхнего хвоста, под обязательством: у журнала гейтвея
 	// вердикт обязан быть у каждой записи, и пакет без улик его не потеряет.
-	gw := b.Upper.Open != nil && b.Upper.Open.Kind == gateway.ContentType
+	gw := b.Upper.Open != nil && gateway.Verified(b.Upper.Open.Kind)
 	var kindErr error
 	if b.Lower.Open != nil && b.Upper.Open != nil && b.Lower.Open.Kind != b.Upper.Open.Kind {
 		kindErr = fmt.Errorf("the tails name the kind of %s %q at the lower edge and %q at the upper one", b.Source, b.Lower.Open.Kind, b.Upper.Open.Kind)
@@ -369,6 +391,15 @@ func VerifySource(b SourceBundle, trust Trust, from, to time.Time) SourceReport 
 	if b.Subject != nil || b.WithKeys || slices.ContainsFunc(b.Records, func(rec SourceRecord) bool { return len(rec.Evidence) > 0 }) {
 		add("the records attached match their leaves, and their bodies open with their record keys", sourceAttached(b, &r),
 			fmt.Sprintf("%d records, %d bodies opened", r.Attached, len(r.Bodies)))
+	}
+
+	// 9а. Квитанции шлюза: вердикты сцеплены между собой хэшами, как их
+	// подписал шлюз, открытые тела — те самые квитанции, и их подпись
+	// проверяет сам проверяющий ключом шлюза. Закрытая квитанция между двумя
+	// открытыми тоже названа подписью шлюза: её хэш — prev следующей.
+	if kindErr == nil && b.Upper.Open != nil && b.Upper.Open.Kind == gateway.ReceiptContentType {
+		r.Receipts = true
+		add("the gateway receipts chain by hash, and every open one is that very receipt", sourceReceipts(b, trust, &r), r.receiptCounts())
 	}
 
 	// 10. Пакет по субъекту: открыты записи с его меткой и только они, и в
@@ -595,12 +626,112 @@ func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Rec
 			return fmt.Errorf("the verdict on record %s/%s: %w", b.Source, l.Subject, err)
 		}
 		r.GatewayRecords++
-		if !verdict.Clean() {
+		if repeat(verdict) {
+			seq, _ := strconv.ParseUint(l.Subject, 10, 64)
+			r.GatewayRepeats = append(r.GatewayRepeats, seq)
+		} else if !verdict.Clean() {
 			seq, _ := strconv.ParseUint(l.Subject, 10, 64)
 			r.GatewayBroken = append(r.GatewayBroken, seq)
+			if verdict.Signature == gateway.SigInvalid {
+				r.GatewayForged = append(r.GatewayForged, seq)
+			}
 		}
 	}
 	return nil
+}
+
+// repeat — квитанция с подписью шлюза, которую хранилище назвало повтором:
+// кроме повтора, с ней всё в порядке (подпись проверена ключом шлюза, а
+// строку, которая не разбирается, с верной подписью пишет только сам шлюз).
+func repeat(v gateway.Verdict) bool {
+	return v.Link == gateway.LinkStale && v.HashOK && v.Signature == gateway.SigValid
+}
+
+// sourceReceipts — сцепка квитанций по вердиктам пакета и сверка открытых
+// тел. Вердикт — слово хранилища, но его хэши проверяемы: у соседних
+// квитанций одного шлюза prev второй — хэш первой, и «linked» в вердикте
+// должно с этим сходиться. Открытое тело — квитанция с тем же хэшем, шлюзом,
+// seq и prev, что в вердикте, а с ключом проверяющего — и с его подписью.
+func sourceReceipts(b SourceBundle, trust Trust, r *SourceReport) error {
+	type link struct {
+		hash string
+		seq  uint64
+	}
+	verdicts := map[uint64]gateway.Verdict{}
+	last := map[string]link{}
+	for _, rec := range b.Records {
+		if rec.Verdict == nil {
+			continue // без вердикта пакет уже отвергнут (sourceVerdicts)
+		}
+		_, v, err := ParseGatewayLeaf(rec.Verdict.Leaf.chain())
+		if err != nil {
+			return err
+		}
+		seq, _ := strconv.ParseUint(rec.Leaf.Leaf.chain().Subject, 10, 64)
+		verdicts[seq] = v
+		if v.Writer == "" || v.Seq == 0 || v.PrevHash == "" {
+			continue // цепочку не назвать: хранилище её состояние не двигало
+		}
+		prev, seen := last[v.Writer]
+		// Как приём (gateway.MovesChain): строка с чужой подписью и повтор
+		// прежней квитанции в цепочку шлюза не входят.
+		if gateway.MovesChain(v) {
+			last[v.Writer] = link{v.Hash, v.Seq}
+		}
+		if !seen {
+			continue
+		}
+		if v.Link == gateway.LinkStale {
+			// Повтор правдоподобен, только если он не новее последней
+			// квитанции шлюза в пакете; копию начала цепочки пакет не видит.
+			if v.PrevHash != gateway.Genesis && v.Seq > prev.seq {
+				return fmt.Errorf("record %s/%d: the store's verdict calls the receipt of gateway %s with seq %d a repeat of an earlier one, and it is newer than its seq %d in the bundle: the verdict is false", b.Source, seq, v.Writer, v.Seq, prev.seq)
+			}
+			continue
+		}
+		want := gateway.LinkBroken
+		if v.PrevHash == prev.hash && v.Seq == prev.seq+1 {
+			want = gateway.LinkOK
+		}
+		if v.Link != want {
+			// Причин две, и пакет их не различает: между ними в пакете нет
+			// записи, или вердикт хранилища ложен.
+			return fmt.Errorf("record %s/%d: by their hashes and seq the receipt of gateway %s with seq %d is %q after its seq %d in the bundle, and the store's verdict calls it %q: a receipt between them is missing from the bundle, or the verdict is false", b.Source, seq, v.Writer, v.Seq, want, prev.seq, v.Link)
+		}
+		r.ReceiptLinks++
+	}
+	r.ReceiptKeyChecked = trust.GatewayKey != nil
+	for _, body := range r.Bodies {
+		v, ok := verdicts[body.Seq]
+		if !ok {
+			return fmt.Errorf("record %s/%d: an open receipt without the store's verdict", b.Source, body.Seq)
+		}
+		rc, perr := gateway.ParseReceipt(body.Body)
+		switch {
+		case rc.Hash != v.Hash:
+			return fmt.Errorf("record %s/%d: the body is not the receipt the verdict names (hash %s, verdict %s)", b.Source, body.Seq, short(rc.Hash), short(v.Hash))
+		case perr != nil:
+			return fmt.Errorf("record %s/%d: the store called the receipt intact, and it does not parse offline: %w", b.Source, body.Seq, perr)
+		case rc.Gateway != v.Writer || rc.Seq != v.Seq || rc.Prev != v.PrevHash:
+			return fmt.Errorf("record %s/%d: the receipt names gateway %q, seq %d; the verdict %q, seq %d", b.Source, body.Seq, rc.Gateway, rc.Seq, v.Writer, v.Seq)
+		}
+		r.ReceiptsOpened++
+		if trust.GatewayKey != nil {
+			if err := rc.Verify(trust.GatewayKey); err != nil {
+				return fmt.Errorf("record %s/%d (gateway %s, seq %d): %w", b.Source, body.Seq, rc.Gateway, rc.Seq, err)
+			}
+			r.ReceiptsSigned++
+		}
+	}
+	return nil
+}
+
+func (r SourceReport) receiptCounts() string {
+	s := fmt.Sprintf("%d links between receipts checked, %d open receipts", r.ReceiptLinks, r.ReceiptsOpened)
+	if r.ReceiptKeyChecked {
+		s += fmt.Sprintf(", %d signatures checked with your gateway key", r.ReceiptsSigned)
+	}
+	return s
 }
 
 // sourceAttached сверяет приложенные улики со своими листами и вскрывает
@@ -657,7 +788,7 @@ func sourceAttached(b SourceBundle, r *SourceReport) error {
 		if sealed.Source != l.Scope || strconv.FormatUint(sealed.Seq, 10) != l.Subject {
 			return fmt.Errorf("the record attached next to %s/%s is %s/%d: a record goes with its own leaf", b.Source, l.Subject, sealed.Source, sealed.Seq)
 		}
-		if rec.Verdict == nil && sealed.ContentType == gateway.ContentType {
+		if rec.Verdict == nil && gateway.Verified(sealed.ContentType) {
 			return fmt.Errorf("record %s/%d is a gateway journal entry, and the bundle lacks the store's verdict on it", sealed.Source, sealed.Seq)
 		}
 		attached = append(attached, WindowRecord{Evidence: rec.Evidence, DEK: rec.DEK})
@@ -786,6 +917,12 @@ func sourceSubject(b SourceBundle, r *SourceReport) error {
 		}
 		m := month(sealed.Scope())
 		switch {
+		case mine && r.Receipts && slices.Contains(r.GatewayForged, sealed.Seq):
+			// Строка с чужой подписью под меткой действия: метку хранилище
+			// ставит по телу, а тело пишет кто угодно. Квитанцией шлюза она не
+			// стала (P-329) и сделку не держит, но в отчёте названа.
+			r.SubjectForged++
+			r.SubjectForgedSeqs = append(r.SubjectForgedSeqs, sealed.Seq)
 		case mine:
 			m.records++
 			if len(rec.DEK) == 0 {
@@ -952,6 +1089,13 @@ func (r SourceReport) Notes() []string {
 		if r.SubjectUnlabeled > 0 {
 			n = append(n, fmt.Sprintf("%d records received in the window carry no subject label: their lines named no subject, or they came before the source had subject_field, and they could be anyone's", r.SubjectUnlabeled))
 		}
+		if r.SubjectForged > 0 {
+			var seqs []string
+			for _, q := range r.SubjectForgedSeqs {
+				seqs = append(seqs, strconv.FormatUint(q, 10))
+			}
+			n = append(n, fmt.Sprintf("records %s lie under the label of %q, and the store found at intake that they are not signed with the gateway key: someone without the key wrote them; they are not counted as receipts of %q", strings.Join(seqs, ", "), r.Subject, r.Subject))
+		}
 		if r.SubjectOpened > 0 && len(r.SubjectUnconfirmedMonths) > 0 {
 			k1 := fmt.Sprintf("no body of %q is open in %s, and only an open body of a month ties that month's label to the subject: a bundle can name any label for such a month, so the subject's records there, if it has any, can be among the closed records, and nothing here shows that it has none there", r.Subject, QuotedList(r.SubjectUnconfirmedMonths))
 			if r.SubjectUnbound > 0 {
@@ -974,14 +1118,30 @@ func (r SourceReport) Notes() []string {
 	if r.LeafOnly > 0 && r.Subject == "" {
 		n = append(n, LeafOnlyNote(r.LeafOnly, r.LeafOnlyMonths))
 	}
+	if len(r.GatewayRepeats) > 0 {
+		var parts []string
+		for _, q := range r.GatewayRepeats {
+			parts = append(parts, strconv.FormatUint(q, 10))
+		}
+		n = append(n, fmt.Sprintf("gateway receipts %s were found by the store at intake to be repeats (stale): a copy of an earlier receipt of the gateway, which anyone who writes to its file can append without the key, or a second branch of its chain; their bodies are open and checked like the rest, and a copy counts once in a deal", strings.Join(parts, ", ")))
+	}
 	if len(r.GatewayBroken) > 0 {
 		var parts []string
 		for _, q := range r.GatewayBroken {
 			parts = append(parts, strconv.FormatUint(q, 10))
 		}
-		n = append(n, fmt.Sprintf("gateway journal records %s were found broken by the store at intake (entry hash, chain or checkpoint signature): their bodies are not opened here; single-record bundles show what is wrong", strings.Join(parts, ", ")))
+		if r.Receipts {
+			n = append(n, fmt.Sprintf("gateway receipts %s were found broken by the store at intake (a signature that is not the gateway's, a broken chain, or a receipt out of format): their bodies are not opened here; single-record bundles show what is wrong", strings.Join(parts, ", ")))
+		} else {
+			n = append(n, fmt.Sprintf("gateway journal records %s were found broken by the store at intake (entry hash, chain or checkpoint signature): their bodies are not opened here; single-record bundles show what is wrong", strings.Join(parts, ", ")))
+		}
 	}
-	if r.GatewayRecords > 0 {
+	switch {
+	case r.Receipts && r.ReceiptKeyChecked:
+		n = append(n, "gateway receipts: each open one is checked against the gateway key you pinned; a closed receipt between two open ones of the same gateway is named by the signed prev of the next, so it was not left out or swapped; what the receipts say is the gateway's word, not proven true")
+	case r.Receipts:
+		n = append(n, "gateway receipts: the store checked their signatures at intake; pin the gateway key (esverify -gateway-key) to check the open ones yourself")
+	case r.GatewayRecords > 0:
 		n = append(n, "gateway journal records: the store's verdict at intake is in the bundle; the gateway's checkpoint signature can be checked yourself in single-record bundles (evidencestore proof -source S -seq N, esverify -gateway-key)")
 	}
 	if r.WitnessRefused != 0 {

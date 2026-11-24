@@ -149,6 +149,33 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatalf("min_wait 1s на стенде: %v", err)
 	}
+	// Источник квитанций: ключ шлюза обязателен, метка — только по action.
+	key := strings.Repeat("ab", 32)
+	for name, src := range map[string]Source{
+		"квитанции без ключа":             {Name: "shop", ContentType: ReceiptContentType},
+		"квитанции с меткой не по action": {Name: "shop", ContentType: ReceiptContentType, GatewayKey: key, SubjectField: "customer"},
+		"квитанции с коротким ключом":     {Name: "shop", ContentType: ReceiptContentType, GatewayKey: "abcd"},
+		"ключ шлюза у обычного источника": {Name: "shop", ContentType: "syslog", GatewayKey: key},
+		"ключ шлюза у purchase-events":    {Name: "shop", ContentType: "purchase-events", GatewayKey: key},
+	} {
+		c = good()
+		c.Sources = []Source{src}
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: принято", name)
+		}
+	}
+	for _, src := range []Source{
+		{Name: "shop", ContentType: ReceiptContentType, GatewayKey: key},
+		{Name: "shop", ContentType: ReceiptContentType, GatewayKey: key, SubjectField: ReceiptSubjectField},
+		{Name: "gw", ContentType: GatewayContentType, GatewayKey: key},
+		{Name: "gw", ContentType: GatewayContentType},
+	} {
+		c = good()
+		c.Sources = []Source{src}
+		if err := c.Validate(); err != nil {
+			t.Errorf("%+v: %v", src, err)
+		}
+	}
 	// Тик, при котором срока обещания нет вовсе, назван тиком, а не сроком.
 	c = good()
 	c.Chain.Tick = Duration(3 * time.Second)

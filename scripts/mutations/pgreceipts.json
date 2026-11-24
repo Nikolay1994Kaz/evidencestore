@@ -1,0 +1,208 @@
+{
+ "packages": [
+  "./internal/pginput/",
+  "./internal/pgtap/",
+  "./internal/mcpserver/",
+  "./internal/pgundo/",
+  "./cmd/esundo/",
+  "./internal/gateway/",
+  "./cmd/esreceipt/",
+  "./internal/proof/",
+  "./cmd/esverify/"
+ ],
+ "run": "^Test(Intents|IntentOf|IntentGoes|IntentsError|IntentsAre|ForgedReceipt|OutcomesRaise|ReceiptsOf|ReceiptsFile|Transactions|Agent|Alerts|Undo|TestPending|Pending|Foreign|CheckAndApply|Build|LinkDeal|DealBundle|SignRefuses|LedgerReads|ActionsPerMinute|WindowRows|Execute|RowLimit|UndoTakes|UndoIs|LostCommit|Torn)",
+ "mutations": [
+  {
+   "name": "R1 подпись квитанции не проверяется сборщиком",
+   "file": "internal/pginput/receipts.go",
+   "old": "if rc.Verify(k) == nil {",
+   "new": "if rc.Verify(k) == nil || true {"
+  },
+  {
+   "name": "R2 ссылка на другой источник принимается",
+   "file": "internal/pginput/receipts.go",
+   "old": "if ref.Source != r.cfg.Source {",
+   "new": "if false {"
+  },
+  {
+   "name": "R3 окно намерения не сверяется",
+   "file": "internal/pginput/receipts.go",
+   "old": "commit.Sub(at) > intentWindow",
+   "new": "false && commit.Sub(at) > intentWindow"
+  },
+  {
+   "name": "R4 тревоги по прочитанному поднимаются снова",
+   "file": "internal/pginput/receipts.go",
+   "old": "fresh := end > rf.alerted",
+   "new": "fresh := true"
+  },
+  {
+   "name": "R5 намерения не вытесняются",
+   "file": "internal/pginput/receipts.go",
+   "old": "for len(r.order) > maxIntents {",
+   "new": "for false && len(r.order) > maxIntents {"
+  },
+  {
+   "name": "R6 причина намерения не режется",
+   "file": "internal/pginput/receipts.go",
+   "old": "Reason: cut(body.Reason, maxReason)",
+   "new": "Reason: body.Reason"
+  },
+  {
+   "name": "R7 тревога о частоте на каждый отказ",
+   "file": "internal/pginput/receipts.go",
+   "old": "if !alerted {",
+   "new": "if false {"
+  },
+  {
+   "name": "R8 отмена по времени без тревоги",
+   "file": "internal/pginput/receipts.go",
+   "old": "case cause == \"timeout\":",
+   "new": "case false:"
+  },
+  {
+   "name": "R9 заменённый файл — со старым местом",
+   "file": "internal/pginput/receipts.go",
+   "old": "if ino != rf.inode {",
+   "new": "if false {"
+  },
+  {
+   "name": "R10 место одного файла другому",
+   "file": "internal/pginput/receipts.go",
+   "old": "if s.File == path {",
+   "new": "if true {"
+  },
+  {
+   "name": "T1 транзакция без намерения — целиком",
+   "file": "internal/pgtap/pgtap.go",
+   "old": "tx.fp = true",
+   "new": "tx.fp = false"
+  },
+  {
+   "name": "T2 отказ источника намерений не останавливает транзакцию",
+   "file": "internal/pgtap/pgtap.go",
+   "old": "return 0, fmt.Errorf(\"pgtap: transaction %d: the gateway's intents: %w\", m.XID, err)",
+   "new": "_ = err"
+  },
+  {
+   "name": "T3 not-via-gateway и без require_gateway",
+   "file": "internal/pgtap/pgtap.go",
+   "old": "if tx.fp && t.cfg.RequireGateway {",
+   "new": "if tx.fp {"
+  },
+  {
+   "name": "T4 действие шлюза не в справочнике",
+   "file": "internal/pgtap/pgtap.go",
+   "old": "Truncated: tx.truncated, Action: tx.intent,",
+   "new": "Truncated: tx.truncated,"
+  },
+  {
+   "name": "M1 намерение не пишется",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "if err := s.intent(rc, alert.StepIntent); err != nil {",
+   "new": "if err := error(nil); err != nil {"
+  },
+  {
+   "name": "M2 намерение без ссылки на транзакцию",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "refs = []gateway.Ref{{Source: s.cfg.PGSource, Subject: rc.XID}}",
+   "new": "refs = nil"
+  },
+  {
+   "name": "M3 намерение с исходом failed",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "draft.Outcome = OutcomePending",
+   "new": "draft.Outcome = draft.Outcome"
+  },
+  {
+   "name": "M4 откат транзакции чужого действия",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "if plan.Action == nil || plan.Action.ID != actionID || plan.Action.Gateway != s.cfg.Gateway {",
+   "new": "if plan.Action == nil {"
+  },
+  {
+   "name": "M5 чужая подпись — своя квитанция",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "r.Verify(s.cfg.Key.Public().(ed25519.PublicKey)) != nil",
+   "new": "false"
+  },
+  {
+   "name": "M6 намерения идут в счёт пределов",
+   "file": "internal/mcpserver/limits.go",
+   "old": "if !ok || step != alert.StepOutcome {",
+   "new": "if !ok || step == alert.StepOutcome+\"-\" {"
+  },
+  {
+   "name": "U1 намерение отката не пишется",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "if err := intent(out.XID, xid8); err != nil {",
+   "new": "if _, err := xid8, error(nil); err != nil {"
+  },
+  {
+   "name": "U2 откат без намерения",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "if intent == nil {",
+   "new": "if false {"
+  },
+  {
+   "name": "E1 намерение отката ссылается не на его транзакцию",
+   "file": "cmd/esundo/main.go",
+   "old": "Refs: []gateway.Ref{{Source: cfg.PGSource, Subject: xid}}, Body: body})",
+   "new": "Refs: []gateway.Ref{{Source: cfg.PGSource, Subject: xid8}}, Body: body})"
+  },
+  {
+   "name": "G1 порванная строка не закрывается",
+   "file": "internal/gateway/journal.go",
+   "old": "out = append([]byte{'\\n'}, out...)",
+   "new": "out = out[:len(out):len(out)]"
+  },
+  {
+   "name": "D1 пакет, которого квитанции не называют, принят",
+   "file": "internal/proof/deal.go",
+   "old": "if !used[j] && !slices.ContainsFunc(",
+   "new": "if false && !used[j] && !slices.ContainsFunc("
+  },
+  {
+   "name": "D2 закрытая запись транзакции не в счёт",
+   "file": "internal/proof/deal.go",
+   "old": "case r.SubjectOpened != r.SubjectRecords:",
+   "new": "case false:"
+  },
+  {
+   "name": "D3 окно пакетов не сверяется",
+   "file": "internal/proof/deal.go",
+   "old": "if !b.From.Equal(receipts.From) || !b.To.Equal(receipts.To) {",
+   "new": "if false {"
+  },
+  {
+   "name": "D4 квитанция чужого действия",
+   "file": "internal/proof/deal.go",
+   "old": "if rc.Action != receipts.Subject {",
+   "new": "if false {"
+  },
+  {
+   "name": "D5 названный номер без пакета",
+   "file": "internal/proof/deal.go",
+   "old": "if l.Bundle < 0 {",
+   "new": "if false {"
+  },
+  {
+   "name": "D6 пакет квитанций не проверяется",
+   "file": "internal/proof/deal.go",
+   "old": "if !receipts.Valid() {",
+   "new": "if false {"
+  },
+  {
+   "name": "D7 сделка не с пакета квитанций",
+   "file": "internal/proof/deal.go",
+   "old": "case !receipts.Receipts:",
+   "new": "case false:"
+  },
+  {
+   "name": "D8 запись без ключа не в счёт",
+   "file": "internal/proof/deal.go",
+   "old": "case r.SubjectKeyless > 0:",
+   "new": "case false:"
+  }
+ ]
+}

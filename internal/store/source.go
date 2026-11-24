@@ -345,7 +345,7 @@ func (s *Store) proofSource(source, subject string, from, to time.Time, withDEK 
 	// соли — свои у каждого листа хвостов. Вид — каким он был при метке:
 	// конфиг источника могли сменить, и тогда проверка назовёт смену вида.
 	open := func(tails *proof.Leaf, t proof.Tail) *proof.TailOpen {
-		for _, kind := range []string{s.tailKind(source), "", gateway.ContentType} {
+		for _, kind := range []string{s.tailKind(source), "", gateway.ContentType, gateway.ReceiptContentType} {
 			t.Kind = kind
 			if o := proof.TailOf(t); tails != nil {
 				if _, err := proof.OpenTail(tails.Chain(), source, o); err == nil {

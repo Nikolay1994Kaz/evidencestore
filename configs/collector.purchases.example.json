@@ -1,0 +1,14 @@
+{
+  "server": "https://evidencestore.example.internal:8443",
+  "ca": "/etc/escollect/server-ca.crt",
+  "cert": "/etc/escollect/shop-agent.crt",
+  "key": "/etc/escollect/shop-agent.key",
+  "store_key": "PIN-THE-STORE-PUBLIC-KEY-PRINTED-BY-evidencestore-init",
+  "spool_dir": "/var/lib/escollect/shop-agent",
+  "file": "/var/log/shop-agent/receipts.jsonl",
+  "from_start": false,
+  "batch": 256,
+  "flush_every": "1s",
+  "heartbeat_every": "30s",
+  "checkpoint_every": "10m"
+}
