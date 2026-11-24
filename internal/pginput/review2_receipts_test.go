@@ -130,7 +130,7 @@ func TestR2RevSameGatewayNameVoid(t *testing.T) {
 		a.sign(1, intent(fmt.Sprintf("b-%d", i), now, fmt.Sprint(600+i)))
 	}
 	a.r.poll()
-	if err := a.r.void(time.Time{}); err != nil { // база поднята из копии
+	if err := a.r.void(voidSpec{}); err != nil { // база поднята из копии
 		t.Fatal(err)
 	}
 	// После подъёма: новое действие первого агента — его намерение должно быть в счёте.
@@ -157,7 +157,7 @@ func TestR2RevKeyRotationRevivesVoidedIntents(t *testing.T) {
 	path := g.cfg.Files[0]
 	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
 	g.r.poll()
-	if err := g.r.void(time.Time{}); err != nil {
+	if err := g.r.void(voidSpec{}); err != nil {
 		t.Fatal(err)
 	}
 	// Новый ключ шлюза; сборщик знает оба.

@@ -296,3 +296,69 @@ func TestAppendRewritesAGluedReceipt(t *testing.T) {
 		t.Fatalf("the next one: seq %d, glued %v", next.Receipt.Seq, next.Glued)
 	}
 }
+
+// Голову в каталоге только для чтения шлюз видит при запуске (CheckHead), а
+// не отказом на каждом действии.
+func TestCheckHead(t *testing.T) {
+	dir := t.TempDir()
+	receipts := filepath.Join(t.TempDir(), "receipts.jsonl")
+	if err := CheckHead(filepath.Join(dir, "esmcp.head"), receipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckHead(filepath.Join(dir, "missing", "esmcp.head"), receipts); err == nil || !strings.Contains(err.Error(), `unless "head" says where`) {
+		t.Fatalf("a head in a directory that is not there: %v", err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "fifo.head"), 0o600); err == nil {
+		if err := CheckHead(filepath.Join(dir, "fifo.head"), receipts); err == nil {
+			t.Fatal("a FIFO for a head passed")
+		}
+	}
+	// T-5 третьего захода: голова в каталоге квитанций — отказ при запуске.
+	if err := CheckHead(filepath.Join(filepath.Dir(receipts), "esmcp.key.head-0011223344556677"), receipts); err == nil || !strings.Contains(err.Error(), "lies in the directory of the receipts file") {
+		t.Fatalf("a head in the receipts directory: %v", err)
+	}
+	left, _ := os.ReadDir(dir)
+	for _, e := range left {
+		if strings.Contains(e.Name(), ".check-") {
+			t.Fatalf("the check left %s", e.Name())
+		}
+	}
+}
+
+// Дыра разреженного файла посреди файла (за ней дописали) перешагивается, а
+// не читается: 32 ГиБ нулей, свободных для писателя файла, не стоят секунд
+// под flock на каждом Append и в каждом чтении счёта пределов (P-378).
+// Строки по обе стороны дыры — те же, что при чтении нулей.
+func TestReadLinesStepsOverAHole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	if err := os.WriteFile(path, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 6+32<<30); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte("\nsecond\n")); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := f.Stat()
+	var got []string
+	start := time.Now()
+	done, err := ReadLines(f, 0, fi.Size(), func(line []byte, _ int64, long bool) {
+		if long {
+			line = []byte("(long)")
+		}
+		got = append(got, string(line))
+	})
+	took := time.Since(start)
+	if err != nil || done != fi.Size() || strings.Join(got, ",") != "first,(long),second" {
+		t.Fatalf("%q, done %d of %d: %v", got, done, fi.Size(), err)
+	}
+	if took > time.Second {
+		t.Fatalf("the hole was read: %v", took)
+	}
+}

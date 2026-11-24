@@ -153,7 +153,10 @@ func (e Event) Kinds() []string {
 // строки отрезается (падение посреди записи): иначе следующая строка
 // приклеилась бы к обрывку.
 func OpenLines(path string) (_ *os.File, err error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	// O_APPEND: файл обрезали на ходу (обслуживание) — следующая строка
+	// ложится в конец, а не на прежнее место за дырой из нулей, которую не
+	// прочтёт ни Lookup, ни сверка повторов (R2-3 третьего захода).
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}

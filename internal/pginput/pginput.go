@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -60,6 +61,7 @@ import (
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgoutput"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgrole"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgtap"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
@@ -617,9 +619,14 @@ type slotState struct {
 	// другая — база ушла назад или её место заняла реплика (R2-1).
 	System   string `json:"system,omitempty"`
 	Timeline string `json:"timeline,omitempty"`
-	// Rewound — место сборщика, от которого вход уже отступил назад: тот же
-	// откат после перезапуска не называется второй раз.
-	Rewound string `json:"rewound,omitempty"`
+	// Rewound и RewoundStart — место сборщика, от которого вход уже отступил
+	// назад, и запуск базы (микросекунды), у которой он это увидел: тот же
+	// откат после перезапуска не называется второй раз, а база, поднятая из
+	// копии снова (другой запуск, место то же), — называется (T-1 третьего
+	// захода: второй подъём подряд глушился, и намерение из первой поднятой
+	// базы решало чужую транзакцию во второй).
+	Rewound      string `json:"rewound,omitempty"`
+	RewoundStart int64  `json:"rewound_start,omitempty"`
 	// XID8 — старший номер транзакции с эпохой, прочитанный в потоке: база,
 	// которая выдаст следующим номер не выше, ушла назад, даже если её
 	// журнал уже за местом сборщика (T-1 второго захода).
@@ -944,6 +951,7 @@ func (s *Source) ensureSlot(cat *pgwire.Conn) (pgwire.LSN, error) {
 	case exists && row[1] != nil && *row[1] == "lost":
 		lost = "the server removed the log that replication slot " + s.cfg.Slot + " had not read yet (max_slot_wal_keep_size): changes made meanwhile are lost"
 	case !exists && (known.Slot == s.cfg.Slot || s.knownLost):
+		s.knownLost = false // пропуск назван; слот дальше — свой (R2-5 третьего захода)
 		lost = "replication slot " + s.cfg.Slot + " is gone from the server: changes made since the collector last read are lost"
 	case exists && known.Slot == s.cfg.Slot && confirmed != 0 && at > confirmed && at > pgwire.LSN(s.tap.Cursor()):
 		// Слот ушёл дальше, чем сборщик ему подтверждал: пока сборщик не был
@@ -1070,16 +1078,17 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 	if err := s.tap.Resume(uint64(slotAt), why != ""); err != nil {
 		return 0, err
 	}
-	if why != "" && cursor.String() != s.known.Rewound {
-		since := s.startedAfter(cat, uint64(cursor))
+	started := dbStarted(cat)
+	if why != "" && (cursor.String() != s.known.Rewound || started != s.known.RewoundStart) {
+		v := s.voidSpec(cat, uint64(cursor), started, cursor.String() == s.known.Rewound)
 		if s.receipts != nil {
-			if err := s.receipts.void(since); err != nil {
+			if err := s.receipts.void(v); err != nil {
 				return 0, err
 			}
 		}
 		s.raise(alert.KindRewound, "the database went back: "+why+". Whatever the collector read past the end of its log is no longer in it (the store keeps it); "+
-			voidText(since)+"; the collector reads again from replication slot "+s.cfg.Slot+" ("+slotAt.String()+"), and a transaction it already has is not recorded twice")
-		s.known.Rewound = cursor.String()
+			voidText(v)+"; the collector reads again from replication slot "+s.cfg.Slot+" ("+slotAt.String()+"), and a transaction it already has is not recorded twice")
+		s.known.Rewound, s.known.RewoundStart = cursor.String(), started
 	}
 	if why != "" {
 		s.xid8 = 0 // номера с эпохой — с этой базы заново
@@ -1099,57 +1108,75 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 // этого не видно (T-1 второго захода). Дальше — как при подъёме, увиденном
 // при подключении: намерения шлюза до сих пор не в счёт, людям — тревога.
 func (s *Source) diverged(xid uint32, final, place uint64) error {
-	since := s.startedAfter(s.cat, place)
+	started := dbStarted(s.cat)
+	v := s.voidSpec(s.cat, place, started, pgwire.LSN(place).String() == s.known.Rewound)
 	if s.receipts != nil {
-		if err := s.receipts.void(since); err != nil {
+		if err := s.receipts.void(v); err != nil {
 			return err
 		}
 		s.receipts.ref8 = s.next8
 	}
 	s.xid8 = 0
-	if s.known.Rewound != pgwire.LSN(place).String() {
+	if s.known.Rewound != pgwire.LSN(place).String() || s.known.RewoundStart != started {
 		s.raise(alert.KindRewound, fmt.Sprintf("the database went back: transaction %d committed at %s, below the place the collector has read up to (%s), is not the transaction it read there — "+
 			"it was restored from a copy, or a replica that lagged behind took over, and its log went past the collector's place before the collector connected. "+
 			"Whatever the collector read past the end of its copy is no longer in it (the store keeps it); %s; the database's new transactions are recorded from here",
-			xid, pgwire.LSN(final), pgwire.LSN(place), voidText(since)))
-		s.known.Rewound = pgwire.LSN(place).String()
+			xid, pgwire.LSN(final), pgwire.LSN(place), voidText(v)))
+		s.known.Rewound, s.known.RewoundStart = pgwire.LSN(place).String(), started
 	}
 	return s.saveKnown()
 }
 
 // voidText — что тревога db-rewound говорит о намерениях шлюза.
-func voidText(since time.Time) string {
-	if since.IsZero() {
+func voidText(v voidSpec) string {
+	if v.since.IsZero() {
 		return "the gateway's intents written so far are void, because the database gives their transaction numbers to other transactions again: " +
 			"transactions of the gateway made since it went back come as fingerprints"
 	}
-	return "the gateway's intents written before the database started again (" + since.UTC().Format(time.RFC3339) + ") are void, " +
-		"because it gives their transaction numbers to other transactions again; the gateway's actions after that stay actions"
+	return "the gateway's intents written in the database before it went back are void, because it gives their transaction numbers to other transactions again " +
+		"(by the start of the database in the intent; for intents without it — those written before the database started again, " + v.since.UTC().Format(time.RFC3339) +
+		"); the gateway's actions in the database since then stay actions"
 }
 
-// startedAfter — миг запуска базы (pg_postmaster_start_time), если он позже
-// последней транзакции, прочитанной сборщиком из её прежней истории (на
-// месте place): так запускается копия, поднятая после неё, и до этого мига в
-// новой истории базы транзакций не было. Иначе (реплика, запущенная раньше и
-// занявшая место; время не узнать) — ноль: void снимает все намерения.
-func (s *Source) startedAfter(cat *pgwire.Conn, place uint64) time.Time {
-	last, ok := s.tap.PlaceTime(place)
-	if !ok || cat == nil {
-		return time.Time{}
+// dbStarted — когда запущена база (pg_postmaster_start_time), микросекунды;
+// 0 — не узнать.
+func dbStarted(cat *pgwire.Conn) int64 {
+	if cat == nil {
+		return 0
 	}
-	row, ok, err := cat.QueryRow("SELECT (extract(epoch FROM pg_postmaster_start_time()) * 1000000)::bigint::text")
+	row, ok, err := cat.QueryRow("SELECT " + pgundo.StartedSQL)
 	if err != nil || !ok || row[0] == nil {
-		return time.Time{}
+		return 0
 	}
-	us, err := strconv.ParseInt(*row[0], 10, 64)
-	if err != nil {
-		return time.Time{}
+	us, _ := strconv.ParseInt(*row[0], 10, 64)
+	return us
+}
+
+// voidSpec — что снять, когда база ушла назад, а последняя транзакция её
+// прежней истории, прочитанная сборщиком, — на месте place; started — запуск
+// базы сейчас (микросекунды). again — на этом месте база уже уходила назад,
+// а сейчас это другой её запуск: её снова подняли из копии (или прежнюю
+// поднятую перезапустили, а сборщик с тех пор ничего не прочёл — не
+// отличить): не в счёт всё, что писалось не в нынешнем запуске.
+func (s *Source) voidSpec(cat *pgwire.Conn, place uint64, started int64, again bool) voidSpec {
+	v := voidSpec{}
+	last, known := s.tap.PlaceTime(place)
+	switch {
+	case known && !again:
+		// Намерение, чья база запущена не позже последней транзакции прежней
+		// истории, — из прежней истории: её база тогда уже шла.
+		v.startedBefore = last.UnixMicro()
+		if t := time.UnixMicro(started); started != 0 && t.After(last) {
+			v.since = t // база запущена после неё: копия, поднятая после
+		}
+	case started != 0:
+		// Снова на том же месте (again) или время места не узнать: не в
+		// счёт всё, что писалось не в нынешнем запуске.
+		v.startedBefore = started - 1
+	default:
+		v.startedBefore = math.MaxInt64 - 1
 	}
-	started := time.UnixMicro(us)
-	if !started.After(last) {
-		return time.Time{}
-	}
-	return started
+	return v
 }
 
 // writeFile заменяет файл целиком: временный файл, fsync, переименование.

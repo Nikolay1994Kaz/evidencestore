@@ -159,6 +159,11 @@ type Receipt struct {
 	// FullXID — он же с эпохой (xid8): различает номера, занятые заново.
 	XID     string `json:"xid,omitempty"`
 	FullXID string `json:"xid8,omitempty"`
+	// DBStarted — когда запущена база, в которой идёт транзакция действия
+	// (pg_postmaster_start_time, микросекунды с 1970): по нему сборщик
+	// отличает намерение из истории базы до подъёма из копии от намерения
+	// после, в часах самой базы, а не шлюза (R2-1, R2-2 третьего захода).
+	DBStarted string `json:"db_started,omitempty"`
 	// Outcome — committed, failed, refused (остановлено пределом), escaped
 	// (SQL агента сам закрыл транзакцию сервера: что он изменил после этого,
 	// могло зафиксироваться мимо пределов) или unknown (связь оборвалась на
@@ -516,7 +521,7 @@ func (s *Server) history() []Receipt {
 	if s.cfg.ReceiptsPath == "" {
 		return s.recent
 	}
-	f, err := os.Open(s.cfg.ReceiptsPath)
+	f, err := gateway.OpenReceipts(s.cfg.ReceiptsPath, os.O_RDONLY, 0)
 	if err != nil {
 		return s.recent
 	}
@@ -589,6 +594,9 @@ const OutcomePending = "pending"
 
 // appended — в журнал сервера то, что Append сказал о файле квитанций.
 func (s *Server) appended(a gateway.Appended) {
+	if s.ledger != nil && a.Line != nil {
+		s.ledger.add(a.Line, s.now())
+	}
 	if a.Torn {
 		s.log.Warn("the last line of the receipts file was torn (a writer died in the middle of it): it is closed and stays as a broken line", "file", s.cfg.ReceiptsPath)
 	}
@@ -764,8 +772,8 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	})
 	// Откат — тоже действие: его намерение несёт и номер действия, и что он
 	// возвращает, и транзакцию отката — до её изменений.
-	applied, err := plan.Apply(s.db, func(xid, xid8 string) error {
-		rc.XID, rc.FullXID = xid, xid8
+	applied, err := plan.Apply(s.db, func(xid, xid8, started string) error {
+		rc.XID, rc.FullXID, rc.DBStarted = xid, xid8, started
 		return s.intent(&rc, alert.StepUndo)
 	})
 	var lim *undoLimit
@@ -1064,7 +1072,7 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	// бита, как в журнале базы, справочнике, хранилище и тревогах; полный
 	// (с эпохой) — рядом (P-247).
 	counting := s.cfg.RowLimit > 0 || s.cfg.WindowRows > 0
-	ask := "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text"
+	ask := "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, " + pgundo.StartedSQL
 	if counting {
 		ask += ", " + xactRows
 	}
@@ -1075,8 +1083,11 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		}
 		return fail(err)
 	}
-	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) >= 2 && res[0].Rows[0][0] != nil && res[0].Rows[0][1] != nil {
+	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) >= 3 && res[0].Rows[0][0] != nil && res[0].Rows[0][1] != nil {
 		rc.XID, rc.FullXID = *res[0].Rows[0][0], *res[0].Rows[0][1]
+		if v := res[0].Rows[0][2]; v != nil {
+			rc.DBStarted = *v
+		}
 	}
 	// Намерение — до SQL агента и тем более до COMMIT: по нему сборщик
 	// берёт транзакцию целиком как действие агента (DECISIONS, п. 42). Не
@@ -1086,7 +1097,7 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	}
 	before := 0
 	if counting {
-		if before, err = countIn(res, 2); err != nil {
+		if before, err = countIn(res, 3); err != nil {
 			return fail(fmt.Errorf("the rows the action changes could not be counted, so the row limits cannot be checked: %w", err))
 		}
 	}

@@ -16,6 +16,7 @@ package mcpserver
 // действие: предел мягкий, не замок.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -23,7 +24,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -269,6 +272,9 @@ type spent struct {
 	// Оно в счёте с худшим случаем строк, пока исход его не заменит.
 	action  string
 	pending bool
+	// hash — квитанции, по которой оно в счёте, intent — его намерения:
+	// копия той же строки, дописанная без ключа, второй раз не считается.
+	hash, intent string
 }
 
 // ledger — расход агента за последнее время по файлу квитанций. Файл читается
@@ -283,14 +289,21 @@ type ledger struct {
 	primed  bool
 	off     int64
 	ino     uint64 // inode файла, который читался: другой по пути — ротация
+	tail    []byte // байты перед off: другие — файл переписан (copytruncate и дорос)
 	items   []spent
 	alerted time.Time // последний отказ за частоту, о котором людям ушла тревога
 }
 
 // refresh дочитывает файл и забывает то, что старше keep.
 func (l *ledger) refresh(now time.Time) error {
-	f, err := os.Open(l.path)
+	f, err := gateway.OpenReceipts(l.path, os.O_RDONLY, 0)
 	if errors.Is(err, os.ErrNotExist) {
+		if !l.primed {
+			// Файла по пути ещё нет — только что повернули: счёт окна — по
+			// повёрнутым рядом (R2-4 третьего захода).
+			l.primeSiblings(now)
+			l.primed = true
+		}
 		return nil
 	}
 	if err != nil {
@@ -303,19 +316,23 @@ func (l *ledger) refresh(now time.Time) error {
 	}
 	ino := inodeOf(fi)
 	if !l.primed {
-		// Первый раз: нужен только хвост файла, покрывающий окно. Хвост
-		// берётся с запасом и растёт, пока не покроет окно или весь файл.
-		for tail := int64(256 << 10); ; tail *= 16 {
-			start := max(fi.Size()-tail, 0)
-			items, covered, end, err := l.read(f, start, fi.Size(), now, start > 0)
-			if err != nil {
-				return err
-			}
-			if covered || start == 0 {
-				l.items, l.off, l.primed, l.ino = items, end, true, ino
-				break
-			}
+		_, covered, _, err := l.prime(f, fi.Size(), now)
+		if err != nil {
+			return err
 		}
+		if !covered {
+			// Окно начинается раньше этого файла: его начало может лежать в
+			// повёрнутом файле рядом. Новый сеанс (процесс esmcp) после
+			// ротации иначе не видел действий, сделанных до неё (R2-4
+			// третьего захода). Сначала они, потом этот файл — копии строк
+			// между ними (copytruncate) в счёт один раз, по хэшу.
+			l.primeSiblings(now)
+		}
+		items, _, end, err := l.prime(f, fi.Size(), now)
+		if err != nil {
+			return err
+		}
+		l.items, l.off, l.primed, l.ino = append(l.items, items...), end, true, ino
 	} else {
 		// Ротация (logrotate, mv; copytruncate) — не повод забыть счёт: в
 		// окне остаются действия, сделанные до неё (R2-9, T-4 второго
@@ -333,15 +350,26 @@ func (l *ledger) refresh(now time.Time) error {
 				old.Close()
 			}
 			l.off, l.ino = 0, ino
-		case fi.Size() < l.off:
-			l.off = 0 // тот же файл обрезан (copytruncate): в нём всё новое
+		case fi.Size() < l.off || !l.sameTail(f):
+			// Тот же файл обрезан (copytruncate) — и, может быть, уже дорос за
+			// прежнее место (R2-4 третьего захода): читать с начала; что уже в
+			// счёте, второй раз не считается (по хэшу).
+			l.off = 0
 		}
-		items, _, end, err := l.read(f, l.off, fi.Size(), now, false)
+		fromStart := l.off == 0
+		items, covered, end, err := l.read(f, l.off, fi.Size(), now, false)
 		if err != nil {
 			return err
 		}
 		l.items, l.off = append(l.items, items...), end
+		if fromStart && !covered {
+			// Файл с начала, и он не покрывает окна: начало окна — в
+			// повёрнутых рядом (их копия при copytruncate), в том числе то,
+			// что сеанс не успел прочесть до ротации.
+			l.primeSiblings(now)
+		}
 	}
+	l.keepTail(f)
 	fresh := l.items[:0]
 	for _, it := range l.items {
 		if now.Sub(it.at) <= l.keep {
@@ -350,6 +378,90 @@ func (l *ledger) refresh(now time.Time) error {
 	}
 	l.items = fresh
 	return nil
+}
+
+// prime читает хвост файла f (size байт), покрывающий окно: хвост берётся с
+// запасом и растёт, пока не покроет окно или весь файл.
+func (l *ledger) prime(f *os.File, size int64, now time.Time) (items []spent, covered bool, end int64, err error) {
+	for tail := int64(256 << 10); ; tail *= 16 {
+		start := max(size-tail, 0)
+		items, covered, end, err = l.read(f, start, size, now, start > 0)
+		if err != nil || covered || start == 0 {
+			return items, covered, end, err
+		}
+	}
+}
+
+// primeSiblings — в счёт окна то, что лежит в повёрнутых файлах рядом.
+func (l *ledger) primeSiblings(now time.Time) {
+	for _, old := range l.siblings(now) {
+		if ofi, err := old.Stat(); err == nil {
+			if items, _, _, err := l.prime(old, ofi.Size(), now); err == nil {
+				l.items = append(l.items, items...)
+			}
+		}
+		old.Close()
+	}
+}
+
+// siblings — повёрнутые файлы квитанций рядом (имя файла с точкой или дефисом
+// после, не сжатые), менявшиеся в пределах окна, — от старых к новым.
+func (l *ledger) siblings(now time.Time) []*os.File {
+	dir, base := filepath.Dir(l.path), filepath.Base(l.path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	type file struct {
+		f   *os.File
+		mod time.Time
+	}
+	var out []file
+	for _, e := range entries {
+		name := e.Name()
+		if name == base || !strings.HasPrefix(name, base+".") && !strings.HasPrefix(name, base+"-") {
+			continue
+		}
+		switch filepath.Ext(name) {
+		case ".gz", ".bz2", ".xz", ".zst", ".lz4", ".lock", ".head", ".tmp":
+			continue
+		}
+		f, err := gateway.OpenReceipts(filepath.Join(dir, name), os.O_RDONLY, 0)
+		if err != nil {
+			continue
+		}
+		fi, err := f.Stat()
+		if err != nil || now.Sub(fi.ModTime()) > l.keep {
+			f.Close()
+			continue
+		}
+		out = append(out, file{f, fi.ModTime()})
+	}
+	slices.SortFunc(out, func(a, b file) int { return a.mod.Compare(b.mod) })
+	files := make([]*os.File, len(out))
+	for i, x := range out {
+		files[i] = x.f
+	}
+	return files
+}
+
+// keepTail запоминает байты файла перед местом чтения.
+func (l *ledger) keepTail(f *os.File) {
+	n := min(l.off, 64)
+	l.tail = make([]byte, n)
+	if got, _ := f.ReadAt(l.tail, l.off-n); int64(got) != n {
+		l.tail = nil
+	}
+}
+
+// sameTail — байты перед местом чтения те же, что были.
+func (l *ledger) sameTail(f *os.File) bool {
+	if len(l.tail) == 0 {
+		return true
+	}
+	got := make([]byte, len(l.tail))
+	n, _ := f.ReadAt(got, l.off-int64(len(l.tail)))
+	return n == len(got) && bytes.Equal(got, l.tail)
 }
 
 // rotated — прежний файл (inode l.ino), если он лежит в каталоге файла
@@ -411,37 +523,9 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 		if long {
 			return
 		}
-		rc, step, ok := l.own(line)
-		if !ok || (step != alert.StepOutcome && step != alert.StepIntent && step != alert.StepUndo) {
-			return
-		}
-		at, perr := time.Parse(time.RFC3339Nano, rc.Time)
-		if perr != nil {
-			return
-		}
-		if now.Sub(at) > l.keep {
-			covered = true
-			return
-		}
-		if step != alert.StepOutcome {
-			// Намерение: действие пошло в базу. Исхода может не быть никогда —
-			// тогда оно в счёте с худшим случаем (T-8, R2-4).
-			if rc.Agent == l.agent && (rc.Tool == "execute" || rc.Tool == "undo_apply") {
-				items = append(items, spent{at: at, rows: l.worst, action: rc.ActionID, pending: true})
-			}
-			return
-		}
-		l.note(rc, at)
-		if it, ok := l.count(rc, at); ok {
-			it.action = rc.ActionID
-			if !l.settle(items, it) && !l.settle(l.items, it) {
-				items = append(items, it)
-			}
-		} else {
-			// Не в счёт (отказ за частоту и подобное): и намерение его — нет.
-			l.settle(items, spent{at: at, action: rc.ActionID})
-			l.settle(l.items, spent{at: at, action: rc.ActionID})
-		}
+		var old bool
+		items, old = l.take(line, now, items)
+		covered = covered || old
 	})
 	if err != nil {
 		return nil, false, start, err
@@ -449,11 +533,70 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 	return items, covered, done, nil
 }
 
+// take — квитанция line в счёт (в items); old — она старше окна.
+func (l *ledger) take(line []byte, now time.Time, items []spent) (_ []spent, old bool) {
+	rc, step, ok := l.own(line)
+	if !ok || (step != alert.StepOutcome && step != alert.StepIntent && step != alert.StepUndo) {
+		return items, false
+	}
+	sum := sha256.Sum256(bytes.TrimRight(line, "\r\n"))
+	hash := hex.EncodeToString(sum[:])
+	if l.known(items, hash) {
+		return items, false // копия прежней строки: писатель файла копиями держал бы агента под отказом
+	}
+	at, perr := time.Parse(time.RFC3339Nano, rc.Time)
+	if perr != nil {
+		return items, false
+	}
+	if now.Sub(at) > l.keep {
+		return items, true
+	}
+	if step != alert.StepOutcome {
+		// Намерение: действие пошло в базу. Исхода может не быть никогда —
+		// тогда оно в счёте с худшим случаем (T-8, R2-4).
+		if rc.Agent == l.agent && (rc.Tool == "execute" || rc.Tool == "undo_apply") {
+			items = append(items, spent{at: at, rows: l.worst, action: rc.ActionID, pending: true, hash: hash})
+		}
+		return items, false
+	}
+	l.note(rc, at)
+	if it, ok := l.count(rc, at); ok {
+		it.action, it.hash = rc.ActionID, hash
+		if !l.settle(items, it) && !l.settle(l.items, it) {
+			items = append(items, it)
+		}
+	} else {
+		// Не в счёт (отказ за частоту и подобное): и намерение его — нет.
+		l.settle(items, spent{at: at, action: rc.ActionID})
+		l.settle(l.items, spent{at: at, action: rc.ActionID})
+	}
+	return items, false
+}
+
+// add — своя квитанция сеанса, только что записанная, — в счёт сразу, а не
+// когда её прочтут из файла: файл могли повернуть раньше (copytruncate со
+// сжатием, olddir), и своё действие сеанс не увидел бы никогда (R2-4
+// третьего захода). Из файла она второй раз не считается — по хэшу.
+func (l *ledger) add(line []byte, now time.Time) {
+	if len(line) > 0 {
+		l.items, _ = l.take(line, now, l.items)
+	}
+}
+
+// known — квитанция hash уже в счёте (в items или в l.items).
+func (l *ledger) known(items []spent, hash string) bool {
+	has := func(list []spent) bool {
+		return slices.ContainsFunc(list, func(it spent) bool { return it.hash == hash || it.intent == hash })
+	}
+	return has(items) || has(l.items)
+}
+
 // settle — исход it заменяет намерение того же действия в items, если оно
 // там есть.
 func (l *ledger) settle(items []spent, it spent) bool {
 	for i := len(items) - 1; i >= 0; i-- {
 		if items[i].pending && items[i].action == it.action {
+			it.intent = items[i].hash
 			items[i] = it
 			return true
 		}
@@ -559,27 +702,44 @@ func (s *Server) actionLock() (func(), error) {
 		return func() {}, nil
 	}
 	sum := sha256.Sum256([]byte(s.cfg.Agent))
-	f, err := os.OpenFile(s.cfg.ReceiptsPath+"."+hex.EncodeToString(sum[:8])+".lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("the lock of the agent's actions could not be opened, so the limits cannot be checked: %w", err)
-	}
+	path := s.cfg.ReceiptsPath + "." + hex.EncodeToString(sum[:8]) + ".lock"
 	wait := lockWait
 	if s.cfg.StatementTimeout > 0 {
 		wait = s.cfg.StatementTimeout + dbBackstop + lockWait
 	}
-	for deadline := time.Now().Add(wait); ; {
-		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-		if err == nil {
-			return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN); f.Close() }, nil
+	deadline := time.Now().Add(wait)
+	for {
+		// Файл замка лежит в каталоге квитанций, а его пишет и тот, у кого
+		// ключа нет: подмени он файл другим (или ссылкой), сеансы держали бы
+		// замки разных файлов и шли бы разом — мимо счёта пределов (P-252).
+		// Замок взят — путь обязан вести к тому же файлу, иначе — заново.
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("the lock of the agent's actions could not be opened, so the limits cannot be checked: %w", err)
 		}
-		if !errors.Is(err, unix.EWOULDBLOCK) || time.Now().After(deadline) {
+		for {
+			err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+			if err == nil || !errors.Is(err, unix.EWOULDBLOCK) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if err != nil {
 			f.Close()
 			if errors.Is(err, unix.EWOULDBLOCK) {
 				return nil, fmt.Errorf("another action of this agent has been running for more than %s: wait for it and do not retry in a loop", wait)
 			}
 			return nil, fmt.Errorf("the lock of the agent's actions failed, so the limits cannot be checked: %w", err)
 		}
-		time.Sleep(20 * time.Millisecond)
+		held, herr := f.Stat()
+		now, nerr := os.Lstat(path)
+		if herr == nil && nerr == nil && held.Mode().IsRegular() && os.SameFile(held, now) {
+			return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN); f.Close() }, nil
+		}
+		f.Close()
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("the lock file of the agent's actions %s keeps being replaced, so the limits cannot be checked", path)
+		}
 	}
 }
 

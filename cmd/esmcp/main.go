@@ -193,6 +193,9 @@ func main() {
 		dsn.AppName = "esmcp/" + cfg.Agent
 	}
 	fail(os.MkdirAll(filepath.Dir(cfg.Receipts), 0o700))
+	if cfg.Head != "" {
+		fail(gateway.CheckHead(cfg.Head, cfg.Receipts))
+	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	mc := mcpserver.Config{
 		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, ActionsPerMinute: cfg.ActionsPerMinute,

@@ -1,0 +1,162 @@
+{
+ "packages": [
+  "./internal/pginput/",
+  "./internal/pgtap/",
+  "./internal/mcpserver/",
+  "./internal/gateway/",
+  "./cmd/esreceipt/"
+ ],
+ "run": "^Test(R1Rev8|R2Rev8|Live|Review|R1|R2Rev|Resent|Rewound|Pending|Removed|Rotated|Copies|SecondBranch|Void|OutcomeOfARecorded|IntentPutBack|Intents|Outcomes|Truncated|Ledger|Oversized|ActionsPerMinute|CheckHead|Sign|Append|LookupTail|Receipts|Stale|ActionLock|StateOf|CopyFrom|ReadLines|HoleIn|LimitsAcross)",
+ "mutations": [
+  {
+   "name": "X1 исход без сверки хэша обработанных",
+   "file": "internal/pginput/receipts.go",
+   "old": "\treturn r.alerted[rc.Hash] || !r.handledBefore.IsZero() && !rc.Time.After(r.handledBefore)",
+   "new": "\treturn false"
+  },
+  {
+   "name": "X2 обработанный исход не помечается",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\t// ни поиска по справочнику на каждую (R1-2 третьего захода).\n\t\treturn r.markAlerted(rc)",
+   "new": "\t\t// ни поиска по справочнику на каждую (R1-2 третьего захода).\n\t\treturn nil"
+  },
+  {
+   "name": "X3 переход с прежней версии не по месту",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif end <= rf.migrate {",
+   "new": "\t\tif false && end <= rf.migrate {"
+  },
+  {
+   "name": "X4 копия старой ветви двигает сцепку",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif gap && rc.Time.Before(l.time()) {",
+   "new": "\tif false && gap && rc.Time.Before(l.time()) {"
+  },
+  {
+   "name": "X5 сцепка повёрнутого файла под его именем",
+   "file": "internal/pginput/receipts.go",
+   "old": "chain: rf.path, f: f,",
+   "new": "chain: \"\", f: f,"
+  },
+  {
+   "name": "X6 файл квитанций по ссылке",
+   "file": "internal/gateway/journal.go",
+   "old": "\tf, err := os.OpenFile(path, flag|unix.O_NOFOLLOW|unix.O_NONBLOCK, perm)",
+   "new": "\tf, err := os.OpenFile(path, flag|unix.O_NONBLOCK, perm)"
+  },
+  {
+   "name": "X7 дыры разреженного файла читаются",
+   "file": "internal/gateway/journal.go",
+   "old": "\t\tif data, ok := NextData(f, off, size); ok && data > off {",
+   "new": "\t\tif data, ok := NextData(f, off, size); false && ok && data > off {"
+  },
+  {
+   "name": "X8 голова в каталоге квитанций",
+   "file": "internal/gateway/journal.go",
+   "old": "\tif sameDir(head, receipts) {",
+   "new": "\tif false && sameDir(head, receipts) {"
+  },
+  {
+   "name": "X9 намерение с отметкой базы, прочитанное позже, — в счёте",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\treturn started <= r.voidStartedBefore\n",
+   "new": "\t\treturn false\n"
+  },
+  {
+   "name": "X10 void не снимает намерения с отметкой",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif at.started == 0 || at.started <= r.voidStartedBefore {",
+   "new": "\t\tif at.started == 0 {"
+  },
+  {
+   "name": "X11 граница — запуск базы, а не прежняя история",
+   "file": "internal/pginput/pginput.go",
+   "old": "\t\tv.startedBefore = last.UnixMicro()\n",
+   "new": "\t\tv.startedBefore = started - 1\n"
+  },
+  {
+   "name": "X12 подъём узнаётся только по месту",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tif why != \"\" && (cursor.String() != s.known.Rewound || started != s.known.RewoundStart) {",
+   "new": "\tif why != \"\" && cursor.String() != s.known.Rewound {"
+  },
+  {
+   "name": "X13 второй подъём — по месту, как первый",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tcase known && !again:",
+   "new": "\tcase known:"
+  },
+  {
+   "name": "X14 намерение после своей транзакции — без тревоги",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\t\tif commit, ok := r.missed[uint32(xid)]; ok && commit.Sub(rc.Time).Abs() <= intentWindow {",
+   "new": "\t\t\tif commit, ok := r.missed[uint32(xid)]; false && ok && commit.Sub(rc.Time).Abs() <= intentWindow {"
+  },
+  {
+   "name": "X15 транзакция без намерения не запоминается",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\t\tr.miss(xid, commit)\n",
+   "new": "\t\t\t_ = commit\n"
+  },
+  {
+   "name": "X16 справочник без места входа — сверяется",
+   "file": "internal/pgtap/resend.go",
+   "old": "\tif t.lastCommit != 0 && !atPlace {",
+   "new": "\tif false && t.lastCommit != 0 && !atPlace {"
+  },
+  {
+   "name": "X17 пропавший справочник — ошибка",
+   "file": "internal/pgtap/resend.go",
+   "old": "\tif errors.Is(err, os.ErrNotExist) {",
+   "new": "\tif false && errors.Is(err, os.ErrNotExist) {"
+  },
+  {
+   "name": "X18 копия квитанции — в счёт пределов",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\tif l.known(items, hash) {",
+   "new": "\tif false && l.known(items, hash) {"
+  },
+  {
+   "name": "X19 новый сеанс не смотрит повёрнутые",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\t\t// между ними (copytruncate) в счёт один раз, по хэшу.\n\t\t\tl.primeSiblings(now)",
+   "new": "\t\t\t// между ними (copytruncate) в счёт один раз, по хэшу."
+  },
+  {
+   "name": "X20 переписанный файл — по одному размеру",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\tcase fi.Size() < l.off || !l.sameTail(f):",
+   "new": "\t\tcase fi.Size() < l.off:"
+  },
+  {
+   "name": "X21 своя квитанция — только из файла",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\tif s.ledger != nil && a.Line != nil {\n\t\ts.ledger.add(a.Line, s.now())\n\t}",
+   "new": "\tif false && s.ledger != nil && a.Line != nil {\n\t\ts.ledger.add(a.Line, s.now())\n\t}"
+  },
+  {
+   "name": "X22 замок агента по ссылке",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\tf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0o600)",
+   "new": "\t\tf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)"
+  },
+  {
+   "name": "X23 голову не проверяет esreceipt",
+   "file": "cmd/esreceipt/main.go",
+   "old": "\t\tif err := gateway.CheckHead(h, *file); err != nil {",
+   "new": "\t\tif err := error(nil); err != nil {"
+  },
+  {
+   "name": "X24 замок взят, даже если путь ведёт к другому файлу",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\tif herr == nil && nerr == nil && held.Mode().IsRegular() && os.SameFile(held, now) {",
+   "new": "\t\tif herr == nil && nerr == nil && held.Mode().IsRegular() && (os.SameFile(held, now) || true) {"
+  },
+  {
+   "name": "X25 сборщик читает дыры файла квитанций",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif data, ok := gateway.NextData(rf.f, rf.off, fi.Size()); !ok || data > rf.off {",
+   "new": "\t\tif data, ok := gateway.NextData(rf.f, rf.off, fi.Size()); false && (!ok || data > rf.off) {"
+  }
+ ]
+}

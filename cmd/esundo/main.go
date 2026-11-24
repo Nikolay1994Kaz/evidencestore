@@ -308,6 +308,7 @@ func apply(args []string) {
 	}
 	key, err := gateway.LoadKey(cfg.Key)
 	fail(err)
+	fail(gateway.CheckHead(cfg.Head, cfg.Receipts)) // до базы: голову не записать — откат отказал бы после сверки
 	db := dial(*dsn)
 	defer db.Close()
 	action := "undo-" + strconv.FormatUint(uint64(p.XID), 10) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -338,9 +339,9 @@ func undoIntent(cfg *Config, key ed25519.PrivateKey, p *pgundo.Plan, action, by,
 	if p.Action != nil {
 		undoes = p.Action.ID
 	}
-	return func(xid, xid8 string) error {
+	return func(xid, xid8, started string) error {
 		body, err := json.Marshal(map[string]any{"agent": by, "tool": "esundo", "reason": reason, "undoes": undoes,
-			"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "xid8": xid8, "steps": len(p.OK)})
+			"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "xid8": xid8, "db_started": started, "steps": len(p.OK)})
 		if err != nil {
 			return err
 		}

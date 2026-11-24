@@ -453,3 +453,174 @@ func TestLedgerCountsAReceiptCaughtMidWrite(t *testing.T) {
 		t.Fatalf("%v %s", isErr, text)
 	}
 }
+
+// Писатель файла квитанций без ключа дописывает копии прежних строк
+// (намерения и исхода): действие одно, и в счёте пределов оно одно — иначе
+// копиями он держал бы агента под отказом.
+func TestLedgerCountsACopyOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s := serverOn(t, &fakeDB{}, path, func(c *Config) { c.ActionsPerMinute, c.WindowRows, c.Window = 3, 1000, 10*time.Minute })
+	if _, err := s.execute([]string{"UPDATE accounts SET note = 'x' WHERE id = 1"}, "one"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	for range 5 {
+		f.Write(data)
+	}
+	f.Close()
+	actions, _, _, err := s.usage(time.Now(), "")
+	if err != nil || actions != 1 {
+		t.Fatalf("copies of one action: %d actions, %v", actions, err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := s.execute([]string{"UPDATE accounts SET note = 'x' WHERE id = 1"}, ""); err != nil {
+			t.Fatalf("action %d of 3 a minute refused after copies of the first: %v", i+2, err)
+		}
+	}
+}
+
+// Замок действий агента — файл в каталоге квитанций, а его пишет и тот, у
+// кого ключа нет. Ссылка на месте файла — отказ, а не замок на чужом файле.
+// Файл подменили, пока сеанс ждал замка: отпущенный прежний файл сеанс не
+// берёт, пока другой держит новый, — иначе они шли бы разом мимо счёта
+// пределов (P-382).
+func TestActionLockFollowsTheFileAtItsPath(t *testing.T) {
+	old := lockWait
+	lockWait = 5 * time.Second
+	t.Cleanup(func() { lockWait = old })
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	first := serverOn(t, &fakeDB{}, path, nil)
+	unlock, err := first.actionLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks, _ := filepath.Glob(path + ".*.lock")
+	if len(locks) != 1 {
+		t.Fatalf("lock files %v", locks)
+	}
+	lock := locks[0]
+	unlock()
+
+	// Ссылка на месте файла замка.
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere.lock")
+	os.Remove(lock)
+	if err := os.Symlink(elsewhere, lock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.actionLock(); err == nil || !strings.Contains(err.Error(), "could not be opened") {
+		t.Fatalf("a link in place of the lock: %v", err)
+	}
+	if _, err := os.Lstat(elsewhere); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the lock followed the link: %v", err)
+	}
+	os.Remove(lock)
+
+	// Подмена файла, пока второй сеанс ждёт.
+	if unlock, err = first.actionLock(); err != nil {
+		t.Fatal(err)
+	}
+	waiting := serverOn(t, &fakeDB{}, path, nil)
+	got := make(chan func(), 1)
+	go func() {
+		u, err := waiting.actionLock()
+		if err != nil {
+			t.Error(err)
+			u = func() {}
+		}
+		got <- u
+	}()
+	time.Sleep(100 * time.Millisecond) // второй открыл прежний файл и ждёт
+	if err := os.WriteFile(lock+".new", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(lock+".new", lock); err != nil {
+		t.Fatal(err)
+	}
+	third := serverOn(t, &fakeDB{}, path, nil)
+	unlockThird, err := third.actionLock() // новый файл свободен
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	select {
+	case u := <-got:
+		u()
+		t.Fatal("the waiting session took the lock of the replaced file while another one held the new file")
+	case <-time.After(300 * time.Millisecond):
+	}
+	unlockThird()
+	select {
+	case u := <-got:
+		u()
+	case <-time.After(2 * time.Second):
+		t.Fatal("the waiting session did not take the lock once it was free")
+	}
+}
+
+// Новый сеанс после ротации, когда новый файл уже начат другим сеансом:
+// файл по пути не покрывает окна, и начало окна — в повёрнутом рядом
+// (P-376). Своя квитанция сеанса — в счёт сразу, даже если её вынули из
+// файла раньше, чем сеанс её прочёл (copytruncate со сжатием копии).
+// Файл обрезан и дорос за место сеанса — читается с начала.
+func TestLimitsAcrossRotation(t *testing.T) {
+	sql := []string{"UPDATE accounts SET note = 'x' WHERE id = 1"}
+	limit := func(n int) func(*Config) { return func(c *Config) { c.ActionsPerMinute = n } }
+	refused := func(t *testing.T, s *Server, n int) {
+		t.Helper()
+		if _, err := s.execute(sql, ""); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%d actions in the last minute", n)) {
+			t.Fatalf("want a refusal at %d actions: %v", n, err)
+		}
+	}
+	t.Run("a new session after the file was started again", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "receipts.jsonl")
+		a := serverOn(t, &fakeDB{}, path, limit(3))
+		for i := 0; i < 2; i++ {
+			if _, err := a.execute(sql, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Rename(path, path+".1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := serverOn(t, &fakeDB{}, path, limit(3)).execute(sql, ""); err != nil {
+			t.Fatal(err) // третье — уже в новом файле
+		}
+		refused(t, serverOn(t, &fakeDB{}, path, limit(3)), 3)
+	})
+	t.Run("own receipts gone before they were read", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "receipts.jsonl")
+		a := serverOn(t, &fakeDB{}, path, limit(2))
+		for i := 0; i < 2; i++ {
+			if _, err := a.execute(sql, ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Truncate(path, 0); err != nil { // копия ушла в .1.gz
+				t.Fatal(err)
+			}
+		}
+		refused(t, a, 2)
+	})
+	t.Run("cut and grown past the place", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "receipts.jsonl")
+		a := serverOn(t, &fakeDB{}, path, limit(5))
+		for i := 0; i < 2; i++ {
+			if _, err := a.execute(sql, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		data, _ := os.ReadFile(path)
+		os.WriteFile(path+".1", data, 0o600)
+		if err := os.Truncate(path, 0); err != nil { // copytruncate
+			t.Fatal(err)
+		}
+		b := serverOn(t, &fakeDB{}, path, limit(5))
+		b.newID = func() func() string { n := 0; return func() string { n++; return fmt.Sprint("b-", n) } }()
+		for i := 0; i < 3; i++ {
+			if _, err := b.execute(sql, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		refused(t, a, 5)
+	})
+}

@@ -105,6 +105,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if h == "" {
 			h = gateway.DefaultHead(*keyPath, *file, *name)
 		}
+		if err := gateway.CheckHead(h, *file); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return exitInvalid
+		}
 		n, err := sign(key, *name, *file, h, stdin, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %v (%d receipts written before it)\n", err, n)

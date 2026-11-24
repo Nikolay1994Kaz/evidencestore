@@ -76,11 +76,22 @@ var maxIntents = 200_000
 const maxReason = 2000
 
 type receiptsState struct {
-	Files []fileState `json:"files"`
-	// VoidBefore — намерения любого шлюза не позже этого времени не в счёт:
-	// база ушла назад, а запустилась в своей новой истории в этот миг
-	// (void с границей).
+	// Version — 3: исходы считаются обработанными по хэшу
+	// (receipts-alerted.jsonl), а не по месту в файле. Состояние прежней
+	// версии — один раз по месту (Files.Alerted), дальше — по хэшу.
+	Version int         `json:"version,omitempty"`
+	Files   []fileState `json:"files"`
+	// HandledBefore — исходы со временем шлюза не позже этого обработаны:
+	// их хэши ушли из receipts-alerted.jsonl при сжатии.
+	HandledBefore string `json:"handled_before,omitempty"`
+	// VoidBefore — намерения любого шлюза без отметки базы со временем шлюза
+	// не позже этого не в счёт: база ушла назад, а запустилась в своей новой
+	// истории в этот миг (void с границей).
 	VoidBefore string `json:"void_before,omitempty"`
+	// VoidStartedBefore — намерения с отметкой базы (db_started: когда
+	// запущена база, в которой шла транзакция действия, микросекунды) не
+	// позже этого не в счёт: их база — прежняя история, до подъёма из копии.
+	VoidStartedBefore int64 `json:"void_started_before,omitempty"`
 	// Chains — шлюзы по имени: до какого их времени намерения не в счёт.
 	Chains map[string]*chainState `json:"chains,omitempty"`
 	// Links — последняя квитанция каждой цепочки (путь файла, шлюз, ключ),
@@ -98,9 +109,17 @@ type receiptsState struct {
 type chainLink struct {
 	Seq  uint64 `json:"seq"`
 	Hash string `json:"hash"`
+	// Time — время шлюза в этой квитанции.
+	Time string `json:"time,omitempty"`
 	// Genesis — начала цепочек этого шлюза, виденные здесь: копия прежнего
 	// начала — повтор, а не новая цепочка.
 	Genesis []string `json:"genesis,omitempty"`
+}
+
+// time — время шлюза в последней квитанции цепочки (ноль — не записано).
+func (l *chainLink) time() time.Time {
+	t, _ := time.Parse(time.RFC3339Nano, l.Time)
+	return t
 }
 
 // maxGenesis — сколько начал цепочек одного шлюза помнить.
@@ -124,15 +143,21 @@ type chainState struct {
 	last     time.Time // позднее время намерения, прочитанного у шлюза
 }
 
-// ReceiptsAlerted — файл в Config.Dir: хэши квитанций исхода, о которых
-// тревога уже поднята. Ни обрезка, ни замена файла, ни копия прежней строки
-// не поднимают тревоги второй раз, а новая квитанция — новая тревога, какой
-// бы ни был её seq.
+// ReceiptsAlerted — файл в Config.Dir: хэши квитанций исхода, которые
+// сборщик уже обработал (тревога поднята, намерение сверено). Ни обрезка, ни
+// замена, ни сдвиг содержимого файла, ни копия прежней строки не поднимают
+// тревоги второй раз и не прячут новую: новизну решает хэш квитанции, а не
+// место в файле (R1-1 третьего захода: писатель файла без ключа, пока
+// сборщик стоял, сдвигал написанное шлюзом перед прежним местом тревог, и
+// исходы, вынутое намерение и пропуск в цепочке проходили молча).
 const ReceiptsAlerted = "receipts-alerted.jsonl"
 
-// maxAlerted — сколько хэшей поднятых тревог помнить: сжатие оставляет
-// последние.
-const maxAlerted = 100_000
+// stateVersion — receiptsState.Version этой версии.
+const stateVersion = 3
+
+// maxAlerted — сколько хэшей обработанных исходов помнить: сжатие оставляет
+// последние, а время самого позднего из ушедших — граница HandledBefore.
+const maxAlerted = 50_000
 
 // receipts — читатель файлов квитанций шлюзов: намерения по xid и тревоги по
 // исходам. Читает с начала при запуске и дальше по мере роста файлов.
@@ -145,19 +170,27 @@ type receipts struct {
 
 	files  []*receiptFile
 	chains map[string]*chainState
-	// voidBefore — receiptsState.VoidBefore.
-	voidBefore time.Time
-	dirty      bool // chains изменились: сохранить
-	byXID      map[uint32]intentAt
-	order      []uint32
-	// alerted — хэши квитанций исхода с поднятой тревогой (ReceiptsAlerted).
-	alerted      map[string]bool
-	alertedOrder []string
-	alertedPath  string
+	// voidBefore, voidStartedBefore — receiptsState.VoidBefore и
+	// VoidStartedBefore.
+	voidBefore        time.Time
+	voidStartedBefore int64
+	dirty             bool // chains изменились: сохранить
+	byXID             map[uint32]intentAt
+	order             []uint32
+	// alerted — хэши обработанных квитанций исхода (ReceiptsAlerted) и их
+	// время шлюза; handledBefore — граница сжатия.
+	alerted       map[string]bool
+	alertedOrder  []handled
+	alertedPath   string
+	handledBefore time.Time
 	// unreadable — почему файл квитанций сейчас не читается (о том же — одна
 	// тревога, пока не прочтётся).
 	unreadable map[string]string
 	links      map[string]*chainLink
+	// missed — транзакции, у которых на их начале намерения не нашлось
+	// (номер → время фиксации): намерение, пришедшее после, — тревога.
+	missed      map[uint32]time.Time
+	missedOrder []uint32
 	// intents — номера действий, чьё намерение прочитано (и снятое void):
 	// исход с номером транзакции без намерения — тревога.
 	intents      map[string]bool
@@ -180,17 +213,28 @@ type intentAt struct {
 	in    pgtap.Intent
 	xid8  uint64
 	spent uint64
+	// started — отметка базы в намерении (db_started, микросекунды); 0 — нет.
+	started int64
 }
 
 // receiptFile — файл квитанций одного шлюза и место в нём.
 type receiptFile struct {
-	path    string
+	path string
+	// chain — путь из настроек, по которому ведётся цепочка шлюза: у
+	// повёрнутого файла, который дочитывается под своим новым именем, — путь,
+	// где он лежал (R1-3 третьего захода: иначе первая квитанция нового файла
+	// сверялась с местом до остановки, и обычная ротация давала ложный
+	// пропуск).
+	chain   string
 	f       *os.File
 	inode   uint64
 	off     int64  // прочитано до сюда
 	partial []byte // начало строки без перевода строки
 	long    bool   // строка длиннее любой квитанции: её байты пропускаются до перевода строки
 	alerted int64  // тревоги о строках без подписи подняты до этого места
+	// migrate — состояние прежней версии: строки до этого места обработаны
+	// ею (по месту), их исходы — в receipts-alerted.jsonl без тревог.
+	migrate int64
 	tail    []byte // последние байты перед off: другие на их месте — файл переписан
 }
 
@@ -235,7 +279,7 @@ func openReceipts(cfg ReceiptsConfig, dir string, raise func(alert.Event) error)
 	r := &receipts{cfg: cfg, state: filepath.Join(dir, ReceiptsState), raise: raise, now: time.Now, byXID: map[uint32]intentAt{}, chains: map[string]*chainState{},
 		spent: map[string]uint64{}, spentPath: filepath.Join(dir, ReceiptsSpent),
 		alerted: map[string]bool{}, alertedPath: filepath.Join(dir, ReceiptsAlerted), unreadable: map[string]string{},
-		links: map[string]*chainLink{}, intents: map[string]bool{}}
+		links: map[string]*chainLink{}, intents: map[string]bool{}, missed: map[uint32]time.Time{}}
 	if err := r.loadSpent(); err != nil {
 		return nil, err
 	}
@@ -262,16 +306,23 @@ func openReceipts(cfg ReceiptsConfig, dir string, raise func(alert.Event) error)
 	if v, err := time.Parse(time.RFC3339Nano, st.VoidBefore); err == nil {
 		r.voidBefore = v
 	}
+	r.voidStartedBefore = st.VoidStartedBefore
 	for k, l := range st.Links {
 		if l != nil {
 			r.links[k] = l
 		}
+	}
+	if v, err := time.Parse(time.RFC3339Nano, st.HandledBefore); err == nil {
+		r.handledBefore = v
 	}
 	for _, path := range cfg.Files {
 		rf := &receiptFile{path: path}
 		for _, s := range st.Files {
 			if s.File == path {
 				rf.inode, rf.alerted = s.Inode, s.Alerted
+				if st.Version < stateVersion {
+					rf.migrate = s.Alerted
+				}
 			}
 		}
 		r.files = append(r.files, rf)
@@ -294,6 +345,7 @@ func (r *receipts) Intent(xid uint32, commit time.Time, final uint64) (pgtap.Int
 			return pgtap.Intent{}, false, err
 		}
 		if at, ok = r.byXID[xid]; !ok || !r.fits(at, xid, commit, final) {
+			r.miss(xid, commit)
 			return pgtap.Intent{}, false, nil
 		}
 	}
@@ -306,6 +358,24 @@ func (r *receipts) Intent(xid uint32, commit time.Time, final uint64) (pgtap.Int
 		}
 	}
 	return at.in, true, nil
+}
+
+// maxMissed — сколько транзакций без намерения помнить.
+const maxMissed = 100_000
+
+// miss — у транзакции xid (фиксация в commit) намерения не нашлось: она
+// легла отпечатком.
+func (r *receipts) miss(xid uint32, commit time.Time) {
+	if _, ok := r.missed[xid]; !ok {
+		r.missedOrder = append(r.missedOrder, xid)
+	}
+	r.missed[xid] = commit
+	if len(r.missedOrder) > 2*maxMissed {
+		for _, old := range r.missedOrder[:maxMissed] {
+			delete(r.missed, old)
+		}
+		r.missedOrder = append([]uint32(nil), r.missedOrder[maxMissed:]...)
+	}
 }
 
 // fits — намерение at — о транзакции xid, зафиксированной в commit на месте
@@ -405,45 +475,67 @@ func fullXID(ref8 uint64, xid uint32) uint64 {
 	return uint64(int64(ref8) + int64(int32(xid-uint32(ref8))))
 }
 
+// voidSpec — что снять, когда база ушла назад.
+type voidSpec struct {
+	// since — для намерений без отметки базы: время шлюза, до которого они
+	// не в счёт (запуск поднятой базы); ноль — не в счёт все прочитанные.
+	since time.Time
+	// startedBefore — для намерений с отметкой базы: не в счёт, если их база
+	// запущена не позже (микросекунды). Это время последней транзакции,
+	// прочитанной из прежней истории: база новой истории запущена после неё
+	// — и после перезапуска поднятой базы её действия остаются действиями
+	// (R2-2 третьего захода). Отметка — в часах базы, а не шлюза: часы шлюза
+	// впереди не продлевают жизнь намерению прежней истории (R2-1).
+	startedBefore int64
+}
+
 // void — база ушла назад: поднята из копии или её место заняла отставшая
 // реплика, и номера транзакций, названные в намерениях до сих пор, она
-// выдаст снова другим транзакциям (R2-1). since — миг, с которого база живёт
-// своей новой историей (запуск поднятой копии): намерения не позже него не в
-// счёт, после — в счёте, это действия шлюза уже в новой базе (R2-3 второго
-// захода: подъём, увиденный поздно, снимал и их). Ноль — миг не известен:
-// не в счёт все намерения, прочитанные до сих пор (chainState.VoidTime). Так
-// и после перезапуска.
-func (r *receipts) void(since time.Time) error {
+// выдаст снова другим транзакциям (R2-1). Что из прочитанного не в счёт и
+// что не в счёт из прочитанного позже — voidSpec. Так и после перезапуска.
+func (r *receipts) void(v voidSpec) error {
 	if err := r.poll(); err != nil {
 		return err
 	}
-	if since.IsZero() {
-		for _, c := range r.chains {
-			if v, err := time.Parse(time.RFC3339Nano, c.VoidTime); err != nil || c.last.After(v) {
-				c.VoidTime = c.last.UTC().Format(time.RFC3339Nano)
-			}
+	// Намерения без отметки базы — все прочитанные до сих пор: их время —
+	// по часам шлюза, и сравнить его с запуском базы нельзя — часы шлюза
+	// впереди продлевали намерению прежней истории жизнь (T-3, R2-1
+	// третьего захода). Сравнение — внутри одних часов: с последним
+	// прочитанным намерением того же шлюза.
+	for _, c := range r.chains {
+		if t, err := time.Parse(time.RFC3339Nano, c.VoidTime); err != nil || c.last.After(t) {
+			c.VoidTime = c.last.UTC().Format(time.RFC3339Nano)
 		}
-		r.byXID, r.order = map[uint32]intentAt{}, nil
-	} else {
-		if since.After(r.voidBefore) {
-			r.voidBefore = since
-		}
-		var order []uint32
-		for _, xid := range r.order {
-			at, ok := r.byXID[xid]
-			if !ok {
-				continue
-			}
-			if t, err := time.Parse(time.RFC3339Nano, at.in.Time); err != nil || !t.After(r.voidBefore) {
-				delete(r.byXID, xid)
-				continue
-			}
-			order = append(order, xid)
-		}
-		r.order = order
 	}
+	if v.since.After(r.voidBefore) {
+		r.voidBefore = v.since
+	}
+	r.voidStartedBefore = max(r.voidStartedBefore, v.startedBefore)
+	var order []uint32
+	for _, xid := range r.order {
+		at, ok := r.byXID[xid]
+		if !ok {
+			continue
+		}
+		// Без отметки базы — все прочитанные (выше); с отметкой — по ней.
+		if at.started == 0 || at.started <= r.voidStartedBefore {
+			delete(r.byXID, xid)
+			continue
+		}
+		order = append(order, xid)
+	}
+	r.order = order
 	r.dirty = true
 	return r.save()
+}
+
+// isVoid — намерение шлюза c со временем шлюза gw и отметкой базы started
+// дописано до того, как база ушла назад.
+func (r *receipts) isVoid(c *chainState, gw time.Time, started int64) bool {
+	if started != 0 {
+		return started <= r.voidStartedBefore
+	}
+	return c.voided(gw) || !r.voidBefore.IsZero() && !gw.After(r.voidBefore)
 }
 
 // voided — намерение шлюза c со временем at дописано до того, как база ушла
@@ -451,6 +543,12 @@ func (r *receipts) void(since time.Time) error {
 func (c *chainState) voided(at time.Time) bool {
 	v, err := time.Parse(time.RFC3339Nano, c.VoidTime)
 	return err == nil && !at.After(v)
+}
+
+// handled — обработанная квитанция исхода: хэш и время шлюза.
+type handled struct {
+	Hash string `json:"hash"`
+	Time string `json:"time,omitempty"`
 }
 
 // loadAlerted читает ReceiptsAlerted.
@@ -463,31 +561,43 @@ func (r *receipts) loadAlerted() error {
 		return err
 	}
 	for _, line := range bytes.Split(data, []byte("\n")) {
-		var e struct {
-			Hash string `json:"hash"`
-		}
+		var e handled
 		if json.Unmarshal(line, &e) == nil && e.Hash != "" && !r.alerted[e.Hash] {
 			r.alerted[e.Hash] = true
-			r.alertedOrder = append(r.alertedOrder, e.Hash)
+			r.alertedOrder = append(r.alertedOrder, e)
 		}
 	}
 	return nil
 }
 
-// markAlerted — о квитанции исхода hash тревога поднята. Пишется после
-// тревоги: упасть между ними — тревога второй раз, а не ни разу.
-func (r *receipts) markAlerted(hash string) error {
-	r.alerted[hash] = true
-	r.alertedOrder = append(r.alertedOrder, hash)
+// isHandled — квитанция исхода rc уже обработана (по хэшу или до границы
+// сжатия).
+func (r *receipts) isHandled(rc gateway.Receipt) bool {
+	return r.alerted[rc.Hash] || !r.handledBefore.IsZero() && !rc.Time.After(r.handledBefore)
+}
+
+// markAlerted — квитанция исхода rc обработана. Пишется после тревоги:
+// упасть между ними — тревога второй раз, а не ни разу.
+func (r *receipts) markAlerted(rc gateway.Receipt) error {
+	e := handled{Hash: rc.Hash, Time: rc.Time.UTC().Format(time.RFC3339Nano)}
+	r.alerted[e.Hash] = true
+	r.alertedOrder = append(r.alertedOrder, e)
 	if len(r.alertedOrder) > 2*maxAlerted {
-		keep := r.alertedOrder[len(r.alertedOrder)-maxAlerted:]
+		drop, keep := r.alertedOrder[:len(r.alertedOrder)-maxAlerted], r.alertedOrder[len(r.alertedOrder)-maxAlerted:]
+		for _, d := range drop {
+			if t, err := time.Parse(time.RFC3339Nano, d.Time); err == nil && t.After(r.handledBefore) {
+				r.handledBefore = t
+			}
+		}
 		var b bytes.Buffer
 		r.alerted = map[string]bool{}
 		for _, h := range keep {
-			r.alerted[h] = true
-			fmt.Fprintf(&b, "{\"hash\":%q}\n", h)
+			r.alerted[h.Hash] = true
+			line, _ := json.Marshal(h)
+			b.Write(append(line, '\n'))
 		}
-		r.alertedOrder = append([]string(nil), keep...)
+		r.alertedOrder = append([]handled(nil), keep...)
+		r.dirty = true // граница — в receipts.json
 		return replaceFile(r.alertedPath, b.Bytes())
 	}
 	f, err := os.OpenFile(r.alertedPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -495,7 +605,8 @@ func (r *receipts) markAlerted(hash string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = fmt.Fprintf(f, "{\"hash\":%q}\n", hash)
+	line, _ := json.Marshal(e)
+	_, err = f.Write(append(line, '\n'))
 	return err
 }
 
@@ -588,19 +699,14 @@ func (r *receipts) pollFile(rf *receiptFile) (moved bool, err error) {
 // лежит рядом под другим именем, он дочитывается первым: в нём могут быть
 // намерения транзакций, которых сборщик ещё не прочёл.
 func (r *receipts) openFile(rf *receiptFile) error {
-	// O_NONBLOCK: на месте файла может оказаться FIFO, и открытие повисло бы.
-	f, err := os.OpenFile(rf.path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	// Только сам файл (не ссылка на месте пути, R1-4 третьего захода) и
+	// только обычный; O_NONBLOCK: на месте файла может оказаться FIFO, и
+	// открытие повисло бы.
+	f, err := gateway.OpenReceipts(rf.path, os.O_RDONLY, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return r.cannotRead(rf, err)
-	}
-	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
-		f.Close()
-		if err == nil {
-			err = fmt.Errorf("it is not a regular file (%s)", fi.Mode().Type())
-		}
 		return r.cannotRead(rf, err)
 	}
 	if r.unreadable[rf.path] != "" {
@@ -674,7 +780,7 @@ func (r *receipts) drainRotated(rf *receiptFile) error {
 		if err != nil {
 			return nil
 		}
-		old := &receiptFile{path: filepath.Join(dir, e.Name()), f: f, inode: rf.inode, alerted: rf.alerted}
+		old := &receiptFile{path: filepath.Join(dir, e.Name()), chain: rf.path, f: f, inode: rf.inode, alerted: rf.alerted, migrate: rf.migrate}
 		_, err = r.readFile(old)
 		f.Close()
 		return err
@@ -701,6 +807,16 @@ func (r *receipts) readFile(rf *receiptFile) (moved bool, err error) {
 	var bad unsigned
 	buf := make([]byte, min(int64(receiptChunk), fi.Size()-rf.off))
 	for rf.off < fi.Size() {
+		// Дыра разреженного файла — нули, продолжение длинной строки: её не
+		// читают (R1-5 третьего захода: truncate -s +1T — минуты простоя
+		// потока на каждом чтении).
+		if data, ok := gateway.NextData(rf.f, rf.off, fi.Size()); !ok || data > rf.off {
+			rf.off, rf.partial, rf.long, rf.tail = data, nil, true, nil
+			if !ok {
+				rf.off = fi.Size()
+			}
+			continue
+		}
 		got, err := rf.f.ReadAt(buf[:min(int64(len(buf)), fi.Size()-rf.off)], rf.off)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return moved, errUnreadable{err}
@@ -796,7 +912,10 @@ func (r *receipts) unsignedAlert(rf *receiptFile, u unsigned) error {
 }
 
 func (r *receipts) save() error {
-	st := receiptsState{Chains: r.chains, Links: r.links}
+	st := receiptsState{Version: stateVersion, Chains: r.chains, Links: r.links, VoidStartedBefore: r.voidStartedBefore}
+	if !r.handledBefore.IsZero() {
+		st.HandledBefore = r.handledBefore.UTC().Format(time.RFC3339Nano)
+	}
 	if !r.voidBefore.IsZero() {
 		st.VoidBefore = r.voidBefore.UTC().Format(time.RFC3339Nano)
 	}
@@ -833,7 +952,7 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 	if perr != nil {
 		return nil // подписано, но не по формату: хранилище назовёт поломку, сборщику в ней нечего взять
 	}
-	if err := r.link(rf, rc, key, fresh); err != nil {
+	if err := r.link(rf, rc, key); err != nil {
 		return err
 	}
 	var body struct {
@@ -852,6 +971,7 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 		Timeout    string `json:"timeout"`
 		XID        string `json:"xid"`
 		XID8       string `json:"xid8"`
+		DBStarted  string `json:"db_started"`
 		Alerted    bool   `json:"alerted"`
 	}
 	json.Unmarshal(rc.Body, &body)
@@ -864,7 +984,8 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 		if rc.Time.After(c.last) {
 			c.last = rc.Time
 		}
-		if c.voided(rc.Time) || !rc.Time.After(r.voidBefore) && !r.voidBefore.IsZero() {
+		started, _ := strconv.ParseInt(body.DBStarted, 10, 64)
+		if r.isVoid(c, rc.Time, started) {
 			break // дописано до того, как база ушла назад: номер мог быть выдан снова
 		}
 		xid8, _ := strconv.ParseUint(body.XID8, 10, 64)
@@ -876,19 +997,39 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 			if err != nil {
 				continue
 			}
-			at := intentAt{in: act}
+			at := intentAt{in: act, started: started}
 			if xid8 != 0 && uint32(xid8) == uint32(xid) {
 				at.xid8 = xid8
 			}
 			r.remember(uint32(xid), at)
+			if commit, ok := r.missed[uint32(xid)]; ok && commit.Sub(rc.Time).Abs() <= intentWindow {
+				// Намерения не было, когда сборщик читал транзакцию, а теперь
+				// оно есть: его вынули из файла, пока шло действие, и вернули
+				// те же байты на то же место (T-2 третьего захода: пропуска в
+				// цепочке нет, исход — за намерением, и ни одной тревоги).
+				delete(r.missed, uint32(xid))
+				ev := alert.Event{Action: &act}
+				ev.Add(alert.KindIntentMissing, fmt.Sprintf("the intent of action %q for transaction %d came into %s only after the collector had read the transaction (committed %s): "+
+					"someone who writes to the file took the intent out while the action ran and put it back, or the gateway wrote it late; "+
+					"transaction %d went as a fingerprint: whole, with its rows, it is not kept, and it cannot be undone",
+					rc.Action, xid, rf.path, commit.UTC().Format(time.RFC3339), xid))
+				if err := r.raise(ev); err != nil {
+					return err
+				}
+			}
 		}
 	case alert.StepOutcome:
-		// Дважды о том же исходе — нет: ни после обрезки и замены файла, ни
-		// по копии прежней строки, дописанной без ключа.
-		if !fresh || r.alerted[rc.Hash] {
+		// Дважды о том же исходе — нет: ни после обрезки, замены и сдвига
+		// файла, ни по копии прежней строки, дописанной без ключа. Новизна —
+		// по хэшу, а не по месту в файле (R1-1 третьего захода).
+		if r.isHandled(rc) {
 			break
 		}
-		if body.XID != "" && !r.intents[rc.Action] && !r.recorded(rc.Action, body.XID) {
+		if end <= rf.migrate {
+			return r.markAlerted(rc) // обработан прежней версией, по месту
+		}
+		missing := body.XID != "" && !r.intents[rc.Action] && !r.recorded(rc.Action, body.XID)
+		if missing {
 			// Сервер пишет намерение до SQL, с номером транзакции, и без него
 			// SQL не идёт: исход с номером при непрочитанном намерении — строку
 			// намерения вынули из файла, пока шла транзакция, и она легла
@@ -901,11 +1042,12 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 				return err
 			}
 		}
-		raised, err := r.outcome(act, body.Outcome, body.Cause, body.Rows, body.Limit, body.WindowRows, body.Window, body.Actions, body.Timeout, body.XID, body.Alerted)
-		if err != nil || !raised {
+		if _, err := r.outcome(act, body.Outcome, body.Cause, body.Rows, body.Limit, body.WindowRows, body.Window, body.Actions, body.Timeout, body.XID, body.Alerted); err != nil {
 			return err
 		}
-		return r.markAlerted(rc.Hash)
+		// Исход обработан: его копии, дописанные без ключа, — ни тревоги снова,
+		// ни поиска по справочнику на каждую (R1-2 третьего захода).
+		return r.markAlerted(rc)
 	}
 	return nil
 }
@@ -913,8 +1055,12 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 // link сверяет квитанцию rc с цепочкой её шлюза в файле rf: пропуск — тревога
 // (если о строке тревоги ещё не поднимались). Повтор прежней строки и копия
 // прежнего начала цепочку не двигают.
-func (r *receipts) link(rf *receiptFile, rc gateway.Receipt, key []byte, fresh bool) error {
-	k := rf.path + "\x00" + rc.Gateway + "\x00" + hex.EncodeToString(key)
+func (r *receipts) link(rf *receiptFile, rc gateway.Receipt, key []byte) error {
+	chain := rf.chain
+	if chain == "" {
+		chain = rf.path
+	}
+	k := chain + "\x00" + rc.Gateway + "\x00" + hex.EncodeToString(key)
 	l := r.links[k]
 	if rc.Prev == gateway.Genesis {
 		if l != nil && slices.Contains(l.Genesis, rc.Hash) {
@@ -927,20 +1073,27 @@ func (r *receipts) link(rf *receiptFile, rc gateway.Receipt, key []byte, fresh b
 				g = g[len(g)-maxGenesis:]
 			}
 		}
-		r.links[k] = &chainLink{Seq: rc.Seq, Hash: rc.Hash, Genesis: g}
+		r.links[k] = &chainLink{Seq: rc.Seq, Hash: rc.Hash, Time: rc.Time.UTC().Format(time.RFC3339Nano), Genesis: g}
 		return nil
 	}
 	if l == nil {
-		r.links[k] = &chainLink{Seq: rc.Seq, Hash: rc.Hash} // первая увиденная: что до неё, сборщик не читал
+		r.links[k] = &chainLink{Seq: rc.Seq, Hash: rc.Hash, Time: rc.Time.UTC().Format(time.RFC3339Nano)} // первая увиденная: что до неё, сборщик не читал
 		return nil
 	}
 	if rc.Seq <= l.Seq {
 		return nil // повтор прежней строки или её копия
 	}
 	gap := rc.Seq != l.Seq+1 || rc.Prev != l.Hash
+	if gap && rc.Time.Before(l.time()) {
+		// Квитанция старше последней прочитанной, а seq выше: копия из другой
+		// ветви цепочки (прежней, до потери головы шлюзом), не продолжение.
+		// Место цепочки она не двигает: иначе пропуски до её seq не были бы
+		// видны (R1 третьего захода).
+		return nil
+	}
 	from := l.Seq
-	l.Seq, l.Hash = rc.Seq, rc.Hash
-	if !gap || !fresh {
+	l.Seq, l.Hash, l.Time = rc.Seq, rc.Hash, rc.Time.UTC().Format(time.RFC3339Nano)
+	if !gap {
 		return nil
 	}
 	what := fmt.Sprintf("%d receipts between them are", rc.Seq-from-1)
@@ -963,9 +1116,14 @@ func (r *receipts) recorded(id, xid string) bool {
 	if err != nil {
 		return false
 	}
-	e, found, err := pgtap.Lookup(filepath.Join(filepath.Dir(r.state), pgtap.IndexFile), uint32(n))
+	e, found, err := pgtap.LookupTail(filepath.Join(filepath.Dir(r.state), pgtap.IndexFile), uint32(n), recordedSpan)
 	return err == nil && found && e.Action != nil && e.Action.ID == id
 }
+
+// recordedSpan — сколько последних байт справочника смотрит recorded: там
+// транзакции последних часов, а действие, чей исход пришёл сейчас, — среди
+// них.
+const recordedSpan = 16 << 20
 
 // sawIntent — намерение действия id прочитано.
 func (r *receipts) sawIntent(id string) {

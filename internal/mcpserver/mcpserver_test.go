@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pgundo"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
 
@@ -141,7 +142,8 @@ func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 	switch {
 	case strings.Contains(sql, "pg_current_xact_id()::xid::text, pg_current_xact_id()::text"):
 		// Номер транзакции (32 бита и с эпохой), при пределах — счёт строк до SQL агента.
-		cols, row := []string{"xid", "xid8"}, []*string{&v, &v}
+		started := "1795400000000000"
+		cols, row := []string{"xid", "xid8", "started"}, []*string{&v, &v, &started}
 		if strings.Contains(sql, "pg_stat_get_xact_tuples") {
 			zero := "0"
 			cols, row = append(cols, "rows"), append(row, &zero)
@@ -264,7 +266,7 @@ func TestExecuteKeepsItsReceipts(t *testing.T) {
 	// агента подготовкой и исполнением, отложенное — сразу, свои настройки
 	// снова; фиксация. В журнал базы сервер от себя ничего не пишет.
 	if len(db.log) != 13 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
-		db.log[3] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text" || db.log[4] != "SET LOCAL search_path TO DEFAULT" ||
+		db.log[3] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, "+pgundo.StartedSQL || db.log[4] != "SET LOCAL search_path TO DEFAULT" ||
 		db.log[5] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[6] != "EXECUTE es_agent_0" ||
 		db.log[7] != "SET CONSTRAINTS ALL IMMEDIATE" || db.log[8] != "SET LOCAL search_path = pg_catalog, pg_temp" || db.log[11] != ownTimeouts || db.log[12] != "COMMIT" {
 		t.Fatalf("%q", db.log)
@@ -494,7 +496,8 @@ func limitedFrom(t *testing.T, limit int, before, stat string) (*Server, *fakeDB
 		switch {
 		case stat == "":
 		case strings.Contains(sql, "pg_current_xact_id") && strings.Contains(sql, "pg_stat_get_xact_tuples"):
-			return []pgwire.Result{{Columns: []string{"xid", "xid8", "rows"}, Rows: [][]*string{{&xid, &xid, &before}}, Tag: "SELECT 1"}}, true
+			started := "1795400000000000"
+			return []pgwire.Result{{Columns: []string{"xid", "xid8", "started", "rows"}, Rows: [][]*string{{&xid, &xid, &started, &before}}, Tag: "SELECT 1"}}, true
 		case strings.Contains(sql, "pg_stat_get_xact_tuples"):
 			return []pgwire.Result{{Columns: []string{"sum"}, Rows: [][]*string{{&stat}}, Tag: "SELECT 1"}}, true
 		}

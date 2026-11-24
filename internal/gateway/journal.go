@@ -104,7 +104,7 @@ func AppendHead(path, head string, key ed25519.PrivateKey, name string, d Draft)
 	if err != nil {
 		return Appended{}, err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o640)
+	f, err := OpenReceipts(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o640)
 	if err != nil {
 		return Appended{}, err
 	}
@@ -240,6 +240,71 @@ func readHead(path string) (h Head, ok bool, err error) {
 		return Head{}, false, nil // недописанная голова после падения: цепочка — по файлу
 	}
 	return h, true, nil
+}
+
+// OpenReceipts открывает файл квитанций шлюза: только сам файл, а не ссылку
+// на месте его пути, и только обычный файл. Каталог квитанций пишет и тот, у
+// кого ключа нет: ссылка на месте файла уводила квитанции шлюза в чужой файл
+// (в голову цепочки, в /tmp контейнера), а Append говорил «записано», и SQL
+// агента шёл без намерения, которое увидит сборщик (R1-4 третьего захода).
+// Читатели файла (счёт пределов, сборщик) открывают его так же.
+func OpenReceipts(path string, flag int, perm os.FileMode) (*os.File, error) {
+	f, err := os.OpenFile(path, flag|unix.O_NOFOLLOW|unix.O_NONBLOCK, perm)
+	if errors.Is(err, unix.ELOOP) {
+		return nil, fmt.Errorf("the receipts file %s is a symbolic link: give the path of the file itself", path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err == nil && !fi.Mode().IsRegular() {
+		err = fmt.Errorf("the receipts file %s is not a regular file (%s)", path, fi.Mode().Type())
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// CheckHead — голову цепочки по пути head шлюз сможет вести, и она не в
+// каталоге файла квитанций receipts: она обычный файл (или её ещё нет), а в
+// её каталоге он может создать и заменить файл. Шлюзы проверяют это при
+// запуске: голова по умолчанию — рядом с ключом, а каталог ключа часто только
+// для чтения, и иначе шлюз узнал бы это на первом действии и отказывал бы на
+// каждом. Каталог квитанций пишет и тот, у кого ключа нет: голову там он
+// подменял — шлюз останавливался на «the chain has reached seq …» или
+// раздваивал цепочку (T-5 третьего захода: ключ и квитанции в одном каталоге).
+func CheckHead(head, receipts string) error {
+	if sameDir(head, receipts) {
+		return fmt.Errorf("the head of the gateway's chain %s lies in the directory of the receipts file %s: whoever writes receipts there without the key can rewrite it; "+
+			"keep the head (\"head\", by default next to the key) where only the gateway writes", head, receipts)
+	}
+	if _, _, err := readHead(head); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(head), "."+filepath.Base(head)+".check-*")
+	if err != nil {
+		return fmt.Errorf("the head of the gateway's chain %s cannot be written: %w; the gateway keeps it next to its key unless \"head\" says where — "+
+			"give it a file that only the gateway writes, not in the receipts directory", head, err)
+	}
+	f.Close()
+	return os.Remove(f.Name())
+}
+
+// sameDir — файлы a и b в одном каталоге (по настоящему пути каталога).
+func sameDir(a, b string) bool {
+	dir := func(p string) string {
+		d, err := filepath.Abs(filepath.Dir(p))
+		if err != nil {
+			return filepath.Dir(p)
+		}
+		if r, err := filepath.EvalSymlinks(d); err == nil {
+			return r
+		}
+		return d
+	}
+	return dir(a) == dir(b)
 }
 
 // writeHead заменяет голову целиком: временный файл (свой, O_EXCL),
@@ -426,6 +491,16 @@ func ReadLines(f *os.File, from, size int64, each func(line []byte, end int64, l
 	var partial []byte
 	long := false
 	for off := from; off < size; {
+		// Дыра разреженного файла (truncate -s +1T места не занимает) — нули:
+		// ни перевода строки, ни квитанции, продолжение длинной строки. Читать
+		// её — минуты на каждый Append под flock и в потоке сборщика (R1-5
+		// третьего захода): она перешагивается.
+		if data, ok := NextData(f, off, size); ok && data > off {
+			off, partial, long = data, nil, true
+			continue
+		} else if !ok {
+			break // до конца файла — дыра
+		}
 		n := int64(len(buf))
 		if size-off < n {
 			n = size - off
@@ -462,6 +537,22 @@ func ReadLines(f *os.File, from, size int64, each func(line []byte, end int64, l
 		}
 	}
 	return done, nil
+}
+
+// NextData — первое место с данными в f не раньше off (lseek SEEK_DATA); ok
+// = false — дальше до size одна дыра. Файловая система без SEEK_DATA дыр не
+// называет: тогда — off.
+func NextData(f *os.File, off, size int64) (int64, bool) {
+	at, err := unix.Seek(int(f.Fd()), off, unix.SEEK_DATA)
+	switch {
+	case errors.Is(err, unix.ENXIO):
+		return size, false
+	case err != nil || at < off:
+		return off, true
+	case at >= size:
+		return size, false
+	}
+	return at, true
 }
 
 // beforeWrite — для тестов: зовётся между проверкой хвоста и записью, там,

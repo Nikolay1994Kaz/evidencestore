@@ -1,6 +1,8 @@
 package pgtap
 
 import (
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -116,5 +118,26 @@ func TestPendingFingerprintAlertsOnce(t *testing.T) {
 	}
 	if mass != 1 {
 		t.Fatalf("%d mass-change alerts after 3 broken connections", mass)
+	}
+}
+
+// LookupTail — последняя строка с xid в хвосте справочника; строка, начатая
+// до хвоста, не разбирается.
+func TestLookupTail(t *testing.T) {
+	path := t.TempDir() + "/index.jsonl"
+	var b []byte
+	for i := 0; i < 50; i++ {
+		b = append(b, []byte(`{"xid":`+strconv.Itoa(700+i%5)+`,"first_seq":`+strconv.Itoa(i+1)+`,"last_seq":`+strconv.Itoa(i+1)+`,"changes":1}`+"\n")...)
+	}
+	os.WriteFile(path, b, 0o600)
+	e, ok, err := LookupTail(path, 703, 1<<20)
+	if err != nil || !ok || e.FirstSeq != 49 {
+		t.Fatalf("%+v %v %v", e, ok, err)
+	}
+	if _, ok, _ := LookupTail(path, 703, 100); ok {
+		t.Fatal("found outside the tail")
+	}
+	if _, ok, _ := LookupTail(path, 799, 1<<20); ok {
+		t.Fatal("found a transaction that is not there")
 	}
 }

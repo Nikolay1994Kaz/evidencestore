@@ -42,12 +42,16 @@ setup_sql() {
 upgrade() {
 	# Голова цепочки квитанций esmcp — состояние шлюза рядом с ключом, а
 	# каталог ключа смонтирован только для чтения: свой каталог (2026-11).
-	if [ ! -d "$S/mcp-head" ]; then
-		mkdir -m 700 "$S/mcp-head"
-		chown "$UID_ES:$UID_ES" "$S/mcp-head"
-	fi
+	# Владелец и права — каждый раз: сеанс esmcp, запущенный до этого init
+	# (docker compose run после git pull), оставляет Docker'у создать каталог
+	# самому — root:root 0755, и шлюз туда не пишет (R1-6 третьего захода).
+	mkdir -p "$S/mcp-head"
+	chown "$UID_ES:$UID_ES" "$S/mcp-head"
+	chmod 700 "$S/mcp-head"
 	if [ -f "$S/mcp/mcp.json" ] && ! grep -q '"head"' "$S/mcp/mcp.json"; then
-		awk '{ print } /"key": "\/state\/mcp\/esmcp.key",/ { print "  \"head\": \"/state/mcp-head/esmcp.head\"," }' "$S/mcp/mcp.json" >"$S/mcp/mcp.json.new"
+		# Ключ "head" — сразу за первой «{»: так JSON остаётся верным при любой
+		# раскладке остальных строк.
+		awk 'done != 1 && /\{/ { sub(/\{/, "{\n  \"head\": \"/state/mcp-head/esmcp.head\","); done = 1 } { print }' "$S/mcp/mcp.json" >"$S/mcp/mcp.json.new"
 		cat "$S/mcp/mcp.json.new" >"$S/mcp/mcp.json" # тот же файл: владелец и права — прежние
 		rm -f "$S/mcp/mcp.json.new"
 	fi

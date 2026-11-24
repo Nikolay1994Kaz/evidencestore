@@ -815,7 +815,12 @@ type Difference struct {
 // транзакцией отката (xid — 32 бита, как в журнале базы; xid8 — с эпохой)
 // раньше её COMMIT (DECISIONS, п. 42). По ней сборщик берёт откат целиком.
 // Ошибка — откат не идёт: без квитанции он лёг бы отпечатком, не действием.
-type IntentFunc func(xid, xid8 string) error
+type IntentFunc func(xid, xid8, started string) error
+
+// StartedSQL — выражение: когда запущена база (pg_postmaster_start_time),
+// микросекунды с 1970 текстом. Шлюзы кладут его в намерение: сборщик
+// отличает по нему намерение из истории базы до её подъёма из копии.
+const StartedSQL = "(extract(epoch FROM pg_postmaster_start_time()) * 1000000)::bigint::text"
 
 // Apply применяет шаги p.OK одной транзакцией. intent пишет квитанцию отката
 // до его изменений. Строка, изменённая после Check, отменяет всё: ErrChanged.
@@ -870,19 +875,19 @@ func (p *Plan) apply(db DB, intent IntentFunc, groups []group, order string) (_ 
 	}()
 	out := &Applied{Order: order}
 	// 32 бита — как в журнале базы, справочнике и тревогах; с эпохой — для квитанции.
-	res, err := db.Query("SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text")
+	res, err := db.Query("SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, " + StartedSQL)
 	if err != nil {
 		return nil, err
 	}
-	var xid8 string
-	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) == 2 {
-		out.XID, xid8 = deref(res[0].Rows[0][0]), deref(res[0].Rows[0][1])
+	var xid8, started string
+	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) == 3 {
+		out.XID, xid8, started = deref(res[0].Rows[0][0]), deref(res[0].Rows[0][1]), deref(res[0].Rows[0][2])
 	}
 	if out.XID == "" {
 		return nil, errors.New("pgundo: the transaction id of the undo could not be read")
 	}
 	// Квитанция — до изменений: сборщик решает по ней на Begin транзакции.
-	if err := intent(out.XID, xid8); err != nil {
+	if err := intent(out.XID, xid8, started); err != nil {
 		return nil, fmt.Errorf("the undo's receipt could not be written, so the undo did not run: %w", err)
 	}
 	// Счёт до шагов: статистика сеанса держит и не сброшенные прошлые

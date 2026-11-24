@@ -133,7 +133,9 @@ sql_arg() { python3 -I -c 'import json,sys; print(json.dumps({"sql": sys.stdin.r
 stmts_arg() { python3 -I -c 'import json,sys; print(json.dumps({"statements": [l.strip().rstrip(";").rstrip() for l in sys.stdin if l.strip()], "reason": sys.argv[1]}))' "$1"; }
 
 step "ключи шлюзов: esmcp и esundo подписывают каждый свои квитанции (DECISIONS, п. 42)"
-mkdir -p "$WORK/mcp" "$WORK/undo"
+# Голова цепочки квитанций шлюза — его состояние, как ключ: не в каталоге
+# квитанций, который пишет и тот, у кого ключа нет (docs/receipts.md).
+mkdir -p "$WORK/mcp" "$WORK/undo" "$WORK/mcp-head" "$WORK/undo-head"
 MCPPUB=$("$BIN/esreceipt" keygen -key "$WORK/mcp/esmcp.key")
 UNDOPUB=$("$BIN/esreceipt" keygen -key "$WORK/undo/esundo.key")
 echo "esmcp $MCPPUB"
@@ -248,6 +250,7 @@ cat >"$WORK/mcp.json" <<EOF
   "agent": "support-bot",
   "receipts": "mcp/receipts.jsonl",
   "key": "mcp/esmcp.key",
+  "head": "mcp-head/esmcp.head",
   "pg_source": "$SRC",
   "action_row_limit": $ROWS,
   "undo": {
@@ -267,6 +270,7 @@ cat >"$WORK/mcp-strict.json" <<EOF
   "agent": "batch-bot",
   "receipts": "mcp/receipts.jsonl",
   "key": "mcp/esmcp.key",
+  "head": "mcp-head/esmcp.head",
   "pg_source": "$SRC",
   "statement_timeout": "1s",
   "actions_per_minute": 4,
@@ -289,6 +293,7 @@ cat >"$WORK/undo.json" <<EOF
   "search_path": ["public"],
   "receipts": "undo/receipts.jsonl",
   "key": "undo/esundo.key",
+  "head": "undo-head/esundo.head",
   "pg_source": "$SRC"
 }
 EOF

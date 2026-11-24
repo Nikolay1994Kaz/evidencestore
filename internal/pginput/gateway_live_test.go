@@ -64,8 +64,9 @@ func (g *liveGateway) append(d gateway.Draft) {
 // транзакции — из неё, как его берёт esmcp. Отдаёт xid и номер действия.
 func (g *liveGateway) intent(c *pgwire.Conn) (uint32, string) {
 	g.t.Helper()
-	row, ok, err := c.QueryRow("SELECT pg_current_xact_id()::xid::text")
-	if err != nil || !ok || row[0] == nil {
+	// Как esmcp: номер (32 бита и с эпохой) и запуск базы — в намерении.
+	row, ok, err := c.QueryRow("SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, " + pgundo.StartedSQL)
+	if err != nil || !ok || row[0] == nil || row[1] == nil || row[2] == nil {
 		g.t.Fatalf("the transaction id: %v", err)
 	}
 	var xid uint32
@@ -73,7 +74,7 @@ func (g *liveGateway) intent(c *pgwire.Conn) (uint32, string) {
 	g.n++
 	id := fmt.Sprintf("%s-%d", g.name, g.n)
 	g.append(gateway.Draft{Action: id, Step: alert.StepIntent, Refs: []gateway.Ref{{Source: "postgres", Subject: *row[0]}},
-		Body: json.RawMessage(`{"agent":"live-bot","tool":"execute","reason":"test"}`)})
+		Body: json.RawMessage(fmt.Sprintf(`{"agent":"live-bot","tool":"execute","reason":"test","xid8":%q,"db_started":%q}`, *row[1], *row[2]))})
 	return xid, id
 }
 
@@ -100,10 +101,10 @@ func (g *liveGateway) outcome(id, body string) {
 
 // undo — намерение отката транзакции undoes, как его пишет esundo.
 func (g *liveGateway) undo(undoes uint32) pgundo.IntentFunc {
-	return func(xid, xid8 string) error {
+	return func(xid, xid8, started string) error {
 		g.n++
 		_, err := gateway.Append(g.path, g.key, g.name, gateway.Draft{Action: fmt.Sprintf("undo-%d-%d", undoes, g.n), Step: alert.StepUndo,
-			Refs: []gateway.Ref{{Source: "postgres", Subject: xid}}, Body: json.RawMessage(fmt.Sprintf(`{"agent":"test","tool":"esundo","undoes_xid":"%d","xid8":%q}`, undoes, xid8))})
+			Refs: []gateway.Ref{{Source: "postgres", Subject: xid}}, Body: json.RawMessage(fmt.Sprintf(`{"agent":"test","tool":"esundo","undoes_xid":"%d","xid8":%q,"db_started":%q}`, undoes, xid8, started))})
 		return err
 	}
 }

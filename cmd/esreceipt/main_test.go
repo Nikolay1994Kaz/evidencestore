@@ -31,7 +31,7 @@ func newKey(t *testing.T, dir, name string) (string, string) {
 
 func TestSignAndVerify(t *testing.T) {
 	dir := t.TempDir()
-	key, pub := newKey(t, dir, "gw.key")
+	key, pub := newKey(t, t.TempDir(), "gw.key") // ключ и голова — не в каталоге квитанций
 	if st, err := os.Stat(key); err != nil || st.Mode().Perm() != 0o600 {
 		t.Fatalf("key file mode %v, %v", st.Mode(), err)
 	}
@@ -94,7 +94,7 @@ func TestSignAndVerify(t *testing.T) {
 		t.Fatalf("verify of a file with a line taken out: %d\n%s", code, out)
 	}
 	// Чужим ключом — подписи не сходятся.
-	_, otherPub := newKey(t, dir, "other.key")
+	_, otherPub := newKey(t, t.TempDir(), "other.key")
 	if code, out, _ := call(t, "", "verify", "-gateway-key", otherPub, "-file", file); code != exitInvalid || !strings.Contains(out, "4 not intact") {
 		t.Fatalf("verify with another key: %d\n%s", code, out)
 	}
@@ -102,8 +102,8 @@ func TestSignAndVerify(t *testing.T) {
 
 func TestSignRefuses(t *testing.T) {
 	dir := t.TempDir()
-	key, _ := newKey(t, dir, "gw.key")
-	other, _ := newKey(t, dir, "other.key")
+	key, _ := newKey(t, t.TempDir(), "gw.key") // ключ и голова — не в каталоге квитанций
+	other, _ := newKey(t, t.TempDir(), "other.key")
 	file := filepath.Join(dir, "receipts.jsonl")
 	if code, _, errOut := call(t, `{"action":"p-1","step":"mandate"}`, "sign", "-key", key, "-gateway", "gw", "-file", file); code != exitOK {
 		t.Fatalf("sign: %s", errOut)
@@ -191,7 +191,7 @@ func TestSignRefuses(t *testing.T) {
 // Два подписывающих над одним файлом не разводят цепочку: файл под замком.
 func TestSignConcurrent(t *testing.T) {
 	dir := t.TempDir()
-	key, pub := newKey(t, dir, "gw.key")
+	key, pub := newKey(t, t.TempDir(), "gw.key") // ключ и голова — не в каталоге квитанций
 	file := filepath.Join(dir, "receipts.jsonl")
 	var wg sync.WaitGroup
 	for i := range 8 {
@@ -219,5 +219,22 @@ func TestUsage(t *testing.T) {
 		if code, _, _ := call(t, "", args...); code != exitUsage {
 			t.Fatalf("%v: code %d", args, code)
 		}
+	}
+}
+
+// T-5 третьего захода: голова по умолчанию — рядом с ключом; ключ в каталоге
+// квитанций — голова там же, и её подменяет тот, у кого ключа нет: sign
+// отказывает и называет "head".
+func TestSignRefusesAHeadInTheReceiptsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := newKey(t, dir, "gw.key")
+	file := filepath.Join(dir, "receipts.jsonl")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"sign", "-key", key, "-gateway", "gw", "-file", file}, strings.NewReader(`{"action":"a","step":"s"}`+"\n"), &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "lies in the directory of the receipts file") {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	if _, err := os.Stat(file); err == nil {
+		t.Fatal("a receipt was written")
 	}
 }
