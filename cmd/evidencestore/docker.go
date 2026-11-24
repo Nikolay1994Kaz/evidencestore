@@ -527,7 +527,11 @@ Keep the directory to this host's administrators.
 Docs: https://github.com/Nikolay1994Kaz/evidencestore/blob/master/docs/install.md#in-docker
 `, s.name, s.file, s.server)
 
-	now := time.Now()
+	// Время файлов — час назад, целыми секундами: часы хоста сборщика бывают
+	// позади часов хранилища, и tar на распаковке предупреждал бы о файлах
+	// «из будущего» (так было в v0.7.0). Час — тот же запас, что у
+	// NotBefore сертификатов (pki).
+	now := time.Now().Add(-time.Hour).Truncate(time.Second)
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)

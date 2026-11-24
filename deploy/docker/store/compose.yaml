@@ -16,16 +16,18 @@
 # local (the demo TSA built into the store: a trial only).
 # ES_BACKUP_DIR and ES_ROOTS_MIRROR_DIR: put them on other disks, better on
 # other machines (docs/keys.md); the defaults next to this file are for a trial.
-name: evidencestore
+# Not "evidencestore": that is the PostgreSQL trial in the repository root,
+# with a service "store" of its own.
+name: evidencestore-store
 services:
   store:
-    image: ${ES_IMAGE:-ghcr.io/nikolay1994kaz/evidencestore:v0.7.0}
+    image: ${ES_IMAGE:-ghcr.io/nikolay1994kaz/evidencestore:v0.7.1}
     command: ["es-docker-store"]
     environment:
       ES_HOST: ${ES_HOST:-}
       ES_TSA: ${ES_TSA:-digicert}
       # add-collector names this image in the collector's compose.yaml
-      ES_IMAGE: ${ES_IMAGE:-ghcr.io/nikolay1994kaz/evidencestore:v0.7.0}
+      ES_IMAGE: ${ES_IMAGE:-ghcr.io/nikolay1994kaz/evidencestore:v0.7.1}
     # operator commands find evidencestore.json in the working directory
     working_dir: /etc/evidencestore
     ports: ["8443:8443"]

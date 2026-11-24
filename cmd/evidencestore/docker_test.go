@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 )
@@ -43,8 +44,9 @@ func dockerStand(t *testing.T, tsa string) dockerPaths {
 }
 
 type tarFile struct {
-	mode int64
-	body []byte
+	mode  int64
+	body  []byte
+	mtime time.Time
 }
 
 func untar(t *testing.T, data []byte) map[string]tarFile {
@@ -64,7 +66,7 @@ func untar(t *testing.T, data []byte) map[string]tarFile {
 			t.Fatal(err)
 		}
 		b, _ := io.ReadAll(tr)
-		files[h.Name] = tarFile{h.Mode, b}
+		files[h.Name] = tarFile{h.Mode, b, h.ModTime}
 	}
 }
 
@@ -163,6 +165,13 @@ func TestDockerAddSource(t *testing.T) {
 	for _, f := range []string{"web1/", "web1/ca.crt", "web1/web1.crt", "web1/web1.key", "web1/collector.json", "web1/compose.yaml", "web1/README.txt"} {
 		if _, ok := files[f]; !ok {
 			t.Fatalf("в архиве нет %s", f)
+		}
+	}
+	// Время файлов — в прошлом с запасом и целыми секундами: tar на хосте
+	// сборщика с отстающими часами не предупреждает о файлах «из будущего».
+	for name, f := range files {
+		if !f.mtime.Before(time.Now().Add(-30*time.Minute)) || f.mtime.Nanosecond() != 0 {
+			t.Errorf("%s: время %v", name, f.mtime)
 		}
 	}
 	if files["web1/web1.key"].mode != 0o600 {
