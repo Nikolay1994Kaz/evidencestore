@@ -64,7 +64,7 @@ Not proven:
 - **That a receipt is true, or that every step was written.** The platform writes and signs the receipts. A step it never wrote is not in the store, and nothing in a bundle shows that it is missing.
 - **That every receipt of the purchase is under its label.** The store sets the label when it receives a receipt, from its `action`; a receipt that names another purchase is not in this bundle ([Bundles](bundles.md) says what a store dishonest at intake could do).
 - **Whose keys these are.** The platform's gateway key and the customer's key are for you to establish: a key the platform hands you proves nothing against the platform.
-- **Any signature inside a receipt but the mandate's**, and the mandate's only as a compact JWS with ES256. An SD-JWT with disclosures and key binding, which is how AP2 carries mandates, is not parsed, and neither is the agent's signature: check those yourself, from the bodies `esverify -bodies` writes.
+- **Any signature inside a receipt but the mandate's**, and the mandate's only as a compact JWS with ES256. AP2 v0.2 carries its checkout and payment mandates as chains of SD-JWTs (RFC 9901 and the Delegate SD-JWT draft, which is still changing); they are not parsed, and neither is the agent's signature. The store keeps them byte for byte, so they can be checked from the bodies `esverify -bodies` writes, now by yourself or later, once the format settles.
 - **Who pays.** A bundle is evidence of what was recorded and when. Whether it settles a dispute is decided by the rules of the payment method and by whoever applies them.
 
 Limits to plan for:
