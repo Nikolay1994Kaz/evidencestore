@@ -237,7 +237,11 @@ checkpoints-conflict.jsonl  головы, которые прежнюю не п�
 ```
 go build ./... && go vet ./... && go test -race ./...     # гейт (его же гоняет GitHub Actions на пуш в master, на тег и на PR)
 scripts/release.sh dist                                   # бинарники релиза и SHA256SUMS (на тег v* — в Actions)
-python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config|ship|cosign|pgreceipts|pgreview   # мутации: каждая поломка должна уронить тест
+python3 scripts/mutate.py keyring|evlog|tsa|store|edge|auditchain|gateway|config|ship|cosign|seal|tsarevoke|receipt|pgreceipts|pgreview|pgreview2|pgreview3   # мутации: каждая поломка должна уронить тест
+                                                          # (33 мутации edge, store, receipt, pgreceipts, pgreview, pgreview2 устарели после переделок: набор с ними останавливается и называет их)
+PGINPUT_TEST_DSN="host=… port=… dbname=…" go test ./internal/pginput -run Live -v   # вход postgres и откат на живой базе (14+, wal_level=logical)
+experiments/pg-undo/run.sh                                # сквозной сценарий Postgres-пути; WINDOW=1 — ещё пакет по окну и по сделке
+docker compose up -d                                      # проба на одной машине (compose.yaml, Dockerfile, deploy/docker): в Docker не прогнана
 PIPELOCK_BIN=$(which pipelock) scripts/demo-pipelock.sh  # демо с настоящим Pipelock
 scripts/demo.sh                                           # демо на бинарниках, без интернета
 scripts/demo-intruder.sh                                  # взломщик почистил auth.log: удалённые строки — из хранилища
