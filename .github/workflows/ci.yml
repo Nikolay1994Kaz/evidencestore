@@ -24,6 +24,12 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go build ./... && go vet ./... && go test -race ./...
+      # esverify и esreceipt выпускаются и не для Linux: сборка выпуска не
+      # должна впервые упасть на теге (так было перед v0.6.0).
+      - run: >-
+          GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/esverify &&
+          GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/esverify &&
+          GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/esreceipt
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -49,6 +55,8 @@ jobs:
             dist/eswitness-*
             dist/esverify-*
             dist/esreceipt-*
+            dist/esmcp-*
+            dist/esundo-*
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}

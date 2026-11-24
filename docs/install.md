@@ -22,4 +22,4 @@ One service per source. Create the user (`useradd --system --no-create-home --sh
 
 It is run by someone other than the store's administrator: `useradd --system --home-dir /var/lib/eswitness --shell /usr/sbin/nologin eswitness`, `install -d -o eswitness -g eswitness -m 0700 /var/lib/eswitness`, the config in `/etc/eswitness/eswitness.json` from [`configs/eswitness.example.json`](../configs/eswitness.example.json) with each store's public key, then `sudo -u eswitness eswitness init -config /etc/eswitness/eswitness.json`: it prints the verifier key for the store's `witness.cosigners` and for auditors. Then `cp configs/systemd/eswitness.service /etc/systemd/system/ && systemctl enable --now eswitness` ([Cosigning witnesses](copy-and-witness.md#cosigning-witnesses-c2sp)).
 
-There is no container image yet.
+A PostgreSQL source and the MCP server for an agent: [PostgreSQL and an MCP server](postgres.md). A trial of all of it in Docker on one machine: [`compose.yaml`](../compose.yaml) ([Try it in Docker](postgres.md#try-it-in-docker)); no image is published yet.

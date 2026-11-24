@@ -36,7 +36,7 @@ func main() {
 	path := flag.String("config", "collector.json", "collector config")
 	once := flag.Bool("once", false, "read and send what is there, then exit")
 	promises := flag.Bool("promises", false, "list record numbers holding a signed store promise")
-	setup := flag.Bool("setup-sql", false, "print the SQL that prepares the database for a \"postgres\" source (roles, grants, marker trigger, publication) and exit")
+	setup := flag.Bool("setup-sql", false, "print the SQL that prepares the database for a \"postgres\" source (roles and their rights, replica identity, publication) and exit")
 	showVersion := flag.Bool("version", false, "print the version and the commit it was built from")
 	flag.Parse()
 	if *showVersion {
