@@ -105,6 +105,10 @@ services:
     stdin_open: true
     volumes:
       - ./state/mcp:/state/mcp:ro
+      # Голова цепочки квитанций — рядом с ключом по смыслу, но ключ только
+      # для чтения: свой каталог, не каталог квитанций (его пишет и тот, у
+      # кого ключа нет).
+      - ./state/mcp-head:/state/mcp-head
       - ./state/receipts:/state/receipts
 
 volumes:

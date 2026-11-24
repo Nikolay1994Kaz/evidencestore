@@ -29,7 +29,7 @@ var testKey = func() ed25519.PrivateKey {
 
 // gatewayOn — квитанции шлюза в файл path, подписанные testKey.
 func gatewayOn(c *Config, path string) {
-	c.ReceiptsPath, c.Key, c.Gateway, c.PGSource = path, testKey, "esmcp", "postgres"
+	c.ReceiptsPath, c.HeadPath, c.Key, c.Gateway, c.PGSource = path, path+".head", testKey, "esmcp", "postgres"
 }
 
 // chain — все квитанции файла по порядку; каждая обязана быть квитанцией

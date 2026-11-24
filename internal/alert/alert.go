@@ -51,12 +51,22 @@ const (
 	// KindForgedReceipt — строка файла квитанций, подписанная не ключом шлюза:
 	// её дописал тот, у кого ключа нет.
 	KindForgedReceipt = "forged-receipt"
+	// KindReceiptsUnreadable — файл квитанций шлюза не прочесть: транзакции
+	// шлюза идут отпечатком, пока он не прочтётся.
+	KindReceiptsUnreadable = "receipts-unreadable"
+	// KindReceiptsGap — в файле квитанций нет квитанции цепочки шлюза между
+	// двумя прочитанными.
+	KindReceiptsGap = "receipts-gap"
+	// KindIntentMissing — исход действия с номером транзакции, а его
+	// намерения сборщик не читал: транзакция легла отпечатком.
+	KindIntentMissing = "intent-missing"
 	KindRefused       = "refused"        // MCP-сервер остановил действие пределом строк
 	KindEscaped       = "escaped"        // SQL агента сам закрыл транзакцию MCP-сервера
 	KindUnknown       = "commit-unknown" // связь MCP-сервера с базой оборвалась на COMMIT: действие могло зафиксироваться
 	KindDBDown        = "db-down"        // нет связи с базой дольше порога
 	KindDBUp          = "db-up"          // связь с базой вернулась
 	KindGap           = "gap"            // записи потеряны: слот удалён, сдвинут или его журнал стёрт
+	KindSlotUnknown   = "slot-unknown"   // slot.json сборщика пропал: сдвинут ли слот, пока его не было, не сказать
 	KindRewound       = "db-rewound"     // база ушла назад: поднята из копии или её место заняла реплика
 	KindSlotLag       = "slot-lag"       // база копит журнал для слота: до предела — половина или меньше
 	KindSlotOK        = "slot-ok"        // журнал для слота снова в норме

@@ -45,7 +45,10 @@ type DealReport struct {
 	Receipts   int
 	Signed     int
 	KeyChecked bool
-	Links      []DealLink
+	// Copies — открытых копий квитанций действия (тот же хэш): одна
+	// квитанция, сколько бы раз её ни дописали.
+	Copies int
+	Links  []DealLink
 }
 
 // Valid — все проверки прошли.
@@ -136,6 +139,7 @@ func LinkDeal(receipts SourceReport, linked []SourceReport) DealReport {
 	// Что квитанции называют.
 	at := map[[2]string]int{}
 	gateways := map[string]bool{}
+	counted := map[string]bool{} // хэши квитанций: копия — та же квитанция
 	if recErr == nil {
 		for _, body := range receipts.Bodies {
 			rc, err := gateway.ParseReceipt(body.Body)
@@ -149,6 +153,11 @@ func LinkDeal(receipts SourceReport, linked []SourceReport) DealReport {
 			}
 			gateways[rc.Gateway] = true
 			r.Gateway = rc.Gateway
+			if counted[rc.Hash] {
+				r.Copies++
+				continue
+			}
+			counted[rc.Hash] = true
 			r.Receipts++
 			for _, ref := range rc.Refs {
 				k := [2]string{ref.Source, ref.Subject}
@@ -171,6 +180,9 @@ func LinkDeal(receipts SourceReport, linked []SourceReport) DealReport {
 		r.Signed = receipts.ReceiptsSigned
 	}
 	detail := fmt.Sprintf("action %q of gateway %s: %d receipts open", r.Action, r.Gateway, r.Receipts)
+	if r.Copies > 0 {
+		detail += fmt.Sprintf(" (and %d copies of them, counted once)", r.Copies)
+	}
 	if r.KeyChecked {
 		detail += fmt.Sprintf(", %d signatures checked with your gateway key", r.Signed)
 	} else {

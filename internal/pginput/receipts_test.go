@@ -16,6 +16,7 @@ import (
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/pgtap"
 )
 
 // rig — читатель квитанций над файлами шлюзов в своём каталоге и тревоги,
@@ -67,12 +68,19 @@ func (g *rig) open() {
 // расширения).
 func (g *rig) sign(file string, d gateway.Draft) gateway.Receipt {
 	g.t.Helper()
+	return g.append(file, d).Receipt
+}
+
+// append — квитанция шлюза, как пишет его сервер: голова цепочки — состояние
+// шлюза (рядом с ключом), а не файла.
+func (g *rig) append(file string, d gateway.Draft) gateway.Appended {
+	g.t.Helper()
 	path := filepath.Join(g.dir, file)
-	a, err := gateway.Append(path, g.keys[path], strings.TrimSuffix(file, ".jsonl"), d)
+	a, err := gateway.AppendHead(path, path+".head", g.keys[path], strings.TrimSuffix(file, ".jsonl"), d)
 	if err != nil {
 		g.t.Fatal(err)
 	}
-	return a.Receipt
+	return a
 }
 
 func intent(action string, at time.Time, xids ...string) gateway.Draft {
@@ -180,6 +188,7 @@ func TestForgedReceiptDecidesNothing(t *testing.T) {
 // отказ за частоту — только с alerted. Каждая — один раз.
 func TestOutcomesRaiseAlertsOnce(t *testing.T) {
 	g := newRig(t, "esmcp.jsonl")
+	g.sign("esmcp.jsonl", intent("a-1", time.Now(), "751"))
 	for _, b := range []string{
 		`{"outcome":"committed","xid":"751","rows":3}`,
 		`{"outcome":"failed","error":"permission denied"}`,
@@ -459,13 +468,13 @@ func TestVoidedIntentsStayVoid(t *testing.T) {
 	g := newRig(t, "esmcp.jsonl")
 	now := time.Now()
 	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
-	if err := g.r.void(); err != nil {
+	if err := g.r.void(time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := g.r.Intent(751, now, 0); ok {
 		t.Fatal("a voided intent decided a transaction")
 	}
-	g.sign("esmcp.jsonl", intent("a-2", now, "752"))
+	g.sign("esmcp.jsonl", intent("a-2", now.Add(time.Second), "752")) // время шлюза — после подъёма
 	check := func(when string) {
 		t.Helper()
 		if _, ok, _ := g.r.Intent(751, now, 0); ok {
@@ -567,5 +576,184 @@ func TestIntentDecidesOneTransaction(t *testing.T) {
 	g.sign("esmcp.jsonl", intent("a-2", now, "751"))
 	if in, ok, _ := g.r.Intent(751, now, 0x2000); !ok || in.ID != "a-2" {
 		t.Fatalf("a fresh intent for the number: %+v %v", in, ok)
+	}
+}
+
+// T-2 второго захода: писатель файла без ключа вынимает строку намерения,
+// пока идёт SQL агента. Транзакция ляжет отпечатком; людям — тревога о
+// пропуске в цепочке и об исходе без намерения.
+func TestRemovedIntentIsSeen(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	g.sign("esmcp.jsonl", intent("a-1", now, "750"))
+	g.sign("esmcp.jsonl", outcome("a-1", `{"outcome":"committed","xid":"750","rows":1}`))
+	g.r.poll()
+	before, _ := os.ReadFile(path)
+	g.sign("esmcp.jsonl", intent("a-2", now, "751"))
+	if err := os.WriteFile(path, before, 0o600); err != nil { // намерение вынуто
+		t.Fatal(err)
+	}
+	if _, ok, err := g.r.Intent(751, now, 0x751); ok || err != nil {
+		t.Fatalf("an intent removed from the file: %v %v", ok, err)
+	}
+	g.sign("esmcp.jsonl", outcome("a-2", `{"outcome":"committed","xid":"751","rows":1}`))
+	g.r.poll()
+	if g.kinds() != "receipts-gap,intent-missing" {
+		t.Fatalf("alerts %s", g.kinds())
+	}
+	if d := g.alerts[0].Signals[0].Detail; !strings.Contains(d, "seq 4 follows its seq 2") || !strings.Contains(d, "1 receipts between them") {
+		t.Errorf("the gap: %s", d)
+	}
+	if d := g.alerts[1].Signals[0].Detail; !strings.Contains(d, `action "a-2"`) || !strings.Contains(d, "transaction 751 went as a fingerprint") {
+		t.Errorf("the outcome without its intent: %s", d)
+	}
+	// Перезапуск: о прочитанном — не снова.
+	g.open()
+	g.r.poll()
+	if len(g.alerts) != 2 {
+		t.Fatalf("after a restart: %s", g.kinds())
+	}
+}
+
+// T-6 второго захода: пока сборщик стоял, файл квитанций повернули и
+// прежний сжали — недочитанные намерения в нём. Пропуск виден по цепочке,
+// которую сборщик помнит с прошлого запуска.
+func TestRotatedAwayWhileStoppedIsSeen(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	g.sign("esmcp.jsonl", intent("a-1", now, "750"))
+	g.r.poll()
+	g.r.close()
+	g.sign("esmcp.jsonl", intent("a-2", now, "751")) // сборщик стоит
+	if err := os.Rename(path, path+".1.gz"); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(path+".1.gz", []byte("compressed"), 0o600) // сжат: другой inode, не квитанции
+	g.sign("esmcp.jsonl", intent("a-3", now, "752"))
+	g.open()
+	g.r.poll()
+	if g.kinds() != "receipts-gap" {
+		t.Fatalf("alerts %s", g.kinds())
+	}
+	if _, ok, _ := g.r.Intent(752, now, 0x752); !ok {
+		t.Fatal("the intent after the gap is not read")
+	}
+}
+
+// Копии прежних строк и начала цепочки, дописанные без ключа, — не пропуск;
+// у двух цепочек с одним именем (два esmcp, свои файлы и ключи) — у каждой
+// своя сцепка.
+func TestCopiesAreNotAGap(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	var lines [][]byte
+	for i := 1; i <= 3; i++ {
+		lines = append(lines, g.append("esmcp.jsonl", intent(fmt.Sprint("a-", i), now, fmt.Sprint(750+i))).Line)
+	}
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	for _, l := range lines { // копии и последней прочитанной
+		f.Write(append(bytes.TrimRight(l, "\n"), '\n'))
+	}
+	f.Close()
+	g.sign("esmcp.jsonl", intent("a-4", now, "754"))
+	g.r.poll()
+	if len(g.alerts) != 0 {
+		t.Fatalf("copies raised %s", g.kinds())
+	}
+}
+
+// Намерение прочитано до перезапуска, а файл с ним с тех пор повернули и
+// сжали: транзакция уже лежит в справочнике этим действием — исход без
+// намерения в нынешнем файле не тревога.
+func TestOutcomeOfARecordedActionIsNotMissing(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	line := `{"xid":751,"first_seq":1,"last_seq":1,"changes":1,"action":{"id":"a-2","gateway":"esmcp","seq":3}}` + "\n"
+	if err := os.WriteFile(filepath.Join(g.dir, pgtap.IndexFile), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g.sign("esmcp.jsonl", outcome("a-2", `{"outcome":"committed","xid":"751","rows":1}`))
+	g.sign("esmcp.jsonl", outcome("a-3", `{"outcome":"committed","xid":"752","rows":1}`))
+	g.r.poll()
+	if g.kinds() != "intent-missing" || !strings.Contains(g.alerts[0].Signals[0].Detail, `"a-3"`) {
+		t.Fatalf("alerts %s", g.kinds())
+	}
+}
+
+// Вторая ветвь цепочки: квитанция с seq за последней прочитанной, но её prev
+// — не эта квитанция (шлюз потерял голову и пошёл от прежнего места, или
+// строку принесли из другой ветви) — тоже пропуск.
+func TestSecondBranchIsSeen(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	key := g.keys[path]
+	other := filepath.Join(g.dir, "branch.jsonl")
+	for i := 1; i <= 2; i++ {
+		g.sign("esmcp.jsonl", intent(fmt.Sprint("a-", i), now, fmt.Sprint(750+i)))
+	}
+	data, _ := os.ReadFile(path)
+	head, _ := os.ReadFile(path + ".head")
+	os.WriteFile(other, data, 0o600)
+	var h gateway.Head
+	json.Unmarshal(head, &h)
+	h.Receipts = other
+	head, _ = json.Marshal(h)
+	os.WriteFile(other+".head", head, 0o600)
+	g.sign("esmcp.jsonl", intent("a-3", now, "753"))
+	var b4 gateway.Appended
+	for i := 3; i <= 4; i++ {
+		a, err := gateway.AppendHead(other, other+".head", key, "esmcp", intent(fmt.Sprint("b-", i), now, fmt.Sprint(850+i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b4 = a
+	}
+	if b4.Receipt.Seq != 4 {
+		t.Fatalf("the branch is at seq %d", b4.Receipt.Seq)
+	}
+	g.r.poll()
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	f.Write(append(bytes.TrimRight(b4.Line, "\n"), '\n'))
+	f.Close()
+	g.r.poll()
+	if g.kinds() != "receipts-gap" || !strings.Contains(g.alerts[0].Signals[0].Detail, "names another one before it") {
+		t.Fatalf("alerts %s", g.kinds())
+	}
+}
+
+// void с границей (запуск поднятой базы): намерения до неё не в счёт — и
+// прочитанные, и дописанные позже (копия старой строки); после неё — в
+// счёте, их действия уже в новой базе.
+func TestVoidSinceKeepsLaterIntents(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	t0 := time.Now().Add(-time.Minute)
+	old := g.append("esmcp.jsonl", intent("a-1", t0, "751")).Line
+	g.r.poll()
+	since := t0.Add(10 * time.Second)
+	g.sign("esmcp.jsonl", intent("a-2", since.Add(time.Second), "752")) // после запуска, ещё не прочитано
+	if err := g.r.void(since); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := g.r.Intent(751, t0, 0x751); ok {
+		t.Fatal("an intent from before the database started again decides a transaction")
+	}
+	if _, ok, _ := g.r.Intent(752, since.Add(2*time.Second), 0x752); !ok {
+		t.Fatal("an intent written after the database started again is void")
+	}
+	f, _ := os.OpenFile(g.cfg.Files[0], os.O_APPEND|os.O_WRONLY, 0)
+	f.Write(append(bytes.TrimRight(old, "\n"), '\n')) // копия старого намерения, дописанная без ключа
+	f.Close()
+	if _, ok, _ := g.r.Intent(751, t0, 0x751); ok {
+		t.Fatal("a copy of a voided intent, appended later, decides a transaction")
+	}
+	g.open() // и после перезапуска
+	if _, ok, _ := g.r.Intent(751, t0, 0x751); ok {
+		t.Fatal("after a restart a voided intent decides a transaction")
+	}
+	if _, ok, _ := g.r.Intent(752, since.Add(2*time.Second), 0x752); !ok {
+		t.Fatal("after a restart the intent written after the start is void")
 	}
 }

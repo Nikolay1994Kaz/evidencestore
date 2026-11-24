@@ -1638,38 +1638,61 @@ func (c *Collector) readLines(t *tracked, final bool) (int, error) {
 		return nil
 	}
 	off := t.off
+	// Строка — кусками по pieceLen от её начала, и кусок уходит в буфер, как
+	// только за ним в файле есть хоть байт: строка любой длины не копится в
+	// памяти целиком. Раньше она читалась целиком и, пока не дописан перевод
+	// строки, перечитывалась на каждом проходе: строка в 400 МБ без перевода
+	// строки — 1,7 ГБ памяти сборщика, а с пределом памяти — падение по кругу
+	// со всеми источниками (T-5 второго захода). Куски те же, что прежде у
+	// целой строки: середина строки — место сразу за куском, последний кусок
+	// — за переводом строки. В acc — начало строки, ещё не ушедшее в буфер:
+	// не длиннее куска и одного чтения.
+	var acc []byte
+	emit := func(body []byte, used int) error {
+		off += int64(used)
+		recs = append(recs, spoolRecord{kind: kindLine, seq: c.nextSeq, pos: filePos{t.ino, off}, body: bytes.Clone(body)})
+		c.nextSeq++
+		size += len(body)
+		if size >= readChunk {
+			return flush()
+		}
+		return nil
+	}
 	for {
-		line, err := r.ReadBytes('\n')
-		if err != nil && err != io.EOF {
+		chunk, err := r.ReadSlice('\n')
+		if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
 			// Номера строк, не легших в буфер, возвращаются: иначе следующий
 			// проход выдаст тем же строкам новые номера, а хранилище запишет
 			// ложный пропуск.
 			c.nextSeq -= uint64(len(recs))
 			return total, err
 		}
-		if err == io.EOF && (!final || len(line) == 0) {
-			break // недописанная строка ждёт перевода строки
+		acc = append(acc, chunk...)
+		ended := len(acc) > 0 && acc[len(acc)-1] == '\n'
+		body := acc
+		if ended {
+			body = acc[:len(acc)-1]
 		}
-		start := off
-		off += int64(len(line))
-		body := bytes.TrimSuffix(line, []byte("\n"))
-		for cut := 0; ; {
-			n := min(len(body)-cut, pieceLen)
-			end := off // после последнего куска — за переводом строки
-			if cut+n < len(body) {
-				end = start + int64(cut+n) // кусок длинной строки: сразу за ним
-			}
-			recs = append(recs, spoolRecord{kind: kindLine, seq: c.nextSeq, pos: filePos{t.ino, end}, body: body[cut : cut+n]})
-			c.nextSeq++
-			size += n
-			if cut += n; cut == len(body) {
-				break
-			}
-		}
-		if size >= readChunk {
-			if err := flush(); err != nil {
+		for len(body) > pieceLen { // строка идёт дальше куска
+			if err := emit(body[:pieceLen], pieceLen); err != nil {
 				return total, err
 			}
+			body = body[pieceLen:]
+		}
+		switch {
+		case ended:
+			if err := emit(body, len(body)+1); err != nil {
+				return total, err
+			}
+			acc = acc[:0]
+		case err == io.EOF && final && len(body) > 0:
+			// Файл больше не растёт: хвост без перевода строки.
+			if err := emit(body, len(body)); err != nil {
+				return total, err
+			}
+			acc = acc[:0]
+		default:
+			acc = append(acc[:0], body...) // ждёт: перевода строки или байта за куском
 		}
 		if err == io.EOF {
 			break

@@ -12,7 +12,9 @@
 # Кому что (каталог — только тому контейнеру, которому он нужен):
 #   store/      хранилище: серверный сертификат, ключи, данные; undo.json и ключ esundo
 #   collector/  сборщик: сертификаты источников, буфер, пароль роли сборщика
-#   mcp/        MCP-сервер: пароль роли сервера, ключ шлюза esmcp
+#   mcp/        MCP-сервер: пароль роли сервера, ключ шлюза esmcp (только чтение)
+#   mcp-head/   MCP-сервер: голова цепочки его квитанций — состояние шлюза, как
+#               ключ, а не файла квитанций (docs/receipts.md)
 #   pg-index/   справочник и тревоги сборщика (сборщик пишет, esundo читает)
 #   receipts/   квитанции MCP (сервер пишет, сборщик читает)
 #   undo-receipts/ квитанции откатов (esundo пишет, сборщик читает)
@@ -36,7 +38,23 @@ setup_sql() {
 	mv "$S/setup/setup.sql.new" "$S/setup/setup.sql"
 }
 
+# upgrade — то, чего нет в ./state, заведённом прежней версией (каждый запуск).
+upgrade() {
+	# Голова цепочки квитанций esmcp — состояние шлюза рядом с ключом, а
+	# каталог ключа смонтирован только для чтения: свой каталог (2026-11).
+	if [ ! -d "$S/mcp-head" ]; then
+		mkdir -m 700 "$S/mcp-head"
+		chown "$UID_ES:$UID_ES" "$S/mcp-head"
+	fi
+	if [ -f "$S/mcp/mcp.json" ] && ! grep -q '"head"' "$S/mcp/mcp.json"; then
+		awk '{ print } /"key": "\/state\/mcp\/esmcp.key",/ { print "  \"head\": \"/state/mcp-head/esmcp.head\"," }' "$S/mcp/mcp.json" >"$S/mcp/mcp.json.new"
+		cat "$S/mcp/mcp.json.new" >"$S/mcp/mcp.json" # тот же файл: владелец и права — прежние
+		rm -f "$S/mcp/mcp.json.new"
+	fi
+}
+
 if [ -f "$S/.done" ]; then
+	upgrade
 	setup_sql
 	echo "es-init: $S is set up already (the database setup SQL is renewed); to start over: docker compose down -v && rm -rf ./state"
 	exit 0
@@ -46,7 +64,7 @@ if [ -n "$(ls -A "$S" 2>/dev/null)" ]; then
 	exit 1
 fi
 umask 077
-for d in pki store collector mcp pg-index receipts undo-receipts setup; do mkdir -p "$S/$d"; done
+for d in pki store collector mcp mcp-head pg-index receipts undo-receipts setup; do mkdir -p "$S/$d"; done
 
 # Пароль: 32 шестнадцатеричных знака — без кавычек в строке подключения.
 pw() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
@@ -129,6 +147,7 @@ cat >"$S/mcp/mcp.json" <<EOF
   "agent": "agent",
   "receipts": "/state/receipts/receipts.jsonl",
   "key": "/state/mcp/esmcp.key",
+  "head": "/state/mcp-head/esmcp.head",
   "pg_source": "pg-agent"
 }
 EOF
@@ -150,7 +169,7 @@ EOF
 
 printf 'host=db user=agent_bot dbname=shop password=%s\n' "$PW_AGENT" >"$S/agent.txt"
 
-chown -R "$UID_ES:$UID_ES" "$S/store" "$S/collector" "$S/mcp" "$S/pg-index" "$S/receipts" "$S/undo-receipts" "$S/agent.txt"
+chown -R "$UID_ES:$UID_ES" "$S/store" "$S/collector" "$S/mcp" "$S/mcp-head" "$S/pg-index" "$S/receipts" "$S/undo-receipts" "$S/agent.txt"
 chmod 711 "$S"
 setup_sql
 touch "$S/.done"

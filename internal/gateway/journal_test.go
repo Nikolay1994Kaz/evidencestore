@@ -3,8 +3,11 @@ package gateway
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -43,7 +46,19 @@ func appendRaw(t *testing.T, path string, data []byte) {
 
 func mustAppend(t *testing.T, path string, key ed25519.PrivateKey, action string) Appended {
 	t.Helper()
-	a, err := Append(path, key, "esmcp", Draft{Time: at, Action: action, Step: "intent", Refs: []Ref{{Source: "pg", Subject: "754"}}})
+	return mustAppendHead(t, path, "", key, action)
+}
+
+// headOf — голова цепочки рядом с ключом (как у шлюзов продукта); ключ в
+// тестах — в своём каталоге, а не рядом с файлом квитанций.
+func headOf(t *testing.T, path string) string {
+	t.Helper()
+	return DefaultHead(filepath.Join(t.TempDir(), "gw.key"), path, "esmcp")
+}
+
+func mustAppendHead(t *testing.T, path, head string, key ed25519.PrivateKey, action string) Appended {
+	t.Helper()
+	a, err := AppendHead(path, head, key, "esmcp", Draft{Time: at, Action: action, Step: "intent", Refs: []Ref{{Source: "pg", Subject: "754"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,57 +81,75 @@ func chainOf(t *testing.T, path string, pub ed25519.PublicKey) map[uint64]int {
 
 // Копия прежней строки шлюза, дописанная без ключа: Append раньше брал её за
 // последнюю свою квитанцию и сам раздваивал цепочку — новая квитанция
-// получала занятый seq, и у хранилища выходило две чистые seq 3. Теперь
-// цепочка идёт от настоящей последней — и по метке рядом с файлом, и без неё
-// (метку тоже может стереть тот, кто пишет в каталог).
+// получала занятый seq, и у хранилища выходило две чистые seq 3 (R1-2). С
+// головой цепочка идёт от неё; без головы — от своей квитанции с большим seq.
 func TestAppendIgnoresReplays(t *testing.T) {
-	key := receiptKey(t, 42)
-	pub := key.Public().(ed25519.PublicKey)
-	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	for _, a := range []string{"a-1", "a-2", "a-3"} {
-		mustAppend(t, path, key, a)
-	}
-	lines := receiptLines(t, path)
-	appendRaw(t, path, append(bytes.Clone(lines[1]), '\n'))
-	a := mustAppend(t, path, key, "a-4")
-	if a.Receipt.Seq != 4 || a.Stale != 1 {
-		t.Fatalf("after a copy of seq 2: seq %d, stale %d", a.Receipt.Seq, a.Stale)
-	}
-	// Без метки: копии начала цепочки в конце файла — настоящая последняя
-	// раньше них.
-	os.Remove(headsPath(path))
-	appendRaw(t, path, append(append(bytes.Clone(lines[0]), '\n'), append(bytes.Clone(lines[1]), '\n')...))
-	if a := mustAppend(t, path, key, "a-5"); a.Receipt.Seq != 5 {
-		t.Fatalf("without the mark, after copies of seq 1 and 2: seq %d", a.Receipt.Seq)
-	}
-	for seq, n := range chainOf(t, path, pub) {
-		if n != 1 {
-			t.Errorf("seq %d: %d clean receipts", seq, n)
+	for _, withHead := range []bool{true, false} {
+		key := receiptKey(t, 42)
+		pub := key.Public().(ed25519.PublicKey)
+		path := filepath.Join(t.TempDir(), "receipts.jsonl")
+		head := ""
+		if withHead {
+			head = headOf(t, path)
 		}
-	}
-	if c := chainOf(t, path, pub); len(c) != 5 {
-		t.Fatalf("clean receipts: %v", c)
+		for _, a := range []string{"a-1", "a-2", "a-3"} {
+			mustAppendHead(t, path, head, key, a)
+		}
+		lines := receiptLines(t, path)
+		appendRaw(t, path, append(bytes.Clone(lines[1]), '\n'))
+		if a := mustAppendHead(t, path, head, key, "a-4"); a.Receipt.Seq != 4 || a.Stale != 1 {
+			t.Fatalf("head %v, after a copy of seq 2: seq %d, stale %d", withHead, a.Receipt.Seq, a.Stale)
+		}
+		// Копии начала цепочки в конце файла: настоящая последняя — раньше.
+		appendRaw(t, path, append(append(bytes.Clone(lines[0]), '\n'), append(bytes.Clone(lines[1]), '\n')...))
+		if a := mustAppendHead(t, path, head, key, "a-5"); a.Receipt.Seq != 5 {
+			t.Fatalf("head %v, after copies of seq 1 and 2: seq %d", withHead, a.Receipt.Seq)
+		}
+		if c := chainOf(t, path, pub); len(c) != 5 || c[3] != 1 {
+			t.Fatalf("head %v, clean receipts: %v", withHead, c)
+		}
 	}
 }
 
-// Метка рядом с файлом — подсказка: устаревшая (на более раннюю квитанцию)
-// или указывающая за конец файла цепочку не раздваивает.
-func TestAppendDoesNotTrustTheMark(t *testing.T) {
+// Голова — состояние шлюза, а не подсказка рядом с файлом квитанций (R1-1,
+// R1-2, R1-3 второго захода). Обрезка, оставившая ранние свои строки, —
+// цепочка идёт от головы, а не от ранней квитанции (раньше — второй seq k+1
+// без единого предупреждения); что лежит в каталоге файла квитанций, шлюз не
+// читает: ни метка у предела seq, ни FIFO, ни ссылка его не останавливают.
+// Голова другого файла, другого шлюза или ключа — не его.
+func TestAppendHeadIsTheGatewaysState(t *testing.T) {
 	key := receiptKey(t, 49)
-	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	first := mustAppend(t, path, key, "a-1")
-	mustAppend(t, path, key, "a-2")
-	mustAppend(t, path, key, "a-3")
-	old := readHeads(path)["esmcp"]
-	old.Seq, old.Hash, old.End = first.Receipt.Seq, first.Receipt.Hash, int64(len(first.Line)+1)
-	writeHeads(path, map[string]headMark{"esmcp": old})
-	if a := mustAppend(t, path, key, "a-4"); a.Receipt.Seq != 4 {
-		t.Fatalf("from an old mark: seq %d", a.Receipt.Seq)
+	pub := key.Public().(ed25519.PublicKey)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipts.jsonl")
+	head := headOf(t, path)
+	for _, a := range []string{"a-1", "a-2", "a-3", "a-4", "a-5"} {
+		mustAppendHead(t, path, head, key, a)
 	}
-	old.End = 1 << 30
-	writeHeads(path, map[string]headMark{"esmcp": old})
-	if a := mustAppend(t, path, key, "a-5"); a.Receipt.Seq != 5 {
-		t.Fatalf("from a mark past the end: seq %d", a.Receipt.Seq)
+	lines := receiptLines(t, path)
+	last, _ := ParseReceipt(lines[4])
+	keep := append(append(bytes.Clone(lines[0]), '\n'), append(bytes.Clone(lines[1]), '\n')...)
+	if err := os.WriteFile(path, keep, 0o640); err != nil { // обрезка до конца второй
+		t.Fatal(err)
+	}
+	// Подложенное в каталог файла квитанций: метка прежней версии с seq у
+	// предела, FIFO и ссылка на чужой файл.
+	os.WriteFile(filepath.Join(dir, ".receipts_jsonl.heads"), []byte(`{"esmcp":{"key":"`+hex.EncodeToString(pub)+`","seq":9007199254740989,"hash":"`+strings.Repeat("a", 64)+`","end":1}}`), 0o640)
+	syscall.Mkfifo(filepath.Join(dir, ".receipts_jsonl.heads.tmp"), 0o640)
+	a := mustAppendHead(t, path, head, key, "a-6")
+	if a.Receipt.Seq != 6 || a.Receipt.Prev != last.Hash {
+		t.Fatalf("after a truncation that kept seq 1 and 2: seq %d, prev %s", a.Receipt.Seq, a.Receipt.Prev)
+	}
+	// Голова чужого файла (тот же ключ) — не его: цепочка по файлу.
+	other := filepath.Join(dir, "other.jsonl")
+	if a := mustAppendHead(t, other, head, key, "b-1"); a.Receipt.Seq != 1 || a.Receipt.Prev != Genesis {
+		t.Fatalf("another file with this head: seq %d", a.Receipt.Seq)
+	}
+	// Голова — не обычный файл: отказ, а не ожидание и не запись по ссылке.
+	fifo := filepath.Join(t.TempDir(), "fifo.head")
+	syscall.Mkfifo(fifo, 0o640)
+	if _, err := AppendHead(path, fifo, key, "esmcp", Draft{Time: at, Action: "a-7", Step: "intent"}); err == nil || !strings.Contains(err.Error(), "is not a file of the gateway") {
+		t.Fatalf("a FIFO for a head: %v", err)
 	}
 }
 
@@ -125,41 +158,40 @@ func TestAppendDoesNotTrustTheMark(t *testing.T) {
 func TestAppendPastALongLine(t *testing.T) {
 	key := receiptKey(t, 43)
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	mustAppend(t, path, key, "a-1")
+	head := headOf(t, path)
+	mustAppendHead(t, path, head, key, "a-1")
 	appendRaw(t, path, append(bytes.Repeat([]byte("x"), 2*MaxReceiptLen+1), '\n'))
-	if a := mustAppend(t, path, key, "a-2"); a.Receipt.Seq != 2 || a.Skipped != 1 {
+	if a := mustAppendHead(t, path, head, key, "a-2"); a.Receipt.Seq != 2 || a.Skipped != 1 {
 		t.Fatalf("past a long line: seq %d, skipped %d", a.Receipt.Seq, a.Skipped)
 	}
 	appendRaw(t, path, append(bytes.Repeat([]byte("y"), 3*MaxReceiptLen), '\n'))
-	os.Remove(headsPath(path))
 	if a := mustAppend(t, path, key, "a-3"); a.Receipt.Seq != 3 {
-		t.Fatalf("past a long line without the mark: seq %d", a.Receipt.Seq)
+		t.Fatalf("past a long line without the head: seq %d", a.Receipt.Seq)
 	}
 }
 
 // Обрезать файл и дописать одну строку от имени шлюза с чужой подписью:
 // Append отказывал («none is signed with this key») до тех пор, пока строку
-// не уберут руками (R1-3б). Теперь цепочка идёт дальше от метки, а строка
-// названа в Claimed. Без метки (её тоже можно стереть) — новая цепочка.
+// не уберут руками (R1-3б). Теперь цепочка идёт дальше от головы, а строка
+// названа в Claimed. Без головы — новая цепочка.
 func TestAppendAfterTruncateAndClaim(t *testing.T) {
 	key := receiptKey(t, 44)
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	first := mustAppend(t, path, key, "a-1")
+	head := headOf(t, path)
+	first := mustAppendHead(t, path, head, key, "a-1")
 	forger, _ := NewSigner(receiptKey(t, 45), "esmcp", nil)
 	claim := append(mustSign(t, forger, Draft{Time: at, Action: "x", Step: "intent"}), '\n')
 	if err := os.WriteFile(path, claim, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	a := mustAppend(t, path, key, "a-2")
-	if a.Receipt.Seq != 2 || a.Receipt.Prev != first.Receipt.Hash || a.Claimed != 1 {
-		t.Fatalf("after a truncation and a forged claim: seq %d, prev %s, claimed %d", a.Receipt.Seq, a.Receipt.Prev, a.Claimed)
+	if a := mustAppendHead(t, path, head, key, "a-2"); a.Receipt.Seq != 2 || a.Receipt.Prev != first.Receipt.Hash {
+		t.Fatalf("after a truncation and a forged claim: seq %d, prev %s", a.Receipt.Seq, a.Receipt.Prev)
 	}
-	os.Remove(headsPath(path))
 	if err := os.WriteFile(path, claim, 0o640); err != nil {
 		t.Fatal(err)
 	}
 	if a := mustAppend(t, path, key, "a-3"); a.Receipt.Seq != 1 || a.Receipt.Prev != Genesis || a.Claimed != 1 {
-		t.Fatalf("without the mark: seq %d, prev %s, claimed %d", a.Receipt.Seq, a.Receipt.Prev, a.Claimed)
+		t.Fatalf("without the head: seq %d, prev %s, claimed %d", a.Receipt.Seq, a.Receipt.Prev, a.Claimed)
 	}
 }
 
@@ -170,12 +202,13 @@ func TestAppendAfterRotation(t *testing.T) {
 	key := receiptKey(t, 51)
 	pub := key.Public().(ed25519.PublicKey)
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	mustAppend(t, path, key, "a-1")
-	last := mustAppend(t, path, key, "a-2")
+	head := headOf(t, path)
+	mustAppendHead(t, path, head, key, "a-1")
+	last := mustAppendHead(t, path, head, key, "a-2")
 	if err := os.Rename(path, path+".1"); err != nil {
 		t.Fatal(err)
 	}
-	a := mustAppend(t, path, key, "a-3")
+	a := mustAppendHead(t, path, head, key, "a-3")
 	if a.Receipt.Seq != 3 || a.Receipt.Prev != last.Receipt.Hash {
 		t.Fatalf("after a rotation: seq %d, prev %s", a.Receipt.Seq, a.Receipt.Prev)
 	}
@@ -189,6 +222,25 @@ func TestAppendAfterRotation(t *testing.T) {
 	}
 }
 
+// Шлюз упал между записью квитанции и головы: следующая квитанция идёт от
+// той, что уже в файле, а не от головы, — цепочка не раздваивается.
+func TestAppendCatchesUpAfterACrash(t *testing.T) {
+	key := receiptKey(t, 52)
+	pub := key.Public().(ed25519.PublicKey)
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	head := headOf(t, path)
+	mustAppendHead(t, path, head, key, "a-1")
+	saved, _ := os.ReadFile(head)
+	mustAppendHead(t, path, head, key, "a-2")
+	os.WriteFile(head, saved, 0o600) // голова — до a-2
+	if a := mustAppendHead(t, path, head, key, "a-3"); a.Receipt.Seq != 3 {
+		t.Fatalf("after a crash between the receipt and the head: seq %d", a.Receipt.Seq)
+	}
+	if c := chainOf(t, path, pub); len(c) != 3 {
+		t.Fatalf("clean receipts: %v", c)
+	}
+}
+
 // Строки от имени шлюза с чужой подписью в конце файла: Append проверял
 // подпись каждой при каждом вызове — под flock, так что ждали и остальные
 // писатели (R1-3в). Теперь их читает один Append, следующий идёт от метки
@@ -196,7 +248,8 @@ func TestAppendAfterRotation(t *testing.T) {
 func TestAppendReadsAForgedTailOnce(t *testing.T) {
 	key := receiptKey(t, 47)
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	mustAppend(t, path, key, "a-1")
+	head := headOf(t, path)
+	mustAppendHead(t, path, head, key, "a-1")
 	forger, _ := NewSigner(receiptKey(t, 48), "esmcp", nil)
 	var junk bytes.Buffer
 	for range 2000 {
@@ -204,11 +257,11 @@ func TestAppendReadsAForgedTailOnce(t *testing.T) {
 		junk.WriteByte('\n')
 	}
 	appendRaw(t, path, junk.Bytes())
-	if a := mustAppend(t, path, key, "a-2"); a.Receipt.Seq != 2 || a.Skipped != 2000 || a.Claimed != 2000 {
+	if a := mustAppendHead(t, path, head, key, "a-2"); a.Receipt.Seq != 2 || a.Skipped != 2000 || a.Claimed != 2000 {
 		t.Fatalf("past the forged tail: seq %d, skipped %d, claimed %d", a.Receipt.Seq, a.Skipped, a.Claimed)
 	}
 	start := time.Now()
-	if a := mustAppend(t, path, key, "a-3"); a.Receipt.Seq != 3 || a.Skipped != 0 {
+	if a := mustAppendHead(t, path, head, key, "a-3"); a.Receipt.Seq != 3 || a.Skipped != 0 {
 		t.Fatalf("the next one: seq %d, skipped %d", a.Receipt.Seq, a.Skipped)
 	}
 	t.Logf("the Append after the forged tail: %v", time.Since(start))

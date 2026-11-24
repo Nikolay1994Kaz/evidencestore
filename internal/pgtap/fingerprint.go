@@ -89,7 +89,9 @@ type fpEntry struct {
 	Truncated  []string          `json:"truncated,omitempty"`
 	Rows       []json.RawMessage `json:"rows,omitempty"` // fpRow и строки T (TRUNCATE) по порядку журнала
 
-	end uint64 // EndLSN числом
+	end   uint64    // EndLSN числом
+	final uint64    // место фиксации числом
+	at    time.Time // время фиксации
 }
 
 // pack — отпечатки, ещё не ушедшие в буфер.
@@ -303,6 +305,7 @@ func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err erro
 		XID: tx.begin.XID, CommitTime: tx.begin.CommitTime.UTC().Format(time.RFC3339Nano),
 		CommitLSN: pgwire.LSN(tx.begin.FinalLSN).String(), EndLSN: pgwire.LSN(c.EndLSN).String(),
 		Changes: tx.changes, Tables: tx.tables, Truncated: tx.truncated, Rows: tx.rows, end: c.EndLSN,
+		final: tx.begin.FinalLSN, at: tx.begin.CommitTime,
 	}
 	line, err := json.Marshal(e)
 	if err != nil {
@@ -336,9 +339,22 @@ func (t *Tap) fpCommit(tx *txState, c pgoutput.Commit) (flushed uint64, err erro
 	t.stats.FingerprintChanges += uint64(tx.changes)
 	// Тревоги — как у полной транзакции. Номеров записей в тревоге нет (пачка
 	// ещё не в буфере), и команды отката тоже: откатить отпечаток нельзя.
-	t.closingAlerts(tx)
-	if err := t.flushAlerts(tx, &IndexEntry{Changes: tx.changes, Tables: tx.tables}); err != nil {
-		return 0, err
+	// Тревога поднята, а пачка в буфер не легла (связь оборвалась) — сервер
+	// пришлёт транзакцию снова, и о ней людям второй раз не идёт (T-9
+	// второго захода: три обрыва — три одинаковые тревоги).
+	if r, ok := t.raisedPending[tx.begin.FinalLSN]; ok && r.xid == tx.begin.XID && r.at == tx.begin.CommitTime.UnixNano() {
+		tx.alert = alert.Event{}
+	} else {
+		t.closingAlerts(tx)
+		if len(tx.alert.Signals) > 0 {
+			if t.raisedPending == nil {
+				t.raisedPending = map[uint64]seenTx{}
+			}
+			t.raisedPending[tx.begin.FinalLSN] = seenTx{tx.begin.XID, tx.begin.CommitTime.UnixNano()}
+		}
+		if err := t.flushAlerts(tx, &IndexEntry{Changes: tx.changes, Tables: tx.tables}); err != nil {
+			return 0, err
+		}
 	}
 	if len(p.entries) >= t.cfg.PackTx {
 		return t.flushPack()
@@ -359,7 +375,10 @@ func (t *Tap) flushPack() (flushed uint64, err error) {
 		// Строка справочника отпечатка — только чтобы найти пачку и объяснить
 		// отказ отката: когда и таблицы — в самой пачке, в хранилище.
 		// Полная строка (~290 Б) была бы дороже отпечатка в пачке (замер 23.11).
-		line, err := json.Marshal(IndexEntry{XID: e.XID, Kind: KindFingerprint, FirstSeq: seq, LastSeq: seq, Changes: e.Changes})
+		// Место и время фиксации — чтобы отличить повтор транзакции от новой
+		// на том же месте после подъёма базы из копии (resend.go).
+		line, err := json.Marshal(IndexEntry{XID: e.XID, Kind: KindFingerprint, FirstSeq: seq, LastSeq: seq, Changes: e.Changes,
+			CommitTime: e.CommitTime, CommitLSN: e.CommitLSN})
 		if err != nil {
 			return 0, err
 		}
@@ -384,6 +403,10 @@ func (t *Tap) flushPack() (flushed uint64, err error) {
 	}
 	t.stats.Packs++
 	t.lastCommit = p.last
+	for _, e := range p.entries {
+		t.remember(e.final, e.XID, e.at)
+		delete(t.raisedPending, e.final) // в буфере: повтор теперь — dup
+	}
 	end := p.end
 	p.entries = p.entries[:0]
 	return end, nil

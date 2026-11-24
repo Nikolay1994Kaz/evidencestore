@@ -387,12 +387,13 @@ func TestLedgerReadsOnlyWhatTheWindowNeeds(t *testing.T) {
 	if actions, rows, _, _ := s.usage(now, ""); actions != 2 || rows != 105 {
 		t.Fatalf("after an append: %d actions, %d rows", actions, rows)
 	}
-	// Файл заменили коротким (ротация).
+	// Файл переписали коротким (copytruncate): в нём всё новое, а счёт до
+	// ротации остаётся в окне (R2-9 второго захода).
 	buf.Reset()
 	signer, _ = gateway.NewSigner(testKey, "esmcp", nil)
 	line(now, "support-bot", "committed", "", 7)
 	os.WriteFile(path, buf.Bytes(), 0o600)
-	if actions, rows, _, _ := s.usage(now.Add(time.Second), ""); actions != 1 || rows != 7 {
+	if actions, rows, _, _ := s.usage(now.Add(time.Second), ""); actions != 3 || rows != 112 {
 		t.Fatalf("after the file was replaced: %d actions, %d rows", actions, rows)
 	}
 }

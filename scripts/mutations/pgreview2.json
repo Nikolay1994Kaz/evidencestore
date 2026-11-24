@@ -1,0 +1,175 @@
+{
+ "packages": [
+  "./internal/proof/",
+  "./internal/pginput/",
+  "./internal/pgtap/",
+  "./internal/mcpserver/",
+  "./internal/store/",
+  "./internal/collector/"
+ ],
+ "run": "^Test(Deal|LinkDeal|Receipt|R1|R2Rev|Live|Review|Resent|Rewound|Pending|Removed|Rotated|Copies|SecondBranch|VoidSince|OutcomeOfARecorded|Voided|Outcomes|Intent|Truncated|Ledger|Oversized|ActionsPerMinute|GrowingLongLine|TornLongLine|Restart|Alerts|Stale|ForgedRepeat|SetupSQL)",
+ "mutations": [
+  {
+   "name": "W1 тревога по исходу без сверки хэша",
+   "file": "internal/pginput/receipts.go",
+   "old": "if !fresh || r.alerted[rc.Hash] {",
+   "new": "if !fresh {"
+  },
+  {
+   "name": "W2 пропуск в цепочке не сверяет prev",
+   "file": "internal/pginput/receipts.go",
+   "old": "gap := rc.Seq != l.Seq+1 || rc.Prev != l.Hash",
+   "new": "gap := rc.Seq > l.Seq+1"
+  },
+  {
+   "name": "W3 копия прежнего начала — новая цепочка",
+   "file": "internal/pginput/receipts.go",
+   "old": "if l != nil && slices.Contains(l.Genesis, rc.Hash) {",
+   "new": "if false && l != nil && slices.Contains(l.Genesis, rc.Hash) {"
+  },
+  {
+   "name": "W4 повтор прежней строки двигает цепочку",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif rc.Seq <= l.Seq {\n\t\treturn nil // повтор прежней строки или её копия\n\t}",
+   "new": "\tif rc.Seq < l.Seq {\n\t\treturn nil // повтор прежней строки или её копия\n\t}"
+  },
+  {
+   "name": "W5 исход без намерения — без тревоги",
+   "file": "internal/pginput/receipts.go",
+   "old": "if body.XID != \"\" && !r.intents[rc.Action] && !r.recorded(rc.Action, body.XID) {",
+   "new": "if false && body.XID != \"\" && !r.intents[rc.Action] && !r.recorded(rc.Action, body.XID) {"
+  },
+  {
+   "name": "W6 цепочка не помнится после перезапуска",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tst := receiptsState{Chains: r.chains, Links: r.links}",
+   "new": "\tst := receiptsState{Chains: r.chains}"
+  },
+  {
+   "name": "W7 void с границей снимает все намерения",
+   "file": "internal/pginput/receipts.go",
+   "old": "if t, err := time.Parse(time.RFC3339Nano, at.in.Time); err != nil || !t.After(r.voidBefore) {",
+   "new": "if t, err := time.Parse(time.RFC3339Nano, at.in.Time); err != nil || !t.After(r.voidBefore) || true {"
+  },
+  {
+   "name": "W8 граница void не держит намерения, прочитанные позже",
+   "file": "internal/pginput/receipts.go",
+   "old": "if c.voided(rc.Time) || !rc.Time.After(r.voidBefore) && !r.voidBefore.IsZero() {",
+   "new": "if c.voided(rc.Time) {"
+  },
+  {
+   "name": "W10 сжатие spent не чистит память",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tr.spent = map[string]uint64{}\n\t\tfor _, at := range r.byXID {",
+   "new": "\t\tfor _, at := range r.byXID {"
+  },
+  {
+   "name": "W11 повтор ниже места — без сверки времени фиксации",
+   "file": "internal/pgtap/resend.go",
+   "old": "\t\tif e.xid == xid && e.at == at.UnixNano() {",
+   "new": "\t\tif e.xid == xid {"
+  },
+  {
+   "name": "W12 новая транзакция ниже места — повтор",
+   "file": "internal/pgtap/resend.go",
+   "old": "\t} else if final >= t.floor && t.loaded {\n\t\tdiverged = true // сверить есть с чем, а такой нет",
+   "new": "\t} else if final >= t.floor && t.loaded && false {\n\t\tdiverged = true // сверить есть с чем, а такой нет"
+  },
+  {
+   "name": "W13 справочник не читается при подключении",
+   "file": "internal/pgtap/resend.go",
+   "old": "\treturn t.loadSeen(slot)\n}",
+   "new": "\treturn nil\n}"
+  },
+  {
+   "name": "W14 после подъёма несверяемое — повтор",
+   "file": "internal/pgtap/resend.go",
+   "old": "\t} else if !t.rewound {\n\t\treturn true, nil // сверить не с чем",
+   "new": "\t} else {\n\t\treturn true, nil // сверить не с чем"
+  },
+  {
+   "name": "W15 тревога отпечатка при каждом обрыве",
+   "file": "internal/pgtap/fingerprint.go",
+   "old": "if r, ok := t.raisedPending[tx.begin.FinalLSN]; ok && r.xid == tx.begin.XID && r.at == tx.begin.CommitTime.UnixNano() {",
+   "new": "if r, ok := t.raisedPending[tx.begin.FinalLSN]; ok && r.xid == tx.begin.XID && r.at == tx.begin.CommitTime.UnixNano() && false {"
+  },
+  {
+   "name": "W16 поток от места сборщика, а не от слота",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tfrom = slotAt\n\ts.next8 = next8",
+   "new": "\tfrom = slotAt\n\tif cursor != 0 {\n\t\tfrom = max(slotAt, cursor+1)\n\t}\n\ts.next8 = next8"
+  },
+  {
+   "name": "W17 сдвинутый слот пересоздаётся",
+   "file": "internal/pginput/pginput.go",
+   "old": "\t\tif exists && !moved {",
+   "new": "\t\tif exists && (!moved || true) {"
+  },
+  {
+   "name": "W18 void без границы запуска базы",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tif !started.After(last) {\n\t\treturn time.Time{}\n\t}\n\treturn started",
+   "new": "\tif !started.After(last) || true {\n\t\treturn time.Time{}\n\t}\n\treturn started"
+  },
+  {
+   "name": "W20 схема evidence — только три вида объектов",
+   "file": "internal/pginput/pginput.go",
+   "old": "\tp(\"      SELECT FROM pg_depend d WHERE d.refclassid = 'pg_namespace'::regclass\")",
+   "new": "\tp(\"      SELECT FROM pg_depend d WHERE d.refclassid = 'pg_namespace'::regclass AND d.classid IN ('pg_class'::regclass, 'pg_proc'::regclass, 'pg_type'::regclass)\")"
+  },
+  {
+   "name": "W21 повтор квитанции не открывается",
+   "file": "internal/proof/source.go",
+   "old": "\t\tif repeat(verdict) {",
+   "new": "\t\tif false && repeat(verdict) {"
+  },
+  {
+   "name": "W22 сделка считает копию отдельной квитанцией",
+   "file": "internal/proof/deal.go",
+   "old": "\t\t\tif counted[rc.Hash] {",
+   "new": "\t\t\tif false && counted[rc.Hash] {"
+  },
+  {
+   "name": "W23 повтор — без проверки подписи шлюза",
+   "file": "internal/proof/source.go",
+   "old": "return v.Link == gateway.LinkStale && v.HashOK && v.Signature == gateway.SigValid",
+   "new": "return v.Link == gateway.LinkStale && v.HashOK"
+  },
+  {
+   "name": "W24 длинный SQL отказа до базы — целиком",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "beforeDB := rc.Outcome == \"refused\" && rc.XID == \"\" && len(rc.SQL) > maxRefusedSQL",
+   "new": "beforeDB := false"
+  },
+  {
+   "name": "W25 ротация обнуляет счёт пределов",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\t\tl.off, l.ino = 0, ino\n",
+   "new": "\t\t\tl.off, l.ino, l.items = 0, ino, nil\n"
+  },
+  {
+   "name": "W26 copytruncate обнуляет счёт пределов",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\t\tl.off = 0 // тот же файл обрезан (copytruncate): в нём всё новое",
+   "new": "\t\t\tl.off, l.items = 0, nil // тот же файл обрезан (copytruncate): в нём всё новое"
+  },
+  {
+   "name": "W27 растущая длинная строка копится целиком",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tfor len(body) > pieceLen { // строка идёт дальше куска",
+   "new": "\t\tfor ended && len(body) > pieceLen { // строка идёт дальше куска"
+  },
+  {
+   "name": "W28 кусок без следующего байта уходит сразу",
+   "file": "internal/collector/collector.go",
+   "old": "\t\tfor len(body) > pieceLen { // строка идёт дальше куска",
+   "new": "\t\tfor len(body) >= pieceLen && len(body) > 0 { // строка идёт дальше куска"
+  },
+  {
+   "name": "W29 записанное действие — всё равно без намерения",
+   "file": "internal/pginput/receipts.go",
+   "old": "\treturn err == nil && found && e.Action != nil && e.Action.ID == id\n",
+   "new": "\treturn err == nil && found && e.Action != nil && e.Action.ID == id && false\n"
+  }
+ ]
+}

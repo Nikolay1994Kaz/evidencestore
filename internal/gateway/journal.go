@@ -2,14 +2,15 @@ package gateway
 
 // Файл квитанций шлюза. Пишут его шлюзы (esmcp, esundo, esreceipt sign),
 // иногда несколько процессов и несколько шлюзов сразу: каждая квитанция
-// дописывается под flock, цепочка шлюза идёт от его последней квитанции в
-// файле, подписанной его ключом, мимо чужих строк, и квитанция ложится на
-// диск (fsync) до того, как Append вернётся.
+// дописывается под flock и ложится на диск (fsync) до того, как Append
+// вернётся. Где цепочка шлюза, Append знает по голове (Head) — состоянию
+// шлюза, которое лежит там же, где его ключ, а не рядом с файлом квитанций.
 
 import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -19,7 +20,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,28 +40,67 @@ type Appended struct {
 	Glued   bool
 }
 
-// Append подписывает шаг d квитанцией шлюза name и дописывает её в файл path.
-//
-// Где цепочка шлюза, Append узнаёт по метке в файле рядом (headsPath): место
-// и хэш его последней квитанции. Метка — подсказка, а не правда: Append
-// сверяет её с файлом и идёт от неё вперёд по сцепке, так что устаревшая или
-// подложенная метка цепочку не раздвоит. Нет метки или не сходится — от
-// последней квитанции шлюза в файле с большим seq (fallbackHead).
-//
-// Кто пишет в файл без ключа, шлюз не останавливает и цепочку не
-// раздваивает (R1-2, R1-3): строки от имени шлюза с чужой подписью,
-// строки длиннее любой квитанции и копии его прежних квитанций Append
-// пропускает и называет в Appended. Ни одной своей квитанции, а строки от
-// его имени есть — новая цепочка, а не отказ: отказ на каждой квитанции
-// превращал одну подложенную строку в остановку шлюза; не тот ключ покажет
-// хранилище (подпись не того ключа) и сборщик (forged-receipt).
-//
-// Порванная последняя строка (файл кончается не переводом строки: писавший
-// умер посреди строки — все шлюзы пишут под flock) закрывается переводом
-// строки и остаётся в файле поломанной строкой. Квитанция ложится на диск
-// (fsync) до того, как Append вернётся.
+// Head — голова цепочки шлюза: его последняя квитанция в файле квитанций.
+// Это состояние шлюза, как его ключ, и лежать оно должно там, куда пишет
+// только он (DefaultHead — рядом с ключом). Метку рядом с файлом квитанций
+// подкладывал тот, кто пишет в его каталог без ключа: раздваивал цепочку,
+// останавливал шлюз (seq у предела), затирал через ссылку его файлы (R1-1,
+// R1-2, R1-3 второго захода).
+type Head struct {
+	Receipts string `json:"receipts"` // файл квитанций, абсолютный путь
+	Gateway  string `json:"gateway"`
+	Key      string `json:"key"` // открытый ключ шлюза, hex
+	Seq      uint64 `json:"seq"`
+	Hash     string `json:"hash"`
+	End      int64  `json:"end"` // подсказка: место сразу за строкой квитанции в файле
+}
+
+// DefaultHead — файл головы цепочки шлюза name в файле квитанций receipts:
+// рядом с ключом keyPath, свой у каждой пары «файл, шлюз».
+func DefaultHead(keyPath, receipts, name string) string {
+	abs, err := filepath.Abs(receipts)
+	if err != nil {
+		abs = receipts
+	}
+	sum := sha256.Sum256([]byte(abs + "\x00" + name))
+	return keyPath + ".head-" + hex.EncodeToString(sum[:8])
+}
+
+// Append — AppendHead без головы: цепочка — по файлу (fallbackHead) при
+// каждой квитанции. Для тестов и шлюзов, у которых своего каталога нет;
+// шлюзы продукта ведут голову.
 func Append(path string, key ed25519.PrivateKey, name string, d Draft) (Appended, error) {
+	return AppendHead(path, "", key, name, d)
+}
+
+// AppendHead подписывает шаг d квитанцией шлюза name и дописывает её в файл
+// path; head — файл головы цепочки (Head), пусто — без головы.
+//
+// С головой цепочка идёт от неё и ниже не опускается: обрезанный, заменённый
+// или ротированный файл квитанций её не сбивает (квитанции до обрезки уже у
+// сборщика и в хранилище). Файл читается только вперёд от головы — своя
+// квитанция, сцепленная с ней, двигает её (шлюз упал между записью
+// квитанции и головы). Без головы — своя квитанция с большим seq у конца
+// файла (fallbackHead), и после записи голова заводится.
+//
+// Кто пишет в файл квитанций без ключа, шлюз не останавливает и цепочку не
+// раздваивает: строки от имени шлюза с чужой подписью, строки длиннее любой
+// квитанции и копии его прежних квитанций Append пропускает и называет в
+// Appended. Своих квитанций нет, а строки от его имени есть — новая цепочка,
+// а не отказ (отказ превращал одну подложенную строку в остановку шлюза); не
+// тот ключ покажут хранилище и сборщик.
+//
+// Порванная последняя строка (писавший умер посреди строки — все шлюзы
+// пишут под flock) закрывается переводом строки и остаётся в файле
+// поломанной строкой. Квитанция ложится на диск до того, как Append
+// вернётся; голова — тоже, и не записалась она — ошибка: без неё шлюз снова
+// беззащитен перед обрезкой файла.
+func AppendHead(path, head string, key ed25519.PrivateKey, name string, d Draft) (Appended, error) {
 	s, err := NewSigner(key, name, nil)
+	if err != nil {
+		return Appended{}, err
+	}
+	abs, err := filepath.Abs(path)
 	if err != nil {
 		return Appended{}, err
 	}
@@ -83,25 +122,26 @@ func Append(path string, key ed25519.PrivateKey, name string, d Draft) (Appended
 		return Appended{}, err
 	}
 	pub := key.Public().(ed25519.PublicKey)
-	c := chainScan{name: name, pub: pub}
-	heads := readHeads(path)
-	h, marked := heads[name]
-	marked = marked && h.Key == hex.EncodeToString(pub)
-	if marked && c.resume(f, h, size) {
-		if err := c.scan(f, h.End, size); err != nil {
+	c := newChainScan(name, pub)
+	var h Head
+	trusted := false
+	if head != "" {
+		if h, trusted, err = readHead(head); err != nil {
 			return Appended{}, err
 		}
-	} else {
-		if err := c.fallbackHead(f, size); err != nil {
+		trusted = trusted && h.Receipts == abs && h.Gateway == name && h.Key == hex.EncodeToString(pub) && h.Seq > 0 && isHash(h.Hash)
+	}
+	if trusted {
+		c.cur = &receiptLink{hash: h.Hash, seq: h.Seq}
+		from := int64(0)
+		if c.endsAt(f, h, size) {
+			from, c.counting = h.End, true
+		}
+		if err := c.scan(f, from, size); err != nil {
 			return Appended{}, err
 		}
-		if c.cur == nil && marked && h.Seq > 0 && h.Seq < MaxSeq-1 && isHash(h.Hash) {
-			// Своих квитанций в файле нет, а метка есть: файл ротировали или
-			// обрезали. Цепочка идёт дальше от последней квитанции — она уже
-			// у сборщика и в хранилище, и новая цепочка у них была бы
-			// поломкой на каждой ротации.
-			c.cur = &receiptLink{hash: h.Hash, seq: h.Seq}
-		}
+	} else if err := c.fallbackHead(f, size); err != nil {
+		return Appended{}, err
 	}
 	if c.cur != nil {
 		if c.cur.seq >= MaxSeq {
@@ -143,35 +183,19 @@ func Append(path string, key ed25519.PrivateKey, name string, d Draft) (Appended
 		return Appended{}, err
 	}
 	r, _ := ParseReceipt(line)
-	// Место сразу за строкой: с O_APPEND запись легла в конец, каким он был
-	// в тот миг, — после чужих байтов, если их дописали без flock.
-	if end, err := f.Seek(0, io.SeekCurrent); err == nil {
-		heads[name] = headMark{Key: hex.EncodeToString(pub), Seq: r.Seq, Hash: r.Hash, End: end}
-		writeHeads(path, heads) // не вышло — следующий Append найдёт цепочку медленнее, но найдёт
+	a := Appended{Line: line, Receipt: r, Skipped: c.skipped, Claimed: c.claimed, Stale: c.stale, Torn: torn, Glued: glued}
+	if head != "" {
+		// Место сразу за строкой: с O_APPEND запись легла в конец, каким он
+		// был в тот миг, — после чужих байтов, если их дописали без flock.
+		end, err := f.Seek(0, io.SeekCurrent)
+		if err == nil {
+			err = writeHead(head, Head{Receipts: abs, Gateway: name, Key: hex.EncodeToString(pub), Seq: r.Seq, Hash: r.Hash, End: end})
+		}
+		if err != nil {
+			return a, fmt.Errorf("gateway: the receipt is in %s, but the head of the chain %s could not be saved: %w", path, head, err)
+		}
 	}
-	return Appended{Line: line, Receipt: r, Skipped: c.skipped, Claimed: c.claimed, Stale: c.stale, Torn: torn, Glued: glued}, nil
-}
-
-// beforeWrite — для тестов: зовётся между проверкой хвоста и записью, там,
-// где писатель без flock вклинивается (T-5).
-var beforeWrite func(path string)
-
-// gluedBefore — перед только что дописанными n байтами (запись кончается на
-// текущем месте f) стоит не перевод строки: строка склеилась с чужими байтами.
-func gluedBefore(f *os.File, n int64) (bool, error) {
-	end, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return false, err
-	}
-	start := end - n
-	if start <= 0 {
-		return false, nil
-	}
-	one := make([]byte, 1)
-	if _, err := f.ReadAt(one, start-1); err != nil {
-		return false, err
-	}
-	return one[0] != '\n', nil
+	return a, nil
 }
 
 // tornTail — файл не пуст и кончается не переводом строки.
@@ -187,116 +211,145 @@ func tornTail(f *os.File) (bool, error) {
 	return one[0] != '\n', nil
 }
 
-// headMark — метка цепочки шлюза: его последняя квитанция и место сразу за
-// её строкой в файле.
-type headMark struct {
-	Key  string `json:"key"` // открытый ключ шлюза, hex
-	Seq  uint64 `json:"seq"`
-	Hash string `json:"hash"`
-	End  int64  `json:"end"`
-}
+// maxHead — больше файл головы быть не может.
+const maxHead = 4 << 10
 
-// headsPath — файл меток рядом с файлом квитанций: скрытый и без
-// «.jsonl» в имени, чтобы его не взял вход сборщика по маске.
-func headsPath(path string) string {
-	dir, base := filepath.Split(path)
-	return filepath.Join(dir, "."+strings.ReplaceAll(base, ".", "_")+".heads")
-}
-
-func readHeads(path string) map[string]headMark {
-	heads := map[string]headMark{}
-	if data, err := os.ReadFile(headsPath(path)); err == nil && len(data) <= 1<<20 {
-		json.Unmarshal(data, &heads)
+// readHead читает голову цепочки; ok == false — головы нет. Не обычный файл
+// (ссылка, FIFO) или файл больше головы — ошибка: голову пишет только шлюз.
+func readHead(path string) (h Head, ok bool, err error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return h, false, nil
 	}
-	if heads == nil {
-		heads = map[string]headMark{}
-	}
-	return heads
-}
-
-// writeHeads заменяет файл меток целиком (временный файл и переименование)
-// без fsync: метка лишь ускоряет поиск цепочки, потерянная метка ничего не
-// ломает.
-func writeHeads(path string, heads map[string]headMark) {
-	data, err := json.Marshal(heads)
 	if err != nil {
-		return
+		return h, false, fmt.Errorf("gateway: the head of the chain %s: %w", path, err)
 	}
-	hp := headsPath(path)
-	if err := os.WriteFile(hp+".tmp", data, 0o640); err != nil {
-		return
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return h, false, err
 	}
-	if err := os.Rename(hp+".tmp", hp); err != nil {
-		os.Remove(hp + ".tmp")
+	if !fi.Mode().IsRegular() || fi.Size() > maxHead {
+		return h, false, fmt.Errorf("gateway: the head of the chain %s is not a file of the gateway (%s, %d bytes)", path, fi.Mode().Type(), fi.Size())
 	}
+	data, err := io.ReadAll(io.LimitReader(f, maxHead+1))
+	if err != nil {
+		return h, false, err
+	}
+	if err := json.Unmarshal(data, &h); err != nil {
+		return Head{}, false, nil // недописанная голова после падения: цепочка — по файлу
+	}
+	return h, true, nil
+}
+
+// writeHead заменяет голову целиком: временный файл (свой, O_EXCL),
+// fsync, переименование.
+func writeHead(path string, h Head) error {
+	data, err := json.Marshal(h)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), path)
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+	}
+	return err
 }
 
 // chainScan ищет последнюю квитанцию шлюза name, подписанную ключом pub.
 type chainScan struct {
-	name string
-	pub  ed25519.PublicKey
-	cur  *receiptLink // последняя своя квитанция; nil — своих нет
+	name   string
+	pub    ed25519.PublicKey
+	needle []byte       // "gateway":"<имя>": без него строка не его — и не разбирается
+	cur    *receiptLink // последняя своя квитанция; nil — своих нет
+	// counting — строки после головы считаются в Skipped, Claimed, Stale;
+	// без места головы в файле (файл обрезан или заменён) прежние свои
+	// строки — история, а не копии.
+	counting bool
 
 	skipped, claimed, stale int
 }
 
-// resume — метка h сходится с файлом: строка, которая кончается в h.End, —
-// квитанция шлюза с её seq и хэшем.
-func (c *chainScan) resume(f *os.File, h headMark, size int64) bool {
+func newChainScan(name string, pub ed25519.PublicKey) chainScan {
+	return chainScan{name: name, pub: pub, needle: []byte(`"gateway":"` + name + `"`)}
+}
+
+// endsAt — строка, которая кончается в h.End, — квитанция шлюза с её seq и
+// хэшем: читать вперёд можно от этого места.
+func (c *chainScan) endsAt(f *os.File, h Head, size int64) bool {
 	if h.End <= 0 || h.End > size {
 		return false
 	}
-	lines := backLines{f: f, pos: h.End - 1}
 	one := make([]byte, 1)
 	if _, err := f.ReadAt(one, h.End-1); err != nil || one[0] != '\n' {
 		return false
 	}
+	lines := backLines{f: f, pos: h.End - 1}
 	line, ok, err := lines.next()
 	if err != nil || !ok || lines.long {
 		return false
 	}
 	r, own, _ := c.own(line)
-	if !own || r.Seq != h.Seq || r.Hash != h.Hash {
-		return false
-	}
-	c.cur = &receiptLink{hash: r.Hash, seq: r.Seq}
-	return true
+	return own && r.Seq == h.Seq && r.Hash == h.Hash
 }
 
 // scan идёт по строкам файла от from до size вперёд и двигает цепочку только
 // по сцепке: своя квитанция с seq на один больше и prev — хэш последней.
-// Обрывок без перевода строки в конце — не строка: его дописывают или он
-// порван.
 func (c *chainScan) scan(f *os.File, from, size int64) error {
-	return forwardLines(f, from, size, func(line []byte, long bool) {
+	_, err := ReadLines(f, from, size, func(line []byte, _ int64, long bool) {
 		if long {
-			c.skipped++
+			c.count(true, false, false)
 			return
 		}
 		r, own, claimed := c.own(line)
 		switch {
 		case !own:
-			c.skipped++
-			if claimed {
-				c.claimed++
-			}
+			c.count(len(bytes.TrimSpace(line)) > 0, claimed, false)
 		case c.cur == nil || (r.Seq == c.cur.seq+1 && r.Prev == c.cur.hash):
 			c.take(r)
 		default:
-			c.skipped++
-			c.stale++
+			c.count(true, false, true)
 		}
 	})
+	return err
 }
 
-// fallbackHead — метка не сходится с файлом: последняя квитанция шлюза
-// с большим seq среди своих строк от конца файла до первой своей и ещё на
-// fallbackSpan байт раньше неё. Копия прежней строки в конце (R1-2) так не
-// становится последней: её настоящая преемница — раньше, в пределах окна.
+func (c *chainScan) count(skipped, claimed, stale bool) {
+	if !c.counting {
+		return
+	}
+	if skipped {
+		c.skipped++
+	}
+	if claimed {
+		c.claimed++
+	}
+	if stale {
+		c.stale++
+	}
+}
+
+// fallbackHead — головы нет: последняя квитанция шлюза с большим seq среди
+// своих строк от конца файла до первой своей и ещё на fallbackSpan байт
+// раньше неё. Копия прежней строки в конце так не становится последней: её
+// настоящая преемница — раньше, в пределах окна.
 func (c *chainScan) fallbackHead(f *os.File, size int64) error {
 	if size == 0 {
 		return nil
 	}
+	c.counting = true
 	lines := backLines{f: f, pos: size}
 	if torn, err := tornTail(f); err != nil {
 		return err
@@ -321,10 +374,7 @@ func (c *chainScan) fallbackHead(f *os.File, size int64) error {
 		switch {
 		case !own && c.cur == nil:
 			// Строки после последней своей — в счёт, как у Append.
-			c.skipped++
-			if claimed {
-				c.claimed++
-			}
+			c.count(lines.long || len(bytes.TrimSpace(line)) > 0, claimed, false)
 		case !own:
 		case c.cur == nil:
 			c.cur, bestAt = &receiptLink{hash: r.Hash, seq: r.Seq}, lines.pos
@@ -346,8 +396,8 @@ const fallbackSpan = 4 << 20
 // own — строка — квитанция шлюза c.name с подписью его ключа; claimed —
 // строка от его имени с другой подписью (или без неё).
 func (c *chainScan) own(line []byte) (r Receipt, own, claimed bool) {
-	if len(bytes.TrimSpace(line)) == 0 {
-		return Receipt{}, false, false
+	if !bytes.Contains(line, c.needle) {
+		return Receipt{}, false, false // не его: чужой шлюз или мусор, разбирать незачем (R1-6)
 	}
 	r, _ = ParseReceipt(line)
 	switch {
@@ -365,10 +415,13 @@ func (c *chainScan) take(r Receipt) {
 	c.skipped, c.claimed, c.stale = 0, 0, 0
 }
 
-// forwardLines отдаёт строки файла от from до size кусками; строка длиннее
-// любой квитанции отдаётся один раз как long, без байтов, — память не
-// растёт с тем, что дописали в файл.
-func forwardLines(f *os.File, from, size int64, each func(line []byte, long bool)) error {
+// ReadLines отдаёт строки файла f от from до size кусками: строка длиннее
+// любой квитанции отдаётся один раз как long, без байтов, — память не растёт
+// с тем, что дописали в файл. end — место сразу за строкой. Обрывок без
+// перевода строки в конце не отдаётся: его дописывают или он порван; done —
+// место сразу за последней отданной строкой.
+func ReadLines(f *os.File, from, size int64, each func(line []byte, end int64, long bool)) (done int64, err error) {
+	done = from
 	buf := make([]byte, 1<<20)
 	var partial []byte
 	long := false
@@ -379,7 +432,7 @@ func forwardLines(f *os.File, from, size int64, each func(line []byte, long bool
 		}
 		got, err := f.ReadAt(buf[:n], off)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return err
+			return done, err
 		}
 		if got == 0 {
 			break
@@ -397,17 +450,40 @@ func forwardLines(f *os.File, from, size int64, each func(line []byte, long bool
 				}
 				break
 			}
+			end := off - int64(len(data)) + int64(i) + 1
 			if long {
-				each(nil, true)
+				each(nil, end, true)
 				long = false
 			} else {
-				each(append(partial, data[:i]...), false)
+				each(append(partial, data[:i]...), end, false)
 			}
-			partial = partial[:0]
+			partial, done = partial[:0], end
 			data = data[i+1:]
 		}
 	}
-	return nil
+	return done, nil
+}
+
+// beforeWrite — для тестов: зовётся между проверкой хвоста и записью, там,
+// где писатель без flock вклинивается (T-5).
+var beforeWrite func(path string)
+
+// gluedBefore — перед только что дописанными n байтами (запись кончается на
+// текущем месте f) стоит не перевод строки: строка склеилась с чужими байтами.
+func gluedBefore(f *os.File, n int64) (bool, error) {
+	end, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false, err
+	}
+	start := end - n
+	if start <= 0 {
+		return false, nil
+	}
+	one := make([]byte, 1)
+	if _, err := f.ReadAt(one, start-1); err != nil {
+		return false, err
+	}
+	return one[0] != '\n', nil
 }
 
 // backLines читает строки файла с конца. pos — где кончаются ещё не

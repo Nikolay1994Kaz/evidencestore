@@ -217,6 +217,12 @@ type SourceReport struct {
 	GatewayRecords int
 	GatewayBroken  []uint64
 	GatewayForged  []uint64
+	// GatewayRepeats — номера квитанций с верной подписью, которые хранилище
+	// назвало повтором (stale): копия прежней квитанции шлюза или вторая
+	// ветвь его цепочки. Их тела открываются: копию дописывает любой, кто
+	// пишет в файл, без ключа, и закрытое тело держало бы пакет по субъекту
+	// неполным — сделку честного действия не свести (R1-5 второго захода).
+	GatewayRepeats []uint64
 	// Receipts — источник квитанций шлюза (receipt/v1). ReceiptLinks —
 	// пар соседних квитанций одного шлюза, чью сцепку пакет проверил сам;
 	// ReceiptsOpened — открытых квитанций, сверенных с вердиктом;
@@ -620,7 +626,10 @@ func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Rec
 			return fmt.Errorf("the verdict on record %s/%s: %w", b.Source, l.Subject, err)
 		}
 		r.GatewayRecords++
-		if !verdict.Clean() {
+		if repeat(verdict) {
+			seq, _ := strconv.ParseUint(l.Subject, 10, 64)
+			r.GatewayRepeats = append(r.GatewayRepeats, seq)
+		} else if !verdict.Clean() {
 			seq, _ := strconv.ParseUint(l.Subject, 10, 64)
 			r.GatewayBroken = append(r.GatewayBroken, seq)
 			if verdict.Signature == gateway.SigInvalid {
@@ -629,6 +638,13 @@ func sourceVerdicts(b SourceBundle, gw bool, linkAt func(uint64) (auditchain.Rec
 		}
 	}
 	return nil
+}
+
+// repeat — квитанция с подписью шлюза, которую хранилище назвало повтором:
+// кроме повтора, с ней всё в порядке (подпись проверена ключом шлюза, а
+// строку, которая не разбирается, с верной подписью пишет только сам шлюз).
+func repeat(v gateway.Verdict) bool {
+	return v.Link == gateway.LinkStale && v.HashOK && v.Signature == gateway.SigValid
 }
 
 // sourceReceipts — сцепка квитанций по вердиктам пакета и сверка открытых
@@ -1101,6 +1117,13 @@ func (r SourceReport) Notes() []string {
 	}
 	if r.LeafOnly > 0 && r.Subject == "" {
 		n = append(n, LeafOnlyNote(r.LeafOnly, r.LeafOnlyMonths))
+	}
+	if len(r.GatewayRepeats) > 0 {
+		var parts []string
+		for _, q := range r.GatewayRepeats {
+			parts = append(parts, strconv.FormatUint(q, 10))
+		}
+		n = append(n, fmt.Sprintf("gateway receipts %s were found by the store at intake to be repeats (stale): a copy of an earlier receipt of the gateway, which anyone who writes to its file can append without the key, or a second branch of its chain; their bodies are open and checked like the rest, and a copy counts once in a deal", strings.Join(parts, ", ")))
 	}
 	if len(r.GatewayBroken) > 0 {
 		var parts []string

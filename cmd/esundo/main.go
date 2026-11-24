@@ -97,6 +97,9 @@ type Config struct {
 	Key      string `json:"key"`
 	Gateway  string `json:"gateway"`
 	PGSource string `json:"pg_source"`
+	// Head — где esundo держит голову своей цепочки квитанций (gateway.Head):
+	// туда пишет только он. По умолчанию — рядом с ключом.
+	Head string `json:"head"`
 }
 
 func loadConfig(path string) *Config {
@@ -111,7 +114,7 @@ func loadConfig(path string) *Config {
 	if err := c.Validate(filepath.Dir(path)); err != nil {
 		fail(fmt.Errorf("%s: %w", path, err))
 	}
-	for _, f := range []*string{&c.Receipts, &c.Key} {
+	for _, f := range []*string{&c.Receipts, &c.Key, &c.Head} {
 		if *f != "" && !filepath.IsAbs(*f) {
 			*f = filepath.Join(filepath.Dir(path), *f)
 		}
@@ -124,6 +127,9 @@ func loadConfig(path string) *Config {
 	}
 	if c.PGSource == "" {
 		c.PGSource = "postgres"
+	}
+	if c.Head == "" && c.Key != "" && c.Receipts != "" {
+		c.Head = gateway.DefaultHead(c.Key, c.Receipts, c.Gateway)
 	}
 	return &c
 }
@@ -338,7 +344,7 @@ func undoIntent(cfg *Config, key ed25519.PrivateKey, p *pgundo.Plan, action, by,
 		if err != nil {
 			return err
 		}
-		_, err = gateway.Append(cfg.Receipts, key, cfg.Gateway, gateway.Draft{Action: action, Step: alert.StepUndo,
+		_, err = gateway.AppendHead(cfg.Receipts, cfg.Head, key, cfg.Gateway, gateway.Draft{Action: action, Step: alert.StepUndo,
 			Refs: []gateway.Ref{{Source: cfg.PGSource, Subject: xid}}, Body: body})
 		return err
 	}

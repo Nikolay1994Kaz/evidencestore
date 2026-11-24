@@ -58,6 +58,11 @@ type Config struct {
 	// Gateway — имя цепочки квитанций (1–128 знаков из латиницы, цифр и
 	// . _ : -). По умолчанию "esmcp". У каждого агента в общем файле — своё.
 	Gateway string `json:"gateway"`
+	// Head — где сервер держит голову своей цепочки квитанций (gateway.Head):
+	// туда пишет только он, как и ключ. По умолчанию — рядом с ключом; если
+	// каталог ключа только на чтение (Docker), — путь в каталоге, куда пишет
+	// только сервер.
+	Head string `json:"head"`
 	// PGSource — имя источника базы в хранилище: на него ссылается намерение
 	// ({"source": pg_source, "subject": xid}). По умолчанию "postgres"; то же
 	// имя — в receipts.source у сборщика.
@@ -117,6 +122,12 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if c.Gateway == "" {
 		c.Gateway = "esmcp"
+	}
+	if c.Head != "" && !filepath.IsAbs(c.Head) {
+		c.Head = filepath.Join(filepath.Dir(path), c.Head)
+	}
+	if c.Head == "" && c.Key != "" && c.Receipts != "" {
+		c.Head = gateway.DefaultHead(c.Key, c.Receipts, c.Gateway)
 	}
 	if !gateway.ValidName(c.Gateway) {
 		errs = append(errs, fmt.Errorf("gateway %q: 1 to %d letters, digits and . _ : -", c.Gateway, gateway.MaxGatewayName))
@@ -186,7 +197,7 @@ func main() {
 	mc := mcpserver.Config{
 		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, ActionsPerMinute: cfg.ActionsPerMinute,
 		WindowRows: cfg.WindowRows, Window: cfg.Window.D(), StatementTimeout: cfg.StatementTimeout.D(), LockTimeout: cfg.LockTimeout.D(),
-		ReceiptsPath: cfg.Receipts, Key: key, Gateway: cfg.Gateway, PGSource: cfg.PGSource, Version: version.String("esmcp"),
+		ReceiptsPath: cfg.Receipts, HeadPath: cfg.Head, Key: key, Gateway: cfg.Gateway, PGSource: cfg.PGSource, Version: version.String("esmcp"),
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dsn
 			c.Params = params

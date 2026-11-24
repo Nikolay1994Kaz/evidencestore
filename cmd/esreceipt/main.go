@@ -57,6 +57,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	name := fs.String("gateway", "", "gateway name: 1 to 128 letters, digits and . _ : - (it stays readable in the store's verdicts)")
 	file := fs.String("file", "", "receipts file (JSONL)")
 	pubKey := fs.String("gateway-key", "", "gateway public key (64 hex) or file containing it")
+	head := fs.String("head", "", "where sign keeps the head of the gateway's chain (default: next to -key); only the gateway may write there")
 	usageErr := func(err error) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return exitUsage
@@ -100,7 +101,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if err != nil {
 			return usageErr(err)
 		}
-		n, err := sign(key, *name, *file, stdin, stderr)
+		h := *head
+		if h == "" {
+			h = gateway.DefaultHead(*keyPath, *file, *name)
+		}
+		n, err := sign(key, *name, *file, h, stdin, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %v (%d receipts written before it)\n", err, n)
 			return exitInvalid
@@ -184,7 +189,7 @@ func parseStep(line []byte) (gateway.Draft, error) {
 // последней своей квитанции мимо чужих строк, fsync каждой). Сколько
 // записано — даже при ошибке: записанное уже подписано и сцеплено,
 // повторять его нельзя.
-func sign(key ed25519.PrivateKey, name, path string, in io.Reader, warn io.Writer) (int, error) {
+func sign(key ed25519.PrivateKey, name, path, head string, in io.Reader, warn io.Writer) (int, error) {
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 64<<10), gateway.MaxReceiptLen)
 	n := 0
@@ -196,7 +201,7 @@ func sign(key ed25519.PrivateKey, name, path string, in io.Reader, warn io.Write
 		if err != nil {
 			return n, fmt.Errorf("input line %d: %w", n+1, err)
 		}
-		a, err := gateway.Append(path, key, name, d)
+		a, err := gateway.AppendHead(path, head, key, name, d)
 		if err != nil {
 			return n, fmt.Errorf("input line %d: %w", n+1, err)
 		}

@@ -16,20 +16,21 @@ package mcpserver
 // действие: предел мягкий, не замок.
 
 import (
-	"bufio"
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgrole"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -281,6 +282,7 @@ type ledger struct {
 	worst   int           // строк у намерения без исхода: предел действия, без него — предел окна
 	primed  bool
 	off     int64
+	ino     uint64 // inode файла, который читался: другой по пути — ротация
 	items   []spent
 	alerted time.Time // последний отказ за частоту, о котором людям ушла тревога
 }
@@ -299,6 +301,7 @@ func (l *ledger) refresh(now time.Time) error {
 	if err != nil {
 		return err
 	}
+	ino := inodeOf(fi)
 	if !l.primed {
 		// Первый раз: нужен только хвост файла, покрывающий окно. Хвост
 		// берётся с запасом и растёт, пока не покроет окно или весь файл.
@@ -309,13 +312,29 @@ func (l *ledger) refresh(now time.Time) error {
 				return err
 			}
 			if covered || start == 0 {
-				l.items, l.off, l.primed = items, end, true
+				l.items, l.off, l.primed, l.ino = items, end, true, ino
 				break
 			}
 		}
 	} else {
-		if fi.Size() < l.off {
-			l.off, l.items = 0, nil // файл заменили (ротация): в нём всё новое
+		// Ротация (logrotate, mv; copytruncate) — не повод забыть счёт: в
+		// окне остаются действия, сделанные до неё (R2-9, T-4 второго
+		// захода). Прежний файл, если он лежит рядом под другим именем,
+		// дочитывается до конца; новый — весь новый.
+		switch {
+		case ino != l.ino:
+			if old := l.rotated(ino); old != nil {
+				if ofi, err := old.Stat(); err == nil {
+					items, _, _, err := l.read(old, l.off, ofi.Size(), now, false)
+					if err == nil {
+						l.items = append(l.items, items...)
+					}
+				}
+				old.Close()
+			}
+			l.off, l.ino = 0, ino
+		case fi.Size() < l.off:
+			l.off = 0 // тот же файл обрезан (copytruncate): в нём всё новое
 		}
 		items, _, end, err := l.read(f, l.off, fi.Size(), now, false)
 		if err != nil {
@@ -333,6 +352,45 @@ func (l *ledger) refresh(now time.Time) error {
 	return nil
 }
 
+// rotated — прежний файл (inode l.ino), если он лежит в каталоге файла
+// квитанций под другим именем; ino — файл, что теперь по пути.
+func (l *ledger) rotated(ino uint64) *os.File {
+	if l.ino == 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Dir(l.path))
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil || inodeOf(fi) != l.ino {
+			continue
+		}
+		f, err := os.Open(filepath.Join(filepath.Dir(l.path), e.Name()))
+		if err != nil {
+			return nil
+		}
+		if ofi, err := f.Stat(); err != nil || inodeOf(ofi) != l.ino {
+			f.Close()
+			return nil
+		}
+		return f
+	}
+	return nil
+}
+
+// inodeOf — номер inode файла (0 — не узнать).
+func inodeOf(fi os.FileInfo) uint64 {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
+}
+
 // read разбирает квитанции файла от start до end. midline — start взят
 // наугад (хвост файла) и может стоять посреди строки. covered — среди
 // прочитанных есть квитанция старше keep: хвост покрыл окно. done — докуда
@@ -341,38 +399,29 @@ func (l *ledger) refresh(now time.Time) error {
 // файла, и квитанция, застигнутая недописанной, пропадала из счёта насовсем
 // (P-244).
 func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool) (items []spent, covered bool, done int64, err error) {
-	r := bufio.NewReaderSize(io.NewSectionReader(f, start, end-start), 1<<16)
-	done = start
-	if midline {
-		// Остаток строки, посреди которой началось чтение, — не квитанция.
-		skip, err := r.ReadBytes('\n')
-		if err == io.EOF {
-			return nil, false, start, nil
-		} else if err != nil {
-			return nil, false, start, err
+	// Строки — кусками, строка длиннее любой квитанции пропускается: файл
+	// квитанций дописывает и тот, у кого ключа нет, и продлённый нулями файл
+	// иначе ронял сервер на нехватке памяти (P-351 у сервера).
+	first := midline
+	done, err = gateway.ReadLines(f, start, end, func(line []byte, _ int64, long bool) {
+		if first {
+			first = false // остаток строки, посреди которой началось чтение, — не квитанция
+			return
 		}
-		done += int64(len(skip))
-	}
-	for {
-		line, err := r.ReadBytes('\n')
-		if err == io.EOF {
-			return items, covered, done, nil // обрывок без перевода строки ещё дописывается
+		if long {
+			return
 		}
-		if err != nil {
-			return nil, false, start, err
-		}
-		done += int64(len(line))
-		rc, step, ok := l.own(bytes.TrimRight(line, "\n"))
+		rc, step, ok := l.own(line)
 		if !ok || (step != alert.StepOutcome && step != alert.StepIntent && step != alert.StepUndo) {
-			continue
+			return
 		}
 		at, perr := time.Parse(time.RFC3339Nano, rc.Time)
 		if perr != nil {
-			continue
+			return
 		}
 		if now.Sub(at) > l.keep {
 			covered = true
-			continue
+			return
 		}
 		if step != alert.StepOutcome {
 			// Намерение: действие пошло в базу. Исхода может не быть никогда —
@@ -380,7 +429,7 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 			if rc.Agent == l.agent && (rc.Tool == "execute" || rc.Tool == "undo_apply") {
 				items = append(items, spent{at: at, rows: l.worst, action: rc.ActionID, pending: true})
 			}
-			continue
+			return
 		}
 		l.note(rc, at)
 		if it, ok := l.count(rc, at); ok {
@@ -393,7 +442,11 @@ func (l *ledger) read(f *os.File, start, end int64, now time.Time, midline bool)
 			l.settle(items, spent{at: at, action: rc.ActionID})
 			l.settle(l.items, spent{at: at, action: rc.ActionID})
 		}
+	})
+	if err != nil {
+		return nil, false, start, err
 	}
+	return items, covered, done, nil
 }
 
 // settle — исход it заменяет намерение того же действия в items, если оно

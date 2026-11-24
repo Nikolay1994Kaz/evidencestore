@@ -956,6 +956,35 @@ func TestTornLongLineResumesAtChunk(t *testing.T) {
 	}
 }
 
+// T-5 второго захода: строка без перевода строки растёт — её куски уходят в
+// буфер по мере записи, а не копятся целиком в памяти до перевода строки, и
+// режутся так же, как целая строка: за последним куском — перевод строки.
+func TestGrowingLongLineGoesInPieces(t *testing.T) {
+	saved := pieceLen
+	pieceLen = 100
+	t.Cleanup(func() { pieceLen = saved })
+	r := newRig(t)
+	c := r.collector(t)
+	appendLines(t, r.cfg.File, strings.Repeat("a", 250)) // перевода строки нет
+	if n, err := c.ReadOnce(); err != nil || n != 2 {
+		t.Fatalf("прочитано %d, %v: два полных куска уходят сразу", n, err)
+	}
+	appendLines(t, r.cfg.File, strings.Repeat("b", 50)) // ровно на кусок, а что дальше — не известно
+	if n, err := c.ReadOnce(); err != nil || n != 0 {
+		t.Fatalf("прочитано %d, %v: кусок, за которым ничего нет, ждёт", n, err)
+	}
+	appendLines(t, r.cfg.File, "\nnext\n")
+	if n, err := c.ReadOnce(); err != nil || n != 2 {
+		t.Fatalf("прочитано %d, %v", n, err)
+	}
+	cycle(t, c)
+	got := r.bodies(t)
+	want := []string{strings.Repeat("a", 100), strings.Repeat("a", 100), strings.Repeat("a", 50) + strings.Repeat("b", 50), "next"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("принято %q", got)
+	}
+}
+
 // Падение посреди записи обещания: обрывок строки отрезается при запуске, и
 // следующее обещание к нему не приклеивается; нечитаемая строка не прячет
 // остальные обещания.

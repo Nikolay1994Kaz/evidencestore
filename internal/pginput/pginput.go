@@ -324,10 +324,14 @@ func SetupSQL(c *Config) (string, error) {
 	p("    WHERE p.proowner = o AND NOT tg.tgisinternal LOOP")
 	p("    EXECUTE format('DROP TRIGGER %%I ON %%s', t.tgname, t.rel);")
 	p("  END LOOP;")
+	p("  -- Объект схемы любого вида (таблица, функция, тип, правило сортировки, словарь поиска, оператор…)")
+	p("  -- лежит в pg_depend ссылкой на схему, а владелец его, если это не evidence_owner, — без строки")
+	p("  -- владельца на неё в pg_shdepend: так видны все виды, а не три (R2-7 второго захода).")
 	p("  IF EXISTS (SELECT FROM pg_namespace n WHERE n.nspname = 'evidence' AND n.nspowner = o) AND EXISTS (")
-	p("      SELECT FROM pg_class c WHERE c.relnamespace = 'evidence'::regnamespace AND c.relowner <> o")
-	p("      UNION ALL SELECT FROM pg_proc p WHERE p.pronamespace = 'evidence'::regnamespace AND p.proowner <> o")
-	p("      UNION ALL SELECT FROM pg_type ty WHERE ty.typnamespace = 'evidence'::regnamespace AND ty.typowner <> o) THEN")
+	p("      SELECT FROM pg_depend d WHERE d.refclassid = 'pg_namespace'::regclass")
+	p("        AND d.refobjid = (SELECT n.oid FROM pg_namespace n WHERE n.nspname = 'evidence')")
+	p("        AND NOT EXISTS (SELECT FROM pg_shdepend sd WHERE sd.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())")
+	p("          AND sd.classid = d.classid AND sd.objid = d.objid AND sd.deptype = 'o' AND sd.refobjid = o)) THEN")
 	p("    EXECUTE format('ALTER SCHEMA evidence OWNER TO %%I', (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()));")
 	p("    RAISE WARNING 'evidencestore: schema evidence holds objects of other roles: it stays, and the owner of the database owns it now';")
 	p("  END IF;")
@@ -616,6 +620,10 @@ type slotState struct {
 	// Rewound — место сборщика, от которого вход уже отступил назад: тот же
 	// откат после перезапуска не называется второй раз.
 	Rewound string `json:"rewound,omitempty"`
+	// XID8 — старший номер транзакции с эпохой, прочитанный в потоке: база,
+	// которая выдаст следующим номер не выше, ушла назад, даже если её
+	// журнал уже за местом сборщика (T-1 второго захода).
+	XID8 uint64 `json:"xid8,omitempty"`
 }
 
 // Source — вход «PostgreSQL» (input.Input).
@@ -661,6 +669,12 @@ type Source struct {
 	// подтверждать серверу можно, не дописав файла.
 	known     slotState
 	persisted pgwire.LSN
+	// next8 — номер, который база выдаст следующим, на миг подключения: по
+	// нему 32-битный xid потока — с эпохой; xid8 — старший из них.
+	next8, xid8 uint64
+	// knownLost — slot.json не было, а сборщик эту базу уже читал: сдвинут
+	// ли слот, пока его не было, не сказать (T-7 второго захода).
+	knownLost bool
 }
 
 // New готовит вход; к базе он подключится при первом чтении.
@@ -683,7 +697,22 @@ func New(cfg Config, log *slog.Logger) (*Source, error) {
 // Open — input.Input: справочник открыт, место входа принято.
 func (s *Source) Open(cursor uint64, sink input.Sink) (err error) {
 	s.sink = sink
-	cfg := pgtap.Config{Dir: s.cfg.Dir, AlertRows: s.cfg.AlertRows, RequireGateway: s.cfg.RequireGateway, Canaries: s.cfg.Canaries, PartSize: s.partSize}
+	// slot.json — раз, при запуске: испорченный — ясная ошибка, а не
+	// ежесекундная ложная тревога db-down на каждом подключении (T-7).
+	knownPath := filepath.Join(s.cfg.Dir, SlotFile)
+	if data, err := os.ReadFile(knownPath); err == nil {
+		if err := json.Unmarshal(data, &s.known); err != nil {
+			return fmt.Errorf("%s: %w", knownPath, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	} else if cursor != 0 {
+		s.knownLost = true
+	}
+	s.persisted, _ = pgwire.ParseLSN(s.known.Confirmed)
+	s.xid8 = s.known.XID8
+	cfg := pgtap.Config{Dir: s.cfg.Dir, AlertRows: s.cfg.AlertRows, RequireGateway: s.cfg.RequireGateway, Canaries: s.cfg.Canaries, PartSize: s.partSize,
+		Diverged: s.diverged}
 	if s.cfg.Receipts != nil {
 		// Тревоги по квитанциям идут в тот же файл тревог, что и о транзакциях.
 		if s.receipts, err = openReceipts(*s.cfg.Receipts, s.cfg.Dir, func(ev alert.Event) error { return s.tap.Raise(ev) }); err != nil {
@@ -820,6 +849,14 @@ func (s *Source) connect(ctx context.Context) (err error) {
 	// подтверждённую позицию, если слот с тех пор не сохранялся.
 	// Сообщений журнала (messages) вход не просит: чья транзакция, говорит
 	// квитанция шлюза, а не база (DECISIONS, п. 42).
+	// Пачка отпечатков, прочитанная до обрыва, — в буфер сейчас: эти
+	// транзакции целы, а слота, от которого сервер прислал бы их снова, после
+	// переключения на реплику может уже не быть (T-8 второго захода). Сервер
+	// всё равно пришлёт их — повтором (resend.go).
+	if _, err := s.tap.Flush(); err != nil {
+		repl.Close()
+		return err
+	}
 	from, err := s.identify(cat, repl, start)
 	if err != nil {
 		repl.Close()
@@ -889,21 +926,13 @@ func (s *Source) watchIdentity(cat *pgwire.Conn) {
 // Слот пропал или база стёрла его непрочитанный журнал — потеря: пропуск
 // номера, слот заново.
 func (s *Source) ensureSlot(cat *pgwire.Conn) (pgwire.LSN, error) {
-	var known slotState
-	knownPath := filepath.Join(s.cfg.Dir, SlotFile)
-	if data, err := os.ReadFile(knownPath); err == nil {
-		if err := json.Unmarshal(data, &known); err != nil {
-			return 0, fmt.Errorf("%s: %w", knownPath, err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return 0, err
-	}
+	known := s.known
 	name := pgwire.Literal(s.cfg.Slot)
 	row, exists, err := cat.QueryRow("SELECT plugin, wal_status, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = " + name)
 	if err != nil {
 		return 0, err
 	}
-	lost := ""
+	lost, moved := "", false
 	confirmed, _ := pgwire.ParseLSN(known.Confirmed)
 	var at pgwire.LSN
 	if exists && row[2] != nil {
@@ -914,15 +943,22 @@ func (s *Source) ensureSlot(cat *pgwire.Conn) (pgwire.LSN, error) {
 		return 0, fmt.Errorf("replication slot %s exists, but it is not a pgoutput slot", s.cfg.Slot)
 	case exists && row[1] != nil && *row[1] == "lost":
 		lost = "the server removed the log that replication slot " + s.cfg.Slot + " had not read yet (max_slot_wal_keep_size): changes made meanwhile are lost"
-	case !exists && known.Slot == s.cfg.Slot:
+	case !exists && (known.Slot == s.cfg.Slot || s.knownLost):
 		lost = "replication slot " + s.cfg.Slot + " is gone from the server: changes made since the collector last read are lost"
-	case exists && known.Slot == s.cfg.Slot && confirmed != 0 && at > confirmed:
+	case exists && known.Slot == s.cfg.Slot && confirmed != 0 && at > confirmed && at > pgwire.LSN(s.tap.Cursor()):
 		// Слот ушёл дальше, чем сборщик ему подтверждал: пока сборщик не был
 		// подключён, его сдвинули (pg_replication_slot_advance ролью с
 		// REPLICATION) или пересоздали. Транзакций между ними сервер уже не
-		// пришлёт, и без этой проверки они пропадали без следа (T-3).
+		// пришлёт, и без этой проверки они пропадали без следа (T-3). Не
+		// дальше места сборщика — ничего не потеряно, как бы слот туда ни
+		// попал (slot.json из старой копии каталога).
 		lost = fmt.Sprintf("replication slot %s was moved past where the collector had confirmed it (from %s to %s) while the collector was not connected: "+
 			"a role with REPLICATION advanced or re-created it, and the changes made in between are lost", s.cfg.Slot, confirmed, at)
+		moved = true
+	case s.knownLost && exists:
+		s.knownLost = false
+		s.raise(alert.KindSlotUnknown, fmt.Sprintf("the collector's %s is gone, and the store holds this source up to %s: whether replication slot %s (now at %s) was moved while the collector was away cannot be told — "+
+			"if it was, the changes made in between are lost without a gap in the store", SlotFile, pgwire.LSN(s.tap.Cursor()), s.cfg.Slot, at))
 	}
 	if lost != "" {
 		// Сначала пропуск — в буфер, потом новый слот: упасть между ними —
@@ -932,7 +968,10 @@ func (s *Source) ensureSlot(cat *pgwire.Conn) (pgwire.LSN, error) {
 			return 0, err
 		}
 		s.raise(alert.KindGap, lost+": the store records a gap in the numbering of this source")
-		if exists {
+		// Сдвинутый слот читается дальше, от своего места: пересоздать его —
+		// потерять ещё и всё, что база записала с его сдвига до этого мига
+		// (R2-1 второго захода). Пересоздаётся только слот, чей журнал стёрт.
+		if exists && !moved {
 			if _, err := cat.Query("SELECT pg_drop_replication_slot(" + name + ")"); err != nil {
 				return 0, fmt.Errorf("drop the lost slot %s: %w", s.cfg.Slot, err)
 			}
@@ -977,6 +1016,7 @@ func (s *Source) ensureSlot(cat *pgwire.Conn) (pgwire.LSN, error) {
 
 // saveKnown пишет slot.json.
 func (s *Source) saveKnown() error {
+	s.known.XID8 = s.xid8
 	s.persisted, _ = pgwire.ParseLSN(s.known.Confirmed)
 	return writeFile(filepath.Join(s.cfg.Dir, SlotFile), s.known)
 }
@@ -1018,27 +1058,31 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 		why = fmt.Sprintf("its log ends at %s, and the collector has read up to %s: it was restored from a copy, or a replica that lagged behind took over", end, cursor)
 	case s.known.Timeline != "" && timeline != s.known.Timeline:
 		why = fmt.Sprintf("its timeline is %s, and the collector read timeline %s: a replica took over", timeline, s.known.Timeline)
+	case next8 != 0 && s.xid8 != 0 && next8 <= s.xid8:
+		why = fmt.Sprintf("the next transaction number it gives is %d, and the collector has read transaction %d: it was restored from a copy, or a replica that lagged behind took over", next8, s.xid8)
 	}
-	from = 0
-	if cursor != 0 {
-		from = cursor + 1
+	// Поток — всегда от слота, а не от места сборщика: база, поднятая из
+	// копии, пишет новые транзакции на места журнала, которые сборщик уже
+	// прочёл, и по месту сервер бы их не прислал (T-1, R2-3 второго захода).
+	// Повторы того, что уже в буфере, pgtap узнаёт по справочнику.
+	from = slotAt
+	s.next8 = next8
+	if err := s.tap.Resume(uint64(slotAt), why != ""); err != nil {
+		return 0, err
 	}
 	if why != "" && cursor.String() != s.known.Rewound {
+		since := s.startedAfter(cat, uint64(cursor))
 		if s.receipts != nil {
-			if err := s.receipts.void(); err != nil {
+			if err := s.receipts.void(since); err != nil {
 				return 0, err
 			}
 		}
 		s.raise(alert.KindRewound, "the database went back: "+why+". Whatever the collector read past the end of its log is no longer in it (the store keeps it); "+
-			"the gateway's intents written so far are void, because the database gives their transaction numbers to other transactions again: "+
-			"transactions of the gateway made since it went back come as fingerprints; the collector reads again from replication slot "+s.cfg.Slot+" ("+slotAt.String()+"), and a transaction read before may be recorded twice")
+			voidText(since)+"; the collector reads again from replication slot "+s.cfg.Slot+" ("+slotAt.String()+"), and a transaction it already has is not recorded twice")
 		s.known.Rewound = cursor.String()
 	}
 	if why != "" {
-		// Позиции базы теперь ниже места сборщика: от слота, а не от места,
-		// иначе её новые транзакции шли бы за повторы и пропадали.
-		s.tap.Rewind(uint64(slotAt))
-		from = slotAt
+		s.xid8 = 0 // номера с эпохой — с этой базы заново
 		if s.receipts != nil {
 			s.receipts.ref8 = next8
 		}
@@ -1047,6 +1091,65 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 	}
 	s.known.System, s.known.Timeline = system, timeline
 	return from, s.saveKnown()
+}
+
+// diverged — pgtap.Config.Diverged: в потоке ниже места сборщика транзакция,
+// которой у него на этом месте нет. База ушла назад, а её журнал успел уйти
+// за место сборщика, пока его не было: по концу журнала при подключении
+// этого не видно (T-1 второго захода). Дальше — как при подъёме, увиденном
+// при подключении: намерения шлюза до сих пор не в счёт, людям — тревога.
+func (s *Source) diverged(xid uint32, final, place uint64) error {
+	since := s.startedAfter(s.cat, place)
+	if s.receipts != nil {
+		if err := s.receipts.void(since); err != nil {
+			return err
+		}
+		s.receipts.ref8 = s.next8
+	}
+	s.xid8 = 0
+	if s.known.Rewound != pgwire.LSN(place).String() {
+		s.raise(alert.KindRewound, fmt.Sprintf("the database went back: transaction %d committed at %s, below the place the collector has read up to (%s), is not the transaction it read there — "+
+			"it was restored from a copy, or a replica that lagged behind took over, and its log went past the collector's place before the collector connected. "+
+			"Whatever the collector read past the end of its copy is no longer in it (the store keeps it); %s; the database's new transactions are recorded from here",
+			xid, pgwire.LSN(final), pgwire.LSN(place), voidText(since)))
+		s.known.Rewound = pgwire.LSN(place).String()
+	}
+	return s.saveKnown()
+}
+
+// voidText — что тревога db-rewound говорит о намерениях шлюза.
+func voidText(since time.Time) string {
+	if since.IsZero() {
+		return "the gateway's intents written so far are void, because the database gives their transaction numbers to other transactions again: " +
+			"transactions of the gateway made since it went back come as fingerprints"
+	}
+	return "the gateway's intents written before the database started again (" + since.UTC().Format(time.RFC3339) + ") are void, " +
+		"because it gives their transaction numbers to other transactions again; the gateway's actions after that stay actions"
+}
+
+// startedAfter — миг запуска базы (pg_postmaster_start_time), если он позже
+// последней транзакции, прочитанной сборщиком из её прежней истории (на
+// месте place): так запускается копия, поднятая после неё, и до этого мига в
+// новой истории базы транзакций не было. Иначе (реплика, запущенная раньше и
+// занявшая место; время не узнать) — ноль: void снимает все намерения.
+func (s *Source) startedAfter(cat *pgwire.Conn, place uint64) time.Time {
+	last, ok := s.tap.PlaceTime(place)
+	if !ok || cat == nil {
+		return time.Time{}
+	}
+	row, ok, err := cat.QueryRow("SELECT (extract(epoch FROM pg_postmaster_start_time()) * 1000000)::bigint::text")
+	if err != nil || !ok || row[0] == nil {
+		return time.Time{}
+	}
+	us, err := strconv.ParseInt(*row[0], 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	started := time.UnixMicro(us)
+	if !started.After(last) {
+		return time.Time{}
+	}
+	return started
 }
 
 // writeFile заменяет файл целиком: временный файл, fsync, переименование.
@@ -1064,7 +1167,23 @@ func writeFile(path string, v any) error {
 	if err = errors.Join(err, f.Sync(), f.Close()); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Без fsync каталога переименование после пропажи питания может
+	// откатиться: в slot.json — прежняя позиция, и сборщик принял бы свои же
+	// подтверждения за сдвиг слота чужой рукой (R2-1 второго захода).
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir — fsync каталога: переименование в нём легло на диск.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // drop закрывает соединения после ошибки; следующая попытка — после паузы.
@@ -1124,6 +1243,9 @@ func (s *Source) step(wait time.Duration) (idle bool, err error) {
 	msg, err := pgoutput.Parse(m.Data)
 	if err != nil {
 		return false, fmt.Errorf("at %s: %w", m.WALStart, err)
+	}
+	if b, ok := msg.(pgoutput.Begin); ok && s.next8 != 0 {
+		s.xid8 = max(s.xid8, fullXID(s.next8, b.XID))
 	}
 	done, err := s.tap.Handle(msg)
 	if err != nil {

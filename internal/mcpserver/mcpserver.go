@@ -120,6 +120,9 @@ type Config struct {
 	// файлу же действие находится после перезапуска и считаются пределы.
 	// Пусто — квитанции только в памяти (тесты): сборщику брать нечего.
 	ReceiptsPath string
+	// HeadPath — голова цепочки квитанций сервера (gateway.Head): там, куда
+	// пишет только он. Пусто — цепочка по файлу при каждой квитанции.
+	HeadPath string
 	// Key — ключ шлюза (Ed25519): его открытый ключ — в gateway_keys
 	// сборщика и в gateway_key источника квитанций у хранилища.
 	Key ed25519.PrivateKey
@@ -513,27 +516,36 @@ func (s *Server) history() []Receipt {
 	if s.cfg.ReceiptsPath == "" {
 		return s.recent
 	}
-	data, err := os.ReadFile(s.cfg.ReceiptsPath)
+	f, err := os.Open(s.cfg.ReceiptsPath)
+	if err != nil {
+		return s.recent
+	}
+	defer f.Close()
+	fi, err := f.Stat()
 	if err != nil {
 		return s.recent
 	}
 	// Файл квитанций может быть общим у нескольких агентов и шлюзов: свои —
 	// только квитанции этого шлюза, подписанные его ключом, и этого агента
-	// (P-247). Чужое действие агент не видит и не откатывает.
+	// (P-247). Чужое действие агент не видит и не откатывает. Читается
+	// кусками: файл дописывает и тот, у кого ключа нет (P-351 у сервера).
 	var out []Receipt
 	at := map[string]int{}
-	for _, line := range strings.Split(string(data), "\n") {
-		rc, _, ok := s.own([]byte(line))
+	gateway.ReadLines(f, 0, fi.Size(), func(line []byte, _ int64, long bool) {
+		if long {
+			return
+		}
+		rc, _, ok := s.own(line)
 		if !ok || rc.Agent != s.cfg.Agent {
-			continue
+			return
 		}
 		if i, seen := at[rc.ActionID]; seen {
 			out[i] = rc
-			continue
+			return
 		}
 		at[rc.ActionID] = len(out)
 		out = append(out, rc)
-	}
+	})
 	return out
 }
 
@@ -566,7 +578,7 @@ func (s *Server) intent(rc *Receipt, step string) error {
 	}
 	draft := *rc
 	draft.Outcome = OutcomePending
-	a, err := gateway.Append(s.cfg.ReceiptsPath, s.cfg.Key, s.cfg.Gateway, gateway.Draft{
+	a, err := gateway.AppendHead(s.cfg.ReceiptsPath, s.cfg.HeadPath, s.cfg.Key, s.cfg.Gateway, gateway.Draft{
 		Time: s.now(), Action: rc.ActionID, Step: step, Refs: refs, Body: bodyOf(draft)})
 	s.appended(a)
 	return err
@@ -1314,7 +1326,7 @@ func (s *Server) keep(rc Receipt) error {
 	}
 	// Исход — отдельной квитанцией после действия: что было, видно по
 	// намерению и без неё (оборвался сервер между ними — исхода нет).
-	a, err := gateway.Append(s.cfg.ReceiptsPath, s.cfg.Key, s.cfg.Gateway, gateway.Draft{
+	a, err := gateway.AppendHead(s.cfg.ReceiptsPath, s.cfg.HeadPath, s.cfg.Key, s.cfg.Gateway, gateway.Draft{
 		Time: s.now(), Action: rc.ActionID, Step: alert.StepOutcome, Body: outcomeBody(rc)})
 	s.appended(a)
 	return err
@@ -1326,9 +1338,15 @@ func (s *Server) keep(rc Receipt) error {
 // исход — нет, и пределы и тревоги refused его действий не видели (R2-4).
 // Не влезает — текст SQL заменён его SHA-256 (целиком он в намерении), ошибка
 // укорочена.
+//
+// Отказ до базы (частота) — без намерения, ничего не изменил, в счёт не
+// идёт, а агент в цикле повторяет его сколько угодно раз: длинный текст SQL
+// в нём — тоже его SHA-256, иначе каждый отказ дописывал бы в файл квитанций
+// до мегабайта текста агента с fsync (R2-4 второго захода).
 func outcomeBody(rc Receipt) json.RawMessage {
 	body := bodyOf(rc)
-	if len(body) <= gateway.MaxReceiptLen-outcomeEnvelope {
+	beforeDB := rc.Outcome == "refused" && rc.XID == "" && len(rc.SQL) > maxRefusedSQL
+	if len(body) <= gateway.MaxReceiptLen-outcomeEnvelope && !beforeDB {
 		return body
 	}
 	sum := sha256.Sum256([]byte(rc.SQL))
@@ -1344,4 +1362,7 @@ func outcomeBody(rc Receipt) json.RawMessage {
 const (
 	outcomeEnvelope = 4 << 10
 	maxOutcomeError = 2000
+	// maxRefusedSQL — до этой длины текст SQL отказа до базы лежит в его
+	// квитанции целиком.
+	maxRefusedSQL = 4 << 10
 )

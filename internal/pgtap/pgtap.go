@@ -111,6 +111,12 @@ type Config struct {
 	// столько транзакций или когда поток молчит столько (Tick); 0 — умолчания.
 	PackTx   int
 	PackWait time.Duration
+	// Diverged — транзакция xid с местом фиксации final ниже места входа place
+	// — не та, что лежит в буфере на её месте: база ушла назад (поднята из
+	// копии, её место заняла отставшая реплика), и её журнал ушёл за место
+	// входа раньше, чем вход подключился (resend.go). Зовётся один раз, до
+	// намерений шлюза для этой транзакции; дальше она и следующие — новые.
+	Diverged func(xid uint32, final, place uint64) error
 }
 
 // RelInfo — то, чего нет в сообщении Relation: имена типов и первичный ключ.
@@ -179,11 +185,22 @@ type Tap struct {
 	// транзакции, которая лежит в буфере целиком. Транзакции не новее база
 	// может прислать заново — они пропускаются.
 	lastCommit uint64
-	rels       map[uint32]pgoutput.Relation
-	info       map[uint32]RelInfo
-	tx         *txState
-	stats      Stats
-	pack       pack
+	// seen, floor, recheck, rewound — сверка повторов ниже места входа
+	// (resend.go).
+	seen      map[uint64]seenTx
+	seenOrder []uint64
+	floor     uint64
+	loaded    bool
+	recheck   uint64
+	rewound   bool
+	// raisedPending — отпечатки пачки, ещё не легшей в буфер, о которых
+	// тревога уже поднята (место фиксации → транзакция).
+	raisedPending map[uint64]seenTx
+	rels          map[uint32]pgoutput.Relation
+	info          map[uint32]RelInfo
+	tx            *txState
+	stats         Stats
+	pack          pack
 }
 
 type txState struct {
@@ -311,7 +328,11 @@ func (t *Tap) Handle(msg any) (flushed uint64, err error) {
 		if t.tx != nil {
 			return 0, fmt.Errorf("pgtap: begin of %d inside transaction %d", m.XID, t.tx.begin.XID)
 		}
-		tx := &txState{begin: m, dup: m.FinalLSN <= t.lastCommit}
+		dup, err := t.resent(m.XID, m.FinalLSN, m.CommitTime)
+		if err != nil {
+			return 0, fmt.Errorf("pgtap: transaction %d: %w", m.XID, err)
+		}
+		tx := &txState{begin: m, dup: dup}
 		if !tx.dup && t.cfg.Intents != nil {
 			// Чья транзакция — решается здесь, до первого изменения: её
 			// намерение шлюз положил на диск раньше COMMIT, а поток отдаёт её
@@ -719,6 +740,7 @@ func (t *Tap) finish(tx *txState, c pgoutput.Commit) error {
 			tx.begin.XID, firstSeq, lastSeq, tx.firstSeq, tx.firstSeq+uint64(tx.parts-1))
 	}
 	t.lastCommit = tx.begin.FinalLSN
+	t.remember(tx.begin.FinalLSN, tx.begin.XID, tx.begin.CommitTime)
 	if tx.fp {
 		t.stats.Fingerprinted++
 		t.stats.FingerprintChanges += uint64(tx.changes)
@@ -741,7 +763,11 @@ func (t *Tap) closingAlerts(tx *txState) {
 		t.alert(tx, alert.KindMassChange, detail)
 	}
 	if tx.fp && t.cfg.RequireGateway {
-		t.alert(tx, alert.KindNotViaGateway, "the gateway wrote no intent for this transaction: the named tables were changed past it; "+
+		// «Шлюз не писал» — не наверняка: строку намерения мог вынуть из файла
+		// тот, кто пишет в него без ключа, пока шла транзакция; тогда следом —
+		// receipts-gap и intent-missing (T-2 второго захода).
+		t.alert(tx, alert.KindNotViaGateway, "the collector found no intent of the gateway for this transaction: the named tables were changed past the gateway, "+
+			"or its intent was removed from the receipts file (then a receipts-gap or intent-missing alert follows); "+
 			"the store keeps only a fingerprint, and who did it the database log does not say")
 	}
 }
