@@ -1,0 +1,50 @@
+# evidencestore in Docker: the store's host. The collectors run on other hosts,
+# each from a bundle this store issues (docs/install.md, "In Docker").
+#
+#   ES_HOST=logs.example.com docker compose up -d
+#       the first start sets the store up: a CA for its collectors, the server
+#       certificate for ES_HOST (the name or address collectors reach this host
+#       by; several, comma-separated), the config and the keys; then it serves
+#   docker compose exec -T store add-collector web1 > web1.tgz
+#       a collector that reads /var/log/auth.log (another log: -file PATH);
+#       copy web1.tgz to its host, and there:
+#       tar -xzf web1.tgz && cd web1 && docker compose up -d
+#   docker compose exec store evidencestore status
+#       likewise proof, stamp, keys: the config is found without -config
+#
+# ES_TSA at the first start: digicert (default), nca (the NCA of Kazakhstan) or
+# local (the demo TSA built into the store: a trial only).
+# ES_BACKUP_DIR and ES_ROOTS_MIRROR_DIR: put them on other disks, better on
+# other machines (docs/keys.md); the defaults next to this file are for a trial.
+name: evidencestore
+services:
+  store:
+    image: ${ES_IMAGE:-ghcr.io/nikolay1994kaz/evidencestore:v0.7.0}
+    command: ["es-docker-store"]
+    environment:
+      ES_HOST: ${ES_HOST:-}
+      ES_TSA: ${ES_TSA:-digicert}
+      # add-collector names this image in the collector's compose.yaml
+      ES_IMAGE: ${ES_IMAGE:-ghcr.io/nikolay1994kaz/evidencestore:v0.7.0}
+    # operator commands find evidencestore.json in the working directory
+    working_dir: /etc/evidencestore
+    ports: ["8443:8443"]
+    restart: unless-stopped
+    # root in the container, without capabilities: it owns what it writes in
+    # the directories below and nothing else.
+    user: "0:0"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./config:/etc/evidencestore
+      - ./data:/var/lib/evidencestore
+      - ./roots:/var/lib/evidencestore-roots
+      - ${ES_BACKUP_DIR:-./backup}:/backup
+      - ${ES_ROOTS_MIRROR_DIR:-./roots-mirror}:/roots-mirror
+    healthcheck:
+      test: ["CMD", "evidencestore", "status"]
+      interval: 10s
+      start_period: 30s
+      retries: 6

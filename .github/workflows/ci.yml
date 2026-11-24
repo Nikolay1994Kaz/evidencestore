@@ -1,7 +1,9 @@
-# Гейт — на каждый пуш и PR. На тег v* — ещё и релиз: бинарники, SHA256SUMS,
-# подтверждение происхождения (проверяется `gh attestation verify`) и
-# страница релиза с заметками из docs/releases/<тег>.md. Сторонние действия
-# закреплены по коммиту: метку версии можно передвинуть, коммит — нет.
+# Гейт — на каждый пуш и PR: тесты и установка в Docker (scripts/docker-check.sh).
+# На тег v* — ещё и релиз: бинарники, SHA256SUMS, образ в ghcr.io из тех же
+# бинарников, подтверждение происхождения бинарников и образа (проверяется
+# `gh attestation verify`) и страница релиза с заметками из
+# docs/releases/<тег>.md. Сторонние действия закреплены по коммиту: метку
+# версии можно передвинуть, коммит — нет.
 name: ci
 
 on:
@@ -31,18 +33,35 @@ jobs:
           GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/esverify &&
           GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/esreceipt
 
+  # Хранилище и сборщик в Docker по шагам docs/install.md: образ из исходников.
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/docker-check.sh
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, docker]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write
       attestations: write
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # compose.yaml хоста хранилища называет образ этого выпуска: забытая
+      # правка — отказ до того, как что-то опубликовано.
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          n=$(grep -c "ghcr.io/nikolay1994kaz/evidencestore:${TAG}" deploy/docker/store/compose.yaml || true)
+          [ "$n" = 2 ] || { echo "deploy/docker/store/compose.yaml must name ghcr.io/nikolay1994kaz/evidencestore:${TAG} (twice)"; exit 1; }
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -57,6 +76,32 @@ jobs:
             dist/esreceipt-*
             dist/esmcp-*
             dist/esundo-*
+      # Образ — из тех же бинарников dist/, без сборки: release.Dockerfile.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/release.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/nikolay1994kaz/evidencestore:${{ github.ref_name }}
+            ghcr.io/nikolay1994kaz/evidencestore:latest
+      # Опубликованный образ — по тем же шагам, что образ из исходников.
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/docker-check.sh "ghcr.io/nikolay1994kaz/evidencestore:$TAG"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/nikolay1994kaz/evidencestore
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}

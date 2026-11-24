@@ -16,5 +16,9 @@ RUN adduser -D -H -u 10001 es
 COPY --from=build /out/ /usr/local/bin/
 COPY deploy/docker/init.sh /usr/local/bin/es-init
 COPY deploy/docker/store.sh /usr/local/bin/es-store
+# Хранилище на две машины (deploy/docker/store/compose.yaml, ES_IMAGE=evidencestore:local).
+COPY configs/tsa /usr/local/share/evidencestore/tsa
+COPY deploy/docker/store/entry.sh /usr/local/bin/es-docker-store
+COPY deploy/docker/store/add-collector.sh /usr/local/bin/add-collector
 USER es
 WORKDIR /state

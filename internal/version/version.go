@@ -37,3 +37,26 @@ func String(name string) string {
 	parts = append(parts, runtime.Version()+" "+runtime.GOOS+"/"+runtime.GOARCH)
 	return fmt.Sprintf("%s %s (%s)", name, v, strings.Join(parts, ", "))
 }
+
+// Release — тег выпуска, из которого собран бинарник (vX.Y.Z), или "", если
+// это не выпуск: псевдоверсия, изменённое дерево, сборка без сведений VCS.
+// По нему docker add-source называет образ того же выпуска для сборщика.
+func Release() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	return releaseTag(info.Main.Version)
+}
+
+func releaseTag(v string) string {
+	if !strings.HasPrefix(v, "v") || strings.ContainsAny(v, "-+") || strings.Count(v, ".") != 2 {
+		return ""
+	}
+	for _, part := range strings.Split(v[1:], ".") {
+		if part == "" || strings.Trim(part, "0123456789") != "" {
+			return ""
+		}
+	}
+	return v
+}

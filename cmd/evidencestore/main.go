@@ -4,6 +4,7 @@
 //	evidencestore serve    -config C           принимать улики
 //	evidencestore dev-pki  -out DIR -source N…  учебный УЦ и сертификаты для стенда
 //	evidencestore dev-setup -dir DIR [-source N] [-log F] [-port P]  учебная установка в одном каталоге
+//	evidencestore docker init|add-source …     установка в Docker: хранилище и архивы сборщиков
 //	evidencestore status   -config C           сводка
 //	evidencestore stamp    -config C           заверить голову цепи у TSA сейчас
 //	evidencestore proof    -config C -source S -seq N [-dek] [-show-label] [-to-head H] [-out F]
@@ -61,6 +62,8 @@ func main() {
 		err = cmdDevPKI(args)
 	case "dev-setup":
 		err = cmdDevSetup(args)
+	case "docker":
+		err = cmdDocker(args)
 	case "status":
 		err = adminGet(args, "/admin/status", nil)
 	case "statement":
@@ -105,6 +108,14 @@ Server:
                                                a demo store in a new or empty directory: certificates,
                                                store.json, init, store.pub, collector.json
   version                                      print the version and the commit it was built from
+
+Docker (inside the store's container, deploy/docker/store/compose.yaml):
+  docker init -host NAMES [-tsa digicert|nca|local]
+                                               first start: a CA for collectors, the server certificate,
+                                               store.json, init and store.pub in /etc/evidencestore
+  docker add-source -name NAME [-file LOG] [-content-type T] [-retention-months N] [-server URL] [-image I]
+                                               a collector: issues its certificate, pins it in store.json
+                                               and writes its bundle (.tgz) to standard output
 
 Operator (talks to the running server via its admin socket):
   status    -config FILE

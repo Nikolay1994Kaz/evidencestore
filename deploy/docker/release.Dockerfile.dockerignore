@@ -1,0 +1,6 @@
+*
+!dist/*-linux-amd64
+!dist/*-linux-arm64
+!configs/tsa
+!deploy/docker/store/entry.sh
+!deploy/docker/store/add-collector.sh

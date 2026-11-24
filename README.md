@@ -195,7 +195,17 @@ evidencestore version
 
 **On hosts.** The store, a collector for each source and a witness as systemd services, with the unit files from [`configs/systemd/`](configs/systemd): [Installing on hosts](docs/install.md). The store runs under its own user, with `keys.backup_dir` and `keys.roots_mirror_dir` on other disks; the witness is run by someone other than the store's administrator.
 
-**In Docker.** [`compose.yaml`](compose.yaml) and the [`Dockerfile`](Dockerfile) build one image with every binary and run PostgreSQL, the store and the collector on one machine as a trial ([Try it in Docker](docs/postgres.md#try-it-in-docker)). No image is published yet.
+**In Docker.** The store on its host and a collector on each host with a log, from the image `ghcr.io/nikolay1994kaz/evidencestore` (from v0.7.0): the first start of the store makes a CA for its collectors and the server certificate, and the store issues each collector a bundle to unpack and start ([In Docker](docs/install.md#in-docker)):
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/Nikolay1994Kaz/evidencestore/v0.7.0/deploy/docker/store/compose.yaml
+ES_HOST=logs.example.com docker compose up -d
+docker compose exec -T store add-collector web1 > web1.tgz
+# on web1:
+tar -xzf web1.tgz && cd web1 && docker compose up -d
+```
+
+A trial of PostgreSQL with the MCP server, the store and the collector on one machine: [`compose.yaml`](compose.yaml) ([Try it in Docker](docs/postgres.md#try-it-in-docker)).
 
 ## Documentation
 
