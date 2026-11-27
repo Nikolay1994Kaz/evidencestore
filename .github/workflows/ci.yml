@@ -1,4 +1,5 @@
-# Гейт — на каждый пуш и PR: тесты и установка в Docker (scripts/docker-check.sh).
+# Гейт — на каждый пуш и PR: тесты, установка в Docker (scripts/docker-check.sh)
+# и проба Postgres в Docker (scripts/docker-check-pg.sh).
 # На тег v* — ещё и релиз: бинарники, SHA256SUMS, образ в ghcr.io из тех же
 # бинарников, подтверждение происхождения бинарников и образа (проверяется
 # `gh attestation verify`) и страница релиза с заметками из
@@ -42,9 +43,19 @@ jobs:
           persist-credentials: false
       - run: scripts/docker-check.sh
 
+  # Проба Postgres в Docker (корневой compose.yaml): действие агента через MCP,
+  # откат esundo, отпечаток правки мимо сервера, отказы (docs/postgres.md).
+  docker-pg:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/docker-check-pg.sh
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, docker]
+    needs: [test, docker, docker-pg]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

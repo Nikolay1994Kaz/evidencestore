@@ -8,6 +8,8 @@ GitHub Actions runs the same gate on every push to master and every pull request
 go build ./... && go vet ./... && go test -race ./...
 scripts/release.sh dist               # release binaries and SHA256SUMS
 ES_BIN=/usr/local/bin scripts/demo.sh # the demo on installed binaries instead of a fresh build
+scripts/docker-check.sh               # the store and a collector in Docker, the try, through to VERIFIED
+scripts/docker-check-pg.sh            # the PostgreSQL trial in Docker: an agent's action, its undo, a fingerprint, refusals
 python3 scripts/mutate.py keyring     # mutation testing: every injected bug must fail a test
                                       # sets: keyring, evlog, tsa, store, edge, auditchain, gateway, config, ship, cosign,
                                       # and the rest in scripts/mutations/
