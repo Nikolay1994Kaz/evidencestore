@@ -528,6 +528,15 @@ type ReceiptTracker struct {
 	// genesis — шлюз → хэш начала его нынешней цепочки: копия этого начала —
 	// не новая цепочка, а повтор (LinkStale).
 	genesis map[string]string
+	// kid — шлюз → ключ его последней квитанции в цепочке; retired — шлюз →
+	// ключи, с которых он ушёл: ключ → seq первой квитанции под следующим.
+	// Смену ключа выводит цепочка, а не срок (P-388): прежний ключ перестаёт
+	// говорить за шлюз с первой принятой квитанцией под новым. Квитанции,
+	// подписанные им раньше, лежат в файле до неё и приходят раньше, сколько
+	// бы ни ехали; после неё под прежним ключом пишет только тот, у кого он
+	// остался. not_after — для отзыва (DECISIONS, п. 47).
+	kid     map[string]string
+	retired map[string]map[string]uint64
 }
 
 type receiptLink struct {
@@ -538,7 +547,8 @@ type receiptLink struct {
 // NewReceiptTracker — без ключей (nil) подписи не проверяются (SigNoKey).
 // Хранилище так не делает: у источника квитанций ключ обязателен.
 func NewReceiptTracker(keys *KeySet) *ReceiptTracker {
-	return &ReceiptTracker{keys: keys, last: map[string]receiptLink{}, genesis: map[string]string{}}
+	return &ReceiptTracker{keys: keys, last: map[string]receiptLink{}, genesis: map[string]string{},
+		kid: map[string]string{}, retired: map[string]map[string]uint64{}}
 }
 
 // Check проверяет очередную квитанцию и двигает состояние её цепочки.
@@ -556,15 +566,21 @@ func (t *ReceiptTracker) Check(line []byte, received time.Time) Verdict {
 	case t.keys.Len() == 0:
 		v.Signature = SigNoKey
 	default:
-		// Чужая подпись, ключ не из списка источника и ключ вне своего срока
-		// — одно и то же: за шлюз строка не говорит и в его цепочку не входит.
-		if err := t.keys.Verify(r, received); err == nil {
-			v.Signature = SigValid
-		} else {
+		// Чужая подпись, ключ не из списка источника, ключ вне своего срока и
+		// ключ, с которого шлюз ушёл, — одно и то же: за шлюз строка не
+		// говорит и в его цепочку не входит.
+		if err := t.keys.Verify(r, received); err != nil {
 			v.Signature = SigInvalid
 			if v.Problem == "" {
 				v.Problem = err.Error()
 			}
+		} else if at, gone := t.retired[r.Gateway][r.Kid]; gone {
+			v.Signature = SigInvalid
+			if v.Problem == "" {
+				v.Problem = fmt.Sprintf("the gateway moved on from key %s at its seq %d: a receipt under that key after it is written by whoever kept the key, not by the gateway", r.Kid, at)
+			}
+		} else {
+			v.Signature = SigValid
 		}
 	}
 	if r.Gateway == "" || r.Seq == 0 || r.Prev == "" {
@@ -584,6 +600,7 @@ func (t *ReceiptTracker) Check(line []byte, received time.Time) Verdict {
 			if r.Prev == Genesis {
 				t.genesis[r.Gateway] = r.Hash
 			}
+			t.moveKey(v)
 		}
 	}()
 	switch {
@@ -636,7 +653,25 @@ func (t *ReceiptTracker) Resume(v Verdict) {
 		if v.PrevHash == Genesis {
 			t.genesis[v.Writer] = v.Hash
 		}
+		t.moveKey(v)
 	}
+}
+
+// moveKey — квитанция с вердиктом v стала последней в цепочке шлюза: её ключ
+// — его нынешний, а прежний, если он другой, снят. Снятый ключ проверяется
+// только при ключах источника: без них (SigNoKey) подписи не проверяются
+// вовсе.
+func (t *ReceiptTracker) moveKey(v Verdict) {
+	if v.Kid == "" {
+		return
+	}
+	if old := t.kid[v.Writer]; old != "" && old != v.Kid {
+		if t.retired[v.Writer] == nil {
+			t.retired[v.Writer] = map[string]uint64{}
+		}
+		t.retired[v.Writer][old] = v.Seq
+	}
+	t.kid[v.Writer] = v.Kid
 }
 
 // MovesChain — квитанция с этим вердиктом стала последней в цепочке своего

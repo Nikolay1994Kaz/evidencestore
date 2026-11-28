@@ -226,6 +226,123 @@ func TestRevokedKeyIsRemovedFromTheCollector(t *testing.T) {
 	}
 }
 
+// Смену ключа выводит файл (P-388): оба ключа в списке сборщика, а после
+// первой квитанции шлюза под новым строки под прежним ничего не решают — ни
+// со следующим seq, ни со старым, ни после рестарта, ни в новом файле после
+// ротации, ни в обрезанном. Честные намерения до смены и под новым ключом —
+// решают, без ложных тревог.
+func TestKeyChangeRetiresThePreviousKey(t *testing.T) {
+	now := time.Now()
+	type rot struct {
+		g    *rig
+		path string
+		old  ed25519.PrivateKey
+		last gateway.Receipt
+	}
+	setup := func(t *testing.T) *rot {
+		g := newRig(t, "esmcp.jsonl")
+		r := &rot{g: g, path: g.cfg.Files[0]}
+		r.old = g.keys[r.path]
+		g.sign("esmcp.jsonl", intent("a-1", now, "751"))
+		pub, key, _ := ed25519.GenerateKey(rand.Reader)
+		g.cfg.GatewayKeys = append(g.cfg.GatewayKeys, hex.EncodeToString(pub))
+		g.keys[r.path] = key
+		g.open()
+		a := g.append("esmcp.jsonl", intent("a-2", now, "752"))
+		if !a.KeyChanged {
+			t.Fatal("the gateway did not say the key changed")
+		}
+		r.last = a.Receipt
+		for xid, id := range map[uint32]string{751: "a-1", 752: "a-2"} {
+			if in, ok, _ := g.r.Intent(xid, now, 0); !ok || in.ID != id {
+				t.Fatalf("xid %d: %+v %v", xid, in, ok)
+			}
+		}
+		if g.kinds() != "" {
+			t.Fatalf("alerts on an honest key change: %s", g.kinds())
+		}
+		return r
+	}
+	thief := func(t *testing.T, r *rot, after *gateway.Receipt, action, xid string) {
+		s, _ := gateway.NewSigner(r.old, "esmcp", nil)
+		if after != nil {
+			s.After(after.Seq, after.Hash)
+		}
+		line, err := s.Sign(intent(action, now, xid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, _ := os.OpenFile(r.path, os.O_APPEND|os.O_WRONLY, 0)
+		f.Write(append(line, '\n'))
+		f.Close()
+	}
+	refused := func(t *testing.T, r *rot, xid uint32) {
+		t.Helper()
+		if in, ok, _ := r.g.r.Intent(xid, now, 0); ok {
+			t.Fatalf("xid %d: an intent under the key the gateway moved on from decided the transaction: %+v", xid, in)
+		}
+		k := r.g.kinds()
+		if !strings.HasSuffix(k, alert.KindForgedReceipt) || !strings.Contains(r.g.alerts[len(r.g.alerts)-1].Signals[0].Detail, "moved on from") {
+			t.Fatalf("alerts %s %+v", k, r.g.alerts)
+		}
+	}
+
+	t.Run("next seq", func(t *testing.T) {
+		r := setup(t)
+		thief(t, r, &r.last, "a-x", "999")
+		refused(t, r, 999)
+		if a := r.g.append("esmcp.jsonl", intent("a-3", now, "753")); a.Receipt.Seq != r.last.Seq+1 {
+			t.Fatalf("the gateway's chain: %+v", a.Receipt)
+		}
+		if in, ok, _ := r.g.r.Intent(753, now, 0); !ok || in.ID != "a-3" {
+			t.Fatalf("the gateway after the forgery: %+v %v", in, ok)
+		}
+	})
+	t.Run("an old seq", func(t *testing.T) {
+		r := setup(t)
+		thief(t, r, nil, "a-x", "999")
+		refused(t, r, 999)
+	})
+	t.Run("after a restart", func(t *testing.T) {
+		r := setup(t)
+		r.g.open()
+		r.g.alerts = nil
+		thief(t, r, &r.last, "a-x", "999")
+		refused(t, r, 999)
+	})
+	t.Run("in the new file after a rotation", func(t *testing.T) {
+		r := setup(t)
+		if err := os.Rename(r.path, r.path+".1"); err != nil {
+			t.Fatal(err)
+		}
+		a := r.g.append("esmcp.jsonl", intent("a-3", now, "753"))
+		if in, ok, _ := r.g.r.Intent(753, now, 0); !ok || in.ID != "a-3" {
+			t.Fatalf("the new file: %+v %v", in, ok)
+		}
+		thief(t, r, &a.Receipt, "a-x", "999")
+		refused(t, r, 999)
+	})
+	t.Run("in a truncated file, after a restart", func(t *testing.T) {
+		// Снятый ключ — из receipts.json: в файле смены уже нет.
+		r := setup(t)
+		if err := os.Truncate(r.path, 0); err != nil {
+			t.Fatal(err)
+		}
+		r.g.open()
+		r.g.alerts = nil
+		thief(t, r, &r.last, "a-x", "999")
+		refused(t, r, 999)
+	})
+	t.Run("in a truncated file", func(t *testing.T) {
+		r := setup(t)
+		if err := os.Truncate(r.path, 0); err != nil {
+			t.Fatal(err)
+		}
+		thief(t, r, &r.last, "a-x", "999")
+		refused(t, r, 999)
+	})
+}
+
 // Исход действия — тревога по его причине; committed и failed — без тревоги,
 // отказ за частоту — только с alerted. Каждая — один раз.
 func TestOutcomesRaiseAlertsOnce(t *testing.T) {

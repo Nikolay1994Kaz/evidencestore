@@ -301,6 +301,24 @@
    "file": "internal/gateway/keys.go",
    "old": "\tk, ok := s.Lookup(r.Kid)\n\tif !ok {",
    "new": "\tk, ok := s.Lookup(r.Kid)\n\tif !ok && false {"
+  },
+  {
+   "name": "Q50 ключ, с которого шлюз ушёл, проходит",
+   "file": "internal/gateway/receipt.go",
+   "old": "} else if at, gone := t.retired[r.Gateway][r.Kid]; gone {",
+   "new": "} else if at, gone := t.retired[r.Gateway][r.Kid]; gone && false {"
+  },
+  {
+   "name": "Q51 смена ключа не снимает прежний",
+   "file": "internal/gateway/receipt.go",
+   "old": "\t\tt.retired[v.Writer][old] = v.Seq",
+   "new": "\t\t_ = v.Seq"
+  },
+  {
+   "name": "Q52 Resume не восстанавливает ключ шлюза",
+   "file": "internal/gateway/receipt.go",
+   "old": "\t\t\tt.genesis[v.Writer] = v.Hash\n\t\t}\n\t\tt.moveKey(v)",
+   "new": "\t\t\tt.genesis[v.Writer] = v.Hash\n\t\t}"
   }
  ]
 }

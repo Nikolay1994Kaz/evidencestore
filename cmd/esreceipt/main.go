@@ -267,7 +267,7 @@ func sign(key ed25519.PrivateKey, name, path, head string, in io.Reader, warn io
 			fmt.Fprintf(warn, "warning: the receipt was glued to bytes that someone wrote into %s without its lock: it is written once more on a line of its own\n", path)
 		}
 		if a.KeyChanged {
-			fmt.Fprintf(warn, "note: gateway %q signs with a new key (%s), and its chain goes on from seq %d: list the new key in gateway_keys of the store's source, and give the previous one a not_after\n", name, a.Receipt.Kid, a.Receipt.Seq)
+			fmt.Fprintf(warn, "note: gateway %q signs with a new key (%s), and its chain goes on from seq %d: the store's source and the collector must list the new key (gateway_keys); keep the previous one there, with no not_after — the chain retires it from this receipt on\n", name, a.Receipt.Kid, a.Receipt.Seq)
 		}
 		if a.Stale > 0 {
 			fmt.Fprintf(warn, "warning: %d lines of %s are copies of earlier receipts of gateway %q or a second branch of its chain: someone who can write the file wrote them, and the chain does not go on from them\n", a.Stale, path, name)

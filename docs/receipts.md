@@ -82,21 +82,26 @@ The collector's PostgreSQL input reads the same files (`postgres.receipts`: `fil
 
 ## Keys
 
-A source can list several gateway keys, each with the period in which it speaks for the gateway:
+A source can list several gateway keys, and a key can have a period in which it speaks for the gateway:
 
 ```json
 {"name": "shop-agent", "content_type": "receipt/v2", "subject_field": "action", "retention_months": 24,
  "gateway_keys": [
-   {"key": "<64 hex, the previous key>", "not_after": "2026-12-01T00:00:00Z"},
-   {"key": "<64 hex, the new key>", "not_before": "2026-11-30T00:00:00Z"}
+   "<64 hex, the key before the last change>",
+   "<64 hex, the key the gateway signs with now>",
+   {"key": "<64 hex, a key stolen on 1 December>", "not_after": "2026-12-01T09:30:00Z"}
  ]}
 ```
 
 An entry is 64 hex characters or `{"key", "not_before", "not_after"}`, the times in RFC 3339 and optional; a key speaks from `not_before` up to, not including, `not_after`. A receipt names its key in `kid`, and the store checks it with that key and compares the key's period with the time **the store received** the receipt. The `time` inside a receipt is written by whoever signs it, so the holder of a stolen key would write any.
 
-**Changing the key.** List the new key at the store's source (and in `gateway_keys` of a collector that reads the receipts for PostgreSQL) and restart them, then give the gateway the new key at the path of the old one, and then set `not_after` on the old key. The gateway's chain goes on: `esreceipt sign`, `esmcp` and `esundo` continue from the head they keep next to the key, and say that the key changed. A key at another path has another default head, so name the previous head with `-head` (`head` in the settings of `esmcp` and `esundo`), or the gateway starts a new chain and the store calls its first receipt broken. A receipt under a key the source does not list yet is taken in with the verdict `invalid`, and that verdict stays.
+**Changing the key.** List the new key at the store's source and in `gateway_keys` of a collector that reads the receipts for PostgreSQL, and restart them; then give the gateway the new key at the path of the old one. Keep the old key in both lists, with no `not_after`: the receipts it signed are still checked with it, however late they reach the store. The gateway's chain goes on: `esreceipt sign`, `esmcp` and `esundo` continue from the head they keep next to the key, and say that the key changed. The chain also retires the old key: from the gateway's first receipt under the new key that the store accepts, a receipt of that gateway under the old one gets the verdict `invalid` ("the gateway moved on from key …"), and the collector does not take its intents and raises `forged-receipt`. Receipts the old key signed before the change are in the file before that receipt and reach the store and the collector first. A gateway cannot go back to a key it moved on from: give it a new one.
 
-**Revoking a key.** `not_after` is the moment from which the key is not trusted. A receipt received from then on under it gets the verdict `invalid` with the reason, does not enter the gateway's chain and is not opened in bundles, like one signed with a stranger's key. Verdicts already in the chain keep what they said: moving `not_after` back does not judge again what the store has received. An auditor does that with a key list of their own (below).
+A key at another path has another default head, so name the previous head with `-head` (`head` in the settings of `esmcp` and `esundo`), or the gateway starts a new chain and the store calls its first receipt broken. A receipt under a key the source does not list yet is taken in with the verdict `invalid`, and that verdict stays.
+
+What the chain does not cover: the collector keeps the retired key in its state, and when it restarts and reads the file from the start, an honest intent under the old key written before the change decides nothing either, so a transaction of that time that it has not read yet goes as a fingerprint. And if someone who can write the file removes the gateway's first receipt under the new key before the store and the collector read it, they never learn of the change, and the old key stays in force (the gap raises `receipts-gap`): that is a stolen key, and it takes a revocation.
+
+**Revoking a key.** For a key that may be stolen, not for a routine change. `not_after` is the moment from which the key is not trusted. A receipt received from then on under it gets the verdict `invalid` with the reason, does not enter the gateway's chain and is not opened in bundles, like one signed with a stranger's key. That includes a receipt the gateway signed before `not_after` that reaches the store after it, and the next receipt of the gateway, linked to it, is then broken: the store cannot tell a late honest receipt from the thief's, and that is the price of a revocation. Verdicts already in the chain keep what they said: moving `not_after` back does not judge again what the store has received. An auditor does that with a key list of their own (below).
 
 Remove a revoked key from `gateway_keys` of a collector that reads the receipts for PostgreSQL as well, and restart it. The collector knows no periods: it takes an intent signed with any key on its list, so while the revoked key is there, its holder decides which transaction counts as an agent's action. Once the key is off the list, its intents decide nothing and every new line under it raises `forged-receipt`. That also holds for an honest intent under the key that the collector has not read yet: its transaction goes as a fingerprint, as one without an intent does.
 
@@ -132,7 +137,7 @@ Not proven:
 
 Limits to plan for:
 
-- **Keys and their periods are settings.** A new key and a revocation take a change of the source's settings and a restart of the store; verdicts already in the chain keep what they said. Nothing signed says that the gateway changed its key: the store's operator lists the keys, and the auditor brings their own list.
+- **Keys and their periods are settings.** A new key and a revocation take a change of the source's settings and a restart of the store; the chain retires the old key after a change, a revocation is a `not_after`, and verdicts already in the chain keep what they said. Nothing signed says that the gateway changed its key: the store's operator lists the keys, and the auditor brings their own list.
 - **One algorithm.** Receipts are signed with Ed25519. The header names the algorithm, so another one, such as ML-DSA (RFC 9964), is a new `alg` value and not a new format; it is not built.
 - **The bundle grows with the whole source**, not with the action, as every bundle over a window does ([Purchases](purchases.md)).
 - **A receipt is one record.** Anything bigger goes elsewhere, with its hash in `body`.
