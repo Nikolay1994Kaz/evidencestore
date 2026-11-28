@@ -154,12 +154,12 @@ type intents struct {
 	err       error
 }
 
-func (n *intents) intent(xid, xid8, _ string) error {
+func (n *intents) intent(xid, xid8, _, _ string) error {
 	n.xid, n.xid8 = append(n.xid, xid), append(n.xid8, xid8)
 	return n.err
 }
 
-func okIntent(string, string, string) error { return nil }
+func okIntent(string, string, string, string) error { return nil }
 
 func TestBuildFromManyPartsAndAResentCopy(t *testing.T) {
 	lines := []m{rel(1, "t")}
@@ -285,7 +285,7 @@ func TestCheckAndApply(t *testing.T) {
 	db.log = nil
 	var in intents
 	var atIntent int // сколько запросов база получила к намерению
-	done, err := p.Apply(db, func(xid, xid8, _ string) error { atIntent = len(db.log); return in.intent(xid, xid8, "") })
+	done, err := p.Apply(db, func(xid, xid8, _, _ string) error { atIntent = len(db.log); return in.intent(xid, xid8, "", "") })
 	if err != nil || done.XID != "900" || done.Steps != 2 || done.Order != OrderJournal || done.Differ != nil {
 		t.Fatal(done, err)
 	}
@@ -301,7 +301,7 @@ func TestCheckAndApply(t *testing.T) {
 		t.Fatalf("%q", db.log)
 	}
 	db.log = db.log[1:]
-	if len(db.log) != 7 || db.log[0] != "BEGIN" || db.log[1] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, "+StartedSQL ||
+	if len(db.log) != 7 || db.log[0] != "BEGIN" || db.log[1] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, "+StartedSQL+", "+TimelineSQL ||
 		!strings.HasPrefix(db.log[2], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[3], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
 		!strings.Contains(db.log[3], `WHERE t."id" = w.n0 AND t."id"::text IS NOT DISTINCT FROM w.n0::text AND t."v"::text IS NOT DISTINCT FROM w.n1::text`) ||
 		!strings.Contains(db.log[4], `LEFT JOIN "public"."t" t ON t."id" = w.o0`) || !strings.Contains(db.log[5], `NOT (t."v"::text IS NOT DISTINCT FROM w.o1::text)`) || db.log[6] != "COMMIT" {

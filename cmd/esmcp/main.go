@@ -46,6 +46,13 @@ type Config struct {
 	// DSN — подключение ролью сервера: "host=db user=esmcp_bot dbname=shop
 	// sslmode=verify-full". Пароль — здесь или в PGPASSWORD.
 	DSN string `json:"dsn"`
+	// Pooler — dsn ведёт к пулеру соединений (PgBouncer; пул по сессиям или
+	// по транзакциям), а не прямо к базе. Сервер тогда не шлёт параметров
+	// входа, которых пулер не пропускает, а ставит их и чистит соединение
+	// базы сам, внутри каждой своей транзакции. Без него через пулер сервер
+	// не входит («unsupported startup parameter»). Раздел undo с ним не
+	// задаётся: откат — командой esundo по прямому соединению с базой.
+	Pooler bool `json:"pooler"`
 	// Agent — имя агента в квитанциях.
 	Agent string `json:"agent"`
 	// Receipts — файл квитанций шлюза (receipt/v2); его читает escollect:
@@ -159,6 +166,10 @@ func loadConfig(path string) (*Config, error) {
 			errs = append(errs, fmt.Errorf("%s is negative", name))
 		}
 	}
+	if c.Undo != nil && c.Pooler {
+		errs = append(errs, errors.New("undo: the undo tools keep session settings between transactions, and a pooler gives no session: "+
+			"leave `undo` out with `pooler`, and undo with esundo over a direct connection to the database"))
+	}
 	if c.Undo != nil {
 		if err := c.Undo.Validate(filepath.Dir(path)); err != nil {
 			errs = append(errs, fmt.Errorf("undo: %w", err))
@@ -192,6 +203,7 @@ func main() {
 	if dsn.AppName == "" {
 		dsn.AppName = "esmcp/" + cfg.Agent
 	}
+	dsn.Pooler = cfg.Pooler
 	fail(os.MkdirAll(filepath.Dir(cfg.Receipts), 0o700))
 	if cfg.Head != "" {
 		fail(gateway.CheckHead(cfg.Head, cfg.Receipts))
@@ -200,6 +212,7 @@ func main() {
 	mc := mcpserver.Config{
 		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, ActionsPerMinute: cfg.ActionsPerMinute,
 		WindowRows: cfg.WindowRows, Window: cfg.Window.D(), StatementTimeout: cfg.StatementTimeout.D(), LockTimeout: cfg.LockTimeout.D(),
+		Pooler: cfg.Pooler, AppName: dsn.AppName,
 		ReceiptsPath: cfg.Receipts, HeadPath: cfg.Head, Key: key, Gateway: cfg.Gateway, PGSource: cfg.PGSource, Version: version.String("esmcp"),
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dsn

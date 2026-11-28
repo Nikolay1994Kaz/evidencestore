@@ -94,10 +94,10 @@ func TestUndoIntentIsASignedReceipt(t *testing.T) {
 	cfg := &Config{Receipts: filepath.Join(dir, "undo-receipts.jsonl"), Gateway: "esundo", PGSource: "shop"}
 	p := &pgundo.Plan{XID: 751, Action: &pgtap.Intent{ID: "a-1", Gateway: "esmcp"}, OK: []int{1, 2}}
 	intent := undoIntent(cfg, key, p, "undo-751-x", "nikolay", "wrong rows")
-	if err := intent("900", "4294968196", "1795400000000000"); err != nil {
+	if err := intent("900", "4294968196", "1795400000000000", "3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := intent("901", "4294968197", "1795400000000000"); err != nil {
+	if err := intent("901", "4294968197", "1795400000000000", "3"); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(cfg.Receipts)

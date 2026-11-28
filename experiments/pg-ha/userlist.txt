@@ -1,0 +1,4 @@
+"postgres" "stand"
+"esmcp_bot" "stand"
+"undo_op" "stand"
+"agent_bot" "stand"

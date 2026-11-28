@@ -1,0 +1,30 @@
+# Настройки Patroni стенда: общие для обоих узлов, имя и адреса — из окружения
+# (compose.yaml). Постоянный слот сборщика здесь НЕ объявлен: сценарий сначала
+# показывает, что без него делает Patroni, и объявляет его сам
+# (patronictl edit-config).
+scope: es
+bootstrap:
+  dcs:
+    ttl: 20
+    loop_wait: 3
+    retry_timeout: 5
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: logical
+        hot_standby_feedback: "on"
+        max_slot_wal_keep_size: 2GB
+        max_wal_senders: 10
+        max_replication_slots: 10
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+postgresql:
+  bin_dir: /usr/lib/postgresql/17/bin
+  data_dir: /var/lib/postgresql/patroni
+  pg_hba:
+    - local all all trust
+    - host replication replicator all scram-sha-256
+    - host all all all scram-sha-256

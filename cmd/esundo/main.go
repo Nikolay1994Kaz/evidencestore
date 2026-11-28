@@ -339,9 +339,9 @@ func undoIntent(cfg *Config, key ed25519.PrivateKey, p *pgundo.Plan, action, by,
 	if p.Action != nil {
 		undoes = p.Action.ID
 	}
-	return func(xid, xid8, started string) error {
+	return func(xid, xid8, started, timeline string) error {
 		body, err := json.Marshal(map[string]any{"agent": by, "tool": "esundo", "reason": reason, "undoes": undoes,
-			"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "xid8": xid8, "db_started": started, "steps": len(p.OK)})
+			"undoes_xid": strconv.FormatUint(uint64(p.XID), 10), "xid8": xid8, "db_started": started, "db_timeline": timeline, "steps": len(p.OK)})
 		if err != nil {
 			return err
 		}

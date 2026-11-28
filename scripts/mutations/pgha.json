@@ -1,0 +1,142 @@
+{
+ "packages": [
+  "./internal/pginput/",
+  "./internal/mcpserver/",
+  "./internal/pgwire/"
+ ],
+ "run": "^Test(ParseTimelineHistory|IntentDecidesOnly|VoidSpares|VoidWithoutATimeline|VoidOnTheSameTimeline|SwitchoverVoids|Pooler|DirectConnection|IntentCarries|StartupParameters)",
+ "mutations": [
+  {
+   "name": "H1 намерение решает транзакцию чужой линии времени",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif tl := r.timelineOf(final); at.timeline != 0 && final != 0 && tl != 0 && tl != at.timeline {",
+   "new": "\tif tl := r.timelineOf(final); false && at.timeline != 0 && final != 0 && tl != 0 && tl != at.timeline {"
+  },
+  {
+   "name": "H2 место на стыке линий — ещё прежняя линия",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif final < s.end {",
+   "new": "\t\tif final <= s.end {"
+  },
+  {
+   "name": "H3 граница по запуску щадит и линию, на которой база ушла назад",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif timeline != 0 && r.voidTimeline != 0 && timeline > r.voidTimeline {",
+   "new": "\tif timeline != 0 && r.voidTimeline != 0 && timeline >= r.voidTimeline {"
+  },
+  {
+   "name": "H4 без линии в границе отметка линии снимает правило запуска",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif timeline != 0 && r.voidTimeline != 0 && timeline > r.voidTimeline {",
+   "new": "\tif timeline != 0 && timeline > r.voidTimeline {"
+  },
+  {
+   "name": "H5 void не запоминает линию",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tr.voidTimeline = max(r.voidTimeline, v.timeline)\n",
+   "new": "\tr.voidTimeline = max(r.voidTimeline, 0)\n"
+  },
+  {
+   "name": "H6 линия границы не переживает перезапуск",
+   "file": "internal/pginput/receipts.go",
+   "old": "VoidStartedBefore: r.voidStartedBefore, VoidTimeline: r.voidTimeline}",
+   "new": "VoidStartedBefore: r.voidStartedBefore}"
+  },
+  {
+   "name": "H7 переключение не запоминает время у шлюза",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\t\tc.SwitchTime = c.last.UTC().Format(time.RFC3339Nano)\n",
+   "new": "\t\t\tc.SwitchTime = \"\"\n"
+  },
+  {
+   "name": "H8 переключение не снимает прочитанные намерения без линии",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif at.timeline == 0 {\n\t\t\tdelete(r.byXID, xid)\n",
+   "new": "\t\tif at.timeline == 0 && false {\n\t\t\tdelete(r.byXID, xid)\n"
+  },
+  {
+   "name": "H9 переключение снимает намерения без линии, дописанные после",
+   "file": "internal/pginput/receipts.go",
+   "old": "timeline == 0 && err == nil && !gw.After(t) {",
+   "new": "timeline == 0 && err == nil && gw.After(t) {"
+  },
+  {
+   "name": "H10 переключение снимает и намерения с линией",
+   "file": "internal/pginput/receipts.go",
+   "old": "; timeline == 0 && err == nil && !gw.After(t) {",
+   "new": "; err == nil && !gw.After(t) {"
+  },
+  {
+   "name": "H11 история линий не по порядку принята",
+   "file": "internal/pginput/pginput.go",
+   "old": "\t\tif n := len(out); n > 0 && (uint32(tl) <= out[n-1].timeline || uint64(end) < out[n-1].end) {",
+   "new": "\t\tif n := len(out); false && n > 0 && (uint32(tl) <= out[n-1].timeline || uint64(end) < out[n-1].end) {"
+  },
+  {
+   "name": "H12 через пулер соединение не чистится",
+   "file": "internal/mcpserver/session.go",
+   "old": "\tout := slices.Clone(pooledReset)\n",
+   "new": "\tout := slices.Clone(pooledReset)[:0]\n"
+  },
+  {
+   "name": "H13 через пулер вид текста значений не ставится",
+   "file": "internal/mcpserver/session.go",
+   "old": "\t\tout = append(out, \"SET LOCAL \"+kv[0]+\" = \"+pgwire.Literal(kv[1]))\n",
+   "new": "\t\t_ = kv\n"
+  },
+  {
+   "name": "H14 через пулер таймаут — не тот",
+   "file": "internal/mcpserver/session.go",
+   "old": "\" WHEN 'statement_timeout' THEN \"+pgwire.Literal(p[\"statement_timeout\"])+",
+   "new": "\" WHEN 'statement_timeout' THEN \"+pgwire.Literal(p[\"lock_timeout\"])+"
+  },
+  {
+   "name": "H15 через пулер таймауты «как при входе»",
+   "file": "internal/mcpserver/session.go",
+   "old": "\tout = append(out, own[:len(own)-1]...)\n",
+   "new": "\tout = append(out, own...)\n"
+  },
+  {
+   "name": "H16 через пулер соединение в транзакции идёт дальше",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\t\tif s.db.TxStatus() == pgwire.TxIdle {\n\t\t\treturn nil\n",
+   "new": "\t\tif true {\n\t\t\treturn nil\n"
+  },
+  {
+   "name": "H17 через пулер DISCARD ALL вне транзакции",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\tif s.cfg.Pooler {\n\t\tif s.db.TxStatus() == pgwire.TxIdle {",
+   "new": "\tif false {\n\t\tif s.db.TxStatus() == pgwire.TxIdle {"
+  },
+  {
+   "name": "H18 через пулер идут параметры входа",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\tif s.cfg.Pooler {\n\t\treturn nil\n\t}\n\treturn s.loginParams()\n",
+   "new": "\tif false {\n\t\treturn nil\n\t}\n\treturn s.loginParams()\n"
+  },
+  {
+   "name": "H19 линия времени не попадает в намерение",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\t\t\trc.DBTimeline = *row[len(row)-1]\n",
+   "new": "\t\t\t_ = row\n"
+  },
+  {
+   "name": "H20 счёт строк принят за линию времени",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "len(row) > 3 && row[len(row)-1] != nil && (!counting || len(row) > 4) {",
+   "new": "len(row) > 2 && row[len(row)-1] != nil {"
+  },
+  {
+   "name": "H21 pgwire шлёт пулеру параметры входа",
+   "file": "internal/pgwire/pgwire.go",
+   "old": "\tif !cfg.Pooler {\n\t\tfor _, kv := range TextParams {",
+   "new": "\tif true {\n\t\tfor _, kv := range TextParams {"
+  },
+  {
+   "name": "H22 прямое соединение без вида текста значений",
+   "file": "internal/pgwire/pgwire.go",
+   "old": "\t\tfor _, kv := range TextParams {\n\t\t\tadd(kv[0], kv[1])\n\t\t}\n",
+   "new": "\t\tfor _, kv := range TextParams {\n\t\t\t_ = kv\n\t\t}\n"
+  }
+ ]
+}

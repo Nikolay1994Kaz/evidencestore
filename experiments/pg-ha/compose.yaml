@@ -1,0 +1,72 @@
+# Стенд «кластер клиента»: два узла PostgreSQL под Patroni, etcd, HAProxy
+# (адрес основной базы) и два PgBouncer (по сессиям и по транзакциям).
+# Ничего из этого не часть evidencestore: это среда, в которой проверяются
+# esmcp и сборщик (README.md этого каталога). Порты — только на 127.0.0.1.
+name: es-pgha
+
+x-node: &node
+  image: es-pgha:${PG_VERSION:-17}
+  build: .
+  user: postgres
+  command: ["patroni", "/etc/patroni.yml"]
+  depends_on: [etcd]
+  stop_grace_period: 20s
+
+x-node-env: &node-env
+  PATRONI_ETCD3_HOSTS: etcd:2379
+  PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+  PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+  PATRONI_SUPERUSER_USERNAME: postgres
+  PATRONI_SUPERUSER_PASSWORD: ${PGHA_PASSWORD:-stand}
+  PATRONI_REPLICATION_USERNAME: replicator
+  PATRONI_REPLICATION_PASSWORD: ${PGHA_PASSWORD:-stand}
+
+services:
+  etcd:
+    image: es-pgha:${PG_VERSION:-17}
+    build: .
+    command: ["etcd", "--name", "e1", "--data-dir", "/tmp/etcd",
+              "--listen-client-urls", "http://0.0.0.0:2379", "--advertise-client-urls", "http://etcd:2379"]
+
+  pg1:
+    <<: *node
+    hostname: pg1
+    environment:
+      <<: *node-env
+      PATRONI_NAME: pg1
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg1:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg1:5432
+    volumes: ["./patroni.yml:/etc/patroni.yml:ro"]
+
+  pg2:
+    <<: *node
+    hostname: pg2
+    environment:
+      <<: *node-env
+      PATRONI_NAME: pg2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg2:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg2:5432
+    volumes: ["./patroni.yml:/etc/patroni.yml:ro"]
+
+  haproxy:
+    image: es-pgha:${PG_VERSION:-17}
+    command: ["haproxy", "-f", "/etc/haproxy.cfg", "-db"]
+    depends_on: [pg1, pg2]
+    ports: ["127.0.0.1:${PGHA_PORT:-55000}:5000"]
+    volumes: ["./haproxy.cfg:/etc/haproxy.cfg:ro"]
+
+  pgb-session:
+    image: es-pgha:${PG_VERSION:-17}
+    user: postgres
+    entrypoint: ["sh", "-c", "sed s/POOL_MODE/session/ /cfg/pgbouncer.ini >/tmp/pgbouncer.ini && exec pgbouncer /tmp/pgbouncer.ini"]
+    depends_on: [haproxy]
+    ports: ["127.0.0.1:${PGHA_SESSION_PORT:-56432}:6432"]
+    volumes: ["./pgbouncer.ini:/cfg/pgbouncer.ini:ro", "${PGHA_USERLIST:-./userlist.txt}:/etc/pgbouncer/userlist.txt:ro"]
+
+  pgb-tx:
+    image: es-pgha:${PG_VERSION:-17}
+    user: postgres
+    entrypoint: ["sh", "-c", "sed s/POOL_MODE/transaction/ /cfg/pgbouncer.ini >/tmp/pgbouncer.ini && exec pgbouncer /tmp/pgbouncer.ini"]
+    depends_on: [haproxy]
+    ports: ["127.0.0.1:${PGHA_TX_PORT:-56433}:6432"]
+    volumes: ["./pgbouncer.ini:/cfg/pgbouncer.ini:ro", "${PGHA_USERLIST:-./userlist.txt}:/etc/pgbouncer/userlist.txt:ro"]

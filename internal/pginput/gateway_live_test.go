@@ -101,10 +101,10 @@ func (g *liveGateway) outcome(id, body string) {
 
 // undo — намерение отката транзакции undoes, как его пишет esundo.
 func (g *liveGateway) undo(undoes uint32) pgundo.IntentFunc {
-	return func(xid, xid8, started string) error {
+	return func(xid, xid8, started, timeline string) error {
 		g.n++
 		_, err := gateway.Append(g.path, g.key, g.name, gateway.Draft{Action: fmt.Sprintf("undo-%d-%d", undoes, g.n), Step: alert.StepUndo,
-			Refs: []gateway.Ref{{Source: "postgres", Subject: xid}}, Body: json.RawMessage(fmt.Sprintf(`{"agent":"test","tool":"esundo","undoes_xid":"%d","xid8":%q,"db_started":%q}`, undoes, xid8, started))})
+			Refs: []gateway.Ref{{Source: "postgres", Subject: xid}}, Body: json.RawMessage(fmt.Sprintf(`{"agent":"test","tool":"esundo","undoes_xid":"%d","xid8":%q,"db_started":%q,"db_timeline":%q}`, undoes, xid8, started, timeline))})
 		return err
 	}
 }

@@ -113,6 +113,14 @@ type Config struct {
 	// (pgwire.Config.Params) — их задаёт сервер (sessionParams), и Dial обязан
 	// их передать. Зовётся при первом запросе и заново после обрыва.
 	Dial func(params map[string]string) (DB, error)
+	// Pooler — Dial ведёт к пулеру соединений (PgBouncer, по сессиям или по
+	// транзакциям), а не к базе: параметров входа нет (params — nil), сеанс
+	// чистит и настраивает сама транзакция (ownSettings). Инструментов отката
+	// в этом режиме нет: сверка и откат держат настройки сеанса между
+	// транзакциями (pgundo). AppName — имя программы для pg_stat_activity,
+	// которое при прямом соединении ставит Dial.
+	Pooler  bool
+	AppName string
 	// ReceiptsPath — файл квитанций шлюза (receipt/v2, DECISIONS, п. 42–43, 47):
 	// на каждое действие — намерение с xid транзакции до её COMMIT и исход
 	// после, подписанные ключом Key (gateway.Append: flock, fsync). По
@@ -164,6 +172,11 @@ type Receipt struct {
 	// отличает намерение из истории базы до подъёма из копии от намерения
 	// после, в часах самой базы, а не шлюза (R2-1, R2-2 третьего захода).
 	DBStarted string `json:"db_started,omitempty"`
+	// DBTimeline — линия времени, на которой база писала журнал в транзакции
+	// действия (pgundo.TimelineSQL): после переключения кластера на реплику
+	// сборщик отличает по ней намерение новой основной от намерения прежней —
+	// запуск у реплики старый.
+	DBTimeline string `json:"db_timeline,omitempty"`
 	// Outcome — committed, failed, refused (остановлено пределом), escaped
 	// (SQL агента сам закрыл транзакцию сервера: что он изменил после этого,
 	// могло зафиксироваться мимо пределов) или unknown (связь оборвалась на
@@ -775,8 +788,8 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	})
 	// Откат — тоже действие: его намерение несёт и номер действия, и что он
 	// возвращает, и транзакцию отката — до её изменений.
-	applied, err := plan.Apply(s.db, func(xid, xid8, started string) error {
-		rc.XID, rc.FullXID, rc.DBStarted = xid, xid8, started
+	applied, err := plan.Apply(s.db, func(xid, xid8, started, timeline string) error {
+		rc.XID, rc.FullXID, rc.DBStarted, rc.DBTimeline = xid, xid8, started, timeline
 		return s.intent(&rc, alert.StepUndo)
 	})
 	var lim *undoLimit
@@ -855,9 +868,22 @@ func (s *Server) pipe(sqls []string) ([]pgwire.Result, error) {
 // рекомендательные замки, временные таблицы, подготовленные команды. Не
 // вышло (сеанс, например, внутри транзакции) — соединение бросается и
 // открывается новое: новый сеанс чист сам.
+//
+// Через пулер (Config.Pooler) DISCARD ALL вне транзакции ушёл бы на
+// соединение базы, которое пулер следующей транзакции может и не дать:
+// чистит его сама транзакция (pooledReset). Заодно DISCARD ALL ловил сеанс,
+// оставшийся внутри транзакции; здесь это видно по её состоянию в последнем
+// ответе базы — такое соединение бросается так же.
 func (s *Server) fresh() error {
 	if err := s.connect(); err != nil {
 		return err
+	}
+	if s.cfg.Pooler {
+		if s.db.TxStatus() == pgwire.TxIdle {
+			return nil
+		}
+		s.drop()
+		return s.connect()
 	}
 	if _, err := s.run("DISCARD ALL"); err == nil {
 		return nil
@@ -927,11 +953,11 @@ func (s *Server) query(sql string) (string, error) {
 	if _, err := s.run("BEGIN TRANSACTION READ ONLY"); err != nil {
 		return "", err
 	}
-	if _, err := s.run(strings.Join(append(slices.Clone(own), s.guards()...), "; ")); err != nil {
+	if _, err := s.run(strings.Join(append(slices.Clone(s.ownSettings()), s.guards()...), "; ")); err != nil {
 		s.run("ROLLBACK")
 		return "", err
 	}
-	b := newBatch([]string{sql}, false, s.guards())
+	b := newBatch([]string{sql}, false, s.ownSettings(), s.guards())
 	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(b.sqls) })
 	res := b.agent(all)
 	if s.db != nil && s.leftReadOnly(res) {
@@ -1067,7 +1093,7 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	}
 	// Свои настройки — раньше своих запросов: сеанс после DISCARD ALL несёт
 	// умолчания роли, а их мог сменить и не сервер (P-242).
-	if _, err := s.run(strings.Join(append(slices.Clone(own), s.guards()...), "; ")); err != nil {
+	if _, err := s.run(strings.Join(append(slices.Clone(s.ownSettings()), s.guards()...), "; ")); err != nil {
 		return fail(err)
 	}
 	// Номер транзакции, а при пределах строк — и счёт строк до SQL агента
@@ -1079,6 +1105,8 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 	if counting {
 		ask += ", " + xactRows
 	}
+	// Линия времени — последней колонкой: место счёта строк (countIn) прежнее.
+	ask += ", " + pgundo.TimelineSQL
 	res, err := s.run(ask)
 	if err != nil {
 		if counting {
@@ -1090,6 +1118,9 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 		rc.XID, rc.FullXID = *res[0].Rows[0][0], *res[0].Rows[0][1]
 		if v := res[0].Rows[0][2]; v != nil {
 			rc.DBStarted = *v
+		}
+		if row := res[0].Rows[0]; len(row) > 3 && row[len(row)-1] != nil && (!counting || len(row) > 4) {
+			rc.DBTimeline = *row[len(row)-1]
 		}
 	}
 	// Намерение — до SQL агента и тем более до COMMIT: по нему сборщик
@@ -1104,7 +1135,7 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 			return fail(fmt.Errorf("the rows the action changes could not be counted, so the row limits cannot be checked: %w", err))
 		}
 	}
-	b := newBatch(stmts, true, s.guards())
+	b := newBatch(stmts, true, s.ownSettings(), s.guards())
 	all, err := s.timed(func() ([]pgwire.Result, error) { return s.pipe(b.sqls) })
 	for _, r := range b.agent(all) {
 		rc.Tags = append(rc.Tags, r.Tag)
