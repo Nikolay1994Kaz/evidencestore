@@ -71,10 +71,14 @@ func mustAppendHead(t *testing.T, path, head string, key ed25519.PrivateKey, act
 // каждого seq.
 func chainOf(t *testing.T, path string, pub ed25519.PublicKey) map[uint64]int {
 	t.Helper()
-	tr := NewReceiptTracker(pub)
+	keys, err := NewKeySet(Key{Pub: pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := NewReceiptTracker(keys)
 	clean := map[uint64]int{}
 	for _, l := range receiptLines(t, path) {
-		if v := tr.Check(l); v.Clean() {
+		if v := tr.Check(l, noTime); v.Clean() {
 			clean[v.Seq]++
 		}
 	}
@@ -202,7 +206,6 @@ func TestAppendAfterTruncateAndClaim(t *testing.T) {
 // «receipts after seq N may be lost» на каждой ротации.
 func TestAppendAfterRotation(t *testing.T) {
 	key := receiptKey(t, 51)
-	pub := key.Public().(ed25519.PublicKey)
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
 	head := headOf(t, path)
 	mustAppendHead(t, path, head, key, "a-1")
@@ -214,10 +217,10 @@ func TestAppendAfterRotation(t *testing.T) {
 	if a.Receipt.Seq != 3 || a.Receipt.Prev != last.Receipt.Hash {
 		t.Fatalf("after a rotation: seq %d, prev %s", a.Receipt.Seq, a.Receipt.Prev)
 	}
-	tr := NewReceiptTracker(pub)
+	tr := NewReceiptTracker(keySet(t, key))
 	for _, f := range []string{path + ".1", path} {
 		for _, l := range receiptLines(t, f) {
-			if v := tr.Check(l); !v.Clean() {
+			if v := tr.Check(l, noTime); !v.Clean() {
 				t.Fatalf("%s: %+v", f, v)
 			}
 		}
@@ -362,5 +365,70 @@ func TestReadLinesStepsOverAHole(t *testing.T) {
 	}
 	if took > time.Second {
 		t.Fatalf("the hole was read: %v", took)
+	}
+}
+
+// Шлюз сменил ключ: цепочка идёт дальше от головы, которую вёл прежний ключ,
+// а не начинается заново. Новая цепочка после принятых у хранилища — поломка,
+// и квитанция с поломкой в пакете не открывается: смена ключа стоила бы
+// действия, с которого началась.
+func TestAppendAfterKeyChange(t *testing.T) {
+	old, fresh := receiptKey(t, 61), receiptKey(t, 62)
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	head := headOf(t, path)
+	mustAppendHead(t, path, head, old, "a-1")
+	last := mustAppendHead(t, path, head, old, "a-2")
+	if last.KeyChanged {
+		t.Fatal("a key change is reported under one key")
+	}
+	saved, err := os.ReadFile(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := mustAppendHead(t, path, head, fresh, "a-3")
+	if a.Receipt.Seq != 3 || a.Receipt.Prev != last.Receipt.Hash || !a.KeyChanged || a.Receipt.Kid != KeyID(pubOf(fresh)) {
+		t.Fatalf("the first receipt under the new key: seq %d, prev %s, key changed %v", a.Receipt.Seq, a.Receipt.Prev, a.KeyChanged)
+	}
+	// Шлюз упал между квитанцией и головой: голова — ещё прежнего ключа, а
+	// квитанция нового уже в файле. Вторая под новым ключом идёт от неё.
+	if err := os.WriteFile(head, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := mustAppendHead(t, path, head, fresh, "a-4")
+	if b.Receipt.Seq != 4 || b.Receipt.Prev != a.Receipt.Hash || b.KeyChanged {
+		t.Fatalf("after a crash between the receipt and the head: seq %d, prev %s, key changed %v", b.Receipt.Seq, b.Receipt.Prev, b.KeyChanged)
+	}
+	if c := mustAppendHead(t, path, head, fresh, "a-5"); c.Receipt.Seq != 5 || c.KeyChanged || c.Skipped != 0 || c.Claimed != 0 {
+		t.Fatalf("the next receipt: %+v", c)
+	}
+
+	// Хранилище знает оба ключа: цепочка цела, без единой поломки.
+	both := NewReceiptTracker(keySet(t, old, fresh))
+	for i, l := range receiptLines(t, path) {
+		want := LinkOK
+		if i == 0 {
+			want = LinkGenesis
+		}
+		if v := both.Check(l, noTime); !v.Clean() || v.Link != want {
+			t.Fatalf("receipt %d: %+v", i+1, v)
+		}
+	}
+	// Нового ключа в списке источника нет: его квитанции — не шлюза.
+	only := NewReceiptTracker(keySet(t, old))
+	for i, l := range receiptLines(t, path) {
+		if v := only.Check(l, noTime); (v.Signature == SigValid) != (i < 2) {
+			t.Fatalf("receipt %d with the new key not listed: %+v", i+1, v)
+		}
+	}
+
+	// Голова другого шлюза или другого файла под новый ключ не годится: своя
+	// цепочка, с начала.
+	other := filepath.Join(t.TempDir(), "other.jsonl")
+	if err := os.WriteFile(head, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if a := mustAppendHead(t, other, head, fresh, "b-1"); a.Receipt.Seq != 1 || a.KeyChanged {
+		t.Fatalf("a head of another receipts file was taken: seq %d", a.Receipt.Seq)
 	}
 }

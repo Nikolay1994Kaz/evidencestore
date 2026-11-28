@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -157,14 +160,14 @@ func TestSignRefuses(t *testing.T) {
 	// Порванная последняя строка (писавший умер посреди неё): она закрыта
 	// переводом строки и осталась поломанной строкой, цепочка — от квитанции
 	// до неё.
-	os.WriteFile(file, append(data, []byte(`{"v":1,"gateway":"gw"`)...), 0o640)
+	os.WriteFile(file, append(data, []byte(`{"v":2,"gateway":"gw"`)...), 0o640)
 	if code, _, errOut := call(t, `{"action":"p-1","step":"cart"}`, "sign", "-key", key, "-gateway", "gw", "-file", file); code != exitOK || !strings.Contains(errOut, "torn") {
 		t.Fatalf("after a torn line: %d %s", code, errOut)
 	}
 	if code, out, _ := call(t, "", "verify", "-gateway-key", keyPub, "-file", file); code != exitInvalid || !strings.Contains(out, "6 receipts of 2 gateways, 3 not intact") || !strings.Contains(out, "line 5:") {
 		t.Fatalf("verify after a torn line: %d\n%s", code, out)
 	}
-	if after, _ := os.ReadFile(file); !bytes.HasPrefix(after, data) || !bytes.Contains(after, []byte(`{"v":1,"gateway":"gw"`+"\n")) {
+	if after, _ := os.ReadFile(file); !bytes.HasPrefix(after, data) || !bytes.Contains(after, []byte(`{"v":2,"gateway":"gw"`+"\n")) {
 		t.Fatalf("the file after a torn line:\n%s", after[len(data):])
 	}
 
@@ -236,5 +239,98 @@ func TestSignRefusesAHeadInTheReceiptsDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(file); err == nil {
 		t.Fatal("a receipt was written")
+	}
+}
+
+// Ключ шлюза как JWK и квитанции обычным компактным JWS: всё, что нужно
+// чужой библиотеке JOSE, чтобы проверить подпись без этого кода.
+func TestReceiptsForAJOSELibrary(t *testing.T) {
+	dir := t.TempDir()
+	key, pub := newKey(t, t.TempDir(), "gw.key")
+	raw, _ := gateway.ParseKey(pub)
+	code, out, errOut := call(t, "", "pubkey", "-key", key, "-jwk")
+	var jwk struct{ Kty, Crv, X, Kid string }
+	if err := json.Unmarshal([]byte(out), &jwk); code != exitOK || err != nil || jwk.Kty != "OKP" || jwk.Crv != "Ed25519" ||
+		jwk.X != base64.RawURLEncoding.EncodeToString(raw) || jwk.Kid != gateway.KeyID(raw) {
+		t.Fatalf("pubkey -jwk: %d %q %s %v", code, out, errOut, err)
+	}
+
+	file := filepath.Join(dir, "receipts.jsonl")
+	steps := `{"action":"p-1","step":"mandate","body":{"customer":"c-1"}}` + "\n" + `{"action":"p-1","step":"cart"}` + "\n"
+	if code, _, errOut := call(t, steps, "sign", "-key", key, "-gateway", "shop-gw", "-file", file); code != exitOK {
+		t.Fatalf("sign: %d %s", code, errOut)
+	}
+	data, _ := os.ReadFile(file)
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	code, out, errOut = call(t, "", "jws", "-file", file)
+	tokens := strings.Fields(out)
+	if code != exitOK || len(tokens) != 2 {
+		t.Fatalf("jws: %d, %d tokens, %s", code, len(tokens), errOut)
+	}
+	for i, tok := range tokens {
+		parts := strings.Split(tok, ".")
+		if len(parts) != 3 {
+			t.Fatalf("token %d has %d parts", i+1, len(parts))
+		}
+		// Как проверяет библиотека: заголовок, тело и подпись — из токена, ключ —
+		// из JWK по kid заголовка.
+		var hdr struct{ Alg, Kid, Typ string }
+		h, _ := base64.RawURLEncoding.DecodeString(parts[0])
+		if err := json.Unmarshal(h, &hdr); err != nil || hdr.Alg != "Ed25519" || hdr.Kid != jwk.Kid || hdr.Typ != gateway.ReceiptType {
+			t.Fatalf("token %d header %s", i+1, h)
+		}
+		sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+		if !ed25519.Verify(raw, []byte(parts[0]+"."+parts[1]), sig) {
+			t.Fatalf("token %d does not verify as a JWS", i+1)
+		}
+		// Тело токена — строка файла без поля jws, а поле jws — тот же токен
+		// без тела.
+		payload, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		if want := string(payload[:len(payload)-1]) + `,"jws":"` + parts[0] + ".." + parts[2] + `"}`; want != lines[i] {
+			t.Fatalf("token %d is not line %d of the file:\n%s\n%s", i+1, i+1, want, lines[i])
+		}
+	}
+	// Строка без подписи квитанции названа, остальные напечатаны, код — 1.
+	os.WriteFile(file, []byte(lines[0]+"\nnot a receipt\n"+lines[1]+"\n"), 0o640)
+	if code, out, errOut := call(t, "", "jws", "-file", file); code != exitInvalid || len(strings.Fields(out)) != 2 || !strings.Contains(errOut, "line 2: not a receipt with a signature") {
+		t.Fatalf("jws of a file with a foreign line: %d, %q, %q", code, out, errOut)
+	}
+}
+
+// Шлюз сменил ключ на том же месте: цепочка идёт дальше, sign говорит об
+// этом, а verify проверяет файл обоими ключами — по одному каждому или
+// списком gateway_keys источника.
+func TestSignAfterAKeyChange(t *testing.T) {
+	dir, keys := t.TempDir(), t.TempDir()
+	key, oldPub := newKey(t, keys, "gw.key")
+	file := filepath.Join(dir, "receipts.jsonl")
+	if code, _, errOut := call(t, `{"action":"p-1","step":"mandate"}`+"\n"+`{"action":"p-1","step":"cart"}`, "sign", "-key", key, "-gateway", "gw", "-file", file); code != exitOK {
+		t.Fatalf("sign: %s", errOut)
+	}
+	if err := os.Rename(key, key+".2026"); err != nil {
+		t.Fatal(err)
+	}
+	_, newPub := newKey(t, keys, "gw.key")
+	code, _, errOut := call(t, `{"action":"p-1","step":"payment"}`+"\n"+`{"action":"p-1","step":"delivery"}`, "sign", "-key", key, "-gateway", "gw", "-file", file)
+	if code != exitOK || strings.Count(errOut, "signs with a new key") != 1 || !strings.Contains(errOut, "its chain goes on from seq 3") {
+		t.Fatalf("sign with a new key: %d %s", code, errOut)
+	}
+	if code, out, _ := call(t, "", "verify", "-gateway-key", oldPub, "-gateway-key", newPub, "-file", file); code != exitOK || !strings.Contains(out, "4 receipts of 1 gateways, 0 not intact") {
+		t.Fatalf("verify with both keys: %d\n%s", code, out)
+	}
+	for _, one := range []string{oldPub, newPub} {
+		if code, out, _ := call(t, "", "verify", "-gateway-key", one, "-file", file); code != exitInvalid || !strings.Contains(out, "not among the gateway keys") {
+			t.Fatalf("verify with one key of two: %d\n%s", code, out)
+		}
+	}
+	// Ключи списком, как в настройках источника; о сроках verify предупреждает:
+	// времени приёма у него нет.
+	list := filepath.Join(dir, "keys.json")
+	os.WriteFile(list, []byte(`[{"key":"`+oldPub+`","not_after":"2026-12-01T00:00:00Z"},"`+newPub+`"]`), 0o644)
+	if code, out, _ := call(t, "", "verify", "-gateway-key", list, "-file", file); code != exitOK || !strings.Contains(out, "periods of the gateway keys are not checked here") || !strings.Contains(out, "0 not intact") {
+		t.Fatalf("verify with a key list: %d\n%s", code, out)
+	}
+	if code, _, errOut := call(t, "", "verify", "-gateway-key", oldPub, "-gateway-key", oldPub, "-file", file); code != exitUsage || !strings.Contains(errOut, "listed twice") {
+		t.Fatalf("verify with a key twice: %d %s", code, errOut)
 	}
 }

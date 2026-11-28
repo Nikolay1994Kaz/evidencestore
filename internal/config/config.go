@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/proof"
 )
 
@@ -212,10 +213,30 @@ type Source struct {
 	// GatewayKey — открытый ключ гейтвея (Ed25519, 64 hex). У источника с
 	// content_type "pipelock/recorder" им при приёме проверяются подписи
 	// контрольных точек бортового журнала; пусто — подписи не проверяются,
-	// сцепка и хэши — проверяются. У источника "receipt/v1" — подпись каждой
+	// сцепка и хэши — проверяются. У источника "receipt/v2" — подпись каждой
 	// квитанции, и ключ обязателен: квитанция без проверенной подписи ничего
-	// не доказывает.
+	// не доказывает. Там это короткая запись gateway_keys с одним ключом без
+	// срока.
 	GatewayKey string `json:"gateway_key"`
+	// GatewayKeys — ключи шлюзов источника "receipt/v2", когда их несколько
+	// или у ключа есть срок: каждый — 64 hex или {"key", "not_before",
+	// "not_after"}. Квитанция называет свой ключ сама (kid), а срок сверяется
+	// со временем её приёма: not_after — и смена ключа, и его отзыв (DECISIONS,
+	// п. 47). Вместе с gateway_key не задаётся.
+	GatewayKeys []gateway.KeyEntry `json:"gateway_keys"`
+}
+
+// GatewayKeySet — ключи шлюзов источника: gateway_keys или один gateway_key.
+// nil — ключей нет.
+func (s Source) GatewayKeySet() (*gateway.KeySet, error) {
+	entries := s.GatewayKeys
+	if s.GatewayKey != "" {
+		entries = append([]gateway.KeyEntry{{Key: s.GatewayKey}}, entries...)
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	return gateway.ParseKeySet(entries)
 }
 
 // GatewayContentType — строки бортового журнала Pipelock: такой источник
@@ -224,7 +245,12 @@ const GatewayContentType = "pipelock/recorder"
 
 // ReceiptContentType — общая квитанция шлюза (gateway.ReceiptContentType):
 // подпись и сцепка каждой строки проверяются при приёме.
-const ReceiptContentType = "receipt/v1"
+const ReceiptContentType = gateway.ReceiptContentType
+
+// retiredReceiptContentType — квитанция прежнего формата (подпись без имени
+// ключа и алгоритма). Источник с ним не поднимается: строки v2 под этим видом
+// легли бы без проверки, как обычный журнал.
+const retiredReceiptContentType = "receipt/v1"
 
 // ReceiptSubjectField — поле метки у источника квитанций: номер действия.
 // Других полей верхнего уровня, годных в субъекты, у квитанции нет.
@@ -343,6 +369,9 @@ func (c *Config) Defaults() {
 	for i := range c.Sources {
 		c.Sources[i].CertSHA256 = strings.ToLower(c.Sources[i].CertSHA256)
 		c.Sources[i].GatewayKey = strings.ToLower(c.Sources[i].GatewayKey)
+		for j := range c.Sources[i].GatewayKeys {
+			c.Sources[i].GatewayKeys[j].Key = strings.ToLower(c.Sources[i].GatewayKeys[j].Key)
+		}
 		if c.Sources[i].ExpectContact == 0 {
 			c.Sources[i].ExpectContact = Duration(DefaultExpectContact)
 		}
@@ -481,9 +510,24 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_key is used only with content_type %q or %q", i, s.Name, GatewayContentType, ReceiptContentType))
 			}
 		}
+		if s.ContentType == retiredReceiptContentType {
+			errs = append(errs, fmt.Errorf("sources[%d] %s: content_type %q is the earlier receipt format, which this release does not check: receipts are %q now (docs/receipts.md)", i, s.Name, retiredReceiptContentType, ReceiptContentType))
+		}
+		if len(s.GatewayKeys) > 0 {
+			switch {
+			case s.ContentType != ReceiptContentType:
+				errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_keys is used only with content_type %q (a %q source has one key, gateway_key)", i, s.Name, ReceiptContentType, GatewayContentType))
+			case s.GatewayKey != "":
+				errs = append(errs, fmt.Errorf("sources[%d] %s: set gateway_key or gateway_keys, not both: gateway_key is the short form of one key without a period", i, s.Name))
+			default:
+				if _, err := gateway.ParseKeySet(s.GatewayKeys); err != nil {
+					errs = append(errs, fmt.Errorf("sources[%d] %s: gateway_keys: %w", i, s.Name, err))
+				}
+			}
+		}
 		if s.ContentType == ReceiptContentType {
-			if s.GatewayKey == "" {
-				errs = append(errs, fmt.Errorf("sources[%d] %s: content_type %q needs gateway_key: the store checks the signature of every receipt with it, and a receipt whose signature nobody checked proves nothing", i, s.Name, ReceiptContentType))
+			if s.GatewayKey == "" && len(s.GatewayKeys) == 0 {
+				errs = append(errs, fmt.Errorf("sources[%d] %s: content_type %q needs gateway_key (or gateway_keys): the store checks the signature of every receipt with it, and a receipt whose signature nobody checked proves nothing", i, s.Name, ReceiptContentType))
 			}
 			if s.SubjectField != "" && s.SubjectField != ReceiptSubjectField {
 				errs = append(errs, fmt.Errorf("sources[%d] %s: subject_field of content_type %q is %q (the receipt's action) or none", i, s.Name, ReceiptContentType, ReceiptSubjectField))

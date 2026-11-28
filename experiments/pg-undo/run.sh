@@ -2,7 +2,7 @@
 # Сценарий «аудит + откат» на живом Postgres, на частях этой ветки:
 #
 #   ИИ-агент → esmcp (MCP-сервер, шлюз): запрос идёт ролью сервера; до COMMIT сервер пишет
-#                подписанное намерение — квитанцию receipt/v1 с номером транзакции, после — исход
+#                подписанное намерение — квитанцию receipt/v2 с номером транзакции, после — исход
 #   Postgres: ничего своего — ни триггеров, ни отметок; права ролей — то, что агенту можно
 #     → escollect, источник "postgres": логическая репликация (pgoutput); транзакция, названная
 #                в подписанном намерении шлюза, — целиком, остальные — отпечатком; тревоги
@@ -10,7 +10,7 @@
 #     → пакеты записей транзакции → esverify → esundo: обратные операции, сверка с базой,
 #                одна транзакция отката со своим намерением; сам откат тоже ложится в хранилище
 #   Сборщик один: тот же процесс escollect читает и файлы квитанций шлюзов (esmcp, esundo) —
-#   источники receipt/v1, подпись каждой квитанции хранилище проверяет при приёме (п. 43).
+#   источники receipt/v2, подпись каждой квитанции хранилище проверяет при приёме (п. 43).
 #   Тревоги сборщик несёт людям сам: Telegram, Slack-совместимый веб-хук, свой адрес в JSON
 #   (здесь все три — местный приёмник hook_server.py). В тревоге — готовая команда отката.
 #   У MCP-сервера — предел строк на действие: больше — откат до фиксации и тревога.
@@ -141,7 +141,7 @@ UNDOPUB=$("$BIN/esreceipt" keygen -key "$WORK/undo/esundo.key")
 echo "esmcp $MCPPUB"
 echo "esundo $UNDOPUB"
 
-step "хранилище: источники $SRC (метка субъекта — xid), agent-mcp и undo-op (квитанции receipt/v1, метка — action)"
+step "хранилище: источники $SRC (метка субъекта — xid), agent-mcp и undo-op (квитанции receipt/v2, метка — action)"
 "$BIN/evidencestore" dev-pki -out "$WORK/pki" -source "$SRC" -source agent-mcp -source undo-op >/dev/null
 cat >"$WORK/evidencestore.json" <<EOF
 {
@@ -155,8 +155,8 @@ cat >"$WORK/evidencestore.json" <<EOF
   "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},
   "sources": [
     {"name": "$SRC", "content_type": "pg/before-images-v1", "subject_field": "xid", "retention_months": 1, "expect_every": "1h"},
-    {"name": "agent-mcp", "content_type": "receipt/v1", "gateway_key": "$MCPPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"},
-    {"name": "undo-op", "content_type": "receipt/v1", "gateway_key": "$UNDOPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"}
+    {"name": "agent-mcp", "content_type": "receipt/v2", "gateway_key": "$MCPPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"},
+    {"name": "undo-op", "content_type": "receipt/v2", "gateway_key": "$UNDOPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"}
   ]
 }
 EOF

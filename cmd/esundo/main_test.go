@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/alert"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
@@ -105,7 +106,7 @@ func TestUndoIntentIsASignedReceipt(t *testing.T) {
 		t.Fatalf("%d receipts", len(lines))
 	}
 	pub := key.Public().(ed25519.PublicKey)
-	tracker := gateway.NewChecker(gateway.ReceiptContentType, pub)
+	tracker := gateway.NewChecker(gateway.ReceiptContentType, gateway.OneKey(pub))
 	for i, l := range lines {
 		rc, err := gateway.ParseReceipt(l)
 		if err != nil || rc.Verify(pub) != nil {
@@ -120,7 +121,7 @@ func TestUndoIntentIsASignedReceipt(t *testing.T) {
 			body["undoes"] != "a-1" || body["undoes_xid"] != "751" || body["steps"] != float64(2) {
 			t.Fatalf("receipt %d body: %v %v", i+1, body, err)
 		}
-		if v := tracker.Check(l); !v.Clean() {
+		if v := tracker.Check(l, time.Time{}); !v.Clean() {
 			t.Fatalf("receipt %d in the chain: %+v", i+1, v)
 		}
 	}

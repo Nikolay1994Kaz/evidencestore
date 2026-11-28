@@ -35,15 +35,18 @@ import (
 // квитанции; из них Claimed — от его имени с чужой подписью, Stale — его же
 // квитанции не новее последней (копии прежних строк или вторая ветвь
 // цепочки); Torn — последняя строка была порвана; Glued — квитанцию
-// склеили с байтами, дописанными без flock, и она записана ещё раз.
+// склеили с байтами, дописанными без flock, и она записана ещё раз;
+// KeyChanged — голову цепочки вёл прежний ключ шлюза, и квитанция — первая
+// под новым.
 type Appended struct {
-	Line    []byte
-	Receipt Receipt
-	Skipped int
-	Claimed int
-	Stale   int
-	Torn    bool
-	Glued   bool
+	Line       []byte
+	Receipt    Receipt
+	Skipped    int
+	Claimed    int
+	Stale      int
+	Torn       bool
+	Glued      bool
+	KeyChanged bool
 }
 
 // Head — голова цепочки шлюза: его последняя квитанция в файле квитанций.
@@ -96,6 +99,13 @@ func Append(path string, key ed25519.PrivateKey, name string, d Draft) (Appended
 // а не отказ (отказ превращал одну подложенную строку в остановку шлюза); не
 // тот ключ покажут хранилище и сборщик.
 //
+// Шлюз сменил ключ — цепочка та же: голова названа другим ключом, но лежит
+// она там, куда пишет только шлюз, и квитанция под новым ключом идёт от неё
+// (seq на один больше, prev — хэш прежней). Иначе смена ключа выглядела бы у
+// хранилища новой цепочкой после принятых, то есть поломкой, а квитанция с
+// поломкой в пакете не открывается (DECISIONS, п. 47). Ключ на новом месте —
+// голова по умолчанию тоже на новом (DefaultHead): прежнюю называют в head.
+//
 // Порванная последняя строка (писавший умер посреди строки — все шлюзы
 // пишут под flock) закрывается переводом строки и остаётся в файле
 // поломанной строкой. Квитанция ложится на диск до того, как Append
@@ -130,12 +140,13 @@ func AppendHead(path, head string, key ed25519.PrivateKey, name string, d Draft)
 	pub := key.Public().(ed25519.PublicKey)
 	c := newChainScan(name, pub)
 	var h Head
-	trusted := false
+	trusted, keyChanged := false, false
 	if head != "" {
 		if h, trusted, err = readHead(head); err != nil {
 			return Appended{}, err
 		}
-		trusted = trusted && h.Receipts == abs && h.Gateway == name && h.Key == hex.EncodeToString(pub) && h.Seq > 0 && isHash(h.Hash)
+		trusted = trusted && h.Receipts == abs && h.Gateway == name && isHash(h.Key) && h.Seq > 0 && isHash(h.Hash)
+		keyChanged = trusted && h.Key != hex.EncodeToString(pub)
 	}
 	if trusted {
 		c.cur = &receiptLink{hash: h.Hash, seq: h.Seq}
@@ -189,7 +200,10 @@ func AppendHead(path, head string, key ed25519.PrivateKey, name string, d Draft)
 		return Appended{}, err
 	}
 	r, _ := ParseReceipt(line)
-	a := Appended{Line: line, Receipt: r, Skipped: c.skipped, Claimed: c.claimed, Stale: c.stale, Torn: torn, Glued: glued}
+	// Первая квитанция под новым ключом — та, что сцеплена с головой прежнего:
+	// после падения между квитанцией и головой следующая — уже вторая.
+	a := Appended{Line: line, Receipt: r, Skipped: c.skipped, Claimed: c.claimed, Stale: c.stale, Torn: torn, Glued: glued,
+		KeyChanged: keyChanged && r.Seq == h.Seq+1}
 	if head != "" {
 		// Место сразу за строкой: с O_APPEND запись легла в конец, каким он
 		// был в тот миг, — после чужих байтов, если их дописали без flock.

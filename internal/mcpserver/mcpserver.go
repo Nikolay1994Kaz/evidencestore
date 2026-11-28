@@ -4,7 +4,7 @@
 // (что он уже делал) и, если сервер настроен на хранилище, undo_preview и
 // undo_apply (откат своего действия по до-образам из хранилища). Каждый вызов
 // execute — одно действие: сервер открывает транзакцию, берёт её номер и до
-// SQL агента пишет квитанцию-намерение шлюза (receipt/v1, подписанную его
+// SQL агента пишет квитанцию-намерение шлюза (receipt/v2, подписанную его
 // ключом, со ссылкой на транзакцию), исполняет запрос, а после — квитанцию
 // исхода: кто, что, какая транзакция, чем кончилось (DECISIONS, п. 42–43).
 // Сборщик (escollect, источник "postgres") по намерению берёт транзакцию
@@ -113,7 +113,7 @@ type Config struct {
 	// (pgwire.Config.Params) — их задаёт сервер (sessionParams), и Dial обязан
 	// их передать. Зовётся при первом запросе и заново после обрыва.
 	Dial func(params map[string]string) (DB, error)
-	// ReceiptsPath — файл квитанций шлюза (receipt/v1, DECISIONS, п. 42–43):
+	// ReceiptsPath — файл квитанций шлюза (receipt/v2, DECISIONS, п. 42–43, 47):
 	// на каждое действие — намерение с xid транзакции до её COMMIT и исход
 	// после, подписанные ключом Key (gateway.Append: flock, fsync). По
 	// намерению сборщик берёт транзакцию целиком как действие агента; по
@@ -611,6 +611,9 @@ func (s *Server) appended(a gateway.Appended) {
 	}
 	if a.Glued {
 		s.log.Warn("the receipt was glued to bytes that someone wrote into the receipts file without its lock: it is written once more on a line of its own", "file", s.cfg.ReceiptsPath)
+	}
+	if a.KeyChanged {
+		s.log.Warn("the gateway signs with a new key, and its chain goes on: the store's source and the collector must list the new key (gateway_keys), or its receipts count as not the gateway's", "file", s.cfg.ReceiptsPath, "key", a.Receipt.Kid, "seq", a.Receipt.Seq)
 	}
 }
 

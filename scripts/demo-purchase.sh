@@ -3,7 +3,7 @@
 # платформу, а спор — об одной покупке (docs/purchases.md).
 #
 #   1. хранилище «на своей машине», сборщик «у платформы агента»: на каждый шаг
-#      покупки платформа пишет квитанцию шлюза (receipt/v1, docs/receipts.md) и
+#      покупки платформа пишет квитанцию шлюза (receipt/v2, docs/receipts.md) и
 #      подписывает её своим ключом (esreceipt sign); action квитанции — номер
 #      покупки, у источника subject_field = action, gateway_key — ключ
 #      платформы; мандат в квитанции подписан ключом клиента (компактный JWS,
@@ -59,7 +59,7 @@ cat >"$WORK/evidencestore.json" <<EOF
   "demo": true,
   "keys": {"min_wait": "1s", "backup_dir": "keyring-backup", "roots_mirror_dir": "roots-mirror"},
   "sources": [
-    {"name": "shop-agent", "content_type": "receipt/v1", "gateway_key": "$PLATFORM_PUB", "subject_field": "action", "retention_months": 24}
+    {"name": "shop-agent", "content_type": "receipt/v2", "gateway_key": "$PLATFORM_PUB", "subject_field": "action", "retention_months": 24}
   ]
 }
 EOF
@@ -189,16 +189,19 @@ steps "p-1001 notification" "p-1002 notification" "p-1003 cart" "p-1001 payment"
 sleep 1
 steps "p-1003 notification" "p-1002 payment" "p-1003 cancel" "p-1001 delivery" "p-1002 delivery"
 # Кто-то пишет в журнал платформы, но её ключа у него нет: «отмена p-1002» следом
-# за последней квитанцией, с верными seq и prev, подпись — не платформы.
+# за последней квитанцией, с верными seq и prev и с заголовком подписи,
+# который называет ключ платформы, — а сама подпись не её.
 python3 -I - "$LOG" <<'PY'
-import hashlib, json, sys
+import base64, hashlib, json, sys
 path = sys.argv[1]
 last = open(path, "rb").read().rstrip(b"\n").split(b"\n")[-1]
 r = json.loads(last)
-fake = {"v": 1, "gateway": r["gateway"], "seq": r["seq"] + 1, "prev": hashlib.sha256(last).hexdigest(), "time": r["time"],
+fake = {"v": 2, "gateway": r["gateway"], "seq": r["seq"] + 1, "prev": hashlib.sha256(last).hexdigest(), "time": r["time"],
         "action": "p-1002", "step": "cancel", "body": {"by": "customer", "channel": "app"}}
+header = r["jws"].split("..")[0]
+sig = base64.urlsafe_b64encode(b"\xab" * 64).rstrip(b"=").decode()
 with open(path, "a") as f:
-    f.write(json.dumps(fake, separators=(",", ":"))[:-1] + ',"sig":"' + "ab" * 64 + '"}\n')
+    f.write(json.dumps(fake, separators=(",", ":"))[:-1] + ',"jws":"' + header + ".." + sig + '"}\n')
 PY
 wait_seq 18
 python3 -I - "$LOG" <<'PY'

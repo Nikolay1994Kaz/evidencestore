@@ -7,7 +7,7 @@ An AI agent works on a PostgreSQL database through an MCP server, and every chan
 ```
 AI agent
   → esmcp           the MCP server and the gateway: runs the agent's SQL in its own transaction, under its own role;
-                    before the SQL a signed intent with the transaction's id, after it the outcome (receipt/v1)
+                    before the SQL a signed intent with the transaction's id, after it the outcome (receipt/v2)
   → PostgreSQL      observed, not changed: no triggers, no markers, no key of ours in the database
   → escollect       the "postgres" input: reads the database's log by logical replication (pgoutput)
                     and the gateway's receipts file
@@ -80,7 +80,7 @@ The server runs the transaction, and nothing is committed before its `COMMIT`. E
 
 In each case the agent is told not to split or retry and to call a person, the receipts keep the outcome and its cause, and the collector raises `refused` from the outcome receipt, so people learn about what did not happen in the database (an alert about the rate at most once a minute). Rows are counted by the database itself, from the statistics of the transaction, so changes made by triggers, cascades and inside `WITH` count. The limits are counted from the receipts file, shared by all of the agent's sessions.
 
-`key` is an Ed25519 key in PKCS#8 PEM (`esreceipt keygen`); `esmcp -config mcp.json -pubkey` prints its public key, which goes into the collector's `receipts.gateway_keys` and the store's `gateway_key` of the receipts source. The gateway keeps the head of its chain next to the key (`head`, by default `<key>.head-<8 hex>`): it must be writable, and not in the receipts directory, or the server refuses to start.
+`key` is an Ed25519 key in PKCS#8 PEM (`esreceipt keygen`); `esmcp -config mcp.json -pubkey` prints its public key, which goes into the collector's `receipts.gateway_keys` and the store's `gateway_key` of the receipts source (to change the key later, see [Keys](receipts.md#keys)). The gateway keeps the head of its chain next to the key (`head`, by default `<key>.head-<8 hex>`): it must be writable, and not in the receipts directory, or the server refuses to start.
 
 ## Undo: esundo
 
@@ -135,7 +135,7 @@ One `escollect` runs several sources, each with its own certificate, spool and i
 - `receipts`: the gateways' receipts files and their public keys; `source` is the name the intents refer to (`pg_source` of `esmcp` and `esundo`). Without the section there is no gateway: every transaction is kept whole, and the records do not say whose it is.
 - `require_gateway`, `alert_rows` (the threshold of `mass-change`), `canaries` (rows whose change raises `canary`), `down_after` (1m), `status_every` (5s), `slot_alert_mb`, `notify`.
 
-`escollect -config collector.json -setup-sql` prints the SQL that prepares the database: the roles and their rights by an allow-list, `REPLICA IDENTITY FULL` on the tables and the publication. Run it as a superuser, and again after adding tables or partitions. It needs PostgreSQL 14 or newer with `wal_level=logical`; `pgoutput` is built in. The receipts files go to the store as sources of their own (`"content_type": "receipt/v1"`, see [Gateway receipts](receipts.md)), so the intents and outcomes are evidence too, and `esverify -linked` checks an action's receipts together with the bundle of its transaction.
+`escollect -config collector.json -setup-sql` prints the SQL that prepares the database: the roles and their rights by an allow-list, `REPLICA IDENTITY FULL` on the tables and the publication. Run it as a superuser, and again after adding tables or partitions. It needs PostgreSQL 14 or newer with `wal_level=logical`; `pgoutput` is built in. The receipts files go to the store as sources of their own (`"content_type": "receipt/v2"`, see [Gateway receipts](receipts.md)), so the intents and outcomes are evidence too, and `esverify -linked` checks an action's receipts together with the bundle of its transaction.
 
 ## Alerts
 

@@ -187,6 +187,45 @@ func TestForgedReceiptDecidesNothing(t *testing.T) {
 	}
 }
 
+// Сроков ключей сборщик не знает: отозванному ключу, пока тот в его списке,
+// он верит, и держатель украденного ключа решает, какая транзакция — действие
+// агента. Ключ убран из списка — его намерения ничего не решают, новые строки
+// под ним — тревога forged-receipt; честное намерение под ним, которого
+// сборщик ещё не прочёл, тоже не решает ничего — цена отзыва (P-389).
+func TestRevokedKeyIsRemovedFromTheCollector(t *testing.T) {
+	g := newRig(t, "esmcp.jsonl")
+	now := time.Now()
+	path := g.cfg.Files[0]
+	g.sign("esmcp.jsonl", intent("a-1", now, "751"))
+	thief, _ := gateway.NewSigner(g.keys[path], "esmcp", nil)
+	write := func(d gateway.Draft) {
+		line, err := thief.Sign(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		f.Write(append(line, '\n'))
+		f.Close()
+	}
+	write(intent("a-x", now, "999"))
+	if in, ok, _ := g.r.Intent(999, now, 0); !ok || in.ID != "a-x" || g.kinds() != "" {
+		t.Fatalf("the key is on the collector's list: %+v %v, alerts %s", in, ok, g.kinds())
+	}
+
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	g.cfg.GatewayKeys = []string{hex.EncodeToString(pub)}
+	g.open()
+	for _, xid := range []uint32{999, 751} {
+		if in, ok, _ := g.r.Intent(xid, now, 0); ok {
+			t.Fatalf("xid %d: an intent under a key removed from the list decided the transaction: %+v", xid, in)
+		}
+	}
+	write(intent("a-y", now, "1000"))
+	if _, ok, _ := g.r.Intent(1000, now, 0); ok || g.kinds() != alert.KindForgedReceipt {
+		t.Fatalf("a new intent under the removed key: taken %v, alerts %s", ok, g.kinds())
+	}
+}
+
 // Исход действия — тревога по его причине; committed и failed — без тревоги,
 // отказ за частоту — только с alerted. Каждая — один раз.
 func TestOutcomesRaiseAlertsOnce(t *testing.T) {

@@ -1,8 +1,8 @@
 package store
 
 import (
-	"crypto/ed25519"
 	"fmt"
+	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/config"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
@@ -11,7 +11,7 @@ import (
 )
 
 // Журнал гейтвея: бортовой журнал Pipelock (content_type pipelock/recorder)
-// или общая квитанция (receipt/v1). Каждая принятая строка проверяется
+// или общая квитанция (receipt/v2). Каждая принятая строка проверяется
 // (gateway.Checker): у Pipelock — хэш записи, сцепка с предыдущей, подпись
 // контрольной точки; у квитанции — разбор, подпись самой строки и сцепка. Вердикт ложится в цепь листом рядом с уликой, в порядке
 // журнала улик, поэтому пачки такого источника принимаются по одной.
@@ -39,18 +39,18 @@ func newTracker(src config.Source) gateway.Checker {
 	if !config.VerifiedContentType(src.ContentType) {
 		return nil
 	}
-	var key ed25519.PublicKey
-	if src.GatewayKey != "" {
-		key, _ = gateway.ParseKey(src.GatewayKey) // проверен config.Validate
-	}
-	return gateway.NewChecker(src.ContentType, key)
+	keys, _ := src.GatewayKeySet() // проверен config.Validate
+	return gateway.NewChecker(src.ContentType, keys)
 }
 
 // recordGateway проверяет записи и кладёт вердикты в цепь. Зовётся под
 // st.gwMu, записи — в порядке позиций.
 func (s *Store) recordGateway(st *sourceState, items []gwItem) {
 	for _, it := range items {
-		s.appendGatewayVerdict(st, it.header, it.pos, st.gw.Check(it.body))
+		// Срок ключа квитанции — по времени приёма из заголовка улики: оно под
+		// отпечатком и между метками TSA, а после рестарта вердикт досчитывается
+		// по тому же времени, а не по часам рестарта.
+		s.appendGatewayVerdict(st, it.header, it.pos, st.gw.Check(it.body, time.Unix(0, it.header.ReceivedAt)))
 	}
 }
 

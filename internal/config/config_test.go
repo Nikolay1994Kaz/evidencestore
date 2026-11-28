@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/cosign"
+	"github.com/Nikolay1994Kaz/evidencestore/internal/gateway"
 )
 
 // Путь сокета длиннее предела ловится при проверке конфига, а не
@@ -176,6 +178,55 @@ func TestValidateRejectsDangerousValues(t *testing.T) {
 			t.Errorf("%+v: %v", src, err)
 		}
 	}
+	// Ключи шлюза списком, со сроками (DECISIONS, п. 47): только у квитанций,
+	// вместо gateway_key, а не вместе с ним; срок — RFC 3339 и не задом наперёд.
+	key2 := strings.Repeat("cd", 32)
+	for name, src := range map[string]Source{
+		"список ключей у журнала Pipelock":  {Name: "gw", ContentType: GatewayContentType, GatewayKeys: []gateway.KeyEntry{{Key: key}}},
+		"список ключей у обычного журнала":  {Name: "shop", ContentType: "syslog", GatewayKeys: []gateway.KeyEntry{{Key: key}}},
+		"gateway_key вместе с gateway_keys": {Name: "shop", ContentType: ReceiptContentType, GatewayKey: key, GatewayKeys: []gateway.KeyEntry{{Key: key2}}},
+		"один ключ в списке дважды":         {Name: "shop", ContentType: ReceiptContentType, GatewayKeys: []gateway.KeyEntry{{Key: key}, {Key: strings.ToUpper(key)}}},
+		"короткий ключ в списке":            {Name: "shop", ContentType: ReceiptContentType, GatewayKeys: []gateway.KeyEntry{{Key: "abcd"}}},
+		"срок не временем":                  {Name: "shop", ContentType: ReceiptContentType, GatewayKeys: []gateway.KeyEntry{{Key: key, NotAfter: "tomorrow"}}},
+		"срок задом наперёд":                {Name: "shop", ContentType: ReceiptContentType, GatewayKeys: []gateway.KeyEntry{{Key: key, NotBefore: "2026-12-02T00:00:00Z", NotAfter: "2026-12-01T00:00:00Z"}}},
+		"квитанции прежнего формата":        {Name: "shop", ContentType: "receipt/v1"},
+	} {
+		c = good()
+		c.Sources = []Source{src}
+		c.Defaults()
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: принято", name)
+		}
+	}
+	c = good()
+	c.Sources = []Source{{Name: "shop", ContentType: ReceiptContentType, SubjectField: ReceiptSubjectField, GatewayKeys: []gateway.KeyEntry{
+		{Key: strings.ToUpper(key), NotAfter: "2026-12-01T00:00:00Z"}, {Key: key2, NotBefore: "2026-11-30T00:00:00+05:00"}}}}
+	c.Defaults()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("два ключа со сроками: %v", err)
+	}
+	set, err := c.Sources[0].GatewayKeySet()
+	if err != nil || set.Len() != 2 || set.Keys()[0].NotAfter.IsZero() || set.Keys()[1].NotBefore.IsZero() {
+		t.Fatalf("набор ключей источника: %v, %+v", err, set.Keys())
+	}
+	// gateway_key — короткая запись одного ключа без срока; без ключей — nil.
+	one := Source{Name: "shop", ContentType: ReceiptContentType, GatewayKey: key}
+	if set, err := one.GatewayKeySet(); err != nil || set.Len() != 1 || !set.Keys()[0].NotAfter.IsZero() {
+		t.Fatalf("gateway_key: %v", err)
+	}
+	if set, err := (Source{Name: "gw", ContentType: GatewayContentType}).GatewayKeySet(); err != nil || set != nil {
+		t.Fatalf("источник без ключа: %v, %v", set, err)
+	}
+	// В файле настроек ключ — строка или объект; опечатка в имени срока — отказ,
+	// а не ключ без срока.
+	var src Source
+	if err := json.Unmarshal([]byte(`{"name":"shop","content_type":"receipt/v2","gateway_keys":["`+key+`",{"key":"`+key2+`","not_before":"2026-12-01T00:00:00Z"}]}`), &src); err != nil || len(src.GatewayKeys) != 2 || src.GatewayKeys[1].NotBefore == "" {
+		t.Fatalf("gateway_keys из JSON: %+v, %v", src.GatewayKeys, err)
+	}
+	if err := json.Unmarshal([]byte(`{"name":"shop","content_type":"receipt/v2","gateway_keys":[{"key":"`+key+`","not_afer":"2026-12-01T00:00:00Z"}]}`), &src); err == nil {
+		t.Fatal("опечатка в not_after принята")
+	}
+
 	// Тик, при котором срока обещания нет вовсе, назван тиком, а не сроком.
 	c = good()
 	c.Chain.Tick = Duration(3 * time.Second)

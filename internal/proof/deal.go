@@ -128,7 +128,7 @@ func LinkDeal(receipts SourceReport, linked []SourceReport) DealReport {
 	var recErr error
 	switch {
 	case !receipts.Receipts:
-		recErr = fmt.Errorf("the first bundle (-proof) is of source %s, which holds no gateway receipts (receipt/v1): a deal starts at the receipts of an action", receipts.Source)
+		recErr = fmt.Errorf("the first bundle (-proof) is of source %s, which holds no gateway receipts (receipt/v2): a deal starts at the receipts of an action", receipts.Source)
 	case receipts.SubjectField != "" && receipts.SubjectField != "action":
 		recErr = fmt.Errorf("the receipts bundle is by %q; a deal is by the action (subject_field \"action\")", receipts.SubjectField)
 	default:

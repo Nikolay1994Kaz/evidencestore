@@ -189,3 +189,79 @@ func TestDealRefusesAMonthWithoutAnOpenBody(t *testing.T) {
 		}
 	}
 }
+
+// Шлюз сменил ключ (DECISIONS, п. 47): проверяющий называет оба ключа —
+// каждым своим -gateway-key или файлом со списком и сроками, как gateway_keys
+// источника, — и срок его ключа сверяется со временем приёма из пакета.
+func TestGatewayKeysOfTheAuditor(t *testing.T) {
+	oldKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{8}, ed25519.SeedSize))
+	newKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{9}, ed25519.SeedSize))
+	oldPub, newPub := hex.EncodeToString(oldKey.Public().(ed25519.PublicKey)), hex.EncodeToString(newKey.Public().(ed25519.PublicKey))
+	w := openWorld(t, []config.Source{{Name: "agent-mcp", ContentType: config.ReceiptContentType, SubjectField: config.ReceiptSubjectField,
+		GatewayKeys: []gateway.KeyEntry{{Key: oldPub, NotAfter: "2026-10-26T10:05:30Z"}, {Key: newPub}}}})
+	at := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	sign := func(s *gateway.Signer, step string) (string, gateway.Receipt) {
+		line, err := s.Sign(gateway.Draft{Time: at, Action: "a-1", Step: step})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, _ := gateway.ParseReceipt(line)
+		return string(line), r
+	}
+	was, _ := gateway.NewSigner(oldKey, "esmcp", nil)
+	now, _ := gateway.NewSigner(newKey, "esmcp", nil)
+	first, _ := sign(was, "start")
+	w.line(t, "agent-mcp", 1, first)
+	w.stamp(t)
+	w.advance(5 * time.Minute) // 10:05: прежний ключ ещё говорит за шлюз
+	intent, last := sign(was, "intent")
+	w.line(t, "agent-mcp", 2, intent)
+	if err := now.After(last.Seq, last.Hash); err != nil {
+		t.Fatal(err)
+	}
+	outcome, _ := sign(now, "outcome")
+	w.line(t, "agent-mcp", 3, outcome)
+	w.advance(5 * time.Minute)
+	w.closeUp(t)
+	b, err := w.s.ProofSubject("agent-mcp", "a-1", w.from, w.to, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := w.file(t, "a-1.json", b)
+
+	code, out, errOut := w.run(t, bundle, "-gateway-key", oldPub, "-gateway-key", newPub)
+	if code != exitValid || !strings.Contains(out, "2 signatures checked with your gateway key") {
+		t.Fatalf("оба ключа: код %d\n%s%s", code, out, errOut)
+	}
+	// Тот же список файлом, со сроками: квитанции приняты в 10:05.
+	list := func(name, entries string) string { return w.file(t, name, []byte("["+entries+"]")) }
+	fits := list("keys.json", `{"key":"`+oldPub+`","not_after":"2026-10-26T10:05:30Z"},{"key":"`+newPub+`","not_before":"2026-10-26T10:00:00Z"}`)
+	if code, out, errOut := w.run(t, bundle, "-gateway-key", fits); code != exitValid || !strings.Contains(out, "2 signatures checked with your gateway key") {
+		t.Fatalf("список со сроками: код %d\n%s%s", code, out, errOut)
+	}
+	// Один ключ из двух — чья-то квитанция не проверена.
+	for _, one := range []string{oldPub, newPub} {
+		if code, out, _ := w.run(t, bundle, "-gateway-key", one); code != exitInvalid || !strings.Contains(out, "not among the gateway keys") {
+			t.Fatalf("один ключ из двух: код %d\n%s", code, out)
+		}
+	}
+	// У проверяющего прежний ключ отозван с 10:02 — раньше, чем квитанция
+	// принята: пакет не проходит, хотя хранилище назвало её целой.
+	early := list("early.json", `{"key":"`+oldPub+`","not_after":"2026-10-26T10:02:00Z"},"`+newPub+`"`)
+	if code, out, _ := w.run(t, bundle, "-gateway-key", early); code != exitInvalid || !strings.Contains(out, "no longer speaks for the gateway") {
+		t.Fatalf("ключ, отозванный проверяющим: код %d\n%s", code, out)
+	}
+	// Настройки, которые не разобрать, — отказ до проверки, а не ключ без срока.
+	for name, args := range map[string][]string{
+		"ключ дважды":            {"-gateway-key", oldPub, "-gateway-key", oldPub},
+		"опечатка в сроке":       {"-gateway-key", list("typo.json", `{"key":"`+oldPub+`","not_afer":"2026-10-26T10:02:00Z"}`)},
+		"срок не временем":       {"-gateway-key", list("time.json", `{"key":"`+oldPub+`","not_after":"soon"}`)},
+		"пустой список":          {"-gateway-key", list("empty.json", ``)},
+		"не ключ и не файл":      {"-gateway-key", "no-such-file"},
+		"файл с коротким ключом": {"-gateway-key", w.file(t, "short.pub", []byte("abcd\n"))},
+	} {
+		if code, _, errOut := w.run(t, bundle, args...); code != exitUsage {
+			t.Errorf("%s: код %d, %s", name, code, errOut)
+		}
+	}
+}

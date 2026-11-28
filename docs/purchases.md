@@ -33,7 +33,7 @@ A gateway receipt for every step, signed with the platform's gateway key (`esrec
 The source names the platform's gateway key and labels by `action` ([Configuration](configuration.md)); the collector follows the file the platform writes its receipts to. Examples: [`configs/evidencestore.purchases.example.json`](../configs/evidencestore.purchases.example.json), [`configs/collector.purchases.example.json`](../configs/collector.purchases.example.json).
 
 ```json
-{"name": "shop-agent", "content_type": "receipt/v1", "gateway_key": "<64 hex, printed by esreceipt keygen>", "subject_field": "action", "retention_months": 24}
+{"name": "shop-agent", "content_type": "receipt/v2", "gateway_key": "<64 hex, printed by esreceipt keygen>", "subject_field": "action", "retention_months": 24}
 ```
 
 With `action` as the subject, a bundle opens one purchase, not everything about one customer. Set `retention_months` to at least the time in which a purchase can still be disputed under the rules of your payment methods: once a month's key is destroyed, its bodies are gone in every copy.
