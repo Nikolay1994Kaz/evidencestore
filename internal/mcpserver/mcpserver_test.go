@@ -462,17 +462,22 @@ func TestUndoPreviewAndApply(t *testing.T) {
 	// Сверка и откат — с чистого сеанса и pg_catalog первым в пути: функции и
 	// операторы под системными именами из схем роли агента их не подменят.
 	// Схемы после него — из настроек сервера.
+	// Путь ставится на транзакцию, первым делом в ней: и у сверки (только для
+	// чтения), и у отката (P-393).
 	var path0, catalog int = -1, -1
 	for i, q := range db.log[before:] {
 		if q == "DISCARD ALL" && path0 < 0 {
 			path0 = i
 		}
-		if q == `SELECT pg_catalog.set_config('search_path', 'pg_catalog, "app", pg_temp', false)` && catalog < 0 {
+		if q == `SELECT pg_catalog.set_config('search_path', 'pg_catalog, "app", pg_temp', true)` && catalog < 0 {
 			catalog = i
 		}
 	}
-	if path0 < 0 || catalog < path0 || !strings.Contains(db.log[before+catalog+1], "pg_attribute") {
+	if path0 < 0 || catalog < path0 || db.log[before+path0+1] != "BEGIN TRANSACTION READ ONLY" || !strings.Contains(db.log[before+catalog+1], "pg_attribute") {
 		t.Fatalf("the session of the undo: %q", db.log[before:])
+	}
+	if strings.Contains(strings.Join(db.log[before:], "\n"), ", false)") {
+		t.Fatalf("the undo leaves a setting to the session: %q", db.log[before:])
 	}
 	data, _ := os.ReadFile(path)
 	if !strings.Contains(string(data), `"tool":"undo_apply"`) || !strings.Contains(string(data), `"undoes":"a-1"`) || fetched != 2 {

@@ -55,6 +55,50 @@ type canceler interface{ Cancel() error }
 // errTimeout — запрос агента шёл дольше предела.
 var errTimeout = errors.New("the statement timed out")
 
+// errNoReply — база не ответила на свой запрос сервера за ReplyTimeout:
+// соединение закрыто. Это не ответ базы (*pgwire.PgError), а обрыв: что
+// стало с запросом, отсюда не узнать.
+var errNoReply = errors.New("the database did not answer")
+
+// watch стережёт ответ базы на свой запрос сервера (P-394). Таймер запроса
+// агента (timed) своих запросов не касался, а основная, которая замерла, не
+// закрыв соединения, держала вызов на COMMIT, пока обрыв не заметит TCP — на
+// стенде 268 с. За ReplyTimeout ответа нет — соединение db закрывается, и
+// чтение ответа возвращается с ошибкой. Позванная после запроса, late
+// отвечает, сработал ли предел. Сработал — ответа нет, даже если он пришёл
+// в тот же миг: соединение уже закрыто, и то, что сервер делал бы дальше в
+// «той же» транзакции, шло бы по новому — вне её.
+func (s *Server) watch(db DB) (late func() bool) {
+	limit := s.cfg.ReplyTimeout
+	if limit <= 0 {
+		return func() bool { return false }
+	}
+	fired := make(chan struct{})
+	t := time.AfterFunc(limit, func() {
+		defer close(fired)
+		if c, ok := db.(io.Closer); ok {
+			c.Close()
+		}
+	})
+	return func() bool {
+		if t.Stop() {
+			return false
+		}
+		<-fired
+		return true
+	}
+}
+
+// ask — свой запрос сервера по соединению db, под пределом ожидания ответа.
+func (s *Server) ask(db DB, sql string) ([]pgwire.Result, error) {
+	late := s.watch(db)
+	res, err := db.Query(sql)
+	if late() {
+		return nil, fmt.Errorf("%w within %s, and the connection to it is closed", errNoReply, s.cfg.ReplyTimeout)
+	}
+	return res, err
+}
+
 // connect открывает соединение с базой, если его нет.
 func (s *Server) connect() error {
 	if s.db != nil {
@@ -67,7 +111,13 @@ func (s *Server) connect() error {
 	// Роль проверяется на каждом новом соединении, а не только при запуске:
 	// база могла быть недоступна на старте (её занял или рвал агент — R1-4,
 	// R2-5, T-2), а права выдают и после (DECISIONS, п. 39).
-	if err := checkRole(db); err != nil {
+	late := s.watch(db)
+	err = checkRole(db)
+	if late() {
+		// База приняла вход и замолчала на проверке роли.
+		return fmt.Errorf("the database is unreachable: %w within %s", errNoReply, s.cfg.ReplyTimeout)
+	}
+	if err != nil {
 		if c, ok := db.(io.Closer); ok {
 			c.Close()
 		}
@@ -223,6 +273,12 @@ func (s *Server) drop() {
 // запрос отменяется на сервере базы, а соединение закрывается: просьба об
 // отмене не должна догнать следующий запрос, и транзакция должна откатиться,
 // что бы агент в ней ни выставил.
+//
+// Просьба об отмене может уйти и в никуда: база, которая замерла, не закрыв
+// соединений, новое соединение для отмены примет (его принимает ядро), а на
+// запрос не ответит. Поэтому после отмены ответа ждут ещё cancelGrace и
+// закрывают соединение сами (P-394): иначе вызов висел бы, пока обрыв не
+// заметит TCP.
 func (s *Server) timed(run func() ([]pgwire.Result, error)) ([]pgwire.Result, error) {
 	limit := s.cfg.StatementTimeout
 	if limit <= 0 {
@@ -232,20 +288,25 @@ func (s *Server) timed(run func() ([]pgwire.Result, error)) ([]pgwire.Result, er
 		return nil, err
 	}
 	db := s.db
-	fired := make(chan struct{})
+	fired, answered := make(chan struct{}), make(chan struct{})
 	t := time.AfterFunc(limit, func() {
 		defer close(fired)
 		c, ok := db.(canceler)
 		if ok && c.Cancel() == nil {
-			return
+			select {
+			case <-answered:
+				return
+			case <-time.After(s.cancelGrace):
+			}
 		}
-		// Отменить нечем или отмена не дошла: закрыть соединение, чтобы хотя
-		// бы сервер агента не ждал ответа.
+		// Отменить нечем, отмена не дошла или база на неё не ответила: закрыть
+		// соединение, чтобы хотя бы сервер агента не ждал ответа.
 		if cl, ok := db.(io.Closer); ok {
 			cl.Close()
 		}
 	})
 	res, err := run()
+	close(answered)
 	if t.Stop() {
 		return res, err
 	}

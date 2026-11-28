@@ -222,6 +222,43 @@ func (d *fakeDB) Query(sql string) ([]pgwire.Result, error) {
 	return d.answer(sql)
 }
 
+// outside — запросы журнала, ушедшие вне транзакции. В пуле соединений по
+// транзакциям такой запрос попадает на соединение базы, которое пулер даёт
+// только ему: без пути поиска отката, без того, что поставил запрос до него
+// (P-393).
+func outside(log []string) []string {
+	var out []string
+	in := false
+	for _, q := range log {
+		switch {
+		case strings.HasPrefix(q, "BEGIN"):
+			if in {
+				out = append(out, q+" (inside a transaction)")
+			}
+			in = true
+		case q == "COMMIT" || q == "ROLLBACK":
+			if !in {
+				out = append(out, q)
+			}
+			in = false
+		case !in:
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// opened — что идёт за каждым BEGIN журнала: n запросов.
+func opened(log []string, n int) [][]string {
+	var out [][]string
+	for i, q := range log {
+		if strings.HasPrefix(q, "BEGIN") {
+			out = append(out, log[i:min(i+1+n, len(log))])
+		}
+	}
+	return out
+}
+
 func rows(vals ...[]string) []pgwire.Result {
 	var out [][]*string
 	for _, r := range vals {
@@ -269,6 +306,12 @@ func TestCheckAndApply(t *testing.T) {
 	if fmt.Sprint(p.OK) != "[2 4]" {
 		t.Fatalf("apply %v", p.OK)
 	}
+	// Сверка — одна транзакция «только для чтения» с путём поиска внутри, и
+	// она откатывается: вне её — ни одного запроса (P-393).
+	if db.log[0] != "BEGIN TRANSACTION READ ONLY" || db.log[1] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)" ||
+		db.log[len(db.log)-1] != "ROLLBACK" || len(outside(db.log)) != 0 || strings.Count(strings.Join(db.log, "\n"), "BEGIN") != 1 {
+		t.Fatalf("the check is not one read-only transaction: outside %q\n%q", outside(db.log), db.log)
+	}
 	// Тип — в первой строке VALUES, кавычка удвоена, NULL без кавычек.
 	var check string
 	for _, q := range db.log {
@@ -296,11 +339,12 @@ func TestCheckAndApply(t *testing.T) {
 	// Транзакция, её номер, шаг 2 (вернуть удалённую — со своим прежним номером, даже если колонка
 	// GENERATED ALWAYS AS IDENTITY), шаг 4 (вернуть значения: пишется только колонка, которую транзакция
 	// меняла), сверка обеих команд с до-образами, фиксация. Шаги 1 и 3 не тронуты.
-	// Перед всем — путь поиска (session): схем в настройках нет — только Path.
-	if len(db.log) != 8 || db.log[0] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', false)" {
+	// Первым в транзакции — путь поиска (session), на неё одну: схем в
+	// настройках нет — только Path. Вне транзакции — ни одного запроса.
+	if len(db.log) != 8 || db.log[0] != "BEGIN" || db.log[1] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)" || len(outside(db.log)) != 0 {
 		t.Fatalf("%q", db.log)
 	}
-	db.log = db.log[1:]
+	db.log = slices.Delete(db.log, 1, 2)
 	if len(db.log) != 7 || db.log[0] != "BEGIN" || db.log[1] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, "+StartedSQL+", "+TimelineSQL ||
 		!strings.HasPrefix(db.log[2], `INSERT INTO "public"."t" ("id", "v") OVERRIDING SYSTEM VALUE`) || !strings.HasPrefix(db.log[3], `UPDATE "public"."t" t SET "v" = w.o1`+"\n") ||
 		!strings.Contains(db.log[3], `WHERE t."id" = w.n0 AND t."id"::text IS NOT DISTINCT FROM w.n0::text AND t."v"::text IS NOT DISTINCT FROM w.n1::text`) ||
@@ -404,6 +448,17 @@ func TestCheckTakesGeneratedAndUncomparableColumnsFromTheCatalog(t *testing.T) {
 	if _, err := p.Check(db); err != nil {
 		t.Fatal(err)
 	}
+	// Вопрос «есть ли у типа равенство» базе задаётся командой, которая может
+	// отказать, а сверка — одна транзакция: отказ сломал бы её. Вопрос идёт под
+	// точкой сохранения, и после отказа сверка продолжается.
+	probe := slices.Index(db.log, "SELECT NULL::point IS NOT DISTINCT FROM NULL::point")
+	if probe < 1 || db.log[probe-1] != "SAVEPOINT es_equality" || db.log[probe+1] != "ROLLBACK TO SAVEPOINT es_equality" || db.log[probe+2] != "RELEASE SAVEPOINT es_equality" ||
+		len(outside(db.log)) != 0 || !slices.ContainsFunc(db.log[probe:], func(q string) bool { return strings.HasPrefix(q, "SELECT w.step") }) {
+		t.Fatalf("the equality probe: %q", db.log)
+	}
+	if answered := slices.Index(db.log, "SELECT NULL::integer IS NOT DISTINCT FROM NULL::integer"); db.log[answered+1] != "RELEASE SAVEPOINT es_equality" {
+		t.Fatalf("a probe that the database answered: %q", db.log[answered:answered+2])
+	}
 	tab := p.Tables["public.t"]
 	if fmt.Sprint(tab.Generated) != "[double]" || fmt.Sprint(tab.AsText) != "[place]" {
 		t.Fatalf("generated %v, as text %v", tab.Generated, tab.AsText)
@@ -444,6 +499,8 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 		rel(1, "child"), ch("D", 1, v("1", "c"), nil), ch("D", 1, v("2", "c"), nil), // каскад
 		rel(3, "other"), ch("U", 3, v("5", "a"), v("6", "a")), ch("I", 3, nil, v("7", "new")))
 	p.OK = []int{1, 2, 3, 4, 5}
+	// Через пулер: с этих команд начинается каждая транзакция отката.
+	p.Setup = []string{"RESET ALL", "SET LOCAL DateStyle = 'ISO, YMD'"}
 	violation := &pgwire.PgError{Severity: "ERROR", Code: "23503", Message: `insert or update on table "child" violates foreign key constraint`}
 	attempt, locked := 0, "1"
 	db := &fakeDB{}
@@ -475,6 +532,24 @@ func TestApplyFallsBackToTheOrderOfForeignKeys(t *testing.T) {
 	done, err := p.Apply(db, okIntent)
 	if err != nil || done.Order != OrderKeys || done.XID != "902" || done.Steps != 5 {
 		t.Fatal(done, err)
+	}
+	// Три транзакции: первая попытка, вопрос каталогу о ключах (только для
+	// чтения) и вторая попытка. Каждая начинается с Setup и пути поиска, и вне
+	// их нет ни одного запроса: порядок по ключам раньше спрашивался вне
+	// транзакции, с путём поиска соединения, какое даст пулер (P-393).
+	begins := opened(db.log, 2)
+	if len(begins) != 3 || begins[0][0] != "BEGIN" || begins[1][0] != "BEGIN TRANSACTION READ ONLY" || begins[2][0] != "BEGIN" || len(outside(db.log)) != 0 {
+		t.Fatalf("transactions %q, outside %q", begins, outside(db.log))
+	}
+	for _, b := range begins {
+		if b[1] != "RESET ALL; SET LOCAL DateStyle = 'ISO, YMD'" || b[2] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)" {
+			t.Fatalf("a transaction of the undo starts with %q", b)
+		}
+	}
+	if keys := slices.IndexFunc(db.log, func(q string) bool {
+		return strings.Contains(q, "pg_constraint") && !strings.Contains(q, "confdeltype")
+	}); db.log[keys-3] != "BEGIN TRANSACTION READ ONLY" || db.log[keys+1] != "ROLLBACK" {
+		t.Fatalf("the order by foreign keys is asked outside its own transaction: %q", db.log[keys-3:keys+2])
 	}
 	// Что шло после отмены первой попытки: какая команда над какой таблицей.
 	table := regexp.MustCompile(`"public"\."(\w+)"`)
@@ -694,7 +769,7 @@ func TestApplyRefusesToRemoveARowThatOthersReferTo(t *testing.T) {
 	all := strings.Join(db.log, "\n")
 	if !errors.Is(err, ErrChanged) || !strings.Contains(err.Error(), "have rows of child referring to them, and ON DELETE CASCADE would delete them") ||
 		strings.Count(err.Error(), "referring to them") != 1 ||
-		strings.Contains(all, "DELETE FROM") || strings.Count(all, "BEGIN") != 2 || db.log[len(db.log)-1] != "ROLLBACK" {
+		strings.Contains(all, "DELETE FROM") || len(opened(db.log, 0)) != 3 || len(outside(db.log)) != 0 || db.log[len(db.log)-1] != "ROLLBACK" {
 		t.Fatalf("%v\n%s", err, all)
 	}
 }
@@ -728,7 +803,8 @@ func TestSessionSearchPath(t *testing.T) {
 	str := func(s string) *string { return &s }
 	log, err := run(nil, nil)
 	if err != nil || len(log) != 4 || !strings.Contains(log[1], `ARRAY['public', 'My Schema']`) ||
-		log[3] != `SELECT pg_catalog.set_config('search_path', 'pg_catalog, "public", "My Schema", pg_temp', false)` {
+		log[0] != `SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)` ||
+		log[3] != `SELECT pg_catalog.set_config('search_path', 'pg_catalog, "public", "My Schema", pg_temp', true)` {
 		t.Fatalf("%v %q", err, log)
 	}
 	if _, err := run(str(`"My Schema"`), nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), `no schema "My Schema"`) {
@@ -739,6 +815,41 @@ func TestSessionSearchPath(t *testing.T) {
 	}
 	if err := (&Plan{SearchPath: []string{"$user"}}).session(&fakeDB{}); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a bad path in a plan file: %v", err)
+	}
+	// Неверный путь до базы не доходит: транзакция и не открывается.
+	none := &fakeDB{}
+	if err := (&Plan{SearchPath: []string{"$user"}}).begin(none, readOnly); !errors.Is(err, ErrRefused) || len(none.log) != 0 {
+		t.Fatalf("a bad path: %v, %q", err, none.log)
+	}
+	// Отказ при подготовке транзакции (схемы нет, в ней чужой CREATE, Setup не
+	// прошёл) — транзакция откатана: сеанс не остаётся внутри неё.
+	if log, err := run(str(`"My Schema"`), nil); err == nil || len(log) != 2 {
+		t.Fatalf("%v %q", err, log)
+	}
+	missing := `"My Schema"`
+	db := &fakeDB{answer: func(sql string) ([]pgwire.Result, error) {
+		if strings.Contains(sql, "unnest(ARRAY[") {
+			return []pgwire.Result{{Rows: [][]*string{{&missing}}}}, nil
+		}
+		return nil, nil
+	}}
+	p := &Plan{SearchPath: []string{"My Schema"}, Tables: map[string]*Table{}, Setup: []string{"RESET ALL"}}
+	if _, err := p.Check(db); !errors.Is(err, ErrRefused) || db.log[0] != "BEGIN TRANSACTION READ ONLY" || db.log[1] != "RESET ALL" || db.log[len(db.log)-1] != "ROLLBACK" || len(outside(db.log)) != 0 {
+		t.Fatalf("a check refused over its search path: %v %q", err, db.log)
+	}
+	p.OK = []int{1}
+	db.log = nil
+	if _, err := p.Apply(db, okIntent); !errors.Is(err, ErrRefused) || db.log[0] != "BEGIN" || db.log[len(db.log)-1] != "ROLLBACK" || len(outside(db.log)) != 0 {
+		t.Fatalf("an undo refused over its search path: %v %q", err, db.log)
+	}
+	failing := &fakeDB{answer: func(sql string) ([]pgwire.Result, error) {
+		if sql == "RESET ALL" {
+			return nil, &pgwire.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied"}
+		}
+		return nil, nil
+	}}
+	if _, err := p.Check(failing); err == nil || fmt.Sprint(failing.log) != "[BEGIN TRANSACTION READ ONLY RESET ALL ROLLBACK]" {
+		t.Fatalf("a setup that the database refused: %v %q", err, failing.log)
 	}
 }
 

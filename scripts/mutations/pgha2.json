@@ -1,0 +1,135 @@
+{
+ "packages": [
+  "./internal/mcpserver/",
+  "./internal/pgundo/"
+ ],
+ "run": "^Test(StatementTimeout|CommitThatIsNeverAnswered|OwnQueryThatIsNeverAnswered|RoleCheckThatIsNeverAnswered|ReplyTimeout|CommitOfAnUndo|PoolerUndo|UndoPreviewAndApply|LostCommit|CheckAndApply|CheckTakesGenerated|ApplyFallsBack|ApplyRefusesToRemove|SessionSearchPath)",
+ "mutations": [
+  {
+   "name": "J1 предел ожидания ответа базы выключен",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\tlimit := s.cfg.ReplyTimeout\n\tif limit <= 0 {",
+   "new": "\tlimit := s.cfg.ReplyTimeout\n\tif true || limit <= 0 {"
+  },
+  {
+   "name": "J2 предел истёк, а соединение не закрыто",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\tdefer close(fired)\n\t\tif c, ok := db.(io.Closer); ok {\n\t\t\tc.Close()\n\t\t}\n\t})\n\treturn func() bool {",
+   "new": "\t\tdefer close(fired)\n\t})\n\treturn func() bool {"
+  },
+  {
+   "name": "J3 истёкший предел не отличить от обрыва связи",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\tres, err := db.Query(sql)\n\tif late() {",
+   "new": "\tres, err := db.Query(sql)\n\tif late() && false {"
+  },
+  {
+   "name": "J4 проверка роли на новом соединении — без предела",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\tlate := s.watch(db)\n\terr = checkRole(db)",
+   "new": "\tlate := func() bool { return false }\n\terr = checkRole(db)"
+  },
+  {
+   "name": "J5 база приняла отмену и молчит — соединение не закрывается",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\t\tcase <-time.After(s.cancelGrace):\n\t\t\t}",
+   "new": "\t\t\tcase <-time.After(time.Hour):\n\t\t\t}"
+  },
+  {
+   "name": "J6 после отмены ответа не ждут: соединение закрыто сразу",
+   "file": "internal/mcpserver/limits.go",
+   "old": "\t\tif ok && c.Cancel() == nil {\n\t\t\tselect {\n\t\t\tcase <-answered:\n\t\t\t\treturn\n",
+   "new": "\t\tif ok && c.Cancel() == nil {\n\t\t\tselect {\n\t\t\tcase <-answered:\n"
+  },
+  {
+   "name": "J7 свои запросы сервера идут мимо предела",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\tres, err := u.s.ask(u.s.db, sql)\n",
+   "new": "\tres, err := u.s.db.Query(sql)\n"
+  },
+  {
+   "name": "J8 откат держит соединение, которое закрыл предел",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\tif err != nil && !errors.As(err, &pg) {\n\t\tu.s.drop()\n",
+   "new": "\tif false && err != nil && !errors.As(err, &pg) {\n\t\tu.s.drop()\n"
+  },
+  {
+   "name": "J9 COMMIT без ответа назван обрывом связи",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\t\t\tif errors.Is(err, errNoReply) {\n\t\t\t\twhat = ",
+   "new": "\t\t\tif false && errors.Is(err, errNoReply) {\n\t\t\t\twhat = "
+  },
+  {
+   "name": "J10 через пулер транзакции отката без настроек сервера",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\tif s.cfg.Pooler {\n\t\tplan.Setup = s.ownSettings()\n",
+   "new": "\tif false && s.cfg.Pooler {\n\t\tplan.Setup = s.ownSettings()\n"
+  },
+  {
+   "name": "J11 настройки пулера идут и по прямому соединению",
+   "file": "internal/mcpserver/mcpserver.go",
+   "old": "\tif s.cfg.Pooler {\n\t\tplan.Setup = s.ownSettings()\n",
+   "new": "\tif true || s.cfg.Pooler {\n\t\tplan.Setup = s.ownSettings()\n"
+  },
+  {
+   "name": "G1 путь поиска отката — на сеанс",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\tif _, err := db.Query(\"SELECT pg_catalog.set_config('search_path', '\" + Path + \"', true)\"); err != nil {",
+   "new": "\tif _, err := db.Query(\"SELECT pg_catalog.set_config('search_path', '\" + Path + \"', false)\"); err != nil {"
+  },
+  {
+   "name": "G2 транзакция сверки — не только для чтения",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\tif _, err := db.Query(\"BEGIN\" + mode); err != nil {",
+   "new": "\tif _, err := db.Query(\"BEGIN\"); err != nil {"
+  },
+  {
+   "name": "G3 команды Setup в транзакцию не идут",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\tif len(p.Setup) > 0 {\n",
+   "new": "\tif false && len(p.Setup) > 0 {\n"
+  },
+  {
+   "name": "G4 отказ в начале транзакции её не откатывает",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\t\tif err != nil {\n\t\t\tdb.Query(\"ROLLBACK\")\n\t\t}\n\t}()\n\tif len(p.Setup) > 0 {",
+   "new": "\t\tif false && err != nil {\n\t\t\tdb.Query(\"ROLLBACK\")\n\t\t}\n\t}()\n\tif len(p.Setup) > 0 {"
+  },
+  {
+   "name": "G5 проба сравнения — без точки сохранения",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "db.Query(\"SAVEPOINT es_equality\")",
+   "new": "db.Query(\"SELECT 1\")"
+  },
+  {
+   "name": "G6 после неудачной пробы транзакция не возвращена к точке",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "db.Query(\"ROLLBACK TO SAVEPOINT es_equality\")",
+   "new": "db.Query(\"SELECT 2\")"
+  },
+  {
+   "name": "G7 порядок по ключам спрошен вне транзакции",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\tif err = p.begin(db, readOnly); err == nil {\n\t\tordered, err = p.byKeys(db, only)\n\t\tdb.Query(\"ROLLBACK\")\n",
+   "new": "\tif err = p.session(db); err == nil {\n\t\tordered, err = p.byKeys(db, only)\n"
+  },
+  {
+   "name": "G8 сверка фиксирует свою транзакцию",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\tdefer db.Query(\"ROLLBACK\")\n",
+   "new": "\tdefer db.Query(\"COMMIT\")\n"
+  },
+  {
+   "name": "G9 откат открыт только для чтения",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\tif err := p.begin(db, \"\"); err != nil {",
+   "new": "\tif err := p.begin(db, readOnly); err != nil {"
+  },
+  {
+   "name": "G10 Setup — после пути отката",
+   "file": "internal/pgundo/pgundo.go",
+   "old": "\tif len(p.Setup) > 0 {\n\t\tif _, err := db.Query(strings.Join(p.Setup, \"; \")); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn p.session(db)\n",
+   "new": "\tif err := p.session(db); err != nil {\n\t\treturn err\n\t}\n\tif len(p.Setup) > 0 {\n\t\tif _, err := db.Query(strings.Join(p.Setup, \"; \")); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n"
+  }
+ ]
+}

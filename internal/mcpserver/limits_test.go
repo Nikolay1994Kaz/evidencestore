@@ -24,6 +24,10 @@ type slowDB struct {
 	fakeDB
 	slow      string
 	cancelErr error
+	// deaf — просьба об отмене уходит, а запрос не возвращается: база замерла,
+	// не закрыв соединений. exact — висит только запрос, равный slow целиком
+	// (COMMIT есть и в тексте проверки роли).
+	deaf, exact bool
 
 	mu               sync.Mutex
 	cancels, closes  int
@@ -35,7 +39,7 @@ func newSlowDB(slow string) *slowDB {
 }
 
 func (d *slowDB) Query(sql string) ([]pgwire.Result, error) {
-	if !strings.Contains(sql, d.slow) {
+	if !strings.Contains(sql, d.slow) || d.exact && sql != d.slow {
 		return d.fakeDB.Query(sql)
 	}
 	d.log = append(d.log, sql)
@@ -72,6 +76,9 @@ func (d *slowDB) Cancel() error {
 	d.cancels++
 	if d.cancelErr != nil {
 		return d.cancelErr
+	}
+	if d.deaf {
+		return nil
 	}
 	close(d.cancelled)
 	d.cancelled = make(chan struct{})
@@ -164,6 +171,173 @@ func TestStatementTimeoutWhenTheCancelFails(t *testing.T) {
 	}
 	if cancels, closes := db.counts(); cancels != 1 || closes < 1 {
 		t.Fatalf("cancels %d, closes %d", cancels, closes)
+	}
+}
+
+// База замерла, не закрыв соединений (P-394): просьбу об отмене она принимает
+// — новое соединение открывает ядро, — а на запрос не отвечает. После отмены
+// сервер ждёт ответа ещё немного и закрывает соединение сам: раньше вызов
+// висел, пока обрыв не заметит TCP.
+func TestStatementTimeoutWhenTheDatabaseIsFrozen(t *testing.T) {
+	db := newSlowDB("pg_sleep")
+	db.deaf = true
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s := serverOn(t, db, path, func(c *Config) { c.StatementTimeout = 30 * time.Millisecond })
+	s.cancelGrace = 40 * time.Millisecond
+	start := time.Now()
+	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = pg_sleep(3600)::text"}`)
+	if !isErr || !strings.Contains(text, "ran longer than 30ms and was cancelled") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if took := time.Since(start); took < 70*time.Millisecond || took > 3*time.Second {
+		t.Fatalf("the call returned after %v: the cancel was sent at 30ms and the connection is closed 40ms later", took)
+	}
+	if cancels, closes := db.counts(); cancels != 1 || closes < 1 {
+		t.Fatalf("cancels %d, closes %d", cancels, closes)
+	}
+	if rc := receipts(t, path); len(rc) != 1 || rc[0].Outcome != "failed" || rc[0].Cause != CauseTimeout {
+		t.Fatalf("receipt %+v", rc)
+	}
+}
+
+// База не отвечает на COMMIT (P-394): замерла, не закрыв соединения, или ждёт
+// синхронную реплику, которой нет. Таймер запроса агента COMMIT не стерёг, и
+// вызов висел, пока обрыв не заметит TCP (на стенде — 268 с). Теперь ответа
+// ждут ReplyTimeout, соединение закрывается, а исход — «неизвестно», как при
+// обрыве: зафиксирует ли база, отсюда не узнать.
+func TestCommitThatIsNeverAnsweredIsUnknown(t *testing.T) {
+	db := newSlowDB("COMMIT")
+	db.exact = true
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s := serverOn(t, db, path, func(c *Config) { c.StatementTimeout, c.ReplyTimeout = time.Minute, 40*time.Millisecond })
+	start := time.Now()
+	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`)
+	if !isErr || !strings.Contains(text, "the database did not answer the COMMIT within 40ms: the action may have been committed (transaction 751)") ||
+		!strings.Contains(text, "Do not repeat it") || strings.Contains(text, "rolled back") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the call hung on COMMIT for %v", took)
+	}
+	if cancels, closes := db.counts(); cancels != 0 || closes < 1 {
+		t.Fatalf("cancels %d, closes %d: the connection is closed, and a COMMIT is not cancelled", cancels, closes)
+	}
+	if rc := receipts(t, path); len(rc) != 1 || rc[0].Outcome != "unknown" || rc[0].Cause != CauseUnknown {
+		t.Fatalf("receipt %+v", rc)
+	}
+	// Людям — та же тревога, что при обрыве на COMMIT.
+	if o := outcomes(t, path); o[0]["cause"] != CauseUnknown || o[0]["xid"] != "751" {
+		t.Fatalf("no alert about the COMMIT that was not answered: %v", o[0])
+	}
+	// В закрытое соединение после COMMIT не шло ничего, а следующий вызов идёт
+	// по новому.
+	if db.log[len(db.log)-1] != "COMMIT" {
+		t.Fatalf("%q", db.log[len(db.log)-3:])
+	}
+	db.slow = "pg_sleep"
+	if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'y' WHERE id = 1"}`); isErr || !strings.Contains(text, `"outcome":"committed"`) {
+		t.Fatalf("the next action: %v %s", isErr, text)
+	}
+}
+
+// База молчит на другом своём запросе сервера — номере транзакции: до SQL
+// агента дело не дошло, намерения нет, действие не шло. Соединение закрыто,
+// транзакция откатится вместе с ним.
+func TestOwnQueryThatIsNeverAnsweredFailsTheAction(t *testing.T) {
+	db := newSlowDB("pg_current_xact_id")
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s := serverOn(t, db, path, func(c *Config) { c.ReplyTimeout = 40 * time.Millisecond })
+	start := time.Now()
+	text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`)
+	if !isErr || !strings.Contains(text, "action a-1 failed and was rolled back") || !strings.Contains(text, "the database did not answer within 40ms") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the call hung for %v", took)
+	}
+	if _, closes := db.counts(); closes < 1 {
+		t.Fatalf("closes %d", closes)
+	}
+	if slices.ContainsFunc(db.log, func(q string) bool { return strings.Contains(q, "UPDATE accounts") }) || db.log[len(db.log)-1] == "ROLLBACK" {
+		t.Fatalf("the agent's SQL or a ROLLBACK went into the closed connection: %q", db.log)
+	}
+	if rc := receipts(t, path); len(rc) != 1 || rc[0].Outcome != "failed" || rc[0].XID != "" {
+		t.Fatalf("receipt %+v", rc)
+	}
+}
+
+// База приняла вход и замолчала на проверке роли: «недоступна», а не вечное
+// ожидание первого же вызова.
+func TestRoleCheckThatIsNeverAnswered(t *testing.T) {
+	db := newSlowDB(RoleCheck)
+	s := serverOn(t, db, filepath.Join(t.TempDir(), "receipts.jsonl"), func(c *Config) { c.ReplyTimeout = 40 * time.Millisecond })
+	start := time.Now()
+	text, isErr := callText(t, s, "query", `{"sql":"SELECT 1"}`)
+	if !isErr || !strings.Contains(text, "the database is unreachable: the database did not answer within 40ms") {
+		t.Fatalf("%v %s", isErr, text)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the call hung for %v", took)
+	}
+	if _, closes := db.counts(); closes != 1 {
+		t.Fatalf("closes %d", closes)
+	}
+}
+
+// То же у отката (P-394): его запросы идут под тем же пределом ожидания, а
+// COMMIT, на который база не ответила, — исход «неизвестно», как при обрыве.
+func TestCommitOfAnUndoThatIsNeverAnsweredIsUnknown(t *testing.T) {
+	db := newSlowDB("COMMIT")
+	db.exact = true
+	db.answers = undoAnswers
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	s := serverOn(t, db, path, func(c *Config) { c.ReplyTimeout = 40 * time.Millisecond })
+	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
+	appendReceipt(t, path, Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
+	s.newID = func() string { return "u-1" }
+	start := time.Now()
+	out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-1"}`)
+	if !isErr || !strings.Contains(out, "the undo may have been committed") || !strings.Contains(out, "Do not repeat it") {
+		t.Fatalf("%v %s", isErr, out)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the undo hung on COMMIT for %v", took)
+	}
+	got := receipts(t, path)
+	if last := got[len(got)-1]; last.Tool != "undo_apply" || last.Outcome != "unknown" || !strings.Contains(last.Error, "did not answer within 40ms") {
+		t.Fatalf("receipt %+v", last)
+	}
+	if _, closes := db.counts(); closes < 1 || db.log[len(db.log)-1] != "COMMIT" {
+		t.Fatalf("closes %d, the last query %q", closes, db.log[len(db.log)-1])
+	}
+	// Сверка, на которую база не ответила: откат не шёл, а соединение брошено
+	// — следующий вызов откроет новое, а не пойдёт в закрытое.
+	db.slow, db.exact = "SELECT w.step", false
+	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`); !isErr || !strings.Contains(out, "did not answer within 40ms") {
+		t.Fatalf("%v %s", isErr, out)
+	}
+	if s.db != nil {
+		t.Fatal("the server keeps the connection that the timeout closed")
+	}
+	db.slow = "pg_sleep"
+	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`); isErr {
+		t.Fatalf("the preview after the timeout: %s", out)
+	}
+}
+
+// Предел ожидания быстрым запросам не мешает и без настройки не действует.
+func TestReplyTimeoutLeavesAnsweredQueriesAlone(t *testing.T) {
+	for _, limit := range []time.Duration{0, time.Minute} {
+		db := newSlowDB("pg_sleep")
+		path := filepath.Join(t.TempDir(), "receipts.jsonl")
+		s := serverOn(t, db, path, func(c *Config) { c.ReplyTimeout = limit })
+		if text, isErr := callText(t, s, "execute", `{"sql":"UPDATE accounts SET note = 'x' WHERE id = 1"}`); isErr || !strings.Contains(text, `"outcome":"committed"`) {
+			t.Fatalf("reply timeout %v: %v %s", limit, isErr, text)
+		}
+		if cancels, closes := db.counts(); cancels != 0 || closes != 0 {
+			t.Fatalf("reply timeout %v: cancels %d, closes %d", limit, cancels, closes)
+		}
 	}
 }
 

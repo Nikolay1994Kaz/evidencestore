@@ -103,6 +103,12 @@ type Config struct {
 	// блокировку (SET LOCAL lock_timeout в начале транзакции). 0 — не задано.
 	StatementTimeout time.Duration
 	LockTimeout      time.Duration
+	// ReplyTimeout — сколько сервер ждёт ответа базы на свой запрос: BEGIN,
+	// свои настройки, номер транзакции, счёт строк, COMMIT, запросы сверки и
+	// отката. Дольше — соединение закрывается: запрос кончается как при
+	// обрыве связи, а на COMMIT исход — «неизвестно» (P-394). Запросы агента
+	// стережёт StatementTimeout. 0 — ждать без предела.
+	ReplyTimeout time.Duration
 	// ActionsPerMinute — сколько действий execute агент может сделать за
 	// минуту; WindowRows — сколько строк изменить за Window. Счёт — по файлу
 	// квитанций, общий для всех сеансов агента. 0 — без предела.
@@ -115,10 +121,9 @@ type Config struct {
 	Dial func(params map[string]string) (DB, error)
 	// Pooler — Dial ведёт к пулеру соединений (PgBouncer, по сессиям или по
 	// транзакциям), а не к базе: параметров входа нет (params — nil), сеанс
-	// чистит и настраивает сама транзакция (ownSettings). Инструментов отката
-	// в этом режиме нет: сверка и откат держат настройки сеанса между
-	// транзакциями (pgundo). AppName — имя программы для pg_stat_activity,
-	// которое при прямом соединении ставит Dial.
+	// чистит и настраивает сама транзакция (ownSettings) — и у действий, и у
+	// сверки с откатом (pgundo.Plan.Setup, P-393). AppName — имя программы
+	// для pg_stat_activity, которое при прямом соединении ставит Dial.
 	Pooler  bool
 	AppName string
 	// ReceiptsPath — файл квитанций шлюза (receipt/v2, DECISIONS, п. 42–43, 47):
@@ -212,6 +217,9 @@ type Server struct {
 	recent []Receipt
 	// ledger — расход агента по файлу квитанций (limits.go).
 	ledger *ledger
+	// cancelGrace — сколько после просьбы об отмене запроса агента ждать
+	// ответа базы, прежде чем закрыть соединение (timed).
+	cancelGrace time.Duration
 }
 
 // New собирает сервер.
@@ -222,7 +230,7 @@ func New(cfg Config, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Server{cfg: cfg, log: log, now: time.Now, newID: func() string {
+	return &Server{cfg: cfg, log: log, now: time.Now, cancelGrace: dbBackstop, newID: func() string {
 		var b [6]byte
 		rand.Read(b[:])
 		return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
@@ -720,11 +728,17 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 			"the transaction id was taken again (the database was restored from a backup, or the counter wrapped). This action is not undone here: ask a person", xid, actionID)
 	}
 	// Сверка и откат — с чистого сеанса; путь поиска ставит pgundo (Path и
-	// UndoSearchPath), таймауты — параметры входа (sessionParams).
+	// UndoSearchPath) в каждой своей транзакции, таймауты — параметры входа
+	// (sessionParams). Через пулер сеанса нет: с того же, с чего сервер
+	// начинает транзакцию действия (ownSettings), начинается и каждая
+	// транзакция сверки и отката (P-393).
 	if err := s.fresh(); err != nil {
 		return "", err
 	}
-	statuses, err := plan.Check(s.db)
+	if s.cfg.Pooler {
+		plan.Setup = s.ownSettings()
+	}
+	statuses, err := plan.Check(undoDB{s})
 	if err != nil {
 		return "", err
 	}
@@ -788,7 +802,7 @@ func (s *Server) undo(actionID, reason string, apply bool) (string, error) {
 	})
 	// Откат — тоже действие: его намерение несёт и номер действия, и что он
 	// возвращает, и транзакцию отката — до её изменений.
-	applied, err := plan.Apply(s.db, func(xid, xid8, started, timeline string) error {
+	applied, err := plan.Apply(undoDB{s}, func(xid, xid8, started, timeline string) error {
 		rc.XID, rc.FullXID, rc.DBStarted, rc.DBTimeline = xid, xid8, started, timeline
 		return s.intent(&rc, alert.StepUndo)
 	})
@@ -840,10 +854,31 @@ func (s *Server) run(sql string) ([]pgwire.Result, error) {
 	if err := s.connect(); err != nil {
 		return nil, err
 	}
-	res, err := s.db.Query(sql)
+	res, err := s.ask(s.db, sql)
 	var pg *pgwire.PgError
 	if err != nil && !errors.As(err, &pg) {
 		s.drop()
+	}
+	return res, err
+}
+
+// errLost — соединение, в котором шли сверка или откат, закрыто.
+var errLost = errors.New("the connection to the database is lost")
+
+// undoDB — соединение сервера для сверки и отката (pgundo): тот же предел
+// ожидания ответа и то же обращение с оборванным соединением, что у своих
+// запросов сервера (run). Нового соединения посреди отката он не открывает:
+// транзакция отката осталась на прежнем.
+type undoDB struct{ s *Server }
+
+func (u undoDB) Query(sql string) ([]pgwire.Result, error) {
+	if u.s.db == nil {
+		return nil, errLost
+	}
+	res, err := u.s.ask(u.s.db, sql)
+	var pg *pgwire.PgError
+	if err != nil && !errors.As(err, &pg) {
+		u.s.drop()
 	}
 	return res, err
 }
@@ -1203,11 +1238,17 @@ func (s *Server) transaction(rc *Receipt, stmts []string) error {
 			// «Откатилось» сказать нельзя — агент повторил бы действие
 			// (P-250); строки идут в счёт окна, а людям — тревога: «спроси
 			// человека» без человека не работало (P-258).
+			// База не ответила на COMMIT за ReplyTimeout — то же самое: она
+			// замерла или ждёт реплику, а зафиксирует ли, отсюда не узнать (P-394).
 			s.drop()
 			rc.Outcome, rc.Cause = "unknown", CauseUnknown
 			s.markRefused(rc, map[string]any{"xid": rc.XID, "rows": rc.Rows})
-			return fmt.Errorf("lost the connection to the database during COMMIT: the action may have been committed (transaction %s). "+
-				"Do not repeat it: the operators are alerted to check the transaction", rc.XID)
+			what := "lost the connection to the database during COMMIT"
+			if errors.Is(err, errNoReply) {
+				what = fmt.Sprintf("the database did not answer the COMMIT within %s", s.cfg.ReplyTimeout)
+			}
+			return fmt.Errorf("%s: the action may have been committed (transaction %s). "+
+				"Do not repeat it: the operators are alerted to check the transaction", what, rc.XID)
 		}
 		return fail(err)
 	}

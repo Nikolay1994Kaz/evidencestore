@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -131,5 +132,93 @@ func TestIntentCarriesTheTimeline(t *testing.T) {
 		if rcs := receipts(t, path); len(rcs) != 1 || rcs[0].DBTimeline != "" || rcs[0].DBStarted != "1795400000000000" {
 			t.Fatalf("row limit %d, no timeline in the answer: %+v", limit, rcs)
 		}
+	}
+}
+
+// Сверка и откат через пулер (P-393). В пуле по транзакциям запрос вне
+// транзакции уходит на соединение базы, которое пулер даёт только ему: путь
+// поиска, поставленный сеансу, до следующего запроса не доживал, и откат шёл
+// бы с путём роли. Теперь каждый запрос сверки и отката — внутри транзакции,
+// и каждая начинается с того же, с чего сервер начинает транзакцию действия:
+// чистка соединения, вид текста значений, роль, таймауты числами.
+func TestPoolerUndoStaysInsideItsTransactions(t *testing.T) {
+	db := &fakeDB{answers: undoAnswers}
+	s, path := newServer(t, db)
+	s.cfg.Pooler, s.cfg.AppName = true, "esmcp/support-bot"
+	s.cfg.StatementTimeout, s.cfg.LockTimeout = 60e9, 10e9
+	s.cfg.UndoSearchPath = []string{"app"}
+	s.cfg.Fetch = func(uint32) ([][]byte, error) { return [][]byte{journalLine()}, nil }
+	appendReceipt(t, path, Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
+	s.newID = func() string { return "u-1" }
+
+	if out, isErr := callText(t, s, "undo_preview", `{"action_id":"a-1"}`); isErr || !strings.Contains(out, `"to_apply":2`) {
+		t.Fatalf("%v %s", isErr, out)
+	}
+	preview := len(db.log)
+	if out, isErr := callText(t, s, "undo_apply", `{"action_id":"a-1","reason":"wrong rows"}`); isErr || !strings.Contains(out, `"applied":2`) {
+		t.Fatalf("%v %s", isErr, out)
+	}
+	if slices.Contains(db.log, "DISCARD ALL") {
+		t.Fatalf("DISCARD ALL through a pooler: %q", db.log)
+	}
+	// Вне транзакции — ни одного запроса; транзакций три: сверка просмотра,
+	// сверка перед откатом (обе — только для чтения, обе откатаны) и откат.
+	var begins []int
+	in := false
+	for i, q := range db.log {
+		switch {
+		case strings.HasPrefix(q, "BEGIN"):
+			if in {
+				t.Fatalf("BEGIN inside a transaction at %d: %q", i, db.log)
+			}
+			in = true
+			begins = append(begins, i)
+		case q == "COMMIT" || q == "ROLLBACK":
+			if !in {
+				t.Fatalf("%s outside a transaction at %d: %q", q, i, db.log)
+			}
+			in = false
+		case !in:
+			t.Fatalf("a query of the undo outside a transaction, where a pooler gives it a connection of its own:\n%s\n%q", q, db.log)
+		}
+	}
+	if in || len(begins) != 3 || db.log[begins[0]] != "BEGIN TRANSACTION READ ONLY" || db.log[begins[1]] != "BEGIN TRANSACTION READ ONLY" || db.log[begins[2]] != "BEGIN" ||
+		db.log[preview-1] != "ROLLBACK" || db.log[begins[2]-1] != "ROLLBACK" || db.log[len(db.log)-1] != "COMMIT" {
+		t.Fatalf("the transactions of the undo: %v\n%q", begins, db.log)
+	}
+	for _, b := range begins {
+		head := db.log[b+1]
+		for _, want := range []string{
+			"SET SESSION AUTHORIZATION DEFAULT; RESET ALL; DEALLOCATE ALL; CLOSE ALL; UNLISTEN *; SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES; ",
+			"SET LOCAL DateStyle = 'ISO, YMD'; SET LOCAL extra_float_digits = '3'; SET LOCAL IntervalStyle = 'postgres'; SET LOCAL array_nulls = 'on'; ",
+			"SET LOCAL application_name = 'esmcp/support-bot'; SET LOCAL search_path = pg_catalog, pg_temp; SET LOCAL client_encoding = 'UTF8'; SET LOCAL ROLE NONE; ",
+			"WHEN 'statement_timeout' THEN '65000' WHEN 'lock_timeout' THEN '10000' WHEN 'idle_in_transaction_session_timeout' THEN '300000' ELSE '0' END, true)",
+		} {
+			if !strings.Contains(head, want) {
+				t.Fatalf("a transaction of the undo does not start as the server's own do: it lacks %q:\n%s", want, head)
+			}
+		}
+		// Путь отката — после своих настроек сервера: последнее слово за ним.
+		if db.log[b+2] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)" {
+			t.Fatalf("after the head of the transaction: %q", db.log[b+2])
+		}
+	}
+	if n := strings.Count(strings.Join(db.log, "\n"), `set_config('search_path', 'pg_catalog, "app", pg_temp', true)`); n != 3 {
+		t.Fatalf("the search path of the undo is set in %d of its 3 transactions: %q", n, db.log)
+	}
+	// Прямое соединение начинает с DISCARD ALL и своих команд в транзакцию
+	// отката не добавляет: вид текста и таймауты ему дали параметры входа.
+	direct := &fakeDB{answers: undoAnswers}
+	s2, path2 := newServer(t, direct)
+	s2.cfg.Fetch = s.cfg.Fetch
+	appendReceipt(t, path2, Receipt{ActionID: "a-1", Time: time.Now().UTC().Format(time.RFC3339Nano), Agent: "support-bot", Tool: "execute",
+		SQL: "UPDATE accounts SET note = 'b'", XID: "751", Outcome: "committed"})
+	if out, isErr := callText(t, s2, "undo_preview", `{"action_id":"a-1"}`); isErr {
+		t.Fatal(out)
+	}
+	if direct.log[0] != "DISCARD ALL" || direct.log[1] != "BEGIN TRANSACTION READ ONLY" || direct.log[2] != "SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)" ||
+		strings.Contains(strings.Join(direct.log, "\n"), "RESET ALL") {
+		t.Fatalf("the undo over a direct connection: %q", direct.log)
 	}
 }

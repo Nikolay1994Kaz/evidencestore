@@ -50,8 +50,9 @@ type Config struct {
 	// по транзакциям), а не прямо к базе. Сервер тогда не шлёт параметров
 	// входа, которых пулер не пропускает, а ставит их и чистит соединение
 	// базы сам, внутри каждой своей транзакции. Без него через пулер сервер
-	// не входит («unsupported startup parameter»). Раздел undo с ним не
-	// задаётся: откат — командой esundo по прямому соединению с базой.
+	// не входит («unsupported startup parameter»). Сверка и откат раздела
+	// undo через пулер идут так же: каждый их запрос — внутри транзакции,
+	// которая начинается с тех же настроек (DECISIONS, п. 50).
 	Pooler bool `json:"pooler"`
 	// Agent — имя агента в квитанциях.
 	Agent string `json:"agent"`
@@ -93,11 +94,25 @@ type Config struct {
 	// умолчанию 10s. "0s" — без предела.
 	StatementTimeout *config.Duration `json:"statement_timeout"`
 	LockTimeout      *config.Duration `json:"lock_timeout"`
+	// ReplyTimeout — сколько сервер ждёт ответа базы на свой запрос (BEGIN,
+	// счёт строк, COMMIT, запросы отката): дольше — соединение закрывается, а
+	// на COMMIT исход действия — «неизвестно» и тревога людям. Так кончается
+	// вызов, когда база замерла, не закрыв соединения, или COMMIT ждёт
+	// синхронную реплику, которой нет. По умолчанию — statement_timeout и ещё
+	// 15s (свои запросы база и сама обрывает через statement_timeout + 5s);
+	// без statement_timeout и при "0s" — без предела.
+	ReplyTimeout *config.Duration `json:"reply_timeout"`
 	// Undo — откуда брать до-образы для инструментов отката (тот же раздел,
 	// что у esundo -config). Нет секции — инструментов undo_preview и
 	// undo_apply у агента нет.
 	Undo *pgundo.Settings `json:"undo"`
 }
+
+// replyMargin — на столько предел ожидания ответа базы на свои запросы
+// сервера по умолчанию длиннее statement_timeout: база обрывает их сама через
+// statement_timeout + 5 с, и предел сервера срабатывает, только когда она
+// молчит и после этого.
+const replyMargin = 15 * time.Second
 
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -166,9 +181,15 @@ func loadConfig(path string) (*Config, error) {
 			errs = append(errs, fmt.Errorf("%s is negative", name))
 		}
 	}
-	if c.Undo != nil && c.Pooler {
-		errs = append(errs, errors.New("undo: the undo tools keep session settings between transactions, and a pooler gives no session: "+
-			"leave `undo` out with `pooler`, and undo with esundo over a direct connection to the database"))
+	if c.ReplyTimeout == nil {
+		def := config.Duration(0)
+		if c.StatementTimeout != nil && c.StatementTimeout.D() > 0 {
+			def = config.Duration(c.StatementTimeout.D() + replyMargin)
+		}
+		c.ReplyTimeout = &def
+	}
+	if c.ReplyTimeout.D() < 0 {
+		errs = append(errs, errors.New("reply_timeout is negative"))
 	}
 	if c.Undo != nil {
 		if err := c.Undo.Validate(filepath.Dir(path)); err != nil {
@@ -212,7 +233,8 @@ func main() {
 	mc := mcpserver.Config{
 		Agent: cfg.Agent, MaxRows: cfg.MaxRows, RowLimit: cfg.ActionRowLimit, ActionsPerMinute: cfg.ActionsPerMinute,
 		WindowRows: cfg.WindowRows, Window: cfg.Window.D(), StatementTimeout: cfg.StatementTimeout.D(), LockTimeout: cfg.LockTimeout.D(),
-		Pooler: cfg.Pooler, AppName: dsn.AppName,
+		ReplyTimeout: cfg.ReplyTimeout.D(),
+		Pooler:       cfg.Pooler, AppName: dsn.AppName,
 		ReceiptsPath: cfg.Receipts, HeadPath: cfg.Head, Key: key, Gateway: cfg.Gateway, PGSource: cfg.PGSource, Version: version.String("esmcp"),
 		Dial: func(params map[string]string) (mcpserver.DB, error) {
 			c := dsn

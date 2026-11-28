@@ -117,6 +117,13 @@ type Plan struct {
 	// SearchPath — схемы пути поиска сверки и отката после pg_catalog
 	// (Settings.SearchPath): с ними план сверен, с ними Apply и применит.
 	SearchPath []string `json:"search_path,omitempty"`
+	// Setup — команды в начале каждой транзакции сверки и отката, раньше её
+	// собственных настроек. Прямому соединению они не нужны: вид текста
+	// значений и таймауты ему дают параметры входа. Через пулер соединений
+	// параметров входа нет, а соединение базы до этой транзакции держал кто-то
+	// другой: MCP-сервер кладёт сюда то же, с чего начинает свои транзакции
+	// (чистка соединения, вид текста, роль, таймауты — DECISIONS, п. 48 и 50).
+	Setup []string `json:"-"`
 
 	limit func(rows int) error
 }
@@ -559,12 +566,22 @@ func (p *Plan) catalog(db DB) error {
 			no, known := noEquality[typ]
 			if !known {
 				// Спрашиваем саму базу: оператор она ищет здесь так же, как в сверке.
+				// Отказ ломает транзакцию сверки — поэтому под точкой сохранения.
+				if _, err := db.Query("SAVEPOINT es_equality"); err != nil {
+					return err
+				}
 				_, err := db.Query("SELECT NULL::" + typ + " IS NOT DISTINCT FROM NULL::" + typ)
 				var pg *pgwire.PgError
 				switch {
 				case errors.As(err, &pg) && pg.Code == "42883": // undefined_function: оператора нет
 					no = true
+					if _, err := db.Query("ROLLBACK TO SAVEPOINT es_equality"); err != nil {
+						return err
+					}
 				case err != nil:
+					return err
+				}
+				if _, err := db.Query("RELEASE SAVEPOINT es_equality"); err != nil {
 					return err
 				}
 				noEquality[typ] = no
@@ -628,14 +645,18 @@ func ValidSearchPath(schemas []string) error {
 // суперпользователей): «добавить схему в путь — значит доверять всем, у кого
 // там CREATE» (документация PostgreSQL после CVE-2018-1058). Проверять одну
 // роль транзакции мало: она — роль MCP-сервера, а у агента своя (DECISIONS,
-// п. 39). Типы колонок сборщик пишет со схемой. Путь ставится на весь сеанс:
-// следующий запрос человека в esundo — тоже наш, MCP-сервер начинает вызов с
-// DISCARD ALL.
+// п. 39). Типы колонок сборщик пишет со схемой.
+//
+// Путь ставится на транзакцию (SET LOCAL), а не на сеанс, и каждый запрос
+// сверки и отката идёт внутри транзакции (begin): в пуле соединений по
+// транзакциям сеанса у клиента нет — запросы вне транзакции расходятся по
+// разным соединениям базы, и настройка сеанса до следующего запроса не
+// доживает (P-393). Путь, оставленный сеансу, откату и не нужен.
 func (p *Plan) session(db DB) error {
 	if err := ValidSearchPath(p.SearchPath); err != nil {
 		return refuse("%v", err)
 	}
-	if _, err := db.Query("SELECT pg_catalog.set_config('search_path', '" + Path + "', false)"); err != nil {
+	if _, err := db.Query("SELECT pg_catalog.set_config('search_path', '" + Path + "', true)"); err != nil {
 		return err
 	}
 	if len(p.SearchPath) == 0 {
@@ -690,8 +711,35 @@ func (p *Plan) session(db DB) error {
 			"tables and functions with the schema) or let only its owner create there. If such a role could create there before, look at "+
 			"what it made: its functions and operators stay, whoever owns them now", *res[0].Rows[0][0])
 	}
-	_, err = db.Query("SELECT pg_catalog.set_config('search_path', " + pgwire.Literal(p.Path()) + ", false)")
+	_, err = db.Query("SELECT pg_catalog.set_config('search_path', " + pgwire.Literal(p.Path()) + ", true)")
 	return err
+}
+
+// readOnly — транзакция сверки: база в ней не меняется, что бы ни было в
+// запросе.
+const readOnly = " TRANSACTION READ ONLY"
+
+// begin открывает транзакцию сверки (mode — readOnly) или отката и готовит
+// её: команды Setup, затем путь поиска (session). Не вышло — транзакция
+// откатывается здесь же.
+func (p *Plan) begin(db DB, mode string) (err error) {
+	if err := ValidSearchPath(p.SearchPath); err != nil {
+		return refuse("%v", err) // до базы: в неверном пути смотреть нечего
+	}
+	if _, err := db.Query("BEGIN" + mode); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			db.Query("ROLLBACK")
+		}
+	}()
+	if len(p.Setup) > 0 {
+		if _, err := db.Query(strings.Join(p.Setup, "; ")); err != nil {
+			return err
+		}
+	}
+	return p.session(db)
 }
 
 // Path — путь поиска сверки и отката, как его ставит сеанс: pg_catalog,
@@ -717,11 +765,13 @@ func (p *Plan) pathHint(err error) error {
 }
 
 // Check спрашивает базу про каждый шаг и запоминает годные в p.OK.
-// Ответы — по порядку шагов. База не меняется.
+// Ответы — по порядку шагов. База не меняется: вся сверка — одна транзакция
+// «только для чтения», которая откатывается.
 func (p *Plan) Check(db DB) ([]Status, error) {
-	if err := p.session(db); err != nil {
+	if err := p.begin(db, readOnly); err != nil {
 		return nil, err
 	}
+	defer db.Query("ROLLBACK")
 	if err := p.catalog(db); err != nil {
 		return nil, err
 	}
@@ -852,9 +902,6 @@ func (p *Plan) Apply(db DB, intent IntentFunc) (*Applied, error) {
 	for _, n := range p.OK {
 		only[n] = true
 	}
-	if err := p.session(db); err != nil {
-		return nil, err
-	}
 	out, err := p.apply(db, intent, p.groups(only), OrderJournal)
 	var pg *pgwire.PgError
 	// errReferenced в порядке журнала — ещё не приговор: при отложенном внешнем
@@ -863,7 +910,13 @@ func (p *Plan) Apply(db DB, intent IntentFunc) (*Applied, error) {
 		return out, p.pathHint(err)
 	}
 	first := err
-	ordered, err := p.byKeys(db, only)
+	// Порядок по ключам спрашивается у каталога — в своей транзакции с путём
+	// отката, как и всё остальное (P-393).
+	var ordered []group
+	if err = p.begin(db, readOnly); err == nil {
+		ordered, err = p.byKeys(db, only)
+		db.Query("ROLLBACK")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w (and the order by foreign keys could not be built: %v)", first, err)
 	}
@@ -877,8 +930,10 @@ func (p *Plan) Apply(db DB, intent IntentFunc) (*Applied, error) {
 }
 
 func (p *Plan) apply(db DB, intent IntentFunc, groups []group, order string) (_ *Applied, err error) {
-	if _, err := db.Query("BEGIN"); err != nil {
-		return nil, err
+	// Путь поиска и Setup — внутри транзакции отката: что откат проверил о
+	// схемах пути, то и действует до его COMMIT.
+	if err := p.begin(db, ""); err != nil {
+		return nil, p.pathHint(err)
 	}
 	defer func() {
 		if err != nil {

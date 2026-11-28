@@ -32,6 +32,9 @@
 #   WINDOW=1 …                                     # ещё пакет по окну времени и пакет по сделке: +2,5 минуты
 #   ROWS=450000 …                                  # замер объёма: счетов ROWS
 #   PGBIN=/usr/lib/postgresql/16/bin …             # где initdb, pg_ctl, psql
+#   POOLER=/usr/sbin/pgbouncer …                   # esmcp ходит в базу через PgBouncer ("pooler": true), пул по
+#                                                  # транзакциям; POOL_MODE=session — по сессиям. Сборщик и esundo —
+#                                                  # напрямую. Тот же сценарий, с откатом агента через пулер (P-393)
 #
 # Нужны: Go (сборка), PostgreSQL 14+ (плагин pgoutput встроен), python3.
 set -euo pipefail
@@ -46,6 +49,9 @@ PGPORT=${PGPORT:-55432}
 HOOKPORT=${HOOKPORT:-$((PORT + 1))}
 METRICSPORT=${METRICSPORT:-$((PORT + 2))}
 ROWS=${ROWS:-2000}
+POOLER=${POOLER:-}
+POOL_MODE=${POOL_MODE:-transaction}
+POOLPORT=${POOLPORT:-$((PGPORT + 1))}
 WINDOW=${WINDOW:-0}
 SRC=pg-agent
 mkdir -p "$BIN"
@@ -82,6 +88,7 @@ mkdir -p "$WORK/pg" "$WORK/sock"
 
 cleanup() {
   kill "${SERVER:-}" "${COLLECT:-}" "${HOOK:-}" 2>/dev/null || true
+  [ ! -s "$WORK/pool/pgbouncer.pid" ] || as_pg kill "$(cat "$WORK/pool/pgbouncer.pid")" 2>/dev/null || true
   as_pg "$PGBIN/pg_ctl" -D "$WORK/pg" -m fast stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -242,11 +249,43 @@ start_collector
 for _ in $(seq 100); do grep -q 'msg="reading the database log"' "$WORK/collect.log" 2>/dev/null && break; sleep 0.1; done
 grep -q 'msg="reading the database log"' "$WORK/collect.log" || die "сборщик не начал читать журнал базы: $(cat "$WORK/collect.log")"
 ls "$WORK" | grep -c '^spool-' | sed 's/$/ буфера, процесс один; отдельной программы для базы и файла-посредника между ними нет/'
+# С POOLER сервер агента ходит в базу через PgBouncer: параметров входа не шлёт
+# и сеанса базы не держит ("pooler": true). Откат агента — тоже через него.
+MCPDSN="host=$WORK/sock port=$PGPORT user=esmcp_bot dbname=shop"
+MCPPOOLER=
+if [ -n "$POOLER" ]; then
+  step "PgBouncer перед базой для сервера агента: пул по режиму $POOL_MODE, два соединения базы"
+  mkdir -p "$WORK/pool"
+  [ ${#AS_PG[@]} -eq 0 ] || chown postgres "$WORK/pool"
+  cat >"$WORK/pool/pgbouncer.ini" <<INI
+[databases]
+shop = host=$WORK/sock port=$PGPORT dbname=shop
+[pgbouncer]
+listen_addr =
+unix_socket_dir = $WORK/pool
+listen_port = $POOLPORT
+auth_type = trust
+auth_file = $WORK/pool/userlist.txt
+pool_mode = $POOL_MODE
+default_pool_size = 2
+max_client_conn = 100
+logfile = $WORK/pool/pgbouncer.log
+pidfile = $WORK/pool/pgbouncer.pid
+INI
+  echo '"esmcp_bot" ""' >"$WORK/pool/userlist.txt"
+  chmod 644 "$WORK/pool/pgbouncer.ini" "$WORK/pool/userlist.txt"
+  as_pg "$POOLER" -q -d "$WORK/pool/pgbouncer.ini"
+  for _ in $(seq 50); do [ -S "$WORK/pool/.s.PGSQL.$POOLPORT" ] && break; sleep 0.1; done
+  [ -S "$WORK/pool/.s.PGSQL.$POOLPORT" ] || die "PgBouncer не поднялся: $(cat "$WORK/pool/pgbouncer.log" 2>/dev/null)"
+  "$POOLER" --version | head -1
+  MCPDSN="host=$WORK/pool port=$POOLPORT user=esmcp_bot dbname=shop"
+  MCPPOOLER='"pooler": true,'
+fi
 # MCP-сервер агента. Секция undo — как ему достать до-образы из хранилища и
 # чем их проверить: ключ хранилища и доверие к меткам времени заданы здесь.
 cat >"$WORK/mcp.json" <<EOF
 {
-  "dsn": "host=$WORK/sock port=$PGPORT user=esmcp_bot dbname=shop",
+  "dsn": "$MCPDSN", $MCPPOOLER
   "agent": "support-bot",
   "receipts": "mcp/receipts.jsonl",
   "key": "mcp/esmcp.key",
@@ -266,7 +305,7 @@ EOF
 # минуту, 50 строк за десять минут. Шлюз тот же: тот же файл квитанций, ключ и цепочка.
 cat >"$WORK/mcp-strict.json" <<EOF
 {
-  "dsn": "host=$WORK/sock port=$PGPORT user=esmcp_bot dbname=shop",
+  "dsn": "$MCPDSN", $MCPPOOLER
   "agent": "batch-bot",
   "receipts": "mcp/receipts.jsonl",
   "key": "mcp/esmcp.key",

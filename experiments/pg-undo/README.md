@@ -593,6 +593,7 @@ compose up` и образы `golang`, `alpine`, `postgres` — не провер
 experiments/pg-undo/run.sh              # двадцать секунд
 WINDOW=1 experiments/pg-undo/run.sh     # ещё пакет по окну времени и пакет по сделке: +2,5 минуты
 ROWS=450000 experiments/pg-undo/run.sh  # 262 тысячи изменений в одном действии
+POOLER=/usr/sbin/pgbouncer experiments/pg-undo/run.sh  # сервер агента — через PgBouncer, пул по транзакциям (POOL_MODE=session — по сессиям)
 go test ./internal/collector ./internal/pginput ./internal/pgtap ./internal/alert ./internal/pgwire ./internal/pgoutput ./internal/pgundo ./internal/mcpserver
 PGINPUT_TEST_DSN="host=… port=… dbname=…" go test ./internal/pginput -run Live -v   # вход и откат на живой базе
 ```
