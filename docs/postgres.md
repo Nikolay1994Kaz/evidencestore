@@ -67,7 +67,8 @@ The server runs the transaction, and nothing is committed before its `COMMIT`. E
   "window_rows": 5000, "window": "10m",
   "actions_per_minute": 30,
   "statement_timeout": "1m",
-  "lock_timeout": "10s"
+  "lock_timeout": "10s",
+  "reply_timeout": "75s"
 }
 ```
 
@@ -77,6 +78,9 @@ The server runs the transaction, and nothing is committed before its `COMMIT`. E
 | `window_rows` per `window` | the agent splits a large change into parts | the part that overflows the window is rolled back before commit |
 | `actions_per_minute` | an agent in a loop | refused before the action reaches the database |
 | `statement_timeout` | a query that hangs or waits on a lock | cancelled on the database server, the connection closed |
+| `reply_timeout` | a database that stops answering without closing the connection (a frozen machine, a `COMMIT` that waits for a synchronous replica) | the connection closed; on `COMMIT` the outcome is `unknown`: `may have been committed`, people get `commit-unknown` |
+
+`reply_timeout` is how long the server waits for the database to answer the queries it sends itself: `BEGIN`, its settings, the row count, `COMMIT`, the queries of the undo. By default it is `statement_timeout` plus 15 seconds; `"0s"` turns it off, and it is off when `statement_timeout` is `"0s"` and it is not set. The agent's own SQL is under `statement_timeout`: if the database accepts the cancel request and still does not answer, the connection is closed 5 seconds later.
 
 In each case the agent is told not to split or retry and to call a person, the receipts keep the outcome and its cause, and the collector raises `refused` from the outcome receipt, so people learn about what did not happen in the database (an alert about the rate at most once a minute). Rows are counted by the database itself, from the statistics of the transaction, so changes made by triggers, cascades and inside `WITH` count. The limits are counted from the receipts file, shared by all of the agent's sessions.
 
@@ -91,10 +95,10 @@ With `"pooler": true` the `dsn` may point at PgBouncer, in session or in transac
 - Without it the server does not log in through PgBouncer at all (`unsupported startup parameter: extra_float_digits`): it sends its session settings as startup parameters, and a pooler refuses them. Do not work around that with `ignore_startup_parameters`: the pooler would drop the settings silently.
 - With it the server sends no such parameters and keeps nothing in the session. Every call is one transaction, and inside it the server sets what it needs (`SET LOCAL`: the text format of values, the timeouts, its role and search path) and cleans the database connection the way `DISCARD ALL` does, at the start and again after the agent's statements, before `COMMIT`. So nothing the agent's SQL leaves (a session setting, an advisory lock, a prepared statement) reaches whoever gets that connection next, and nothing left by others reaches the agent's action.
 - PgBouncer needs no settings for this. The pool belongs to the server's role: do not let other programs log in to the pooler with it.
-- The limits, the timer that cancels a statement (the cancel request goes through the pooler) and the receipts work the same. The undo tools do not: `undo` together with `pooler` is refused at start, because the check and the undo keep session settings between transactions. Undo with `esundo` over a direct connection to the database.
+- The limits, the timer that cancels a statement (the cancel request goes through the pooler), the receipts and the undo tools work the same. The check and the undo keep nothing in the session either: every query of theirs runs inside a transaction (the check in a read-only one that is rolled back), and each of those starts with the same cleaning and settings.
 - The collector does not go through a pooler: it reads the database log over a replication connection to the primary.
 
-Checked on 28 November 2026 with PgBouncer 1.26.1 and PostgreSQL 17.12, in both pooling modes: [experiments/pg-ha](../experiments/pg-ha/README.md) (in Russian). Other poolers were not tried.
+Checked on 28 November 2026 with PgBouncer 1.26.1 and PostgreSQL 17.12, in both pooling modes: [experiments/pg-ha](../experiments/pg-ha/README.md) (in Russian). The undo tools through a pooler were checked the same day with PgBouncer 1.24.1 and PostgreSQL 16.15 in transaction pooling mode (`POOLER=… experiments/pg-undo/run.sh`), not on that stand. Other poolers were not tried.
 
 `key` is an Ed25519 key in PKCS#8 PEM (`esreceipt keygen`); `esmcp -config mcp.json -pubkey` prints its public key, which goes into the collector's `receipts.gateway_keys` and the store's `gateway_key` of the receipts source (to change the key later, see [Keys](receipts.md#keys)). The gateway keeps the head of its chain next to the key (`head`, by default `<key>.head-<8 hex>`): it must be writable, and not in the receipts directory, or the server refuses to start.
 
@@ -230,8 +234,7 @@ The most important ones; all of them, with their causes, are in [experiments/pg-
 - Through `esmcp` the agent gets only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `VALUES`: an agent that needs to change the schema needs another path.
 - The full rows of the gateway's transactions are personal data in the store. They can be erased by month (the month key), not per person.
 - A server that dies between the intent and the outcome leaves the action `pending`, without an alert.
-- Through a connection pooler the agent has no undo tools (`esundo` over a direct connection undoes).
-- `COMMIT` has no timer of the server's own. If the primary stops answering without closing the connection (a frozen machine) and nothing between it and `esmcp` resets the connection, the call waits until TCP gives up. A balancer that drops sessions of a server it marks down ends the wait in seconds.
+- A `COMMIT` the database does not answer within `reply_timeout` ends as `unknown`, like a broken connection: whether it committed is for people to check. With `reply_timeout` off the call waits until TCP gives up.
 - The index (`index.jsonl`) and the alerts file are not rotated.
 - No ready-made Prometheus rules or dashboards; no mail or other channels than Telegram, Slack-compatible webhooks and your own address.
 - A collector that saw a switchover with a version before the timeline mark keeps the gateway's actions as fingerprints until the new primary is restarted: its state holds a bound by the start time only.
