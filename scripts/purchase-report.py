@@ -3,7 +3,7 @@
 #
 # Скрипт сам ничего не доказывает: он зовёт esverify и печатает отчёт, только
 # если пакет прошёл проверку. Шаги покупки — квитанции шлюза платформы
-# (receipt/v1, docs/receipts.md) из тел, которые esverify записал байт в байт
+# (receipt/v2, docs/receipts.md) из тел, которые esverify записал байт в байт
 # (-bodies); время приёма — из заголовков улик пакета (их esverify сверил с
 # листьями цепи). С -gateway-key esverify сам проверяет подпись платформы у
 # каждой открытой квитанции; без него её проверило только хранилище при
@@ -169,7 +169,7 @@ def receipt_of(raw):
         r = json.loads(raw)
     except ValueError:
         return None
-    if not isinstance(r, dict) or r.get("v") != 1 or not isinstance(r.get("step"), str):
+    if not isinstance(r, dict) or r.get("v") != 2 or not isinstance(r.get("step"), str):
         return None
     body = r.get("body") if isinstance(r.get("body"), dict) else {}
     approval = r.get("approval") if isinstance(r.get("approval"), dict) else None

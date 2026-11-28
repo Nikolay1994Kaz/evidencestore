@@ -207,7 +207,7 @@ type SourceReport struct {
 	// как честный пакет без записей субъекта в этом месяце (P-75).
 	SubjectUnconfirmedMonths []string
 	// SubjectForged — записей под меткой субъекта, чью подпись хранилище при
-	// приёме признало не ключом шлюза (квитанции receipt/v1): их написал тот,
+	// приёме признало не ключом шлюза (квитанции receipt/v2): их написал тот,
 	// у кого ключа нет, квитанциями действия они не считаются (R1-6).
 	SubjectForged     int
 	SubjectForgedSeqs []uint64
@@ -223,7 +223,7 @@ type SourceReport struct {
 	// пишет в файл, без ключа, и закрытое тело держало бы пакет по субъекту
 	// неполным — сделку честного действия не свести (R1-5 второго захода).
 	GatewayRepeats []uint64
-	// Receipts — источник квитанций шлюза (receipt/v1). ReceiptLinks —
+	// Receipts — источник квитанций шлюза (receipt/v2). ReceiptLinks —
 	// пар соседних квитанций одного шлюза, чью сцепку пакет проверил сам;
 	// ReceiptsOpened — открытых квитанций, сверенных с вердиктом;
 	// ReceiptsSigned — из них с подписью, проверенной ключом проверяющего
@@ -700,7 +700,7 @@ func sourceReceipts(b SourceBundle, trust Trust, r *SourceReport) error {
 		}
 		r.ReceiptLinks++
 	}
-	r.ReceiptKeyChecked = trust.GatewayKey != nil
+	r.ReceiptKeyChecked = trust.GatewayKeys.Len() > 0
 	for _, body := range r.Bodies {
 		v, ok := verdicts[body.Seq]
 		if !ok {
@@ -714,10 +714,14 @@ func sourceReceipts(b SourceBundle, trust Trust, r *SourceReport) error {
 			return fmt.Errorf("record %s/%d: the store called the receipt intact, and it does not parse offline: %w", b.Source, body.Seq, perr)
 		case rc.Gateway != v.Writer || rc.Seq != v.Seq || rc.Prev != v.PrevHash:
 			return fmt.Errorf("record %s/%d: the receipt names gateway %q, seq %d; the verdict %q, seq %d", b.Source, body.Seq, rc.Gateway, rc.Seq, v.Writer, v.Seq)
+		case rc.Kid != v.Kid:
+			return fmt.Errorf("record %s/%d: the receipt names key %s, the verdict %s", b.Source, body.Seq, orDash(rc.Kid), orDash(v.Kid))
 		}
 		r.ReceiptsOpened++
-		if trust.GatewayKey != nil {
-			if err := rc.Verify(trust.GatewayKey); err != nil {
+		if trust.GatewayKeys.Len() > 0 {
+			// Тем ключом, который квитанция называет, и в его срок по времени
+			// приёма — так же, как хранилище при приёме, но ключами проверяющего.
+			if err := trust.GatewayKeys.Verify(rc, time.Unix(0, body.ReceivedAt)); err != nil {
 				return fmt.Errorf("record %s/%d (gateway %s, seq %d): %w", b.Source, body.Seq, rc.Gateway, rc.Seq, err)
 			}
 			r.ReceiptsSigned++

@@ -92,8 +92,8 @@ cat >"$S/store/store.json" <<EOF
   "tsa": {"url": "local"},
   "sources": [
     {"name": "pg-agent", "content_type": "pg/before-images-v1", "subject_field": "xid", "retention_months": 1, "expect_every": "1h"},
-    {"name": "agent-mcp", "content_type": "receipt/v1", "gateway_key": "$MCPPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"},
-    {"name": "undo-op", "content_type": "receipt/v1", "gateway_key": "$UNDOPUB", "subject_field": "action", "retention_months": 12}
+    {"name": "agent-mcp", "content_type": "receipt/v2", "gateway_key": "$MCPPUB", "subject_field": "action", "retention_months": 12, "expect_every": "1h"},
+    {"name": "undo-op", "content_type": "receipt/v2", "gateway_key": "$UNDOPUB", "subject_field": "action", "retention_months": 12}
   ]
 }
 EOF

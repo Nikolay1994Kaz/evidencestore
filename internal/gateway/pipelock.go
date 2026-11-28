@@ -236,7 +236,8 @@ const (
 	LinkStale = "stale"
 )
 
-// Исходы подписи контрольной точки.
+// Исходы подписи контрольной точки и квитанции. У квитанции invalid — и
+// чужая подпись, и ключ не из списка источника, и ключ вне своего срока.
 const (
 	SigValid   = "valid"
 	SigInvalid = "invalid"
@@ -260,7 +261,11 @@ type Verdict struct {
 	// подпись (hex), чтобы проверяющий проверил её своим ключом.
 	Signature string `json:"signature,omitempty"`
 	Sig       string `json:"sig,omitempty"`
-	Problem   string `json:"problem,omitempty"`
+	// Kid — у квитанции шлюза: каким ключом она подписана, по её же слову
+	// (KeyID). Ключей у источника несколько, и проверяющему надо знать,
+	// который брать.
+	Kid     string `json:"kid,omitempty"`
+	Problem string `json:"problem,omitempty"`
 }
 
 // Clean — запись цела: хэш сошёлся, сцепка не разорвана, подпись (если
@@ -357,6 +362,18 @@ func (t *Tracker) Resume(v Verdict) {
 	}
 }
 
+// VerifyCheckpointAny проверяет подпись контрольной точки ключами
+// проверяющего: сходится с любым — проверена. Своего ключа точка не называет.
+func VerifyCheckpointAny(keys *KeySet, v Verdict) error {
+	err := errors.New("gateway: no gateway key to check the checkpoint with")
+	for _, k := range keys.Keys() {
+		if err = VerifyCheckpoint(k.Pub, v); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
 // VerifyCheckpoint проверяет подпись контрольной точки ключом
 // проверяющего — без доверия к хранилищу.
 func VerifyCheckpoint(key ed25519.PublicKey, v Verdict) error {
@@ -371,13 +388,4 @@ func VerifyCheckpoint(key ed25519.PublicKey, v Verdict) error {
 		return errors.New("gateway: checkpoint signature does not verify")
 	}
 	return nil
-}
-
-// ParseKey разбирает открытый ключ гейтвея: 64 hex-символа.
-func ParseKey(s string) (ed25519.PublicKey, error) {
-	b, err := hex.DecodeString(strings.TrimSpace(s))
-	if err != nil || len(b) != ed25519.PublicKeySize {
-		return nil, errors.New("gateway: key must be 64 hex characters (Ed25519 public key)")
-	}
-	return ed25519.PublicKey(b), nil
 }

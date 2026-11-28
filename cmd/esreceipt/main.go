@@ -1,10 +1,15 @@
-// Command esreceipt — квитанции шлюза (content_type "receipt/v1") без своего
+// Command esreceipt — квитанции шлюза (content_type "receipt/v2") без своего
 // кода подписи: ключ, подпись шагов в файл квитанций, проверка файла.
 //
 //	esreceipt keygen -key FILE
-//	esreceipt pubkey -key FILE
+//	esreceipt pubkey -key FILE [-jwk]
 //	esreceipt sign -key FILE -gateway NAME -file RECEIPTS < steps.jsonl
-//	esreceipt verify -gateway-key KEY -file RECEIPTS
+//	esreceipt verify -gateway-key KEY [-gateway-key KEY]… -file RECEIPTS
+//	esreceipt jws -file RECEIPTS
+//
+// Подпись квитанции — отсоединённый JWS: jws печатает каждую квитанцию файла
+// обычным компактным JWS, а pubkey -jwk — ключ в виде JWK, и проверить их
+// можно любой библиотекой JOSE, без этого кода.
 //
 // Шаг на входе sign — объект JSON в строке: "action" и "step" обязательны,
 // "time", "refs", "approval", "body" — по желанию. Номер, сцепку и подпись
@@ -40,9 +45,10 @@ func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
 const usage = `usage:
   esreceipt keygen -key FILE                              new gateway key (PKCS#8 PEM, mode 0600); prints its public key for gateway_key
-  esreceipt pubkey -key FILE                              prints the public key (64 hex)
+  esreceipt pubkey -key FILE [-jwk]                       prints the public key (64 hex), or with -jwk as a JSON Web Key with its kid
   esreceipt sign -key FILE -gateway NAME -file RECEIPTS   signs the steps on stdin and appends them to RECEIPTS
-  esreceipt verify -gateway-key KEY -file RECEIPTS        checks every receipt in RECEIPTS: format, signature, chain
+  esreceipt verify -gateway-key KEY -file RECEIPTS        checks every receipt in RECEIPTS: format, signature, chain; repeat -gateway-key for more keys
+  esreceipt jws -file RECEIPTS                            prints every receipt as a compact JWS, for any JOSE library to verify
   esreceipt version`
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -56,7 +62,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	keyPath := fs.String("key", "", "gateway private key (PKCS#8 PEM)")
 	name := fs.String("gateway", "", "gateway name: 1 to 128 letters, digits and . _ : - (it stays readable in the store's verdicts)")
 	file := fs.String("file", "", "receipts file (JSONL)")
-	pubKey := fs.String("gateway-key", "", "gateway public key (64 hex) or file containing it")
+	var pubKeys []string
+	fs.Func("gateway-key", "gateway public key (64 hex) or a file containing it; repeat the flag for more keys. The file may be the gateway_keys array of the store's source", func(v string) error {
+		pubKeys = append(pubKeys, v)
+		return nil
+	})
+	asJWK := fs.Bool("jwk", false, "pubkey: print the key as a JSON Web Key (RFC 8037) with its kid")
 	head := fs.String("head", "", "where sign keeps the head of the gateway's chain (default: next to -key); only the gateway may write there")
 	usageErr := func(err error) int {
 		fmt.Fprintln(stderr, "error:", err)
@@ -66,7 +77,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "version", "-version", "--version":
 		fmt.Fprintln(stdout, version.String("esreceipt"))
 		return exitOK
-	case "keygen", "pubkey", "sign", "verify":
+	case "keygen", "pubkey", "sign", "verify", "jws":
 	default:
 		fmt.Fprintln(stderr, usage)
 		return exitUsage
@@ -92,7 +103,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if err != nil {
 			return usageErr(err)
 		}
-		fmt.Fprintln(stdout, hex.EncodeToString(key.Public().(ed25519.PublicKey)))
+		if pub := key.Public().(ed25519.PublicKey); *asJWK {
+			fmt.Fprintln(stdout, string(gateway.JWK(pub)))
+		} else {
+			fmt.Fprintln(stdout, hex.EncodeToString(pub))
+		}
 	case "sign":
 		if *file == "" || *name == "" {
 			return usageErr(errors.New("-key, -gateway and -file are required"))
@@ -115,10 +130,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return exitInvalid
 		}
 	case "verify":
-		if *file == "" || *pubKey == "" {
+		if *file == "" || len(pubKeys) == 0 {
 			return usageErr(errors.New("-gateway-key and -file are required"))
 		}
-		key, err := parsePub(*pubKey)
+		keys, err := parsePubs(pubKeys)
 		if err != nil {
 			return usageErr(err)
 		}
@@ -127,7 +142,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return usageErr(err)
 		}
 		defer f.Close()
-		ok, err := verify(key, f, stdout)
+		ok, err := verify(keys, f, stdout)
+		if err != nil {
+			return usageErr(err)
+		}
+		if !ok {
+			return exitInvalid
+		}
+	case "jws":
+		if *file == "" {
+			return usageErr(errors.New("-file is required"))
+		}
+		f, err := os.Open(*file)
+		if err != nil {
+			return usageErr(err)
+		}
+		defer f.Close()
+		ok, err := compact(f, stdout, stderr)
 		if err != nil {
 			return usageErr(err)
 		}
@@ -147,15 +178,24 @@ func loadKey(path string) (ed25519.PrivateKey, error) {
 	return gateway.LoadKey(path)
 }
 
-func parsePub(v string) (ed25519.PublicKey, error) {
-	if k, err := gateway.ParseKey(v); err == nil {
-		return k, nil
+// parsePubs — ключи шлюза из -gateway-key: каждый — 64 hex, файл с ключом или
+// файл с массивом gateway_keys источника хранилища.
+func parsePubs(vals []string) (*gateway.KeySet, error) {
+	var entries []gateway.KeyEntry
+	for _, v := range vals {
+		more, err := gateway.ParseKeyList([]byte(v))
+		if err != nil {
+			data, ferr := os.ReadFile(v)
+			if ferr != nil {
+				return nil, errors.New("-gateway-key: neither 64 hex characters nor a readable file")
+			}
+			if more, err = gateway.ParseKeyList(data); err != nil {
+				return nil, fmt.Errorf("-gateway-key %s: %w", v, err)
+			}
+		}
+		entries = append(entries, more...)
 	}
-	data, err := os.ReadFile(v)
-	if err != nil {
-		return nil, errors.New("-gateway-key: neither 64 hex characters nor a readable file")
-	}
-	return gateway.ParseKey(string(data))
+	return gateway.ParseKeySet(entries)
 }
 
 // step — шаг на входе sign.
@@ -226,6 +266,9 @@ func sign(key ed25519.PrivateKey, name, path, head string, in io.Reader, warn io
 		if a.Glued {
 			fmt.Fprintf(warn, "warning: the receipt was glued to bytes that someone wrote into %s without its lock: it is written once more on a line of its own\n", path)
 		}
+		if a.KeyChanged {
+			fmt.Fprintf(warn, "note: gateway %q signs with a new key (%s), and its chain goes on from seq %d: list the new key in gateway_keys of the store's source, and give the previous one a not_after\n", name, a.Receipt.Kid, a.Receipt.Seq)
+		}
 		if a.Stale > 0 {
 			fmt.Fprintf(warn, "warning: %d lines of %s are copies of earlier receipts of gateway %q or a second branch of its chain: someone who can write the file wrote them, and the chain does not go on from them\n", a.Stale, path, name)
 		}
@@ -235,9 +278,16 @@ func sign(key ed25519.PrivateKey, name, path, head string, in io.Reader, warn io
 }
 
 // verify проверяет все квитанции файла тем же разбором, что и хранилище, и
-// печатает каждую поломку и итог.
-func verify(key ed25519.PublicKey, in io.Reader, out io.Writer) (bool, error) {
-	tr := gateway.NewReceiptTracker(key)
+// печатает каждую поломку и итог. Срок ключа здесь не сверяется: когда
+// квитанцию приняло хранилище, знает только оно.
+func verify(keys *gateway.KeySet, in io.Reader, out io.Writer) (bool, error) {
+	tr := gateway.NewReceiptTracker(keys)
+	for _, k := range keys.Keys() {
+		if !k.NotBefore.IsZero() || !k.NotAfter.IsZero() {
+			fmt.Fprintln(out, "note: the periods of the gateway keys are not checked here: a period is compared with the time the store received a receipt, which only the store's bundle shows")
+			break
+		}
+	}
 	br := bufio.NewReaderSize(in, 64<<10)
 	total, bad := 0, 0
 	gateways := map[string]bool{}
@@ -257,7 +307,7 @@ func verify(key ed25519.PublicKey, in io.Reader, out io.Writer) (bool, error) {
 			fmt.Fprintf(out, "line %d: longer than a receipt can be (%d bytes): not a receipt\n", total, gateway.MaxReceiptLen)
 			continue
 		}
-		v := tr.Check(line)
+		v := tr.Check(line, time.Time{})
 		if v.Writer != "" {
 			gateways[v.Writer] = true
 		}
@@ -268,6 +318,39 @@ func verify(key ed25519.PublicKey, in io.Reader, out io.Writer) (bool, error) {
 	}
 	fmt.Fprintf(out, "%d receipts of %d gateways, %d not intact\n", total, len(gateways), bad)
 	return bad == 0, nil
+}
+
+// compact печатает каждую квитанцию файла компактным JWS (заголовок, тело —
+// строка без поля jws — и подпись): по одному в строке, в порядке файла.
+// Подписи он не проверяет — для того их и печатает; строка, которая не
+// кончается подписью квитанции, называется в warn, и итог тогда — false.
+func compact(in io.Reader, out, warn io.Writer) (bool, error) {
+	br := bufio.NewReaderSize(in, 64<<10)
+	ok := true
+	for n := 1; ; n++ {
+		line, long, err := readLine(br, gateway.MaxReceiptLen+2)
+		if err == io.EOF {
+			return ok, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var jws string
+		signed := false
+		if !long {
+			r, _ := gateway.ParseReceipt(line)
+			jws, signed = r.Compact()
+		}
+		if !signed {
+			ok = false
+			fmt.Fprintf(warn, "line %d: not a receipt with a signature, skipped\n", n)
+			continue
+		}
+		fmt.Fprintln(out, jws)
+	}
 }
 
 // readLine — следующая строка без перевода строки; long — строка длиннее

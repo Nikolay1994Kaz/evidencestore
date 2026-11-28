@@ -104,7 +104,7 @@ Every claim with its conditions, and the exit codes of `esverify`: [docs/what-is
 
 ## How it was tested
 
-The test gate with the race detector and the Docker installation run on every push; 650 injected bugs each made a test fail on the code of v0.4.0, a set since grown to 1,301; randomized simulations of crashes, clocks, the collector and a dishonest store owner found no failure. Numbers, dates and commands: [docs/testing.md](docs/testing.md); every finding of the code review: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
+The test gate with the race detector and the Docker installation run on every push; 650 injected bugs each made a test fail on the code of v0.4.0, a set since grown to 1,322; randomized simulations of crashes, clocks, the collector and a dishonest store owner found no failure. Numbers, dates and commands: [docs/testing.md](docs/testing.md); every finding of the code review: [docs/dev/FINDINGS.md](docs/dev/FINDINGS.md), in Russian.
 
 ## Known limitations
 

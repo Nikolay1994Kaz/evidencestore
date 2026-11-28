@@ -1804,7 +1804,7 @@ func (m *storeSim) check() {
 	if err != nil {
 		m.t.Fatal(err)
 	}
-	trust.GatewayKey = gwKey
+	trust.GatewayKeys = gateway.OneKey(gwKey)
 	for _, c := range m.clients {
 		last, err := s.LastSeq(c.source)
 		if err != nil {

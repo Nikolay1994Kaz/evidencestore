@@ -2,7 +2,7 @@
 
 [← README](../README.md)
 
-A gateway is what an AI agent acts through: an MCP server, a purchase platform, a proxy in front of an API. When it writes one signed line for every step of every action, the store checks at intake that each line is the gateway's and that none is missing from its chain, and a bundle over one action shows the same to anyone who holds the gateway's public key. The content type is `receipt/v1`. Pipelock's flight recorder keeps its own format and is checked by its own rules ([Gateway journals](pipelock.md)).
+A gateway is what an AI agent acts through: an MCP server, a purchase platform, a proxy in front of an API. When it writes one signed line for every step of every action, the store checks at intake that each line is the gateway's and that none is missing from its chain, and a bundle over one action shows the same to anyone who holds the gateway's public key. The content type is `receipt/v2`. The signature is a standard one, a JWS, so a receipt can also be checked with any JOSE library, without this project's code. Pipelock's flight recorder keeps its own format and is checked by its own rules ([Gateway journals](pipelock.md)).
 
 ## The line
 
@@ -10,7 +10,7 @@ One JSON object per line:
 
 | Field | Value | Meaning |
 |---|---|---|
-| `v` | `1` | the format version |
+| `v` | `2` | the format version |
 | `gateway` | 1 to 128 of `A–Z a–z 0–9 . _ : -` | the gateway instance that writes the chain; it stays readable in the store's verdicts, so put no personal data in it |
 | `seq` | an integer from 1 to 2^53 − 1 | one more than the gateway's previous receipt |
 | `prev` | `"genesis"` or 64 lowercase hex | SHA-256 of the gateway's previous line, as written, without the newline |
@@ -20,13 +20,21 @@ One JSON object per line:
 | `refs` | optional: up to 64 objects `{"source": S, "subject": V}` | where the same action is recorded in another source of the store: under subject V of source S, such as a database's transaction id or a payment network's reference |
 | `approval` | optional: `{"format": F, "credential": C}` | who allowed the action, exactly as received: a customer's mandate, an operator's confirmation; the store does not parse it |
 | `body` | optional: any JSON | what the gateway knows about the step |
-| `sig` | 128 lowercase hex, the last field | the Ed25519 signature |
+| `jws` | `<protected header>..<signature>`, base64url without padding, the last field | the signature: a JWS with detached content, whose header names the algorithm and the key |
 
 ```json
-{"v":1,"gateway":"shop-agent-1","seq":7,"prev":"5f0c…e1","time":"2026-11-23T12:00:03.1Z","action":"p-1002","step":"cart","body":{"merchant":"sport.example","total":54990,"currency":"KZT"},"sig":"9a41…0c"}
+{"v":2,"gateway":"shop-agent-1","seq":7,"prev":"5f0c…e1","time":"2026-11-23T12:00:03.1Z","action":"p-1002","step":"cart","body":{"merchant":"sport.example","total":54990,"currency":"KZT"},"jws":"eyJhbGciOiJFZDI1NTE5Iiwia2lkIjoi…In0..mK3x…Bw"}
 ```
 
-**The signature** covers the line without `sig`. Write the object without it (bytes B, ending in `}`), sign `evidencestore/receipt/v1` and a newline followed by B with the gateway's Ed25519 key, and write B without its last `}`, then `,"sig":"<128 lowercase hex>"}`, then a newline. A verifier cuts this tail off, puts the `}` back and checks the very bytes that were signed, so no canonical form of JSON is needed: the gateway may order keys and escape strings as its JSON library does. At the top level, in `refs` and in `approval` a key may not appear twice, also in another case (`step` and `STEP` are one key: some parsers take one, some the other), and no other field is allowed there; `body` is free. The line is valid UTF-8, with no half of a surrogate pair escaped alone, and fits in one store record (1 MiB minus 1 KiB): a longer one is cut into pieces by the collector, and no piece is a receipt. Keep a large payload elsewhere and put its SHA-256 into `body`.
+**The signature** is a JWS with detached content (RFC 7515, Appendix F). Write the object without `jws` (bytes B, ending in `}`). Take the protected header `{"alg":"Ed25519","kid":"<key id>","typ":"vnd.evidencestore.receipt+jws"}` in base64url (P), sign `P`, a dot and `BASE64URL(B)` with the gateway's Ed25519 key, which is what a JOSE library signs for the payload B, and write B without its last `}`, then `,"jws":"P..S"}` with the signature in base64url (S), then a newline. A verifier cuts this tail off, puts the `}` back and has the compact JWS `P.BASE64URL(B).S`. It checks the very bytes that were signed, so no canonical form of JSON is needed: the gateway may order keys and escape strings as its JSON library does.
+
+- `alg` is `Ed25519` (RFC 9864). The older name of the same algorithm, `EdDSA` (RFC 8037), is accepted too, for the libraries that still write it. Another algorithm will be another name here, not another format.
+- `kid` names the key the receipt is signed with: the key's JWK thumbprint (RFC 7638), which `esreceipt pubkey -jwk` prints. A source can list several keys ([Keys](#keys)).
+- `typ` keeps a receipt's signature apart from anything else the gateway signs with the same key: a JWS with another `typ` is not a receipt.
+- The header holds these three members and no other. A key inside the signature (`jwk`, `jku`, `x5c`) would invite a verifier to check the signature with the signer's own key, and `crit` and `b64` change what counts as signed: with any of them the line is not a receipt.
+- base64url is strict: no padding, and the unused bits of the last character are zero. Otherwise one signature could be spelled in several ways, and one receipt would have several hashes.
+
+At the top level, in `refs` and in `approval` a key may not appear twice, also in another case (`step` and `STEP` are one key: some parsers take one, some the other), and no other field is allowed there; `body` is free. The line is valid UTF-8, with no half of a surrogate pair escaped alone, and fits in one store record (1 MiB minus 1 KiB): a longer one is cut into pieces by the collector, and no piece is a receipt. Keep a large payload elsewhere and put its SHA-256 into `body`.
 
 **The chain.** A gateway's first receipt has `"seq": 1, "prev": "genesis"`, every next one the next `seq` and the hash of the line before it. A gateway that restarts goes on from its last line; one that starts over from `genesis` shows in the store as a break, since receipts may have been lost in between. Several gateway instances can write into one source, each its own chain under its own `gateway`.
 
@@ -41,25 +49,62 @@ esreceipt keygen -key gateway.key        # PKCS#8 PEM, mode 0600; prints the pub
 echo '{"action":"p-1002","step":"cart","body":{"total":54990}}' |
   esreceipt sign -key gateway.key -gateway shop-agent-1 -file /var/log/shop-agent/receipts.jsonl
 esreceipt verify -gateway-key <64 hex> -file /var/log/shop-agent/receipts.jsonl
+esreceipt pubkey -key gateway.key -jwk   # the public key as a JSON Web Key, with its kid
+esreceipt jws -file /var/log/shop-agent/receipts.jsonl   # every receipt as a compact JWS
 ```
 
 `sign` takes one step per input line (`action` and `step`, and if needed `time`, `refs`, `approval`, `body`), goes on from the gateway's last receipt, holds a lock on the file while it writes, and fsyncs every receipt before the next. Where the gateway's chain stands is the gateway's own state, like its key, and it lives next to the key, not next to the file: the head (`-head`, by default `<key>.head-<8 hex>` for this file and gateway name) holds the `seq`, the hash and the place of the gateway's last receipt, and is replaced whole after every receipt. Whoever writes to the receipts file without the key cannot touch the head, so cutting the file back, rotating it, or planting a copy of an earlier receipt does not fork the chain: the next receipt goes on from the head, and the collector names the receipts missing from the file. That holds only while the head is somewhere the writer of the receipts directory cannot write: a head in the directory of the receipts file is refused (`sign`, esmcp at start, `esundo apply`), so a key kept next to the receipts needs `-head` elsewhere. A head that is not a regular file of at most 4 KiB is refused, the gateway does not write. The receipts file itself is opened only as a regular file and never through a symbolic link at its path (a link there would send the receipts elsewhere while `sign` reported them written), and the holes of a sparse file are stepped over. Without a head (the first receipt, or a head lost with the gateway's state) the gateway's receipt with the highest `seq` near the end of the file is taken. Nothing someone writes into the file without the key stops the gateway or forks its chain: a line that is not a receipt of this gateway signed with this key, such as a forgery, is passed by with a warning, so the store flags only the forgery; a copy of an earlier receipt of the gateway does not become its last one; a line longer than any receipt is passed by. If lines claim the gateway and none of them is signed with the key given, `sign` warns that the key may be the wrong one and goes on from its head, or starts a new chain: refusing there let one planted line stop the gateway, and a wrong key shows anyway, in the store's verdict on every receipt it signs. A file that does not end with a newline has a torn last line (its writer died in the middle of it; every writer holds the lock): `sign` closes it with a newline and warns, the piece stays in the file as a broken line, which the store names, and the chain goes on from the receipt before it. The lock is advisory: if bytes land between that check and the write, the receipt is glued to them, and `sign` writes it once more on a line of its own. `verify` checks a file by the same rules as the store and names every line that is not intact. A gateway written in Go uses `gateway.AppendHead` of this repository the same way (an internal package for now).
 
 Keep the key readable only by the gateway's own system user. Whoever can read it signs receipts in the gateway's name: an agent given a shell on the gateway's host under the same user, too.
 
+## Checking a receipt with a JOSE library
+
+`esreceipt jws` prints every receipt of a file as an ordinary compact JWS, header, payload and signature, and `esreceipt pubkey -jwk` the gateway's key as a JSON Web Key (`{"kty":"OKP","crv":"Ed25519","x":"…","kid":"…"}`). Any JOSE library then checks the signature, here `jose` for Node.js:
+
+```js
+import { compactVerify, importJWK } from 'jose'
+const { payload, protectedHeader } = await compactVerify(token, await importJWK(jwk, 'Ed25519'))
+```
+
+The payload it returns is the receipt's line without the `jws` field, byte for byte. To check a line without `esreceipt`, cut the tail `,"jws":"P..S"}` off, put `}` back to get B, and verify `P.BASE64URL(B).S`.
+
+A library checks the signature and nothing else of what `esverify` checks: that `typ` is a receipt's and the header holds nothing more, that the key is the gateway's and was in its period when the store received the receipt, the chain, and that the line is in the store. A library that knows this algorithm only under its older name refuses `Ed25519` in the header (PyJWT 2.15 does); a gateway written with such a library signs with `"alg":"EdDSA"`, and the store takes both.
+
 ## Settings
 
 ```json
-{"name": "shop-agent", "content_type": "receipt/v1", "gateway_key": "<64 hex>", "subject_field": "action", "retention_months": 24}
+{"name": "shop-agent", "content_type": "receipt/v2", "gateway_key": "<64 hex>", "subject_field": "action", "retention_months": 24}
 ```
 
-`gateway_key` is required for this content type: a receipt whose signature nobody checked proves nothing. `subject_field` is `action` or none; with it, `evidencestore proof -subject` opens the receipts of one action and no others ([One subject](bundles.md)). Point the collector at the file the gateway writes.
+A gateway key is required for this content type: a receipt whose signature nobody checked proves nothing. `gateway_key` is one key with no period; `gateway_keys` lists several, with periods ([Keys](#keys)). `subject_field` is `action` or none; with it, `evidencestore proof -subject` opens the receipts of one action and no others ([One subject](bundles.md)). Point the collector at the file the gateway writes.
 
 The collector's PostgreSQL input reads the same files (`postgres.receipts`: `files`, `gateway_keys`, `source`): a transaction whose id a signed intent names is the gateway's action and is kept whole, with its row images for an undo; any other is kept as a fingerprint. `esmcp` and `esundo` write such intents before their `COMMIT` ([PostgreSQL and an MCP server](postgres.md)).
 
+## Keys
+
+A source can list several gateway keys, each with the period in which it speaks for the gateway:
+
+```json
+{"name": "shop-agent", "content_type": "receipt/v2", "subject_field": "action", "retention_months": 24,
+ "gateway_keys": [
+   {"key": "<64 hex, the previous key>", "not_after": "2026-12-01T00:00:00Z"},
+   {"key": "<64 hex, the new key>", "not_before": "2026-11-30T00:00:00Z"}
+ ]}
+```
+
+An entry is 64 hex characters or `{"key", "not_before", "not_after"}`, the times in RFC 3339 and optional; a key speaks from `not_before` up to, not including, `not_after`. A receipt names its key in `kid`, and the store checks it with that key and compares the key's period with the time **the store received** the receipt. The `time` inside a receipt is written by whoever signs it, so the holder of a stolen key would write any.
+
+**Changing the key.** List the new key at the store's source (and in `gateway_keys` of a collector that reads the receipts for PostgreSQL) and restart them, then give the gateway the new key at the path of the old one, and then set `not_after` on the old key. The gateway's chain goes on: `esreceipt sign`, `esmcp` and `esundo` continue from the head they keep next to the key, and say that the key changed. A key at another path has another default head, so name the previous head with `-head` (`head` in the settings of `esmcp` and `esundo`), or the gateway starts a new chain and the store calls its first receipt broken. A receipt under a key the source does not list yet is taken in with the verdict `invalid`, and that verdict stays.
+
+**Revoking a key.** `not_after` is the moment from which the key is not trusted. A receipt received from then on under it gets the verdict `invalid` with the reason, does not enter the gateway's chain and is not opened in bundles, like one signed with a stranger's key. Verdicts already in the chain keep what they said: moving `not_after` back does not judge again what the store has received. An auditor does that with a key list of their own (below).
+
+**The auditor's keys.** `esverify -gateway-key KEY`, repeated for every key, or a file with the same array as `gateway_keys`, periods included. Each open receipt is checked with the key it names, and that key's period is compared with the receive time in the bundle. A key the auditor knows to be stolen earlier than the store's settings say fails the receipts received after that moment, whatever the store's verdict was.
+
+Whose keys these are, and which periods are true, neither the store nor a bundle shows: the settings are the word of the store's operator, and the auditor brings their own.
+
 ## What the store checks at intake
 
-Every line: the format above, the signature with the pinned key, and the link to the receipt of the same gateway the store received before it. Nothing is rejected. The line is stored as received, and a verdict goes into the chain next to it: the gateway, `seq`, the hash of the line and its `prev`, the link (`genesis`, `linked`, `first-seen` when the chain began before the store's first receipt of it, `broken`, `stale` for a receipt with a valid signature that is not newer than the gateway's last one: a copy of an earlier line or a second branch of its chain), the signature (`valid` or `invalid`) and what is wrong. The action, the step and the body are not in the verdict, so a bundle for one action keeps the others closed. A line whose signature is not the gateway's does not enter the gateway's chain, and neither does a `stale` one: the next real receipt links past both. A copy of an earlier receipt, which anyone who can write the file can add without the key, used to move the chain back and make the next real receipt broken. Every line that is not intact counts in `evidencestore_gateway_problems_total` and goes to the store's log.
+Every line: the format above, the signature with the key the receipt names among the source's keys, that key's period at the time the line was received, and the link to the receipt of the same gateway the store received before it. Nothing is rejected. The line is stored as received, and a verdict goes into the chain next to it: the gateway, `seq`, the hash of the line and its `prev`, the link (`genesis`, `linked`, `first-seen` when the chain began before the store's first receipt of it, `broken`, `stale` for a receipt with a valid signature that is not newer than the gateway's last one: a copy of an earlier line or a second branch of its chain), the key the receipt names (`kid`), the signature (`valid` or `invalid`: a signature that does not verify, a key the source does not list, a key outside its period) and what is wrong. The action, the step and the body are not in the verdict, so a bundle for one action keeps the others closed. A line whose signature is not the gateway's, or is made with a key outside its period, does not enter the gateway's chain, and neither does a `stale` one: the next real receipt links past both. A copy of an earlier receipt, which anyone who can write the file can add without the key, used to move the chain back and make the next real receipt broken. Every line that is not intact counts in `evidencestore_gateway_problems_total` and goes to the store's log.
 
 ## What a bundle proves
 
@@ -85,6 +130,7 @@ Not proven:
 
 Limits to plan for:
 
-- **One key per source.** A new key takes a config change; verdicts already in the chain keep what they said. Check older receipts with the older key.
+- **Keys and their periods are settings.** A new key and a revocation take a change of the source's settings and a restart of the store; verdicts already in the chain keep what they said. Nothing signed says that the gateway changed its key: the store's operator lists the keys, and the auditor brings their own list.
+- **One algorithm.** Receipts are signed with Ed25519. The header names the algorithm, so another one, such as ML-DSA (RFC 9964), is a new `alg` value and not a new format; it is not built.
 - **The bundle grows with the whole source**, not with the action, as every bundle over a window does ([Purchases](purchases.md)).
 - **A receipt is one record.** Anything bigger goes elsewhere, with its hash in `body`.

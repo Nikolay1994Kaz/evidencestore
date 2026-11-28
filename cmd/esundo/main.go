@@ -345,8 +345,11 @@ func undoIntent(cfg *Config, key ed25519.PrivateKey, p *pgundo.Plan, action, by,
 		if err != nil {
 			return err
 		}
-		_, err = gateway.AppendHead(cfg.Receipts, cfg.Head, key, cfg.Gateway, gateway.Draft{Action: action, Step: alert.StepUndo,
+		a, err := gateway.AppendHead(cfg.Receipts, cfg.Head, key, cfg.Gateway, gateway.Draft{Action: action, Step: alert.StepUndo,
 			Refs: []gateway.Ref{{Source: cfg.PGSource, Subject: xid}}, Body: body})
+		if a.KeyChanged {
+			fmt.Fprintf(os.Stderr, "esundo: note: gateway %q signs with a new key (%s), and its chain goes on from seq %d: the store's source and the collector must list the new key (gateway_keys)\n", cfg.Gateway, a.Receipt.Kid, a.Receipt.Seq)
+		}
 		return err
 	}
 }

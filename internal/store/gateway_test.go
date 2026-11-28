@@ -90,7 +90,7 @@ func gatewayTrust(t *testing.T, s *Store, key string) proof.Trust {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr.GatewayKey = k
+	tr.GatewayKeys = gateway.OneKey(k)
 	return tr
 }
 
@@ -139,13 +139,13 @@ func TestGatewayJournalProof(t *testing.T) {
 	}
 
 	other, _, _ := ed25519.GenerateKey(nil)
-	tr.GatewayKey = other
+	tr.GatewayKeys = gateway.OneKey(other)
 	if proof.Verify(b, tr).Valid() {
 		t.Fatal("подпись контрольной точки сошлась с чужим ключом гейтвея")
 	}
 	// Без ключа проверяющего подпись проверило только хранилище — это
 	// предел, а не провал, и он назван.
-	tr.GatewayKey = nil
+	tr.GatewayKeys = nil
 	r = proof.Verify(b, tr)
 	if !r.Valid() || !strings.Contains(strings.Join(r.Notes(), "\n"), "esverify -gateway-key") {
 		t.Fatalf("без ключа гейтвея:\n%s", r.Text())

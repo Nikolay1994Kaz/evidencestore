@@ -74,7 +74,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return nil
 	})
 	promisePath := fs.String("promise", "", "signed promise received by the collector (JSON), optional")
-	gatewayKey := fs.String("gateway-key", "", "pinned gateway public key (64 hex) or file containing it: checks the gateway's signatures yourself (a Pipelock checkpoint, every open gateway receipt)")
+	var gatewayKeys []string
+	fs.Func("gateway-key", "pinned gateway public key (64 hex) or a file containing it: checks the gateway's signatures yourself (a Pipelock checkpoint, every open gateway receipt). Repeat the flag when the gateway changed its key: a receipt names the key it is signed with. The file may also hold the keys with their periods, as gateway_keys of the store's source does: [{\"key\": …, \"not_before\": …, \"not_after\": …}]; a receipt received outside its key's period does not pass", func(v string) error {
+		gatewayKeys = append(gatewayKeys, v)
+		return nil
+	})
 	headsDir := fs.String("heads", "", "directory with signed chain heads you took from a witness yourself, all versions (witness.url, a newspaper, someone else's locked copy): the chain in the bundle must agree with them; with the S3 versions list next to them (aws s3api list-object-versions > DIR/versions.json) or a collector's head journal, each witness fixes the record with the head it received first (give each collector a subdirectory of its own)")
 	var witnessKeys []string
 	fs.Func("witness-key", "verifier key of a C2SP witness (as eswitness vkey prints it) or a file containing it, taken from the witness's operator; repeat the flag for more witnesses: each must have cosigned a head at or after the record (for a bundle over a window, at or after its end), and the chain in the bundle must agree with it", func(v string) error {
@@ -114,10 +118,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return nil
 	})
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: esverify -proof FILE (-store-key KEY | -seal-trust CERT[,CERT] -seal-subject ATTR=VALUE…) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY] [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
+		fmt.Fprintln(stderr, "usage: esverify -proof FILE (-store-key KEY | -seal-trust CERT[,CERT] -seal-subject ATTR=VALUE…) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-promise FILE] [-gateway-key KEY]… [-heads DIR] [-witness-key VKEY]… [-allow-no-tsa] [-json] [-body FILE]")
 		fmt.Fprintln(stderr, "       esverify -proof WINDOW (-store-key KEY | -seal-trust CERT[,CERT] -seal-subject ATTR=VALUE…) -tsa-trust CERT[,CERT] [-tsa-crl CRL]… [-tsa-revoked FILE]… [-from T -to T] [-heads DIR] [-witness-key VKEY]… [-json] [-bodies DIR]")
 		fmt.Fprintln(stderr, "       (WINDOW: a bundle over a window of time, one source or every source: evidencestore proof -from -to)")
-		fmt.Fprintln(stderr, "       esverify -proof RECEIPTS -linked BUNDLE [-linked BUNDLE]… (-store-key KEY | …) -tsa-trust CERT[,CERT] [-gateway-key KEY] [-from T -to T] [-json] [-bodies DIR]")
+		fmt.Fprintln(stderr, "       esverify -proof RECEIPTS -linked BUNDLE [-linked BUNDLE]… (-store-key KEY | …) -tsa-trust CERT[,CERT] [-gateway-key KEY]… [-from T -to T] [-json] [-bodies DIR]")
 		fmt.Fprintln(stderr, "       (a deal: the bundle by subject of an action's receipts and the bundles of the records they name in other sources)")
 		fmt.Fprintln(stderr, "       esverify -version")
 		fs.PrintDefaults()
@@ -179,19 +183,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
-	if *gatewayKey != "" {
-		// Сначала — как ключ: файл с именем, равным ключу, его не подменяет.
-		if err := notAlsoFile("-gateway-key", *gatewayKey, func(v string) bool { _, err := gateway.ParseKey(v); return err == nil }); err != nil {
-			return usageErr(err)
+	if len(gatewayKeys) > 0 {
+		var entries []gateway.KeyEntry
+		for _, v := range gatewayKeys {
+			// Сначала — как ключ: файл с именем, равным ключу, его не подменяет.
+			if err := notAlsoFile("-gateway-key", v, func(v string) bool { _, err := gateway.ParseKey(v); return err == nil }); err != nil {
+				return usageErr(err)
+			}
+			more, err := gateway.ParseKeyList([]byte(v))
+			if err != nil {
+				b, ferr := os.ReadFile(v)
+				if ferr != nil {
+					return usageErr(fmt.Errorf("-gateway-key: %w", err))
+				}
+				if more, err = gateway.ParseKeyList(b); err != nil {
+					return usageErr(fmt.Errorf("-gateway-key %s: %w", v, err))
+				}
+			}
+			entries = append(entries, more...)
 		}
-		if pt.GatewayKey, err = gateway.ParseKey(*gatewayKey); err != nil {
-			b, ferr := os.ReadFile(*gatewayKey)
-			if ferr != nil {
-				return usageErr(err)
-			}
-			if pt.GatewayKey, err = gateway.ParseKey(string(b)); err != nil {
-				return usageErr(err)
-			}
+		if pt.GatewayKeys, err = gateway.ParseKeySet(entries); err != nil {
+			return usageErr(fmt.Errorf("-gateway-key: %w", err))
 		}
 	}
 	if *headsDir != "" {
@@ -262,8 +274,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if kind, _ := proof.BundleKind(data); kind == proof.WindowKind || kind == proof.SourceKind {
 		var single []string
 		// -gateway-key годится и пакету по источнику: им проверяется подпись
-		// каждой открытой квитанции шлюза (receipt/v1).
-		for name, set := range map[string]bool{"-promise": *promisePath != "", "-gateway-key": *gatewayKey != "" && kind == proof.WindowKind, "-allow-no-tsa": *allowNoTSA, "-body": *bodyPath != ""} {
+		// каждой открытой квитанции шлюза (receipt/v2).
+		for name, set := range map[string]bool{"-promise": *promisePath != "", "-gateway-key": len(gatewayKeys) > 0 && kind == proof.WindowKind, "-allow-no-tsa": *allowNoTSA, "-body": *bodyPath != ""} {
 			if set {
 				single = append(single, name)
 			}
@@ -307,6 +319,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		if report.Receipt {
 			out["gateway_receipt_signed"] = report.ReceiptSigned
+			out["gateway_receipt_key"] = report.ReceiptKid
 			out["gateway_key_checked"] = report.GatewayKeyChecked
 		}
 		if report.WitnessChecked {

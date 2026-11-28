@@ -1,19 +1,25 @@
 package gateway
 
-// Общая квитанция шлюза — content_type "receipt/v1" (DECISIONS, п. 43).
+// Общая квитанция шлюза — content_type "receipt/v2" (DECISIONS, п. 43 и 47).
 //
 // Шлюз — то, через что агент действует: MCP-сервер, платформа покупок. На
-// каждый шаг действия он пишет строку JSONL и подписывает её своим ключом
-// Ed25519. Строки одного шлюза сцеплены: prev — SHA-256 предыдущей строки,
-// seq растёт на единицу. Хранилище при приёме проверяет подпись закреплённым
-// ключом (gateway_key источника) и сцепку и кладёт вердикт в цепь рядом с
-// уликой, как у журнала Pipelock. Ничего не отвергается.
+// каждый шаг действия он пишет строку JSONL и подписывает её своим ключом.
+// Строки одного шлюза сцеплены: prev — SHA-256 предыдущей строки, seq растёт
+// на единицу. Хранилище при приёме проверяет подпись ключом источника,
+// который квитанция называет (gateway_keys), его срок и сцепку и кладёт
+// вердикт в цепь рядом с уликой, как у журнала Pipelock. Ничего не
+// отвергается.
 //
-// Подписаны ровно байты строки без поля sig. Шлюз пишет объект без sig
-// (байты B, последний — «}»), подписывает "evidencestore/receipt/v1\n" ‖ B и
-// дописывает подпись перед закрывающей скобкой: B без «}» + `,"sig":"<hex>"}`.
-// Проверяющий отрезает этот хвост, возвращает «}» и проверяет те самые байты:
-// каноническая форма JSON не нужна, а значит, и спорить о ней не с кем.
+// Подпись — отсоединённый JWS (RFC 7515, приложение F) последним полем
+// строки. Шлюз пишет объект без поля jws (байты B, последний — «}»), считает
+// обычный JWS с телом B — подписывает ASCII(P) ‖ "." ‖ BASE64URL(B), где P —
+// защищённый заголовок в base64url, — и дописывает перед закрывающей скобкой
+// заголовок и подпись без тела: B без «}» + `,"jws":"P..S"}`. Проверяющий
+// отрезает этот хвост, возвращает «}» и получает компактный JWS P.BASE64URL(B).S,
+// который проверит любая библиотека JOSE. Подписаны те самые байты, что в
+// строке: каноническая форма JSON не нужна, а значит, и спорить о ней не с
+// кем. В заголовке — alg (алгоритм), kid (каким ключом, KeyID) и typ: он
+// отделяет подпись квитанции от других подписей тем же ключом.
 //
 // В открытом вердикте — только шлюз, seq, хэши и исходы. Номер действия и
 // шаг остаются в зашифрованном теле, поэтому источник квитанций метится по
@@ -23,6 +29,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,7 +46,10 @@ import (
 )
 
 // ReceiptContentType — тип улики для общей квитанции шлюза.
-const ReceiptContentType = "receipt/v1"
+const ReceiptContentType = "receipt/v2"
+
+// ReceiptVersion — поле v квитанции.
+const ReceiptVersion = 2
 
 // Пределы полей квитанции.
 const (
@@ -47,6 +57,7 @@ const (
 	MaxStep           = 64
 	MaxRefs           = 64
 	MaxApprovalFormat = 64
+	MaxKeyID          = 128 // kid в заголовке подписи: он открыт в вердиктах
 	MaxRefSource      = 255 // как имя источника хранилища
 	// MaxSeq — 2^53 − 1: больше число JSON в JavaScript теряет точность, и
 	// шлюз на Node и проверяющий на Go видели бы разные номера.
@@ -56,17 +67,33 @@ const (
 	MaxReceiptLen = evidence.MaxBodyLen
 )
 
-// receiptDomain отделяет подпись квитанции от других подписей тем же ключом.
-const receiptDomain = "evidencestore/receipt/v1\n"
+// ReceiptType — typ защищённого заголовка подписи. Он отделяет подпись
+// квитанции от других подписей тем же ключом (явный тип, RFC 8725, 3.11):
+// JWS с другим typ квитанцией не станет.
+const ReceiptType = "vnd.evidencestore.receipt+jws"
 
-// sigPrefix и длина хвоста с подписью: `,"sig":"` + 128 hex + `"}`.
+// Алгоритмы подписи квитанции, имена JOSE. Ed25519 — полное имя по RFC 9864;
+// EdDSA (RFC 8037) — прежнее имя того же алгоритма, с ключом Ed25519: его ещё
+// пишут библиотеки. Подписывает Signer первым, принимаются оба. Другой
+// алгоритм — новое имя здесь, а не новый формат.
 const (
-	sigPrefix    = `,"sig":"`
-	sigSuffixLen = len(sigPrefix) + 2*ed25519.SignatureSize + len(`"}`)
+	AlgEd25519 = "Ed25519"
+	AlgEdDSA   = "EdDSA"
 )
 
-// receiptFields — поля квитанции v1 верхнего уровня.
-var receiptFields = []string{"v", "gateway", "seq", "prev", "time", "action", "step", "refs", "approval", "body", "sig"}
+// jwsPrefix — начало хвоста с подписью: `,"jws":"P..S"}`. MaxJWS — предел
+// длины хвоста: дальше от конца строки его начало не ищут. Хватает заголовку
+// и подписи любого алгоритма, какой здесь может появиться (у ML-DSA-87
+// подпись — 4627 байт).
+const (
+	jwsPrefix = `,"jws":"`
+	MaxJWS    = 16 << 10
+)
+
+// receiptFields — поля квитанции v2 верхнего уровня.
+var receiptFields = []string{"v", "gateway", "seq", "prev", "time", "action", "step", "refs", "approval", "body", "jws"}
+
+var errNoSignature = errors.New("the receipt has no signature")
 
 // Ref — под каким субъектом то же действие записано в другом источнике
 // хранилища: у базы — xid транзакции, у провайдера — номер платежа. По ним
@@ -95,11 +122,15 @@ type Receipt struct {
 	Refs     []Ref
 	Approval *Approval
 	Body     json.RawMessage // как в строке; nil — поля нет
-	// Sig — подпись из хвоста строки; nil — хвоста с подписью нет.
+	// Alg и Kid — алгоритм и имя ключа из заголовка подписи (KeyID). Sig —
+	// сама подпись; nil — хвоста с подписью нет или его заголовок не годится.
+	Alg string
+	Kid string
 	Sig []byte
 	// Hash — SHA-256 строки (hex): его называет prev следующей квитанции.
-	Hash   string
-	signed []byte // B: строка без поля sig
+	Hash      string
+	signed    []byte // B: строка без поля jws
+	protected string // защищённый заголовок подписи, base64url, как в строке
 }
 
 // ParseReceipt разбирает строку квитанции. Ошибка — квитанция не по формату;
@@ -125,28 +156,36 @@ func ParseReceipt(line []byte) (Receipt, error) {
 		}
 	}
 
-	if b, sig, ok := splitSig(line); !ok {
-		note(errors.New(`receipt: the line does not end with its signature, ,"sig":"<128 hex>"}`))
+	if b, protected, sig, ok := splitJWS(line); !ok {
+		note(errors.New(`receipt: the line does not end with its signature, ,"jws":"<protected header>..<signature>"} (a detached JWS, base64url without padding)`))
 	} else if fields, err := strictObject(b); err != nil {
 		note(fmt.Errorf("receipt without its signature: %w", err))
-	} else if raw := all["sig"]; string(raw) != `"`+hex.EncodeToString(sig)+`"` || len(fields) != len(all)-1 {
-		// Хвост похож на подпись, но поле sig строки — другое: подписанными
+	} else if raw := all["jws"]; string(raw) != `"`+protected+".."+base64.RawURLEncoding.EncodeToString(sig)+`"` || len(fields) != len(all)-1 {
+		// Хвост похож на подпись, но поле jws строки — другое: подписанными
 		// считались бы не те байты, что видит разборщик.
-		note(errors.New("receipt: the signature at the end of the line is not its sig field"))
+		note(errors.New("receipt: the signature at the end of the line is not its jws field"))
+	} else if alg, kid, err := parseProtected(protected); err != nil {
+		// Имя ключа и алгоритм остаются в Receipt: вердикт называет, чем
+		// строка подписана, и когда проверить подпись нельзя.
+		r.Alg, r.Kid = alg, kid
+		note(err)
+	} else if len(sig) != ed25519.SignatureSize {
+		r.Alg, r.Kid = alg, kid
+		note(fmt.Errorf("receipt: an %s signature is %d bytes, this one is %d", alg, ed25519.SignatureSize, len(sig)))
 	} else {
-		r.Sig, r.signed = sig, b
+		r.Alg, r.Kid, r.Sig, r.signed, r.protected = alg, kid, sig, b, protected
 	}
-	delete(all, "sig")
+	delete(all, "jws")
 
 	for k := range all {
 		if !slices.Contains(receiptFields, k) {
 			// Имени поля в тексте нет: вердикт открыт навсегда.
-			note(errors.New("receipt: a top-level field that receipt v1 does not have (it has v, gateway, seq, prev, time, action, step, refs, approval, body and sig)"))
+			note(errors.New("receipt: a top-level field that receipt v2 does not have (it has v, gateway, seq, prev, time, action, step, refs, approval, body and jws)"))
 			break
 		}
 	}
-	if string(all["v"]) != "1" {
-		note(errors.New(`receipt: "v" must be the number 1`))
+	if string(all["v"]) != strconv.Itoa(ReceiptVersion) {
+		note(fmt.Errorf(`receipt: "v" must be the number %d`, ReceiptVersion))
 	}
 	if s, ok := evidence.JSONString(all["gateway"]); ok && validName(s, MaxGatewayName) {
 		r.Gateway = s
@@ -270,39 +309,107 @@ func hex4(b []byte, at int) (uint16, bool) {
 	return v, true
 }
 
-// Verify проверяет подпись квитанции ключом шлюза.
+// Verify проверяет подпись квитанции ключом key. Квитанция обязана называть
+// именно его (kid): подпись, которая сходится с ключом под чужим именем,
+// написал тот, кто путает ключи, — или тот, кто хочет, чтобы их спутали.
 func (r Receipt) Verify(key ed25519.PublicKey) error {
 	if r.Sig == nil {
-		return errors.New("the receipt has no signature")
+		return errNoSignature
 	}
-	if len(key) != ed25519.PublicKeySize || !ed25519.Verify(key, r.message(), r.Sig) {
+	if len(key) != ed25519.PublicKeySize {
+		return errors.New("the gateway key is not an Ed25519 public key")
+	}
+	if id := KeyID(key); r.Kid != id {
+		return fmt.Errorf("the receipt names key %s, not this gateway key (%s)", r.Kid, id)
+	}
+	if !ed25519.Verify(key, r.signingInput(), r.Sig) {
 		return errors.New("the receipt signature does not verify with the gateway key")
 	}
 	return nil
 }
 
-func (r Receipt) message() []byte {
-	return append([]byte(receiptDomain), r.signed...)
+// signingInput — что подписано (RFC 7515, 5.1): ASCII(P) ‖ "." ‖ BASE64URL(B).
+func (r Receipt) signingInput() []byte {
+	return signingInput(r.protected, r.signed)
 }
 
-// splitSig отрезает хвост с подписью: B (строка без поля sig, с «}» на
-// конце) и сама подпись. ok == false — строка кончается не подписью.
-func splitSig(line []byte) (b, sig []byte, ok bool) {
-	n := len(line)
-	if n < sigSuffixLen+2 {
-		return nil, nil, false
+func signingInput(protected string, b []byte) []byte {
+	out := make([]byte, 0, len(protected)+1+base64.RawURLEncoding.EncodedLen(len(b)))
+	out = append(out, protected...)
+	out = append(out, '.')
+	return base64.RawURLEncoding.AppendEncode(out, b)
+}
+
+// Compact — квитанция обычным компактным JWS (RFC 7515, 3.1): заголовок,
+// тело — строка без поля jws — и подпись. В таком виде её проверяет любая
+// библиотека JOSE с ключом шлюза (JWK). ok == false — подписи у строки нет.
+func (r Receipt) Compact() (jws string, ok bool) {
+	if r.Sig == nil {
+		return "", false
 	}
-	tail := line[n-sigSuffixLen:]
-	if !bytes.HasPrefix(tail, []byte(sigPrefix)) || !bytes.HasSuffix(tail, []byte(`"}`)) {
-		return nil, nil, false
+	return string(r.signingInput()) + "." + base64.RawURLEncoding.EncodeToString(r.Sig), true
+}
+
+// splitJWS отрезает хвост с подписью: B (строка без поля jws, с «}» на
+// конце), защищённый заголовок, как он в строке, и сама подпись. ok == false
+// — строка кончается не подписью. Начало хвоста ищется с конца: в нём только
+// знаки base64url и две точки, так что поле "jws" внутри body им не станет.
+// base64url — строгий: без дополнения и с нулевыми лишними битами, иначе у
+// одной подписи было бы несколько записей, а у квитанции — несколько хэшей.
+func splitJWS(line []byte) (b []byte, protected string, sig []byte, ok bool) {
+	if !bytes.HasSuffix(line, []byte(`"}`)) {
+		return nil, "", nil, false
 	}
-	h := string(tail[len(sigPrefix) : len(tail)-2])
-	if !isLowerHex(h) {
-		return nil, nil, false
+	from := max(len(line)-MaxJWS, 0)
+	i := bytes.LastIndex(line[from:], []byte(jwsPrefix))
+	if i < 0 {
+		return nil, "", nil, false
 	}
-	sig, _ = hex.DecodeString(h)
-	b = append(bytes.Clone(line[:n-sigSuffixLen]), '}')
-	return b, sig, true
+	i += from
+	if i+len(jwsPrefix) > len(line)-2 {
+		return nil, "", nil, false // `,"jws":"}`: кавычка хвоста — она же последняя
+	}
+	protected, s, found := strings.Cut(string(line[i+len(jwsPrefix):len(line)-2]), "..")
+	if !found || protected == "" || s == "" {
+		return nil, "", nil, false
+	}
+	if _, err := base64.RawURLEncoding.Strict().DecodeString(protected); err != nil {
+		return nil, "", nil, false
+	}
+	sig, err := base64.RawURLEncoding.Strict().DecodeString(s)
+	if err != nil {
+		return nil, "", nil, false
+	}
+	b = append(bytes.Clone(line[:i]), '}')
+	return b, protected, sig, true
+}
+
+// parseProtected разбирает защищённый заголовок подписи: ровно alg, kid и
+// typ. Алгоритм и имя ключа отдаются и при ошибке, если их удалось прочесть.
+// Остального в заголовке быть не должно: ключ в самой подписи (jwk, jku,
+// x5c) — приглашение проверить её ключом подписавшего, а crit и b64 меняют
+// то, что считается подписанным.
+func parseProtected(protected string) (alg, kid string, err error) {
+	raw, _ := base64.RawURLEncoding.Strict().DecodeString(protected) // проверен splitJWS
+	h, err := strictObject(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("receipt: the protected header of the signature: %w", err)
+	}
+	alg, okAlg := evidence.JSONString(h["alg"])
+	kid, okKid := evidence.JSONString(h["kid"])
+	typ, okTyp := evidence.JSONString(h["typ"])
+	if !okKid || !validName(kid, MaxKeyID) {
+		kid = ""
+	}
+	switch {
+	case len(h) != 3 || !okAlg || !okTyp || kid == "":
+		return alg, kid, errors.New(`receipt: the protected header of the signature must be {"alg": …, "kid": …, "typ": …} and nothing else`)
+	case typ != ReceiptType:
+		return alg, kid, fmt.Errorf("receipt: the signature is not of a receipt: its typ must be %q", ReceiptType)
+	case alg != AlgEd25519 && alg != AlgEdDSA:
+		return "", kid, fmt.Errorf("receipt: the signature algorithm must be %q (or its older name %q)", AlgEd25519, AlgEdDSA)
+	}
+	return alg, kid, nil
 }
 
 // strictObject разбирает объект JSON верхнего уровня: ключ дважды — ошибка
@@ -416,7 +523,7 @@ func isHash(s string) bool { return len(s) == 2*sha256.Size && isLowerHex(s) }
 // квитанция каждого шлюза принята последней. Строки подаются в порядке
 // приёма.
 type ReceiptTracker struct {
-	key  ed25519.PublicKey
+	keys *KeySet
 	last map[string]receiptLink // шлюз → последняя принятая квитанция
 	// genesis — шлюз → хэш начала его нынешней цепочки: копия этого начала —
 	// не новая цепочка, а повтор (LinkStale).
@@ -428,30 +535,36 @@ type receiptLink struct {
 	seq  uint64
 }
 
-// NewReceiptTracker — key nil: подписи не проверяются (SigNoKey). Хранилище
-// так не делает: у источника квитанций gateway_key обязателен.
-func NewReceiptTracker(key ed25519.PublicKey) *ReceiptTracker {
-	return &ReceiptTracker{key: key, last: map[string]receiptLink{}, genesis: map[string]string{}}
+// NewReceiptTracker — без ключей (nil) подписи не проверяются (SigNoKey).
+// Хранилище так не делает: у источника квитанций ключ обязателен.
+func NewReceiptTracker(keys *KeySet) *ReceiptTracker {
+	return &ReceiptTracker{keys: keys, last: map[string]receiptLink{}, genesis: map[string]string{}}
 }
 
 // Check проверяет очередную квитанцию и двигает состояние её цепочки.
-func (t *ReceiptTracker) Check(line []byte) Verdict {
+// received — когда хранилище её приняло: по этому времени сверяется срок
+// ключа (нулевое — срок не сверяется, KeySet.Verify).
+func (t *ReceiptTracker) Check(line []byte, received time.Time) Verdict {
 	r, err := ParseReceipt(line)
-	v := Verdict{Seq: r.Seq, Writer: r.Gateway, Hash: r.Hash, PrevHash: r.Prev, HashOK: true}
+	v := Verdict{Seq: r.Seq, Writer: r.Gateway, Hash: r.Hash, PrevHash: r.Prev, HashOK: true, Kid: r.Kid}
 	if err != nil {
 		v.Problem = err.Error()
 	}
 	switch {
 	case r.Sig == nil:
 		v.Signature = SigInvalid
-	case t.key == nil:
+	case t.keys.Len() == 0:
 		v.Signature = SigNoKey
-	case r.Verify(t.key) == nil:
-		v.Signature = SigValid
 	default:
-		v.Signature = SigInvalid
-		if v.Problem == "" {
-			v.Problem = "the receipt signature does not verify with the pinned gateway key"
+		// Чужая подпись, ключ не из списка источника и ключ вне своего срока
+		// — одно и то же: за шлюз строка не говорит и в его цепочку не входит.
+		if err := t.keys.Verify(r, received); err == nil {
+			v.Signature = SigValid
+		} else {
+			v.Signature = SigInvalid
+			if v.Problem == "" {
+				v.Problem = err.Error()
+			}
 		}
 	}
 	if r.Gateway == "" || r.Seq == 0 || r.Prev == "" {
@@ -535,11 +648,17 @@ func MovesChain(v Verdict) bool {
 
 // Signer ведёт цепочку квитанций одного шлюза и подписывает их.
 type Signer struct {
-	mu      sync.Mutex
-	key     ed25519.PrivateKey
-	gateway string
-	next    uint64
-	prev    string
+	mu        sync.Mutex
+	key       ed25519.PrivateKey
+	protected string // защищённый заголовок подписи, base64url
+	gateway   string
+	next      uint64
+	prev      string
+}
+
+// protectedHeader — защищённый заголовок подписи квитанции ключом pub.
+func protectedHeader(pub ed25519.PublicKey) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"` + AlgEd25519 + `","kid":"` + KeyID(pub) + `","typ":"` + ReceiptType + `"}`))
 }
 
 // NewSigner — last: последняя строка цепочки этого шлюза, написанная раньше
@@ -552,7 +671,7 @@ func NewSigner(key ed25519.PrivateKey, gateway string, last []byte) (*Signer, er
 	if !validName(gateway, MaxGatewayName) {
 		return nil, fmt.Errorf("gateway: the gateway name must be 1 to %d letters, digits and . _ : -", MaxGatewayName)
 	}
-	s := &Signer{key: key, gateway: gateway, next: 1, prev: Genesis}
+	s := &Signer{key: key, protected: protectedHeader(key.Public().(ed25519.PublicKey)), gateway: gateway, next: 1, prev: Genesis}
 	if len(bytes.TrimSpace(last)) == 0 {
 		return s, nil
 	}
@@ -570,6 +689,35 @@ func NewSigner(key ed25519.PrivateKey, gateway string, last []byte) (*Signer, er
 	}
 	s.next, s.prev = r.Seq+1, r.Hash
 	return s, nil
+}
+
+// SignLine подписывает готовый объект квитанции b (без поля jws, последний
+// байт — «}») ключом key и отдаёт строку с подписью: так подписывает шлюз,
+// который собирает JSON сам. Что в b, не проверяется: это дело ParseReceipt.
+func SignLine(key ed25519.PrivateKey, b []byte) []byte {
+	return signLine(key, protectedHeader(key.Public().(ed25519.PublicKey)), b)
+}
+
+func signLine(key ed25519.PrivateKey, protected string, b []byte) []byte {
+	sig := ed25519.Sign(key, signingInput(protected, b))
+	line := append(bytes.Clone(b[:max(len(b)-1, 0)]), jwsPrefix...)
+	line = append(line, protected...)
+	line = append(line, ".."...)
+	line = base64.RawURLEncoding.AppendEncode(line, sig)
+	return append(line, `"}`...)
+}
+
+// After ставит цепочку за квитанцией шлюза с номером seq и хэшем hash,
+// подписанной его прежним ключом: шлюз сменил ключ, а цепочка — та же
+// (AppendHead делает это сам, по голове).
+func (s *Signer) After(seq uint64, hash string) error {
+	if seq == 0 || seq >= MaxSeq || !isHash(hash) {
+		return errors.New("gateway: a chain goes on from a receipt with its seq and its hash (64 hex)")
+	}
+	s.mu.Lock()
+	s.next, s.prev = seq+1, hash
+	s.mu.Unlock()
+	return nil
 }
 
 // Draft — шаг действия, как его знает шлюз. Номер, сцепку и подпись ставит
@@ -606,7 +754,7 @@ func (s *Signer) Sign(d Draft) ([]byte, error) {
 		Refs     []Ref           `json:"refs,omitempty"`
 		Approval *Approval       `json:"approval,omitempty"`
 		Body     json.RawMessage `json:"body,omitempty"`
-	}{1, s.gateway, s.next, s.prev, d.Time.UTC().Format(time.RFC3339Nano), d.Action, d.Step, d.Refs, d.Approval, d.Body}
+	}{ReceiptVersion, s.gateway, s.next, s.prev, d.Time.UTC().Format(time.RFC3339Nano), d.Action, d.Step, d.Refs, d.Approval, d.Body}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -614,10 +762,7 @@ func (s *Signer) Sign(d Draft) ([]byte, error) {
 		return nil, fmt.Errorf("gateway: receipt: %w", err)
 	}
 	b := bytes.TrimRight(buf.Bytes(), "\n")
-	sig := ed25519.Sign(s.key, append([]byte(receiptDomain), b...))
-	line := append(bytes.Clone(b[:len(b)-1]), sigPrefix...)
-	line = append(line, hex.EncodeToString(sig)...)
-	line = append(line, `"}`...)
+	line := signLine(s.key, s.protected, b)
 	if len(line) > MaxReceiptLen {
 		return nil, fmt.Errorf("gateway: the receipt is %d bytes, longer than a store record (%d): keep a large payload elsewhere and put its SHA-256 into the body", len(line), MaxReceiptLen)
 	}
@@ -635,7 +780,8 @@ func (s *Signer) Sign(d Draft) ([]byte, error) {
 // Checker — проверка журнала гейтвея при приёме: бортовой журнал Pipelock
 // или общая квитанция.
 type Checker interface {
-	Check(line []byte) Verdict
+	// received — когда хранилище приняло строку.
+	Check(line []byte, received time.Time) Verdict
 	Resume(v Verdict)
 }
 
@@ -645,13 +791,25 @@ func Verified(contentType string) bool {
 	return contentType == ContentType || contentType == ReceiptContentType
 }
 
-// NewChecker — проверка для вида contentType; nil — вид не проверяется.
-func NewChecker(contentType string, key ed25519.PublicKey) Checker {
+// NewChecker — проверка для вида contentType ключами keys; nil — вид не
+// проверяется. У бортового журнала Pipelock ключ один и срока у него нет:
+// контрольная точка своего ключа не называет.
+func NewChecker(contentType string, keys *KeySet) Checker {
 	switch contentType {
 	case ContentType:
-		return NewTracker(key)
+		var key ed25519.PublicKey
+		if k := keys.Keys(); len(k) > 0 {
+			key = k[0].Pub
+		}
+		return recorderChecker{NewTracker(key)}
 	case ReceiptContentType:
-		return NewReceiptTracker(key)
+		return NewReceiptTracker(keys)
 	}
 	return nil
 }
+
+// recorderChecker — Tracker как Checker: время приёма журналу Pipelock не
+// нужно, срока у его ключа нет.
+type recorderChecker struct{ *Tracker }
+
+func (c recorderChecker) Check(line []byte, _ time.Time) Verdict { return c.Tracker.Check(line) }

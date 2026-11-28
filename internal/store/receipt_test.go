@@ -57,7 +57,7 @@ func receiptTrust(t *testing.T, s *Store, pub string) proof.Trust {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr.GatewayKey = k
+	tr.GatewayKeys = gateway.OneKey(k)
 	return tr
 }
 
@@ -113,7 +113,7 @@ func TestReceiptProof(t *testing.T) {
 	}
 	// Без ключа проверяющего подпись проверило только хранилище: это предел,
 	// и он назван.
-	tr.GatewayKey = nil
+	tr.GatewayKeys = nil
 	r = proof.Verify(b, tr)
 	if !r.Valid() || !strings.Contains(strings.Join(r.Notes(), "\n"), "esverify -gateway-key") {
 		t.Fatalf("без ключа шлюза:\n%s", r.Text())
@@ -305,17 +305,16 @@ func TestReceiptForgedInSubjectBundle(t *testing.T) {
 // ключом: строка собрана так, как её собрал бы сам шлюз.
 func forgeAfter(t *testing.T, key ed25519.PrivateKey, prev gateway.Receipt, action, step string) []byte {
 	t.Helper()
-	b := `{"v":1,"gateway":"` + prev.Gateway + `","seq":` + strconv.FormatUint(prev.Seq+1, 10) + `,"prev":"` + prev.Hash +
+	b := `{"v":2,"gateway":"` + prev.Gateway + `","seq":` + strconv.FormatUint(prev.Seq+1, 10) + `,"prev":"` + prev.Hash +
 		`","time":"2026-09-25T10:01:00Z","action":"` + action + `","step":"` + step + `"}`
-	sig := ed25519.Sign(key, append([]byte("evidencestore/receipt/v1\n"), b...))
-	return []byte(b[:len(b)-1] + `,"sig":"` + hex.EncodeToString(sig) + `"}`)
+	return gateway.SignLine(key, []byte(b))
 }
 
 // liarChecker — хранилище, которое называет каждую квитанцию сцепленной.
 type liarChecker struct{ gateway.Checker }
 
-func (l liarChecker) Check(line []byte) gateway.Verdict {
-	v := l.Checker.Check(line)
+func (l liarChecker) Check(line []byte, received time.Time) gateway.Verdict {
+	v := l.Checker.Check(line, received)
 	v.Link, v.Problem = gateway.LinkOK, ""
 	return v
 }
@@ -353,8 +352,8 @@ func TestReceiptVerdictLieIsSeen(t *testing.T) {
 // выдать за цепочку от предыдущей.
 type staleLiar struct{ gateway.Checker }
 
-func (l staleLiar) Check(line []byte) gateway.Verdict {
-	v := l.Checker.Check(line)
+func (l staleLiar) Check(line []byte, received time.Time) gateway.Verdict {
+	v := l.Checker.Check(line, received)
 	if r, _ := gateway.ParseReceipt(line); r.Action == "p-hide" {
 		v.Link, v.Problem = gateway.LinkStale, "a copy"
 	}
@@ -392,8 +391,8 @@ func TestReceiptStaleLieIsSeen(t *testing.T) {
 // чужой хэш: тело и вердикт расходятся.
 type hashLiar struct{ gateway.Checker }
 
-func (l hashLiar) Check(line []byte) gateway.Verdict {
-	v := l.Checker.Check(line)
+func (l hashLiar) Check(line []byte, received time.Time) gateway.Verdict {
+	v := l.Checker.Check(line, received)
 	if r, _ := gateway.ParseReceipt(line); r.Action == "p-lie" {
 		v.Hash = strings.Repeat("0", 64)
 	}
@@ -471,5 +470,214 @@ func TestReceiptVerdictCatchUp(t *testing.T) {
 		if err != nil || !v.Clean() || v.Seq != uint64(i+1) || v.Link != want || v.Signature != gateway.SigValid {
 			t.Fatalf("вердикт %d: %+v, %v", i, v, err)
 		}
+	}
+}
+
+// ⭐ Смена ключа шлюза на настоящем хранилище (DECISIONS, п. 47). У источника
+// два ключа со сроками, и срок сверяется со временем приёма:
+//
+//	10:01 квитанции 1 и 2 под прежним ключом
+//	10:05 прежний ключ за шлюз больше не говорит (not_after)
+//	10:07 квитанция 3 — держатель прежнего ключа, с верной подписью и сцепкой
+//	      квитанция 4 — шлюз под новым ключом, цепочка та же
+//
+// Третья в цепочку шлюза не входит и в пакете не открывается, четвёртая
+// сцеплена со второй. Проверяющий проверяет подписи своими ключами — и со
+// своими сроками: ключ, отозванный им раньше, чем хранилищем, не проходит.
+func TestReceiptKeyChange(t *testing.T) {
+	oldKey, oldPub := receiptGateway(t, 11)
+	newKey, newPub := receiptGateway(t, 12)
+	change := clockAt(10, 5, 0)
+	keys := []gateway.KeyEntry{
+		{Key: oldPub, NotAfter: change.Format(time.RFC3339)},
+		{Key: newPub, NotBefore: clockAt(10, 4, 0).Format(time.RFC3339)},
+	}
+	c := newClock()
+	cfg := testConfig(t, func(c *config.Config) {
+		c.Sources = append(c.Sources, config.Source{Name: "shop", ContentType: config.ReceiptContentType,
+			GatewayKeys: keys, SubjectField: config.ReceiptSubjectField})
+	})
+	s := openStore(t, cfg, c)
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // 10:00
+	c.add(time.Minute)
+	was, _ := gateway.NewSigner(oldKey, "shop-gw", nil)
+	ingestShop(t, s, 1, sign(t, was, "p-1", "mandate"))
+	second := sign(t, was, "p-1", "cart")
+	ingestShop(t, s, 2, second)
+	c.set(clockAt(10, 7, 0))
+	ingestShop(t, s, 3, sign(t, was, "p-1", "cancel"))
+	now, _ := gateway.NewSigner(newKey, "shop-gw", nil)
+	prev, _ := gateway.ParseReceipt(second)
+	if err := now.After(prev.Seq, prev.Hash); err != nil {
+		t.Fatal(err)
+	}
+	ingestShop(t, s, 4, sign(t, now, "p-1", "payment"))
+	c.set(clockAt(10, 12, 0))
+	mustStamp(t, s)
+	mustStampNow(t, s)
+
+	oldID, newID := keyID(t, oldPub), keyID(t, newPub)
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	var vs []gateway.Verdict
+	for _, l := range leavesOf(t, cfg, auditchain.EventGateway) {
+		_, v, err := proof.ParseGatewayLeaf(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vs = append(vs, v)
+	}
+	if len(vs) != 4 || !vs[0].Clean() || !vs[1].Clean() || vs[0].Kid != oldID ||
+		vs[2].Signature != gateway.SigInvalid || vs[2].Kid != oldID || !strings.Contains(vs[2].Problem, "no longer speaks for the gateway") ||
+		!vs[3].Clean() || vs[3].Link != gateway.LinkOK || vs[3].Kid != newID {
+		t.Fatalf("вердикты %+v", vs)
+	}
+
+	trust := func(entries ...gateway.KeyEntry) proof.Trust {
+		tr := trustOf(t, s)
+		set, err := gateway.ParseKeySet(entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.GatewayKeys = set
+		return tr
+	}
+	// Квитанция под новым ключом: проходит у того, кто знает оба ключа, и у
+	// того, кто знает только новый; подпись проверена именно им.
+	b4, err := s.Proof("shop", 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range []proof.Trust{trust(keys...), trust(gateway.KeyEntry{Key: newPub})} {
+		if r := proof.Verify(b4, tr); !r.Valid() || !r.ReceiptSigned || !r.GatewayKeyChecked || r.ReceiptKid != newID {
+			t.Fatalf("квитанция под новым ключом:\n%s", r.Text())
+		}
+	}
+	// Только прежний ключ — этой квитанции он не подписывал.
+	if r := proof.Verify(b4, trust(gateway.KeyEntry{Key: oldPub})); r.Valid() || !strings.Contains(r.Text(), "not among the gateway keys") {
+		t.Fatalf("квитанция под новым ключом сошлась с прежним:\n%s", r.Text())
+	}
+	// У проверяющего новый ключ говорит за шлюз позже, чем квитанция принята
+	// (10:07): время приёма — из пакета, а не из квитанции.
+	if r := proof.Verify(b4, trust(gateway.KeyEntry{Key: newPub, NotBefore: clockAt(10, 8, 0).Format(time.RFC3339)})); r.Valid() || !strings.Contains(r.Text(), "before gateway key") {
+		t.Fatalf("срок ключа проверяющего не сверен со временем приёма:\n%s", r.Text())
+	}
+	// Квитанция под прежним ключом, принятая после его срока, не проходит и у
+	// того, кто срока не задал: её назвало хранилище.
+	b3, err := s.Proof("shop", 3, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b3, trust(gateway.KeyEntry{Key: oldPub}, gateway.KeyEntry{Key: newPub})); r.Valid() {
+		t.Fatalf("квитанция под истёкшим ключом прошла:\n%s", r.Text())
+	}
+	// Проверяющий знает, что прежний ключ украден раньше, чем это записано в
+	// хранилище: первая квитанция (10:01), чистая у хранилища, у него не проходит.
+	b1, err := s.Proof("shop", 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b1, trust(keys...)); !r.Valid() || r.ReceiptKid != oldID {
+		t.Fatalf("квитанция под прежним ключом в его срок:\n%s", r.Text())
+	}
+	if r := proof.Verify(b1, trust(gateway.KeyEntry{Key: oldPub, NotAfter: clockAt(10, 0, 30).Format(time.RFC3339)})); r.Valid() || !strings.Contains(r.Text(), "no longer speaks for the gateway") {
+		t.Fatalf("ключ, отозванный проверяющим раньше, прошёл:\n%s", r.Text())
+	}
+
+	// Пакет по действию: квитанции 1, 2 и 4 открыты и подписаны — каждая
+	// своим ключом, — третья названа и не открыта, а сцепка четвёртой со
+	// второй сверена по вердиктам.
+	sb, err := s.ProofSubject("shop", "p-1", clockAt(10, 0, 30), clockAt(10, 9, 30), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := proof.VerifySource(sourceRoundTrip(t, sb), trust(keys...), time.Time{}, time.Time{})
+	if !r.Valid() || !slices.Equal(r.GatewayBroken, []uint64{3}) || !slices.Equal(bodySeqs(r.Bodies), []uint64{1, 2, 4}) || r.ReceiptsSigned != 3 {
+		t.Fatalf("пакет по действию: поломано %v, тела %v, подписей %d:\n%s", r.GatewayBroken, bodySeqs(r.Bodies), r.ReceiptsSigned, r.Text())
+	}
+	// С одним ключом из двух пакет не проходит: чья-то квитанция не проверена.
+	for _, one := range []string{oldPub, newPub} {
+		if r := proof.VerifySource(sourceRoundTrip(t, sb), trust(gateway.KeyEntry{Key: one}), time.Time{}, time.Time{}); r.Valid() {
+			t.Fatalf("пакет по действию прошёл с одним ключом из двух:\n%s", r.Text())
+		}
+	}
+	// И со сроком проверяющего, в который вторая квитанция (10:01) не попала.
+	early := gateway.KeyEntry{Key: oldPub, NotAfter: clockAt(10, 0, 30).Format(time.RFC3339)}
+	if r := proof.VerifySource(sourceRoundTrip(t, sb), trust(early, gateway.KeyEntry{Key: newPub}), time.Time{}, time.Time{}); r.Valid() || !strings.Contains(r.Text(), "no longer speaks for the gateway") {
+		t.Fatalf("пакет по действию: срок ключа проверяющего не сверен:\n%s", r.Text())
+	}
+
+	// После рестарта вердикты те же: срок сверен со временем приёма улики, а
+	// не с часами рестарта (10:12, оба ключа уже не те, что в 10:01).
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2 := openStore(t, cfg, c)
+	late := sign(t, now, "p-1", "delivery")
+	ingestShop(t, s2, 5, late)
+	if err := s2.flush(); err != nil {
+		t.Fatal(err)
+	}
+	leaves := leavesOf(t, cfg, auditchain.EventGateway)
+	_, v, err := proof.ParseGatewayLeaf(leaves[len(leaves)-1])
+	if err != nil || !v.Clean() || v.Link != gateway.LinkOK || v.Seq != 4 {
+		t.Fatalf("квитанция после рестарта: %+v, %v", v, err)
+	}
+}
+
+func keyID(t *testing.T, pub string) string {
+	t.Helper()
+	k, err := gateway.ParseKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gateway.KeyID(k)
+}
+
+// kidLiar — хранилище, которое в вердикте называет не тот ключ, каким
+// квитанция подписана.
+type kidLiar struct {
+	gateway.Checker
+	kid string
+}
+
+func (l kidLiar) Check(line []byte, received time.Time) gateway.Verdict {
+	v := l.Checker.Check(line, received)
+	v.Kid = l.kid
+	return v
+}
+
+// Вердикт называет ключ квитанции, и по нему проверяющий выбирает, чем
+// проверять. Хранилище, назвавшее чужой ключ, видно по открытому телу: имя
+// ключа — в подписанном заголовке самой квитанции.
+func TestReceiptVerdictKidLieIsSeen(t *testing.T) {
+	key, pub := receiptGateway(t, 13)
+	_, other := receiptGateway(t, 14)
+	c := newClock()
+	s := openStore(t, testConfig(t, withReceipts(pub)), c)
+	s.sources["shop"].gw = kidLiar{s.sources["shop"].gw, keyID(t, other)}
+	gw, _ := gateway.NewSigner(key, "shop-gw", nil)
+	ingest(t, s, "abs-core", 1, 1)
+	mustStamp(t, s) // 10:00
+	c.add(time.Minute)
+	ingestShop(t, s, 1, sign(t, gw, "p-1", "mandate"))
+	c.add(5 * time.Minute)
+	mustStamp(t, s) // 10:06
+	mustStampNow(t, s)
+	b, err := s.Proof("shop", 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.Verify(b, receiptTrust(t, s, pub)); r.Valid() || !strings.Contains(r.Text(), "the receipt names key "+keyID(t, pub)+", the verdict "+keyID(t, other)) {
+		t.Fatalf("пакет по записи с чужим ключом в вердикте прошёл:\n%s", r.Text())
+	}
+	sb, err := s.ProofSubject("shop", "p-1", clockAt(10, 0, 30), clockAt(10, 3, 30), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := proof.VerifySource(sourceRoundTrip(t, sb), receiptTrust(t, s, pub), time.Time{}, time.Time{}); r.Valid() || !strings.Contains(r.Text(), "the receipt names key "+keyID(t, pub)+", the verdict "+keyID(t, other)) {
+		t.Fatalf("пакет по действию с чужим ключом в вердикте прошёл:\n%s", r.Text())
 	}
 }

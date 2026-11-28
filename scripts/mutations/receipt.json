@@ -3,21 +3,34 @@
   "./internal/gateway/",
   "./internal/config/",
   "./internal/store/",
-  "./cmd/esreceipt/"
+  "./cmd/esreceipt/",
+  "./cmd/esverify/"
  ],
- "run": "^Test(Receipt|SignerResumesTheChain|SignAndVerify|SignRefuses|SignConcurrent|Usage|Validate)",
+ "run": "^Test(Receipt|SignerResumesTheChain|Sign(AndVerify|Refuses|Concurrent|AfterAKeyChange)|Usage|Validate|KeyEntries|Append|Torn|GatewayKeysOfTheAuditor)",
  "mutations": [
   {
    "name": "Q1 подпись квитанции не проверяется",
    "file": "internal/gateway/receipt.go",
-   "old": "\tif len(key) != ed25519.PublicKeySize || !ed25519.Verify(key, r.message(), r.Sig) {",
-   "new": "\tif len(key) != ed25519.PublicKeySize {"
+   "old": "\tif !ed25519.Verify(key, r.signingInput(), r.Sig) {",
+   "new": "\tif false {"
   },
   {
-   "name": "Q2 подпись без домена",
+   "name": "Q2 подписано не «заголовок.тело» (RFC 7515)",
    "file": "internal/gateway/receipt.go",
-   "old": "\treturn append([]byte(receiptDomain), r.signed...)",
-   "new": "\treturn r.signed"
+   "old": "\tout = append(out, '.')\n\treturn base64.RawURLEncoding.AppendEncode(out, b)",
+   "new": "\tout = append(out, ':')\n\treturn base64.RawURLEncoding.AppendEncode(out, b)"
+  },
+  {
+   "name": "Q3 typ заголовка подписи — любой",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tcase typ != ReceiptType:",
+   "new": "\tcase typ == \"\":"
+  },
+  {
+   "name": "Q4 хвост подписи ищется с начала строки",
+   "file": "internal/gateway/receipt.go",
+   "old": "\ti := bytes.LastIndex(line[from:], []byte(jwsPrefix))",
+   "new": "\ti := bytes.Index(line[from:], []byte(jwsPrefix))"
   },
   {
    "name": "Q5 лишние поля верхнего уровня принимаются",
@@ -34,7 +47,7 @@
   {
    "name": "Q7 подделка двигает цепочку шлюза",
    "file": "internal/gateway/receipt.go",
-   "old": "\t\tif v.Signature != SigInvalid {\n\t\t\tt.last[r.Gateway] = receiptLink{hash: r.Hash, seq: r.Seq}",
+   "old": "\t\tif MovesChain(v) {\n\t\t\tt.last[r.Gateway] = receiptLink{hash: r.Hash, seq: r.Seq}",
    "new": "\t\tif true {\n\t\t\tt.last[r.Gateway] = receiptLink{hash: r.Hash, seq: r.Seq}"
   },
   {
@@ -58,7 +71,7 @@
   {
    "name": "Q11 версия не проверяется",
    "file": "internal/gateway/receipt.go",
-   "old": "\tif string(all[\"v\"]) != \"1\" {",
+   "old": "\tif string(all[\"v\"]) != strconv.Itoa(ReceiptVersion) {",
    "new": "\tif string(all[\"v\"]) == \"\" {"
   },
   {
@@ -88,8 +101,8 @@
   {
    "name": "Q16 пакет одной записи не проверяет подпись квитанции",
    "file": "internal/proof/gateway.go",
-   "old": "\t\tr.ReceiptSigned = add(\"the gateway receipt is signed with the pinned gateway key\", rc.Verify(trust.GatewayKey), fmt.Sprintf(\"gateway %s, seq %d\", rc.Gateway, rc.Seq))",
-   "new": "\t\tr.ReceiptSigned = add(\"the gateway receipt is signed with the pinned gateway key\", nil, fmt.Sprintf(\"gateway %s, seq %d\", rc.Gateway, rc.Seq))"
+   "old": "\t\tr.ReceiptSigned = add(\"the gateway receipt is signed with the pinned gateway key\", trust.GatewayKeys.Verify(rc, received), fmt.Sprintf(",
+   "new": "\t\tr.ReceiptSigned = add(\"the gateway receipt is signed with the pinned gateway key\", nil, fmt.Sprintf("
   },
   {
    "name": "Q17 пакет одной записи не сверяет хэш тела с вердиктом",
@@ -106,8 +119,8 @@
   {
    "name": "Q19 пакет по источнику не проверяет подписи открытых квитанций",
    "file": "internal/proof/source.go",
-   "old": "\t\t\tif err := rc.Verify(trust.GatewayKey); err != nil {\n\t\t\t\treturn fmt.Errorf(\"record %s/%d (gateway %s, seq %d): %w\"",
-   "new": "\t\t\tif err := error(nil); err != nil {\n\t\t\t\treturn fmt.Errorf(\"record %s/%d (gateway %s, seq %d): %w\""
+   "old": "\t\t\tif err := trust.GatewayKeys.Verify(rc, time.Unix(0, body.ReceivedAt)); err != nil {",
+   "new": "\t\t\tif err := error(nil); err != nil {"
   },
   {
    "name": "Q20 пакет по источнику двигает цепочку подделкой",
@@ -142,8 +155,8 @@
   {
    "name": "Q25 квитанции без ключа шлюза",
    "file": "internal/config/config.go",
-   "old": "\t\t\tif s.GatewayKey == \"\" {\n\t\t\t\terrs = append(errs, fmt.Errorf(\"sources[%d] %s: content_type %q needs gateway_key",
-   "new": "\t\t\tif false {\n\t\t\t\terrs = append(errs, fmt.Errorf(\"sources[%d] %s: content_type %q needs gateway_key"
+   "old": "\t\t\tif s.GatewayKey == \"\" && len(s.GatewayKeys) == 0 {",
+   "new": "\t\t\tif false {"
   },
   {
    "name": "Q26 метка квитанций по любому полю",
@@ -152,28 +165,142 @@
    "new": "\t\t\tif false {"
   },
   {
-   "name": "Q27 esreceipt без замка файла",
-   "file": "cmd/esreceipt/main.go",
-   "old": "\tif err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {\n\t\treturn 0, fmt.Errorf(\"lock %s: %w\", path, err)\n\t}",
+   "name": "Q27 квитанция пишется без замка файла",
+   "file": "internal/gateway/journal.go",
+   "old": "\tif err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {\n\t\treturn Appended{}, fmt.Errorf(\"gateway: lock %s: %w\", path, err)\n\t}",
    "new": "\t_ = unix.LOCK_EX"
   },
   {
-   "name": "Q28 esreceipt пишет после порванной строки",
-   "file": "cmd/esreceipt/main.go",
-   "old": "\tif one[0] != '\\n' {\n\t\treturn nil, 0, 0, fmt.Errorf(",
-   "new": "\tif false {\n\t\treturn nil, 0, 0, fmt.Errorf("
+   "name": "Q28 квитанция дописывается к порванной строке",
+   "file": "internal/gateway/journal.go",
+   "old": "\tif torn {\n\t\tout = append([]byte{'\\n'}, out...)\n\t}",
+   "new": "\tif false {\n\t\tout = append([]byte{'\\n'}, out...)\n\t}"
   },
   {
-   "name": "Q29 esreceipt начинает вторую цепочку при чужом ключе",
-   "file": "cmd/esreceipt/main.go",
-   "old": "\tif last == nil && claimed > 0 {",
-   "new": "\tif false {"
+   "name": "Q29 смена ключа шлюза начинает новую цепочку",
+   "file": "internal/gateway/journal.go",
+   "old": "\t\ttrusted = trusted && h.Receipts == abs && h.Gateway == name && isHash(h.Key) && h.Seq > 0 && isHash(h.Hash)",
+   "new": "\t\ttrusted = trusted && h.Receipts == abs && h.Gateway == name && h.Key == hex.EncodeToString(pub) && h.Seq > 0 && isHash(h.Hash)"
   },
   {
-   "name": "Q30 esreceipt берёт своей строку без своей подписи",
-   "file": "cmd/esreceipt/main.go",
-   "old": "\t\tif r.Gateway == name && r.Seq > 0 && r.Prev != \"\" && r.Verify(pub) == nil {",
-   "new": "\t\tif r.Gateway == name && r.Seq > 0 && r.Prev != \"\" {"
+   "name": "Q30 шлюз берёт своей строку без своей подписи",
+   "file": "internal/gateway/journal.go",
+   "old": "\tcase r.Seq == 0 || r.Prev == \"\" || r.Verify(c.pub) != nil:",
+   "new": "\tcase r.Seq == 0 || r.Prev == \"\":"
+  },
+  {
+   "name": "Q31 имя ключа в заголовке не сверяется с ключом",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tif id := KeyID(key); r.Kid != id {",
+   "new": "\tif id := KeyID(key); false && r.Kid != id {"
+  },
+  {
+   "name": "Q32 срок ключа не сверяется",
+   "file": "internal/gateway/keys.go",
+   "old": "\treturn k.covers(at)",
+   "new": "\treturn nil"
+  },
+  {
+   "name": "Q33 ключ говорит и в миг not_after",
+   "file": "internal/gateway/keys.go",
+   "old": "\tcase !k.NotAfter.IsZero() && !at.Before(k.NotAfter):",
+   "new": "\tcase !k.NotAfter.IsZero() && at.After(k.NotAfter):"
+  },
+  {
+   "name": "Q34 not_before не сверяется",
+   "file": "internal/gateway/keys.go",
+   "old": "\tcase !k.NotBefore.IsZero() && at.Before(k.NotBefore):",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "Q35 лишнее в заголовке подписи принимается (jwk, crit)",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tcase len(h) != 3 || !okAlg || !okTyp || kid == \"\":",
+   "new": "\tcase !okAlg || !okTyp || kid == \"\":"
+  },
+  {
+   "name": "Q36 любой алгоритм в заголовке подписи",
+   "file": "internal/gateway/receipt.go",
+   "old": "\tcase alg != AlgEd25519 && alg != AlgEdDSA:",
+   "new": "\tcase false:"
+  },
+  {
+   "name": "Q37 имя ключа — не отпечаток JWK (RFC 7638)",
+   "file": "internal/gateway/keys.go",
+   "old": "[]byte(`{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"` + base64.RawURLEncoding.EncodeToString(pub) + `\"}`))",
+   "new": "[]byte(`{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"` + base64.RawURLEncoding.EncodeToString(pub) + `\"}`))"
+  },
+  {
+   "name": "Q38 срок ключа проверяющего — без времени приёма (пакет записи)",
+   "file": "internal/proof/gateway.go",
+   "old": "\t\tverifyReceipt(v, time.Unix(0, sealed.ReceivedAt), r, trust, add)",
+   "new": "\t\tverifyReceipt(v, time.Time{}, r, trust, add)"
+  },
+  {
+   "name": "Q39 срок ключа проверяющего — без времени приёма (пакет по источнику)",
+   "file": "internal/proof/source.go",
+   "old": "trust.GatewayKeys.Verify(rc, time.Unix(0, body.ReceivedAt))",
+   "new": "trust.GatewayKeys.Verify(rc, time.Time{})"
+  },
+  {
+   "name": "Q40 хранилище сверяет срок ключа без времени приёма",
+   "file": "internal/store/gateway.go",
+   "old": "st.gw.Check(it.body, time.Unix(0, it.header.ReceivedAt))",
+   "new": "st.gw.Check(it.body, time.Time{})"
+  },
+  {
+   "name": "Q41 вердикт не называет ключ квитанции",
+   "file": "internal/gateway/receipt.go",
+   "old": "HashOK: true, Kid: r.Kid}",
+   "new": "HashOK: true}"
+  },
+  {
+   "name": "Q42 пакет записи не сверяет имя ключа тела с вердиктом",
+   "file": "internal/proof/gateway.go",
+   "old": "\tcase rc.Kid != v.Kid:\n\t\terr = fmt.Errorf(\"the receipt names key %s, the verdict %s\"",
+   "new": "\tcase false:\n\t\terr = fmt.Errorf(\"the receipt names key %s, the verdict %s\""
+  },
+  {
+   "name": "Q43 пакет по источнику не сверяет имя ключа тела с вердиктом",
+   "file": "internal/proof/source.go",
+   "old": "\t\tcase rc.Kid != v.Kid:\n\t\t\treturn fmt.Errorf(\"record %s/%d: the receipt names key %s, the verdict %s\"",
+   "new": "\t\tcase false:\n\t\t\treturn fmt.Errorf(\"record %s/%d: the receipt names key %s, the verdict %s\""
+  },
+  {
+   "name": "Q44 один ключ в списке дважды",
+   "file": "internal/gateway/keys.go",
+   "old": "\t\tif _, dup := s.byID[id]; dup {",
+   "new": "\t\tif _, dup := s.byID[id]; false && dup {"
+  },
+  {
+   "name": "Q45 опечатка в сроке ключа — ключ без срока",
+   "file": "internal/gateway/keys.go",
+   "old": "\tdec := json.NewDecoder(bytes.NewReader(b))\n\tdec.DisallowUnknownFields()\n\tif err := dec.Decode(&p); err != nil {",
+   "new": "\tdec := json.NewDecoder(bytes.NewReader(b))\n\tif err := dec.Decode(&p); err != nil {"
+  },
+  {
+   "name": "Q46 gateway_key вместе с gateway_keys",
+   "file": "internal/config/config.go",
+   "old": "\t\t\tcase s.GatewayKey != \"\":\n\t\t\t\terrs = append(errs, fmt.Errorf(\"sources[%d] %s: set gateway_key or gateway_keys, not both",
+   "new": "\t\t\tcase false:\n\t\t\t\terrs = append(errs, fmt.Errorf(\"sources[%d] %s: set gateway_key or gateway_keys, not both"
+  },
+  {
+   "name": "Q47 источник прежнего формата receipt/v1 поднимается",
+   "file": "internal/config/config.go",
+   "old": "\t\tif s.ContentType == retiredReceiptContentType {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "Q48 срок ключа задом наперёд принимается",
+   "file": "internal/gateway/keys.go",
+   "old": "\t\tif !k.NotBefore.IsZero() && !k.NotAfter.IsZero() && !k.NotBefore.Before(k.NotAfter) {",
+   "new": "\t\tif false {"
+  },
+  {
+   "name": "Q49 ключ не из списка источника проходит",
+   "file": "internal/gateway/keys.go",
+   "old": "\tk, ok := s.Lookup(r.Kid)\n\tif !ok {",
+   "new": "\tk, ok := s.Lookup(r.Kid)\n\tif !ok && false {"
   }
  ]
 }

@@ -244,7 +244,7 @@
   {
    "name": "P13 подпись точки не проверяется ключом проверяющего",
    "file": "internal/proof/gateway.go",
-   "old": "\t\tif add(\"the checkpoint is signed with the pinned gateway key\", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf(\"seq %d\", cv.Seq)) {",
+   "old": "\t\tif add(\"the checkpoint is signed with the pinned gateway key\", gateway.VerifyCheckpointAny(trust.GatewayKeys, cv), fmt.Sprintf(\"seq %d\", cv.Seq)) {",
    "new": "\t\tif add(\"the checkpoint is signed with the pinned gateway key\", nil, fmt.Sprintf(\"seq %d\", cv.Seq)) {"
   },
   {

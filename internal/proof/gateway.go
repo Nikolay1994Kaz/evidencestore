@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/auditchain"
 	"github.com/Nikolay1994Kaz/evidencestore/internal/evidence"
@@ -13,7 +14,7 @@ import (
 
 // Улика из журнала гейтвея несёт второй лист — вердикт хранилища при приёме
 // (gateway.Verdict): открытые поля цепочки гейтвея (seq, hash, prev_hash) и
-// что сошлось. Так же — у квитанции шлюза (receipt/v1): у неё подписана
+// что сошлось. Так же — у квитанции шлюза (receipt/v2): у неё подписана
 // каждая строка, и контрольной точки нет. Лист ложится в цепь рядом с уликой и, как и она, остаётся
 // проверяемым после уничтожения ключа месяца.
 //
@@ -87,7 +88,7 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	add("the entry is intact in the gateway chain (checked by the store at intake)", err, fmt.Sprintf("seq %d, chaining %s", v.Seq, v.Link))
 
 	if sealed.ContentType == gateway.ReceiptContentType {
-		verifyReceipt(v, r, trust, add)
+		verifyReceipt(v, time.Unix(0, sealed.ReceivedAt), r, trust, add)
 		return
 	}
 
@@ -130,9 +131,9 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 	// проверяющий своим ключом или хранилище при приёме закреплённым ключом
 	// гейтвея. Подпись без проверки — просто байты.
 	switch {
-	case trust.GatewayKey != nil:
+	case trust.GatewayKeys.Len() > 0:
 		r.GatewayKeyChecked = true
-		if add("the checkpoint is signed with the pinned gateway key", gateway.VerifyCheckpoint(trust.GatewayKey, cv), fmt.Sprintf("seq %d", cv.Seq)) {
+		if add("the checkpoint is signed with the pinned gateway key", gateway.VerifyCheckpointAny(trust.GatewayKeys, cv), fmt.Sprintf("seq %d", cv.Seq)) {
 			r.GatewayCheckpoint = &cv
 		}
 	case cv.Signature == gateway.SigValid:
@@ -145,26 +146,30 @@ func verifyGateway(g *GatewayProof, sealed evidence.Sealed, r *Report, trust Tru
 // verifyReceipt — проверки квитанции шлюза сверх вердикта: тело — та самая
 // квитанция, она разбирается и без хранилища, и её подпись проверил кто-то:
 // сам проверяющий ключом шлюза или хранилище при приёме. Контрольной точки у
-// квитанции нет: подписана каждая строка.
-func verifyReceipt(v gateway.Verdict, r *Report, trust Trust, add func(string, error, string) bool) {
+// квитанции нет: подписана каждая строка. received — время приёма из
+// заголовка улики: по нему сверяется срок ключа проверяющего, как у хранилища.
+func verifyReceipt(v gateway.Verdict, received time.Time, r *Report, trust Trust, add func(string, error, string) bool) {
 	r.Receipt = true
 	if !r.BodyOpened {
 		return
 	}
 	rc, perr := gateway.ParseReceipt(r.Body)
+	r.ReceiptKid = rc.Kid
 	var err error
 	switch {
 	case rc.Hash != v.Hash:
 		err = fmt.Errorf("body hash %s, verdict hash %s", short(rc.Hash), short(v.Hash))
 	case rc.Gateway != v.Writer || rc.Seq != v.Seq || rc.Prev != v.PrevHash:
 		err = fmt.Errorf("the receipt names gateway %q, seq %d, prev %s; the verdict %q, seq %d, prev %s", rc.Gateway, rc.Seq, short(rc.Prev), v.Writer, v.Seq, short(v.PrevHash))
+	case rc.Kid != v.Kid:
+		err = fmt.Errorf("the receipt names key %s, the verdict %s", orDash(rc.Kid), orDash(v.Kid))
 	}
 	add("the body is that very gateway receipt (hash recomputed)", err, short(v.Hash))
 	add("the gateway receipt is well-formed (parsed offline)", perr, fmt.Sprintf("gateway %s, seq %d", rc.Gateway, rc.Seq))
 	switch {
-	case trust.GatewayKey != nil:
+	case trust.GatewayKeys.Len() > 0:
 		r.GatewayKeyChecked = true
-		r.ReceiptSigned = add("the gateway receipt is signed with the pinned gateway key", rc.Verify(trust.GatewayKey), fmt.Sprintf("gateway %s, seq %d", rc.Gateway, rc.Seq))
+		r.ReceiptSigned = add("the gateway receipt is signed with the pinned gateway key", trust.GatewayKeys.Verify(rc, received), fmt.Sprintf("gateway %s, seq %d, key %s", rc.Gateway, rc.Seq, orDash(rc.Kid)))
 	case v.Signature == gateway.SigValid:
 		r.ReceiptSigned = true
 	default:

@@ -837,7 +837,7 @@ func (s *Store) open() error {
 		if body, err := s.keys.Unseal(p.envelope); err != nil {
 			v = gateway.Verdict{Problem: "catch-up after restart: body unavailable: " + err.Error()}
 		} else {
-			v = st.gw.Check(body)
+			v = st.gw.Check(body, time.Unix(0, p.header.ReceivedAt))
 		}
 		s.appendGatewayVerdict(st, p.header, p.pos, v)
 	}
