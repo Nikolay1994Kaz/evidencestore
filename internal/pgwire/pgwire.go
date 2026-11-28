@@ -48,6 +48,14 @@ type Config struct {
 	// Params — ещё параметры входа (имя → значение): они сильнее умолчаний
 	// базы и роли, и DISCARD ALL возвращает к ним, а не к умолчаниям.
 	Params map[string]string
+	// Pooler — адрес ведёт к пулеру соединений (PgBouncer), а не к базе:
+	// при входе идут только пользователь, база, client_encoding и
+	// application_name. Остальное (DateStyle, extra_float_digits,
+	// IntervalStyle, array_nulls, Params) пулер либо отвергает («unsupported
+	// startup parameter»), либо молча выбрасывает, а в режиме по транзакциям
+	// сеанса базы у клиента и нет: такие настройки ставит сам клиент в начале
+	// каждой своей транзакции (SET LOCAL).
+	Pooler bool
 }
 
 // ParseDSN разбирает строку вида "host=/var/run/postgresql port=5432 user=u
@@ -256,6 +264,11 @@ func startTLS(nc net.Conn, cfg Config) (net.Conn, error) {
 	return conn, nil
 }
 
+// TextParams — настройки, с которыми текст значений пишется и читается
+// одинаково (startup): параметры входа любого соединения, а через пулер
+// (Config.Pooler) — то, что клиент ставит себе сам в каждой транзакции.
+var TextParams = [][2]string{{"DateStyle", "ISO, YMD"}, {"extra_float_digits", "3"}, {"IntervalStyle", "postgres"}, {"array_nulls", "on"}}
+
 func (c *Conn) startup(cfg Config) error {
 	body := binary.BigEndian.AppendUint32(nil, 196608) // протокол 3.0
 	add := func(k, v string) { body = append(append(append(append(body, k...), 0), v...), 0) }
@@ -271,17 +284,18 @@ func (c *Conn) startup(cfg Config) error {
 	// со строкой "NULL" вместо NULL, и сверка после отката, сравнивая две
 	// одинаково прочитанные стороны, этого не видит. Умолчания роли агент ставит
 	// себе сам, базы — старые приложения (P-257).
-	add("DateStyle", "ISO, YMD")
-	add("extra_float_digits", "3")
-	add("IntervalStyle", "postgres")
-	add("array_nulls", "on")
-	keys := make([]string, 0, len(cfg.Params))
-	for k := range cfg.Params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		add(k, cfg.Params[k])
+	if !cfg.Pooler {
+		for _, kv := range TextParams {
+			add(kv[0], kv[1])
+		}
+		keys := make([]string, 0, len(cfg.Params))
+		for k := range cfg.Params {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			add(k, cfg.Params[k])
+		}
 	}
 	if cfg.AppName != "" {
 		add("application_name", cfg.AppName)

@@ -187,7 +187,19 @@ func deref(v *string) string {
 // был тогда отметкой в журнале базы). Откат же шёл без таймаутов вовсе (агент снимает их у своей роли) и
 // висел на замке строки под замком агента (R2 заход 2). Роль — та, которой
 // сервер вошёл; таймауты — те же, что ставит guards.
+//
+// Через пулер (Config.Pooler) параметров входа нет: пулер их не пропускает.
+// Те же значения транзакция ставит себе сама (ownSettings).
 func (s *Server) sessionParams() map[string]string {
+	if s.cfg.Pooler {
+		return nil
+	}
+	return s.loginParams()
+}
+
+// loginParams — значения, с которыми идут свои запросы сервера: параметрами
+// входа прямого соединения или, через пулер, в начале каждой транзакции.
+func (s *Server) loginParams() map[string]string {
 	ms := func(d time.Duration) string { return strconv.FormatInt(d.Milliseconds(), 10) }
 	p := map[string]string{"role": "none", "statement_timeout": "0", "lock_timeout": "0", "idle_in_transaction_session_timeout": "300000"}
 	if s.cfg.StatementTimeout > 0 {

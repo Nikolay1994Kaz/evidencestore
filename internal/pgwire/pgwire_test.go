@@ -331,3 +331,53 @@ func TestPipelineFramesAndAnswers(t *testing.T) {
 		t.Fatal("a zero byte went through")
 	}
 }
+
+// Через пулер (Config.Pooler) при входе идут только пользователь, база,
+// client_encoding и application_name: остальное PgBouncer отвергает
+// («unsupported startup parameter») или молча выбрасывает. Прямое соединение
+// шлёт и вид текста значений, и Params.
+func TestStartupParametersThroughAPooler(t *testing.T) {
+	login := func(cfg Config) string {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		got := make(chan string, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			var n [4]byte
+			if _, err := io.ReadFull(c, n[:]); err != nil {
+				return
+			}
+			body := make([]byte, int(n[0])<<24|int(n[1])<<16|int(n[2])<<8|int(n[3])-4)
+			if _, err := io.ReadFull(c, body); err != nil {
+				return
+			}
+			got <- strings.ReplaceAll(string(body[4:]), "\x00", " ")
+			c.Write(append(msg('R', 0, 0, 0, 0), msg('Z', 'I')...)) // AuthenticationOk, ReadyForQuery
+		}()
+		cfg.Network, cfg.Address, cfg.User, cfg.Database, cfg.AppName = "tcp", ln.Addr().String(), "bot", "shop", "esmcp/bot"
+		cfg.Params = map[string]string{"statement_timeout": "65000"}
+		c, err := Dial(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.nc.Close()
+		return <-got
+	}
+	if got := login(Config{Pooler: true}); got != "user bot database shop client_encoding UTF8 application_name esmcp/bot  " {
+		t.Errorf("through a pooler: %q", got)
+	}
+	direct := login(Config{})
+	for _, want := range []string{"DateStyle ISO, YMD ", "extra_float_digits 3 ", "IntervalStyle postgres ", "array_nulls on ", "statement_timeout 65000 "} {
+		if !strings.Contains(direct, want) {
+			t.Errorf("a direct connection lacks %q: %q", want, direct)
+		}
+	}
+}

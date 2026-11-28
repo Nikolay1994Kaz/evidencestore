@@ -21,7 +21,7 @@ AI agent
 
 - **A transaction named in a signed intent of the gateway** is kept whole: rows before and after, so that `esundo` can undo it. `esmcp` writes the intent with the transaction's id before the agent's SQL runs and before `COMMIT`, and the stream gives the transaction only after it, so the collector decides at its start. The intent is signed with the gateway's key, which lies with the gateway: not in the database, its log or its copies.
 - **Any other transaction** on those tables — people, applications, someone who logged in with the server's role past the server — is kept as a fingerprint: id, commit time, tables, row keys, the kind of change and hashes of the old and the new row. No rows: it cannot be undone from the store, and `esundo` names the record that holds it. Fingerprints reach the store in packs: a pack leaves when it is full or a minute after its first transaction, so a change made past the server shows up in the store up to a minute later. With `"require_gateway": true` each such transaction raises the alert `not-via-gateway`, for a database where only the gateway writes.
-- **The stream always starts from the replication slot**, and a transaction the store already holds is recognized and not written twice. A database restored from a copy, or a lagging replica that took its place, is seen (`db-rewound`), and the intents of the earlier history no longer decide anything: `esmcp` and `esundo` put the start time of the database into every intent (`db_started`), so that the decision follows the database's own clock.
+- **The stream always starts from the replication slot**, and a transaction the store already holds is recognized and not written twice. A database restored from a copy, or a lagging replica that took its place, is seen (`db-rewound`), and the intents of the earlier history no longer decide anything: `esmcp` and `esundo` put the start time and the timeline of the database into every intent (`db_started`, `db_timeline`), so that the decision follows the database's own clock and history. A cluster that switches over to a replica holding everything the collector has read is not a rewind: see [A cluster with failover](#a-cluster-with-failover).
 - **Loss is named.** A slot dropped or moved, or a log the database removed before the collector read it, becomes a sequence gap in the store's chain and the alert `gap`. A receipt missing from the gateway's chain, or an intent that is missing or came after its transaction, raises `receipts-gap` or `intent-missing`: that transaction went in as a fingerprint.
 
 The roles of the database are the second line, not the first: `escollect -setup-sql` grants the server's role the right to write the named tables and the agent's own role only to read them, by an allow-list, and refuses roles that could get more through membership or ownership. There are more ways to grant rights in PostgreSQL than any check can list, so the promise rests on what the collector sees.
@@ -80,6 +80,22 @@ The server runs the transaction, and nothing is committed before its `COMMIT`. E
 
 In each case the agent is told not to split or retry and to call a person, the receipts keep the outcome and its cause, and the collector raises `refused` from the outcome receipt, so people learn about what did not happen in the database (an alert about the rate at most once a minute). Rows are counted by the database itself, from the statistics of the transaction, so changes made by triggers, cascades and inside `WITH` count. The limits are counted from the receipts file, shared by all of the agent's sessions.
 
+### Through a connection pooler
+
+With `"pooler": true` the `dsn` may point at PgBouncer, in session or in transaction pooling mode:
+
+```json
+{"dsn": "host=pgbouncer port=6432 user=esmcp_bot dbname=shop sslmode=verify-full", "pooler": true, …}
+```
+
+- Without it the server does not log in through PgBouncer at all (`unsupported startup parameter: extra_float_digits`): it sends its session settings as startup parameters, and a pooler refuses them. Do not work around that with `ignore_startup_parameters`: the pooler would drop the settings silently.
+- With it the server sends no such parameters and keeps nothing in the session. Every call is one transaction, and inside it the server sets what it needs (`SET LOCAL`: the text format of values, the timeouts, its role and search path) and cleans the database connection the way `DISCARD ALL` does, at the start and again after the agent's statements, before `COMMIT`. So nothing the agent's SQL leaves (a session setting, an advisory lock, a prepared statement) reaches whoever gets that connection next, and nothing left by others reaches the agent's action.
+- PgBouncer needs no settings for this. The pool belongs to the server's role: do not let other programs log in to the pooler with it.
+- The limits, the timer that cancels a statement (the cancel request goes through the pooler) and the receipts work the same. The undo tools do not: `undo` together with `pooler` is refused at start, because the check and the undo keep session settings between transactions. Undo with `esundo` over a direct connection to the database.
+- The collector does not go through a pooler: it reads the database log over a replication connection to the primary.
+
+Checked on 28 November 2026 with PgBouncer 1.26.1 and PostgreSQL 17.12, in both pooling modes: [experiments/pg-ha](../experiments/pg-ha/README.md) (in Russian). Other poolers were not tried.
+
 `key` is an Ed25519 key in PKCS#8 PEM (`esreceipt keygen`); `esmcp -config mcp.json -pubkey` prints its public key, which goes into the collector's `receipts.gateway_keys` and the store's `gateway_key` of the receipts source (to change the key later, see [Keys](receipts.md#keys)). The gateway keeps the head of its chain next to the key (`head`, by default `<key>.head-<8 hex>`): it must be writable, and not in the receipts directory, or the server refuses to start.
 
 ## Undo: esundo
@@ -137,6 +153,39 @@ One `escollect` runs several sources, each with its own certificate, spool and i
 
 `escollect -config collector.json -setup-sql` prints the SQL that prepares the database: the roles and their rights by an allow-list, `REPLICA IDENTITY FULL` on the tables and the publication. Run it as a superuser, and again after adding tables or partitions. It needs PostgreSQL 14 or newer with `wal_level=logical`; `pgoutput` is built in. The receipts files go to the store as sources of their own (`"content_type": "receipt/v2"`, see [Gateway receipts](receipts.md)), so the intents and outcomes are evidence too, and `esverify -linked` checks an action's receipts together with the bundle of its transaction.
 
+## A cluster with failover
+
+In a cluster managed by Patroni (or anything else that promotes a replica) the replicas are the cluster's business; `esmcp` and the collector only have to work in it. Three things are yours to set up.
+
+**1. The address.** `dsn` of the collector, of `esmcp` and of `esundo` names the address the cluster gives for its current primary (a balancer that asks Patroni, a virtual IP, a DNS name), not a machine. The collector connects straight to it, not through a connection pooler. After a switchover both reconnect by themselves: the collector retries with growing pauses and raises `db-down` and `db-up`, `esmcp` opens a new connection on the next call. A login that gets no answer is given up after 15 seconds.
+
+**2. The collector's replication slot must exist on the new primary.** A replication slot lives on one server; whether a replica has it is the cluster's setting:
+
+- **Patroni:** declare the slot permanent in the cluster configuration (`patronictl edit-config`), before the collector first starts. Patroni then creates it on the primary and keeps a copy on the replicas:
+
+  ```yaml
+  slots:
+    evidence_tap:        # "slot" of the collector's postgres input
+      type: logical
+      database: shop
+      plugin: pgoutput
+  ```
+
+- **PostgreSQL 17 and newer without Patroni's slots:** create the slot yourself with `failover`, before the collector first starts (`SELECT pg_create_logical_replication_slot('evidence_tap', 'pgoutput', false, false, true)`); set `sync_replication_slots = on` and `hot_standby_feedback = on` on the replicas, with `dbname` in `primary_conninfo`; name the replicas' physical slots in `synchronized_standby_slots` on the primary, so that the collector never gets ahead of a replica. Three things to know:
+  - A slot the collector creates itself, on its first start or after a loss, has no `failover` and is not synchronized.
+  - The copy on a replica is ready only after the collector has read past the point the replica was made from. Check it on the replica: `SELECT synced AND NOT temporary FROM pg_replication_slots WHERE slot_name = 'evidence_tap'`.
+  - After a failover the new primary sends nothing to the collector while `synchronized_standby_slots` names the slot of a replica that is gone: the collector is connected and gets no changes, and says so only when the log kept for the slot has grown to half its limit (`slot-lag`). Whoever promotes the replica clears or corrects the setting.
+
+Without either, the slot is gone after a switchover. The collector then raises `gap`, the store records a gap in the numbering of the source, and the collector goes on from a new slot: what was committed in between is not in the store, and that is visible.
+
+**3. Replication that does not lose commits.** With asynchronous replication a failover can drop the last transactions of the old primary. The cluster loses them, not the collector; if the collector had read them, they stay in the store, and the collector raises `db-rewound`. Synchronous replication (`synchronous_mode` in Patroni) keeps a failover from losing a commit the agent was told about.
+
+**What happens at a switchover.** The collector asks the new primary for its timeline history. If the timeline the collector was reading is in it, and ended no earlier than the collector's place, nothing it has read is lost: it logs the switchover and reads on from the slot, without an alert. The slot on the new primary may be a little behind; a transaction the store already holds is not written twice. Otherwise the database went back: `db-rewound`, as before. Each intent of the gateway decides only a transaction of its own timeline (`db_timeline`), so an intent written on the old primary for a transaction that never reached the replica cannot claim the transaction the new primary gives the same number to. A gateway that does not write `db_timeline` into its intents gets the cautious rule: its intents read before the switchover no longer count, so its actions made between the switchover and the collector's reconnect are kept as fingerprints.
+
+**What the agent is told when the primary goes away during an action.** Before `COMMIT`: `failed and was rolled back`, and it is. During `COMMIT`: `the action may have been committed … Do not repeat it`, the outcome `unknown` in the receipts and the alert `commit-unknown`; if the transaction did commit, the store holds it whole, as that action. The same through PgBouncer.
+
+Checked on 28 November 2026 on PostgreSQL 17.12 with Patroni 4.1.5, HAProxy 3.0.11 and PgBouncer 1.26.1: a planned switchover and a killed primary under an agent's load, a primary that goes away during the agent's SQL and during `COMMIT`, and, without Patroni, a failover with PostgreSQL 17's own slot synchronization. The scenarios, with their numbers: [experiments/pg-ha](../experiments/pg-ha/README.md) (in Russian).
+
 ## Alerts
 
 ```json
@@ -162,12 +211,13 @@ One message per transaction, with every cause, a summary of the change and the u
 | `receipts-unreadable` | a receipts file cannot be read: the gateway's transactions go as fingerprints until it can |
 | `truncate`, `identity` | the transaction cannot be restored whole from the log |
 | `refused` | the MCP server stopped an action: rows, rate or time |
+| `commit-unknown` | the connection of the MCP server to the database broke during `COMMIT` of an action: it may be committed, the agent was told not to repeat it |
 | `escaped` | the agent's SQL closed the server's transaction itself: what it changed may have been committed past the limits (a safeguard: `PREPARE` keeps this from happening) |
 | `db-down`, `db-up` | no connection to the database for longer than `down_after`; it is back |
 | `slot-lag`, `slot-ok` | the database keeps log for the slot: half and 80 % of its limit; released |
 | `gap` | records lost: the slot was dropped, recreated or moved while the collector was away, or the database removed its log |
 | `slot-unknown` | the collector's `slot.json` is gone, so whether the slot moved meanwhile cannot be told |
-| `db-rewound` | the database went back: restored from a copy, replaced by a replica on another timeline, another cluster, or a transaction below the collector's place that it does not hold; the gateway's earlier intents no longer count |
+| `db-rewound` | the database went back: restored from a copy, replaced by a replica that lacks what the collector has read, another cluster, or a transaction below the collector's place that it does not hold; the gateway's earlier intents no longer count. A switchover to a replica that has everything is not one |
 
 The collector's `/metrics` (`metrics_listen`) shows every source, the slot, the log the database keeps for it and its limit, and the alert queues.
 
@@ -180,6 +230,9 @@ The most important ones; all of them, with their causes, are in [experiments/pg-
 - Through `esmcp` the agent gets only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `VALUES`: an agent that needs to change the schema needs another path.
 - The full rows of the gateway's transactions are personal data in the store. They can be erased by month (the month key), not per person.
 - A server that dies between the intent and the outcome leaves the action `pending`, without an alert.
+- Through a connection pooler the agent has no undo tools (`esundo` over a direct connection undoes).
+- `COMMIT` has no timer of the server's own. If the primary stops answering without closing the connection (a frozen machine) and nothing between it and `esmcp` resets the connection, the call waits until TCP gives up. A balancer that drops sessions of a server it marks down ends the wait in seconds.
 - The index (`index.jsonl`) and the alerts file are not rotated.
 - No ready-made Prometheus rules or dashboards; no mail or other channels than Telegram, Slack-compatible webhooks and your own address.
+- A collector that saw a switchover with a version before the timeline mark keeps the gateway's actions as fingerprints until the new primary is restarted: its state holds a bound by the start time only.
 - The live tests ran on PostgreSQL 16. On 24 November 2026 the trial ran under Docker (PostgreSQL 17): `docker compose up` from scratch, an action of an agent through the MCP server, its undo with `esundo check` and `apply`, a change made past the server kept as a fingerprint, a statement the server refuses, and the agent's own read-only connection refused a change. `scripts/docker-check-pg.sh` runs the same steps, and CI runs it on every push and before every release.

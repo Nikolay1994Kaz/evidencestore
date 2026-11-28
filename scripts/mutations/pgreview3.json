@@ -59,13 +59,13 @@
   {
    "name": "X9 намерение с отметкой базы, прочитанное позже, — в счёте",
    "file": "internal/pginput/receipts.go",
-   "old": "\t\treturn started <= r.voidStartedBefore\n",
-   "new": "\t\treturn false\n"
+   "old": "\treturn started <= r.voidStartedBefore\n",
+   "new": "\treturn false\n"
   },
   {
    "name": "X10 void не снимает намерения с отметкой",
    "file": "internal/pginput/receipts.go",
-   "old": "\t\tif at.started == 0 || at.started <= r.voidStartedBefore {",
+   "old": "\t\tif at.started == 0 || r.startedVoid(at.started, at.timeline) {",
    "new": "\t\tif at.started == 0 {"
   },
   {

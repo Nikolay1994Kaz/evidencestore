@@ -20,6 +20,7 @@ package mcpserver
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/Nikolay1994Kaz/evidencestore/internal/pgwire"
 )
@@ -45,6 +46,57 @@ var own = []string{
 const ownTimeouts = "SELECT pg_catalog.set_config(s.name, CASE s.name WHEN 'transaction_timeout' THEN '0' ELSE s.reset_val END, true) " +
 	"FROM pg_catalog.pg_settings s WHERE s.name IN ('statement_timeout', 'lock_timeout', 'idle_in_transaction_session_timeout', 'transaction_timeout')"
 
+// Через пулер соединений (Config.Pooler) сеанса базы у сервера нет: в режиме
+// по транзакциям пулер отдаёт соединение базы другому клиенту на каждом
+// COMMIT и ROLLBACK, а параметры входа не пропускает вовсе. Тогда всё, что
+// прямому соединению дают параметры входа и DISCARD ALL, сервер делает внутри
+// своей транзакции — в ней соединение базы его и только его.
+//
+// pooledReset — то же, что делает DISCARD ALL, по частям: целиком он в
+// транзакции запрещён. Идёт дважды. В начале транзакции — от того, что
+// пережило ROLLBACK прошлой (PREPARE и рекомендательные замки сеанса
+// нетранзакционны) или осталось от другого клиента пула. И после команд
+// агента, перед своими запросами сервера и COMMIT — от того, что SQL агента
+// поставил на весь сеанс (SELECT set_config(…, false)): с COMMIT оно осталось
+// бы на соединении базы следующему, кто его получит.
+var pooledReset = []string{
+	"SET SESSION AUTHORIZATION DEFAULT",
+	"RESET ALL",
+	"DEALLOCATE ALL",
+	"CLOSE ALL",
+	"UNLISTEN *",
+	"SELECT pg_catalog.pg_advisory_unlock_all()",
+	"DISCARD PLANS",
+	"DISCARD TEMP",
+	"DISCARD SEQUENCES",
+}
+
+// ownSettings — настройки своих запросов сервера внутри транзакции. Прямое
+// соединение — own. Через пулер перед ними — pooledReset и то, что иначе
+// пришло бы параметрами входа: вид текста значений (pgwire.TextParams) и имя
+// программы; таймауты — числами, а не «как при входе»: у соединения пула
+// «как при входе» — умолчания роли, а их ставит не сервер.
+func (s *Server) ownSettings() []string {
+	if !s.cfg.Pooler {
+		return own
+	}
+	out := slices.Clone(pooledReset)
+	for _, kv := range pgwire.TextParams {
+		out = append(out, "SET LOCAL "+kv[0]+" = "+pgwire.Literal(kv[1]))
+	}
+	if s.cfg.AppName != "" {
+		out = append(out, "SET LOCAL application_name = "+pgwire.Literal(s.cfg.AppName))
+	}
+	out = append(out, own[:len(own)-1]...)
+	p := s.loginParams()
+	return append(out, "SELECT pg_catalog.set_config(s.name, CASE s.name"+
+		" WHEN 'statement_timeout' THEN "+pgwire.Literal(p["statement_timeout"])+
+		" WHEN 'lock_timeout' THEN "+pgwire.Literal(p["lock_timeout"])+
+		" WHEN 'idle_in_transaction_session_timeout' THEN "+pgwire.Literal(p["idle_in_transaction_session_timeout"])+
+		" ELSE '0' END, true) "+
+		"FROM pg_catalog.pg_settings s WHERE s.name IN ('statement_timeout', 'lock_timeout', 'idle_in_transaction_session_timeout', 'transaction_timeout')")
+}
+
 // agentHead — перед командами агента: его search_path (по умолчанию роли).
 // Остальные настройки own командам агента не мешают: текст и так в UTF-8.
 var agentHead = []string{"SET LOCAL search_path TO DEFAULT"}
@@ -55,7 +107,7 @@ var agentHead = []string{"SET LOCAL search_path TO DEFAULT"}
 const immediate = "SET CONSTRAINTS ALL IMMEDIATE"
 
 // batch — пачка одного вызова: agentHead, PREPARE каждой команды агента,
-// EXECUTE каждой, затем свои команды сервера (хвост). Каждая — отдельным
+// EXECUTE каждой, затем свои команды сервера (хвост: own — ownSettings). Каждая — отдельным
 // текстом расширенного протокола, ответ на каждую — свой Result.
 type batch struct {
 	sqls      []string
@@ -67,7 +119,7 @@ type batch struct {
 // команды при разборе — и не исполнена ни одна. Склейка текста безопасна:
 // «;» отвергнет Parse, а после AS грамматика пустит только SELECT, INSERT,
 // UPDATE, DELETE, MERGE и VALUES.
-func newBatch(stmts []string, write bool, guards []string) batch {
+func newBatch(stmts []string, write bool, own, guards []string) batch {
 	b := batch{head: len(agentHead), n: len(stmts), immediate: write}
 	b.sqls = append(b.sqls, agentHead...)
 	for i, st := range stmts {

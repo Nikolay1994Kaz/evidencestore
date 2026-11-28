@@ -1058,14 +1058,35 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 		next8, _ = strconv.ParseUint(*r[0], 10, 64)
 	}
 	cursor := pgwire.LSN(s.tap.Cursor())
+	// История линий времени сервера: где кончалась каждая линия-предок. По
+	// ней смена линии — либо переключение кластера на реплику, у которой есть
+	// всё прочитанное сборщиком (его линия — предок нынешней и кончилась не
+	// раньше его места), либо база ушла назад. Первое — обычное дело в
+	// кластере (Patroni): не тревога, и намерения шлюза остаются в счёте.
+	now, _ := strconv.ParseUint(timeline, 10, 32)
+	switches, herr := timelineHistory(repl, uint32(now))
+	if herr != nil {
+		s.log.Warn("the timeline history of the server could not be read: a change of timeline counts as the database going back", "err", herr)
+	}
+	was, _ := strconv.ParseUint(s.known.Timeline, 10, 32)
+	follows := false
+	for _, sw := range switches {
+		if sw.timeline == uint32(was) && uint64(cursor) <= sw.end {
+			follows = true
+			if timeline != s.known.Timeline {
+				s.log.Info("the database cluster switched over to another server, and everything the collector has read is in its history",
+					"timeline", timeline, "was", s.known.Timeline, "switched at", pgwire.LSN(sw.end).String(), "read up to", cursor.String())
+			}
+		}
+	}
 	var why string
 	switch {
 	case s.known.System != "" && system != s.known.System:
 		why = fmt.Sprintf("this is another database cluster (system %s, the collector read %s)", system, s.known.System)
 	case cursor != 0 && end < cursor:
 		why = fmt.Sprintf("its log ends at %s, and the collector has read up to %s: it was restored from a copy, or a replica that lagged behind took over", end, cursor)
-	case s.known.Timeline != "" && timeline != s.known.Timeline:
-		why = fmt.Sprintf("its timeline is %s, and the collector read timeline %s: a replica took over", timeline, s.known.Timeline)
+	case s.known.Timeline != "" && timeline != s.known.Timeline && !follows:
+		why = fmt.Sprintf("its timeline is %s, and the collector read timeline %s up to %s, which is not in the history of this server: a replica that lagged behind took over, or it was restored from a copy", timeline, s.known.Timeline, cursor)
 	case next8 != 0 && s.xid8 != 0 && next8 <= s.xid8:
 		why = fmt.Sprintf("the next transaction number it gives is %d, and the collector has read transaction %d: it was restored from a copy, or a replica that lagged behind took over", next8, s.xid8)
 	}
@@ -1079,8 +1100,22 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 		return 0, err
 	}
 	started := dbStarted(cat)
+	if s.receipts != nil {
+		s.receipts.setTimelines(uint32(now), switches)
+		if why == "" && follows && timeline != s.known.Timeline {
+			// Чистое переключение: намерения с отметкой линии остаются в
+			// счёте, без неё — прочитанные до сих пор не в счёт.
+			if err := s.receipts.switched(); err != nil {
+				return 0, err
+			}
+		}
+	}
 	if why != "" && (cursor.String() != s.known.Rewound || started != s.known.RewoundStart) {
 		v := s.voidSpec(cat, uint64(cursor), started, cursor.String() == s.known.Rewound)
+		// Линия, которую сборщик читал до сих пор; не знал её — нынешняя.
+		if v.timeline = uint32(was); v.timeline == 0 {
+			v.timeline = uint32(now)
+		}
 		if s.receipts != nil {
 			if err := s.receipts.void(v); err != nil {
 				return 0, err
@@ -1102,6 +1137,54 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 	return from, s.saveKnown()
 }
 
+// timelineHistory спрашивает у сервера историю линии времени now
+// (TIMELINE_HISTORY по соединению репликации): линии-предки по порядку и
+// место журнала, где каждая кончилась. У первой линии предков нет.
+func timelineHistory(repl *pgwire.Conn, now uint32) ([]timelineSwitch, error) {
+	if now <= 1 {
+		return nil, nil
+	}
+	row, ok, err := repl.QueryRow(fmt.Sprintf("TIMELINE_HISTORY %d", now))
+	if err != nil {
+		return nil, fmt.Errorf("TIMELINE_HISTORY %d: %w", now, err)
+	}
+	if !ok || len(row) < 2 || row[1] == nil {
+		return nil, fmt.Errorf("TIMELINE_HISTORY %d: no answer", now)
+	}
+	return parseTimelineHistory(*row[1])
+}
+
+// parseTimelineHistory разбирает файл истории линии времени: строка на
+// предка — «линия, табуляция, место конца, табуляция, причина»; пустые
+// строки и строки с «#» — не в счёт. Порядок — как в файле, от старшего
+// предка; линии и места обязаны расти.
+func parseTimelineHistory(text string) ([]timelineSwitch, error) {
+	var out []timelineSwitch
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			return nil, fmt.Errorf("timeline history: line %q", line)
+		}
+		tl, err := strconv.ParseUint(f[0], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("timeline history: line %q", line)
+		}
+		end, err := pgwire.ParseLSN(f[1])
+		if err != nil {
+			return nil, fmt.Errorf("timeline history: line %q", line)
+		}
+		if n := len(out); n > 0 && (uint32(tl) <= out[n-1].timeline || uint64(end) < out[n-1].end) {
+			return nil, fmt.Errorf("timeline history: line %q is out of order", line)
+		}
+		out = append(out, timelineSwitch{uint32(tl), uint64(end)})
+	}
+	return out, nil
+}
+
 // diverged — pgtap.Config.Diverged: в потоке ниже места сборщика транзакция,
 // которой у него на этом месте нет. База ушла назад, а её журнал успел уйти
 // за место сборщика, пока его не было: по концу журнала при подключении
@@ -1110,6 +1193,9 @@ func (s *Source) identify(cat, repl *pgwire.Conn, slotAt pgwire.LSN) (from pgwir
 func (s *Source) diverged(xid uint32, final, place uint64) error {
 	started := dbStarted(s.cat)
 	v := s.voidSpec(s.cat, place, started, pgwire.LSN(place).String() == s.known.Rewound)
+	if tl, err := strconv.ParseUint(s.known.Timeline, 10, 32); err == nil {
+		v.timeline = uint32(tl)
+	}
 	if s.receipts != nil {
 		if err := s.receipts.void(v); err != nil {
 			return err

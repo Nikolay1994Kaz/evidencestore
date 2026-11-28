@@ -92,6 +92,12 @@ type receiptsState struct {
 	// запущена база, в которой шла транзакция действия, микросекунды) не
 	// позже этого не в счёт: их база — прежняя история, до подъёма из копии.
 	VoidStartedBefore int64 `json:"void_started_before,omitempty"`
+	// VoidTimeline — линия времени, которую сборщик читал, когда база ушла
+	// назад: VoidStartedBefore снимает намерения с отметкой линии
+	// (db_timeline) только не новее её. Намерение с линии новее — из новой
+	// истории, каким бы старым ни был запуск его базы: реплика, ставшая
+	// основной, запущена раньше границы.
+	VoidTimeline uint32 `json:"void_timeline,omitempty"`
 	// Chains — шлюзы по имени: до какого их времени намерения не в счёт.
 	Chains map[string]*chainState `json:"chains,omitempty"`
 	// Links — последняя квитанция каждой цепочки (путь файла, шлюз, ключ),
@@ -155,8 +161,12 @@ type fileState struct {
 type chainState struct {
 	// VoidTime — намерения шлюза не позже этого времени не в счёт: база ушла
 	// назад (void), и названные в них номера она выдаст снова.
-	VoidTime string    `json:"void_time,omitempty"`
-	last     time.Time // позднее время намерения, прочитанного у шлюза
+	VoidTime string `json:"void_time,omitempty"`
+	// SwitchTime — намерения шлюза без отметки линии времени (db_timeline)
+	// не позже этого времени не в счёт: кластер переключился на реплику
+	// (switched), а такое намерение не говорит, на какой основной писалось.
+	SwitchTime string    `json:"switch_time,omitempty"`
+	last       time.Time // позднее время намерения, прочитанного у шлюза
 }
 
 // ReceiptsAlerted — файл в Config.Dir: хэши квитанций исхода, которые
@@ -190,9 +200,15 @@ type receipts struct {
 	// VoidStartedBefore.
 	voidBefore        time.Time
 	voidStartedBefore int64
-	dirty             bool // chains изменились: сохранить
-	byXID             map[uint32]intentAt
-	order             []uint32
+	voidTimeline      uint32 // receiptsState.VoidTimeline
+	// timeline, switches — линия времени сервера и где кончались её
+	// предки (setTimelines): по ним у места фиксации транзакции есть линия
+	// (timelineOf). 0 — не известна: намерения по линии не сверяются.
+	timeline uint32
+	switches []timelineSwitch
+	dirty    bool // chains изменились: сохранить
+	byXID    map[uint32]intentAt
+	order    []uint32
 	// alerted — хэши обработанных квитанций исхода (ReceiptsAlerted) и их
 	// время шлюза; handledBefore — граница сжатия.
 	alerted       map[string]bool
@@ -232,6 +248,32 @@ type intentAt struct {
 	spent uint64
 	// started — отметка базы в намерении (db_started, микросекунды); 0 — нет.
 	started int64
+	// timeline — линия времени базы в намерении (db_timeline); 0 — нет.
+	timeline uint32
+}
+
+// timelineSwitch — линия времени — предок нынешней — и место журнала, где
+// она кончилась: с него история пошла по следующей линии.
+type timelineSwitch struct {
+	timeline uint32
+	end      uint64
+}
+
+// setTimelines — линия времени сервера и её предки (pginput identify, при
+// каждом подключении).
+func (r *receipts) setTimelines(now uint32, switches []timelineSwitch) {
+	r.timeline, r.switches = now, switches
+}
+
+// timelineOf — линия времени, на которой записана фиксация на месте final;
+// 0 — историю линий сервер не дал.
+func (r *receipts) timelineOf(final uint64) uint32 {
+	for _, s := range r.switches {
+		if final < s.end {
+			return s.timeline
+		}
+	}
+	return r.timeline
 }
 
 // receiptFile — файл квитанций одного шлюза и место в нём.
@@ -323,7 +365,7 @@ func openReceipts(cfg ReceiptsConfig, dir string, raise func(alert.Event) error)
 	if v, err := time.Parse(time.RFC3339Nano, st.VoidBefore); err == nil {
 		r.voidBefore = v
 	}
-	r.voidStartedBefore = st.VoidStartedBefore
+	r.voidStartedBefore, r.voidTimeline = st.VoidStartedBefore, st.VoidTimeline
 	for k, l := range st.Links {
 		if l != nil {
 			r.links[k] = l
@@ -408,6 +450,13 @@ func (r *receipts) fits(at intentAt, xid uint32, commit time.Time, final uint64)
 	}
 	if at.xid8 != 0 && r.ref8 != 0 && at.xid8 != fullXID(r.ref8, xid) {
 		return false // номер с эпохой: занятый заново после оборота номер — другой
+	}
+	if tl := r.timelineOf(final); at.timeline != 0 && final != 0 && tl != 0 && tl != at.timeline {
+		// Намерение писалось на другой линии времени, чем фиксация этой
+		// транзакции: после переключения на реплику новая основная выдаёт
+		// заново номера транзакций прежней, не дошедших до неё, — и намерение
+		// прежней основной о таком номере решило бы чужую транзакцию.
+		return false
 	}
 	t, err := time.Parse(time.RFC3339Nano, at.in.Time)
 	return err == nil && commit.Sub(t) <= intentWindow
@@ -502,6 +551,9 @@ type voidSpec struct {
 	// since — для намерений без отметки базы: время шлюза, до которого они
 	// не в счёт (запуск поднятой базы); ноль — не в счёт все прочитанные.
 	since time.Time
+	// timeline — линия времени, которую сборщик читал до сих пор: намерения
+	// с отметкой линии новее её startedBefore не снимает (0 — снимает любые).
+	timeline uint32
 	// startedBefore — для намерений с отметкой базы: не в счёт, если их база
 	// запущена не позже (микросекунды). Это время последней транзакции,
 	// прочитанной из прежней истории: база новой истории запущена после неё
@@ -533,6 +585,7 @@ func (r *receipts) void(v voidSpec) error {
 		r.voidBefore = v.since
 	}
 	r.voidStartedBefore = max(r.voidStartedBefore, v.startedBefore)
+	r.voidTimeline = max(r.voidTimeline, v.timeline)
 	var order []uint32
 	for _, xid := range r.order {
 		at, ok := r.byXID[xid]
@@ -540,7 +593,7 @@ func (r *receipts) void(v voidSpec) error {
 			continue
 		}
 		// Без отметки базы — все прочитанные (выше); с отметкой — по ней.
-		if at.started == 0 || at.started <= r.voidStartedBefore {
+		if at.started == 0 || r.startedVoid(at.started, at.timeline) {
 			delete(r.byXID, xid)
 			continue
 		}
@@ -551,13 +604,61 @@ func (r *receipts) void(v voidSpec) error {
 	return r.save()
 }
 
-// isVoid — намерение шлюза c со временем шлюза gw и отметкой базы started
-// дописано до того, как база ушла назад.
-func (r *receipts) isVoid(c *chainState, gw time.Time, started int64) bool {
+// switched — кластер переключился на реплику, у которой есть всё прочитанное
+// сборщиком (pginput identify): база назад не уходила, и намерения с
+// отметкой линии времени остаются в счёте — каждое решает транзакцию своей
+// линии (fits). Намерение без отметки линии (другой шлюз, прежняя версия
+// esmcp) не говорит, на какой основной писалось, а новая основная выдаёт
+// заново номера транзакций прежней, не дошедших до неё: такие, прочитанные
+// до сих пор, — не в счёт, как при уходе базы назад.
+func (r *receipts) switched() error {
+	if err := r.poll(); err != nil {
+		return err
+	}
+	for _, c := range r.chains {
+		if t, err := time.Parse(time.RFC3339Nano, c.SwitchTime); err != nil || c.last.After(t) {
+			c.SwitchTime = c.last.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	var order []uint32
+	for _, xid := range r.order {
+		at, ok := r.byXID[xid]
+		if !ok {
+			continue
+		}
+		if at.timeline == 0 {
+			delete(r.byXID, xid)
+			continue
+		}
+		order = append(order, xid)
+	}
+	r.order = order
+	r.dirty = true
+	return r.save()
+}
+
+// isVoid — намерение шлюза c со временем шлюза gw и отметками базы started
+// и timeline дописано до того, как база ушла назад или, без отметки линии, до
+// переключения кластера.
+func (r *receipts) isVoid(c *chainState, gw time.Time, started int64, timeline uint32) bool {
+	if t, err := time.Parse(time.RFC3339Nano, c.SwitchTime); timeline == 0 && err == nil && !gw.After(t) {
+		return true
+	}
 	if started != 0 {
-		return started <= r.voidStartedBefore
+		return r.startedVoid(started, timeline)
 	}
 	return c.voided(gw) || !r.voidBefore.IsZero() && !gw.After(r.voidBefore)
+}
+
+// startedVoid — намерение с отметками базы started и timeline — из истории
+// до того, как база ушла назад: его база запущена не позже границы, и линия
+// времени у него не новее той, что сборщик тогда читал. Без отметки линии
+// (timeline 0: шлюз её не пишет) — по одному запуску, как раньше.
+func (r *receipts) startedVoid(started int64, timeline uint32) bool {
+	if timeline != 0 && r.voidTimeline != 0 && timeline > r.voidTimeline {
+		return false
+	}
+	return started <= r.voidStartedBefore
 }
 
 // voided — намерение шлюза c со временем at дописано до того, как база ушла
@@ -973,7 +1074,7 @@ func (r *receipts) retiredKey(rf *receiptFile, rc gateway.Receipt, key []byte) b
 }
 
 func (r *receipts) save() error {
-	st := receiptsState{Version: stateVersion, Chains: r.chains, Links: r.links, Keys: r.keyStates, VoidStartedBefore: r.voidStartedBefore}
+	st := receiptsState{Version: stateVersion, Chains: r.chains, Links: r.links, Keys: r.keyStates, VoidStartedBefore: r.voidStartedBefore, VoidTimeline: r.voidTimeline}
 	if !r.handledBefore.IsZero() {
 		st.HandledBefore = r.handledBefore.UTC().Format(time.RFC3339Nano)
 	}
@@ -1040,6 +1141,7 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 		XID        string `json:"xid"`
 		XID8       string `json:"xid8"`
 		DBStarted  string `json:"db_started"`
+		DBTimeline string `json:"db_timeline"`
 		Alerted    bool   `json:"alerted"`
 	}
 	json.Unmarshal(rc.Body, &body)
@@ -1053,7 +1155,8 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 			c.last = rc.Time
 		}
 		started, _ := strconv.ParseInt(body.DBStarted, 10, 64)
-		if r.isVoid(c, rc.Time, started) {
+		tl, _ := strconv.ParseUint(body.DBTimeline, 10, 32)
+		if r.isVoid(c, rc.Time, started, uint32(tl)) {
 			break // дописано до того, как база ушла назад: номер мог быть выдан снова
 		}
 		xid8, _ := strconv.ParseUint(body.XID8, 10, 64)
@@ -1065,7 +1168,7 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 			if err != nil {
 				continue
 			}
-			at := intentAt{in: act, started: started}
+			at := intentAt{in: act, started: started, timeline: uint32(tl)}
 			if xid8 != 0 && uint32(xid8) == uint32(xid) {
 				at.xid8 = xid8
 			}

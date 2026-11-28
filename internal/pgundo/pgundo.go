@@ -815,12 +815,24 @@ type Difference struct {
 // транзакцией отката (xid — 32 бита, как в журнале базы; xid8 — с эпохой)
 // раньше её COMMIT (DECISIONS, п. 42). По ней сборщик берёт откат целиком.
 // Ошибка — откат не идёт: без квитанции он лёг бы отпечатком, не действием.
-type IntentFunc func(xid, xid8, started string) error
+//
+// started и timeline — отметки базы из транзакции отката (StartedSQL,
+// TimelineSQL): шлюз кладёт их в намерение (db_started, db_timeline).
+type IntentFunc func(xid, xid8, started, timeline string) error
 
 // StartedSQL — выражение: когда запущена база (pg_postmaster_start_time),
 // микросекунды с 1970 текстом. Шлюзы кладут его в намерение: сборщик
 // отличает по нему намерение из истории базы до её подъёма из копии.
 const StartedSQL = "(extract(epoch FROM pg_postmaster_start_time()) * 1000000)::bigint::text"
+
+// TimelineSQL — выражение: линия времени, на которой база пишет журнал
+// сейчас, числом. Шлюзы кладут её в намерение рядом с запуском базы: реплика,
+// ставшая основной (переключение кластера), запущена давно, и по одному
+// запуску её намерения не отличить от намерений прежней основной — а линия
+// времени у неё новая с первой же записи. Берётся из имени файла журнала:
+// pg_control_checkpoint() показывает прежнюю линию до первой контрольной
+// точки после переключения. Исполняется на основной базе, любой ролью.
+const TimelineSQL = "('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int::text"
 
 // Apply применяет шаги p.OK одной транзакцией. intent пишет квитанцию отката
 // до его изменений. Строка, изменённая после Check, отменяет всё: ErrChanged.
@@ -875,19 +887,23 @@ func (p *Plan) apply(db DB, intent IntentFunc, groups []group, order string) (_ 
 	}()
 	out := &Applied{Order: order}
 	// 32 бита — как в журнале базы, справочнике и тревогах; с эпохой — для квитанции.
-	res, err := db.Query("SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, " + StartedSQL)
+	res, err := db.Query("SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, " + StartedSQL + ", " + TimelineSQL)
 	if err != nil {
 		return nil, err
 	}
-	var xid8, started string
-	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) == 3 {
-		out.XID, xid8, started = deref(res[0].Rows[0][0]), deref(res[0].Rows[0][1]), deref(res[0].Rows[0][2])
+	var xid8, started, timeline string
+	if len(res) == 1 && len(res[0].Rows) == 1 && len(res[0].Rows[0]) >= 3 {
+		row := res[0].Rows[0]
+		out.XID, xid8, started = deref(row[0]), deref(row[1]), deref(row[2])
+		if len(row) > 3 {
+			timeline = deref(row[3])
+		}
 	}
 	if out.XID == "" {
 		return nil, errors.New("pgundo: the transaction id of the undo could not be read")
 	}
 	// Квитанция — до изменений: сборщик решает по ней на Begin транзакции.
-	if err := intent(out.XID, xid8, started); err != nil {
+	if err := intent(out.XID, xid8, started, timeline); err != nil {
 		return nil, fmt.Errorf("the undo's receipt could not be written, so the undo did not run: %w", err)
 	}
 	// Счёт до шагов: статистика сеанса держит и не сброшенные прошлые

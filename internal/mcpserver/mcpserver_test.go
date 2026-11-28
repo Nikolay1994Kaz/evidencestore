@@ -148,6 +148,10 @@ func (d *fakeDB) answer(sql string) ([]pgwire.Result, error) {
 			zero := "0"
 			cols, row = append(cols, "rows"), append(row, &zero)
 		}
+		if strings.Contains(sql, "pg_walfile_name") { // линия времени — последней колонкой
+			line := "3"
+			cols, row = append(cols, "timeline"), append(row, &line)
+		}
 		return []pgwire.Result{{Columns: cols, Rows: [][]*string{row}, Tag: "SELECT 1"}}, nil
 	case strings.Contains(sql, "pg_current_xact_id"):
 		return []pgwire.Result{{Columns: []string{"xid"}, Rows: [][]*string{{&v}}, Tag: "SELECT 1"}}, nil
@@ -266,7 +270,7 @@ func TestExecuteKeepsItsReceipts(t *testing.T) {
 	// агента подготовкой и исполнением, отложенное — сразу, свои настройки
 	// снова; фиксация. В журнал базы сервер от себя ничего не пишет.
 	if len(db.log) != 13 || db.log[0] != "DISCARD ALL" || db.log[1] != "BEGIN" || !strings.HasPrefix(db.log[2], "SET LOCAL search_path = pg_catalog, pg_temp; ") ||
-		db.log[3] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, "+pgundo.StartedSQL || db.log[4] != "SET LOCAL search_path TO DEFAULT" ||
+		db.log[3] != "SELECT pg_current_xact_id()::xid::text, pg_current_xact_id()::text, "+pgundo.StartedSQL+", "+pgundo.TimelineSQL || db.log[4] != "SET LOCAL search_path TO DEFAULT" ||
 		db.log[5] != "PREPARE es_agent_0 AS UPDATE accounts SET note = 'it''s' WHERE id = 6" || db.log[6] != "EXECUTE es_agent_0" ||
 		db.log[7] != "SET CONSTRAINTS ALL IMMEDIATE" || db.log[8] != "SET LOCAL search_path = pg_catalog, pg_temp" || db.log[11] != ownTimeouts || db.log[12] != "COMMIT" {
 		t.Fatalf("%q", db.log)
