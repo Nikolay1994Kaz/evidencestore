@@ -471,6 +471,76 @@ func TestReceiptKeysAndTheirPeriods(t *testing.T) {
 	}
 }
 
+// Смену ключа выводит цепочка (P-388): прежний ключ без not_after говорит за
+// шлюз до первой принятой квитанции под новым и ни мигом позже — сколько бы ни
+// ехала до хранилища последняя квитанция под прежним, и после рестарта тоже.
+func TestReceiptKeyChangeRetiresThePreviousKey(t *testing.T) {
+	first, second := receiptKey(t, 20), receiptKey(t, 21)
+	keys, err := NewKeySet(Key{Pub: pubOf(first)}, Key{Pub: pubOf(second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	s1, _ := NewSigner(first, "gw", nil)
+	one := mustSign(t, s1, Draft{Time: change.Add(-time.Hour), Action: "a", Step: "s1"})
+	two := mustSign(t, s1, Draft{Time: change.Add(-time.Minute), Action: "a", Step: "s2"})
+	s2, _ := NewSigner(second, "gw", nil)
+	l2 := mustParse(t, two)
+	s2.After(l2.Seq, l2.Hash)
+	three := mustSign(t, s2, Draft{Time: change.Add(time.Minute), Action: "a", Step: "s3"})
+	l3 := mustParse(t, three)
+	thief, _ := NewSigner(first, "gw", nil)
+	thief.After(l3.Seq, l3.Hash)
+	fake := mustSign(t, thief, Draft{Time: change, Action: "a", Step: "cancel"})
+	four := mustSign(t, s2, Draft{Time: change.Add(2 * time.Minute), Action: "a", Step: "s4"})
+	l4 := mustParse(t, four)
+	old, _ := NewSigner(first, "gw", nil)
+	old.After(l4.Seq, l4.Hash)
+	back := mustSign(t, old, Draft{Time: change.Add(3 * time.Minute), Action: "a", Step: "s5"})
+
+	check := func(tr *ReceiptTracker, name string, line []byte, at time.Time, link, sig string) Verdict {
+		t.Helper()
+		v := tr.Check(line, at)
+		if v.Link != link || v.Signature != sig {
+			t.Fatalf("%s: %+v, want link %s, signature %s", name, v, link, sig)
+		}
+		return v
+	}
+	tr := NewReceiptTracker(keys)
+	late := change.Add(5 * time.Hour) // хранилище лежало: квитанции едут часами
+	var vs []Verdict
+	vs = append(vs, check(tr, "seq 1", one, change.Add(-time.Hour), LinkGenesis, SigValid))
+	vs = append(vs, check(tr, "seq 2, received late", two, late, LinkOK, SigValid))
+	vs = append(vs, check(tr, "seq 3 under the second key", three, late, LinkOK, SigValid))
+	v := check(tr, "the previous key after the change", fake, late, LinkOK, SigInvalid)
+	if !strings.Contains(v.Problem, "moved on from key "+KeyID(pubOf(first))) || !strings.Contains(v.Problem, "seq 3") {
+		t.Fatalf("problem %q", v.Problem)
+	}
+	check(tr, "seq 4 after the forgery", four, late, LinkOK, SigValid)
+	check(tr, "back to the previous key", back, late, LinkOK, SigInvalid)
+
+	// После рестарта — по вердиктам из цепи.
+	resumed := NewReceiptTracker(keys)
+	for _, v := range vs {
+		resumed.Resume(v)
+	}
+	check(resumed, "the previous key after a restart", fake, late, LinkOK, SigInvalid)
+	check(resumed, "seq 4 after a restart", four, late, LinkOK, SigValid)
+
+	// Без ключей ничего не снимается: подписи не проверены.
+	nokeys := NewReceiptTracker(nil)
+	for _, l := range [][]byte{one, two, three, fake} {
+		if v := nokeys.Check(l, late); v.Signature != SigNoKey {
+			t.Fatalf("without keys: %+v", v)
+		}
+	}
+	// У каждого шлюза своя смена: ключ, снятый у одного, у другого в силе.
+	other, _ := NewSigner(first, "gw2", nil)
+	if v := tr.Check(mustSign(t, other, Draft{Time: change, Action: "b", Step: "s"}), late); v.Signature != SigValid || v.Link != LinkGenesis {
+		t.Fatalf("another gateway under the first key: %+v", v)
+	}
+}
+
 func mustParse(t *testing.T, line []byte) Receipt {
 	t.Helper()
 	r, err := ParseReceipt(line)

@@ -98,6 +98,22 @@ type receiptsState struct {
 	// прочитанная сборщиком: выпавшая из файла квитанция видна и после
 	// перезапуска (T-6 второго захода).
 	Links map[string]*chainLink `json:"links,omitempty"`
+	// Keys — ключи шлюзов по цепочке (путь файла, шлюз): каким подписана его
+	// последняя прочитанная квитанция и с каких он ушёл (P-388).
+	Keys map[string]*keyState `json:"keys,omitempty"`
+}
+
+// keyState — ключи шлюза в одном файле. Смену ключа выводит сам файл: с
+// первой квитанцией шлюза под новым ключом прежний для него снят, и строки
+// под прежним после неё ничего не решают — их пишет тот, у кого прежний ключ
+// остался. Состояние — в receipts.json: файл после рестарта читается с
+// начала, его поворачивают и обрезают, а снятый ключ снят навсегда. Цена:
+// честное намерение под прежним ключом, прочитанное заново после рестарта,
+// тоже ничего не решает (DECISIONS, п. 47).
+type keyState struct {
+	Current string `json:"current"` // hex
+	// Retired — hex ключа → seq первой квитанции шлюза под следующим.
+	Retired map[string]uint64 `json:"retired,omitempty"`
 }
 
 // chainLink — где сборщик застал цепочку квитанций одного шлюза в одном
@@ -187,6 +203,7 @@ type receipts struct {
 	// тревога, пока не прочтётся).
 	unreadable map[string]string
 	links      map[string]*chainLink
+	keyStates  map[string]*keyState // (путь файла, шлюз) → его ключи
 	// missed — транзакции, у которых на их начале намерения не нашлось
 	// (номер → время фиксации): намерение, пришедшее после, — тревога.
 	missed      map[uint32]time.Time
@@ -279,7 +296,7 @@ func openReceipts(cfg ReceiptsConfig, dir string, raise func(alert.Event) error)
 	r := &receipts{cfg: cfg, state: filepath.Join(dir, ReceiptsState), raise: raise, now: time.Now, byXID: map[uint32]intentAt{}, chains: map[string]*chainState{},
 		spent: map[string]uint64{}, spentPath: filepath.Join(dir, ReceiptsSpent),
 		alerted: map[string]bool{}, alertedPath: filepath.Join(dir, ReceiptsAlerted), unreadable: map[string]string{},
-		links: map[string]*chainLink{}, intents: map[string]bool{}, missed: map[uint32]time.Time{}}
+		links: map[string]*chainLink{}, keyStates: map[string]*keyState{}, intents: map[string]bool{}, missed: map[uint32]time.Time{}}
 	if err := r.loadSpent(); err != nil {
 		return nil, err
 	}
@@ -310,6 +327,11 @@ func openReceipts(cfg ReceiptsConfig, dir string, raise func(alert.Event) error)
 	for k, l := range st.Links {
 		if l != nil {
 			r.links[k] = l
+		}
+	}
+	for k, ks := range st.Keys {
+		if ks != nil {
+			r.keyStates[k] = ks
 		}
 	}
 	if v, err := time.Parse(time.RFC3339Nano, st.HandledBefore); err == nil {
@@ -873,10 +895,11 @@ func (r *receipts) sameTail(rf *receiptFile) bool {
 
 // unsigned — строки одного чтения файла квитанций, которые не квитанция с
 // подписью ключа шлюза: сколько, где первая и последняя кончаются, сколько
-// из них длиннее любой квитанции.
+// из них длиннее любой квитанции, сколько подписаны ключом, с которого шлюз
+// ушёл (keyState).
 type unsigned struct {
-	n, long     int
-	first, last int64
+	n, long, retired int
+	first, last      int64
 }
 
 func (u *unsigned) add(end int64, long bool) {
@@ -906,13 +929,51 @@ func (r *receipts) unsignedAlert(rf *receiptFile, u unsigned) error {
 		where += fmt.Sprintf(" (%d of them longer than any receipt)", u.long)
 	}
 	ev := alert.Event{}
+	if u.retired == u.n {
+		ev.Add(alert.KindForgedReceipt, fmt.Sprintf("%s of the gateway's receipts %s: signed with a key its gateway moved on from — "+
+			"after the gateway's first receipt under its new key, only whoever kept the previous key signs with it; it decides nothing about any transaction", where, rf.path))
+		return r.raise(ev)
+	}
+	also := ""
+	if u.retired > 0 {
+		also = fmt.Sprintf("; %d of them are signed with a key their gateway moved on from, which only whoever kept that key signs with now", u.retired)
+	}
 	ev.Add(alert.KindForgedReceipt, fmt.Sprintf("%s of the gateway's receipts %s: not a receipt signed with a gateway key the collector knows — "+
-		"a gateway died in the middle of writing it, or someone without the key wrote it; it decides nothing about any transaction", where, rf.path))
+		"a gateway died in the middle of writing it, or someone without the key wrote it%s; it decides nothing about any transaction", where, rf.path, also))
 	return r.raise(ev)
 }
 
+// retiredKey — квитанция rc файла rf подписана ключом key, с которого её шлюз
+// ушёл; иначе ключ становится нынешним ключом шлюза, а прежний, если он
+// другой, снимается (keyState).
+func (r *receipts) retiredKey(rf *receiptFile, rc gateway.Receipt, key []byte) bool {
+	chain := rf.chain
+	if chain == "" {
+		chain = rf.path
+	}
+	id, kh := chain+"\x00"+rc.Gateway, hex.EncodeToString(key)
+	ks := r.keyStates[id]
+	switch {
+	case ks == nil:
+		r.keyStates[id] = &keyState{Current: kh}
+		r.dirty = true
+	case ks.Current == kh:
+	default:
+		if _, gone := ks.Retired[kh]; gone {
+			return true
+		}
+		if ks.Retired == nil {
+			ks.Retired = map[string]uint64{}
+		}
+		ks.Retired[ks.Current] = rc.Seq
+		ks.Current = kh
+		r.dirty = true
+	}
+	return false
+}
+
 func (r *receipts) save() error {
-	st := receiptsState{Version: stateVersion, Chains: r.chains, Links: r.links, VoidStartedBefore: r.voidStartedBefore}
+	st := receiptsState{Version: stateVersion, Chains: r.chains, Links: r.links, Keys: r.keyStates, VoidStartedBefore: r.voidStartedBefore}
 	if !r.handledBefore.IsZero() {
 		st.HandledBefore = r.handledBefore.UTC().Format(time.RFC3339Nano)
 	}
@@ -951,6 +1012,13 @@ func (r *receipts) line(rf *receiptFile, line []byte, end int64, bad *unsigned) 
 	}
 	if perr != nil {
 		return nil // подписано, но не по формату: хранилище назовёт поломку, сборщику в ней нечего взять
+	}
+	if r.retiredKey(rf, rc, key) {
+		if fresh {
+			bad.add(end, false)
+			bad.retired++
+		}
+		return nil
 	}
 	if err := r.link(rf, rc, key); err != nil {
 		return err

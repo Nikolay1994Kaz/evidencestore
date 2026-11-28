@@ -10,7 +10,7 @@
   "./internal/proof/",
   "./cmd/esverify/"
  ],
- "run": "^Test(Intents|IntentOf|IntentGoes|IntentsError|IntentsAre|ForgedReceipt|OutcomesRaise|ReceiptsOf|ReceiptsFile|Transactions|Agent|Alerts|Undo|TestPending|Pending|Foreign|CheckAndApply|Build|LinkDeal|DealBundle|SignRefuses|LedgerReads|ActionsPerMinute|WindowRows|Execute|RowLimit|UndoTakes|UndoIs|LostCommit|Torn)",
+ "run": "^Test(KeyChange|RevokedKey|Intents|IntentOf|IntentGoes|IntentsError|IntentsAre|ForgedReceipt|OutcomesRaise|ReceiptsOf|ReceiptsFile|Transactions|Agent|Alerts|Undo|TestPending|Pending|Foreign|CheckAndApply|Build|LinkDeal|DealBundle|SignRefuses|LedgerReads|ActionsPerMinute|WindowRows|Execute|RowLimit|UndoTakes|UndoIs|LostCommit|Torn)",
  "mutations": [
   {
    "name": "R1 подпись квитанции не проверяется сборщиком",
@@ -203,6 +203,36 @@
    "file": "internal/proof/deal.go",
    "old": "case r.SubjectKeyless > 0:",
    "new": "case false:"
+  },
+  {
+   "name": "K1 ключ, с которого шлюз ушёл, решает транзакцию",
+   "file": "internal/pginput/receipts.go",
+   "old": "\tif r.retiredKey(rf, rc, key) {",
+   "new": "\tif r.retiredKey(rf, rc, key) && false {"
+  },
+  {
+   "name": "K2 снятый ключ не ищется среди снятых",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\tif _, gone := ks.Retired[kh]; gone {",
+   "new": "\t\tif _, gone := ks.Retired[kh]; gone && false {"
+  },
+  {
+   "name": "K3 ключи шлюзов не сохраняются в receipts.json",
+   "file": "internal/pginput/receipts.go",
+   "old": "Links: r.links, Keys: r.keyStates, VoidStartedBefore",
+   "new": "Links: r.links, VoidStartedBefore"
+  },
+  {
+   "name": "K4 ключи шлюзов не читаются из receipts.json",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\t\tr.keyStates[k] = ks\n",
+   "new": "\t\t\tr.keyStates[\"x\"+k] = ks\n"
+  },
+  {
+   "name": "K5 тревога не называет снятый ключ",
+   "file": "internal/pginput/receipts.go",
+   "old": "\t\t\tbad.retired++\n",
+   "new": ""
   }
  ]
 }
