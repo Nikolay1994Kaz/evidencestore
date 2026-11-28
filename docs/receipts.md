@@ -98,6 +98,8 @@ An entry is 64 hex characters or `{"key", "not_before", "not_after"}`, the times
 
 **Revoking a key.** `not_after` is the moment from which the key is not trusted. A receipt received from then on under it gets the verdict `invalid` with the reason, does not enter the gateway's chain and is not opened in bundles, like one signed with a stranger's key. Verdicts already in the chain keep what they said: moving `not_after` back does not judge again what the store has received. An auditor does that with a key list of their own (below).
 
+Remove a revoked key from `gateway_keys` of a collector that reads the receipts for PostgreSQL as well, and restart it. The collector knows no periods: it takes an intent signed with any key on its list, so while the revoked key is there, its holder decides which transaction counts as an agent's action. Once the key is off the list, its intents decide nothing and every new line under it raises `forged-receipt`. That also holds for an honest intent under the key that the collector has not read yet: its transaction goes as a fingerprint, as one without an intent does.
+
 **The auditor's keys.** `esverify -gateway-key KEY`, repeated for every key, or a file with the same array as `gateway_keys`, periods included. Each open receipt is checked with the key it names, and that key's period is compared with the receive time in the bundle. A key the auditor knows to be stolen earlier than the store's settings say fails the receipts received after that moment, whatever the store's verdict was.
 
 Whose keys these are, and which periods are true, neither the store nor a bundle shows: the settings are the word of the store's operator, and the auditor brings their own.
